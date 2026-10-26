@@ -1,0 +1,12 @@
+{
+  "name": "hq",
+  "private": true,
+  "license": "MIT",
+  "version": "0.0.1",
+  "description": "HQ: local multi-agent Claude Code control room",
+  "workspaces": ["backend", "frontend"],
+  "scripts": {
+    "backend": "npm --workspace backend run dev",
+    "frontend": "npm --workspace frontend run dev"
+  }
+}

@@ -1,0 +1,29 @@
+# Typecheck, unit tests and lint on every PR and on main. The e2e suite (tmux + fake Claude Code) stays local for now.
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 25 # node:sqlite and --experimental-strip-types, as HQ runs locally
+          cache: npm
+      - run: npm ci
+      - name: Backend typecheck
+        run: npm --workspace @hq/backend run typecheck
+      - name: Backend unit tests
+        run: npm --workspace @hq/backend test
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: npx tsc -b
+      - name: Frontend lint
+        run: npm --workspace frontend run lint -- --deny-warnings
+      - name: No new lines over 200 characters
+        run: node scripts/long-lines.mjs

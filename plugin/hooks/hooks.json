@@ -1,0 +1,1 @@
+{ "description": "HQ mod", "modules": ["./register.js"] }

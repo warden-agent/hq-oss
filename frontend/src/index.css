@@ -1,0 +1,17 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+:root { color-scheme: dark; }
+body { @apply bg-zinc-950 text-zinc-200 antialiased; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.card { @apply rounded-lg border border-zinc-800 bg-zinc-900/60 p-3; }
+.btn { @apply rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-40; }
+.btn-sm { @apply rounded-md border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[11px] leading-4 whitespace-nowrap text-zinc-200 hover:bg-zinc-700 disabled:opacity-40; } /* 22px tall: board.ts ACTS */
+.btn-primary { @apply border-indigo-500/50 bg-indigo-600/70 hover:bg-indigo-500/80; }
+.pill { @apply rounded-full px-2 py-0.5 text-[11px] font-medium; }
+.input { @apply w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-sm text-zinc-100 outline-none focus:border-indigo-500; }
+/* Graph boxes: 1px border + p-2 + 16px rows; board.ts computes each box's height from these (CHROME, ROW). */
+.hq-card { @apply h-full w-full cursor-pointer overflow-hidden rounded-lg border bg-zinc-900 p-2 text-[11px] leading-4 text-zinc-200; }
+.hq-pop { @apply cursor-auto rounded-lg border border-zinc-700 bg-zinc-900 p-3 text-xs text-zinc-200 shadow-xl; }
+.hq-anchor { opacity: 0 !important; pointer-events: none !important; }
+/* While a splitter is dragged: no text selection, and the preview's frame doesn't swallow the pointer. */
+.hq-dragging { user-select: none; }
+.hq-dragging iframe { pointer-events: none; }
