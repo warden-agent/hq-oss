@@ -3,7 +3,8 @@
 import { execFile } from 'node:child_process'
 import { git, explain, type SyncOpts } from './reposync.ts'
 
-export type Pr = { number: number; url: string; state: 'OPEN' | 'MERGED' | 'CLOSED' }
+/** `mergeable`: GitHub's word on an open PR (CONFLICTING, MERGEABLE, or UNKNOWN while it works it out). */
+export type Pr = { number: number; url: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; mergeable?: string }
 
 function gh(args: string[], o: SyncOpts): Promise<string> {
   return new Promise((resolve, reject) => execFile('gh', args, { env: { ...process.env, GH_CONFIG_DIR: o.ghConfigDir, GH_PROMPT_DISABLED: '1' }, timeout: o.timeoutMs ?? 30_000 }, (err, out, errOut) =>
@@ -22,7 +23,7 @@ export async function pushBranch(repoPath: string, slug: string, branch: string,
 
 /** PRs whose head is `branch`. Asking GitHub, not git ancestry, also catches squash and rebase merges. */
 export async function prsForBranch(slug: string, branch: string, o: SyncOpts): Promise<Pr[]> {
-  return parsePrs(await gh(['pr', 'list', '--repo', slug, '--head', branch, '--state', 'all', '--json', 'number,url,state'], o))
+  return parsePrs(await gh(['pr', 'list', '--repo', slug, '--head', branch, '--state', 'all', '--json', 'number,url,state,mergeable'], o))
 }
 export function parsePrs(json: string): Pr[] {
   const rows = JSON.parse(json || '[]') as Partial<Pr>[]

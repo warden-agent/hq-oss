@@ -23,6 +23,7 @@ export function startListeners(): void {
     if (t?.status === 'awaiting_answer') setTicket(t.id, { status: t.prior_status ?? 'implementing', prior_status: null })
   })
   bus.on('event:ticket.merged', onTicketMerged)
+  bus.on('event:ticket.merged', () => { void checkMerges().catch(() => {}) }) // main moved: do the tickets still waiting merge cleanly?
   bus.on('slot.freed', () => { void fillSlots().catch(() => {}) }) // a finished engineer no longer counts against the limit
   bus.on('repo.synced', () => { void checkMerges().catch(() => {}) }) // a fresh fetch may show a merge
 }

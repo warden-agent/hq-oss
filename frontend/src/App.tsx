@@ -3,7 +3,7 @@ import { api, connectWs, errText, jsonList, showError, waitingFor, FINISHED, typ
 import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
 import { AttentionList, MergeAct, ReviewPanel } from './Nodes'
-import { BoardCtx, buildBoard, liveEngineer, mergeAct, ticketLabel, useBoard, type Board, type Pop, type PopKind } from './board'
+import { BoardCtx, buildBoard, liveEngineer, mergeActs, ticketLabel, useBoard, type Board, type Pop, type PopKind } from './board'
 import { ErrorBar, Menu, Pill } from './ui'
 import { Dot, PreviewPane } from './Preview'
 import { clampH, clampW, rightWidth, usePreviewPrefs } from './previewPrefs'
@@ -195,7 +195,7 @@ function Bell({ state, board }: { state: State; board: Board }) {
   const b = useBoard()
   const reviews = state.reviews.filter((r) => r.status === 'open').sort((x, y) => (y.opened_at ?? 0) - (x.opened_at ?? 0))
   const base = (t: any) => { const f = state.features.find((x) => x.id === t.feature_id); return { cancelled: f?.status === 'cancelled', branch: state.repos.find((r) => r.id === f?.repo_id)?.default_branch ?? 'main' } }
-  const merges = state.tickets.flatMap((t) => { const f = base(t), a = f.cancelled ? null : mergeAct(t, f.branch); return a ? [{ t, a }] : [] })
+  const merges = state.tickets.flatMap((t) => { const f = base(t), acts = f.cancelled ? [] : mergeActs(t, f.branch, liveEngineer(t, state)); return acts.length ? [{ t, acts }] : [] })
   const n = reviews.length + merges.length + state.attention.length
   return <Menu label={`⚠ ${n}`} title="Plan reviews and things that need you" className={`btn ${n ? 'border-rose-500/50! text-rose-300!' : ''}`}>{(close) => <div className="flex max-h-[75vh] w-[440px] max-w-[90vw] flex-col gap-2 overflow-y-auto text-xs">
     {!n && <div className="p-1 text-zinc-500">Nothing needs you right now.</div>}
@@ -207,8 +207,8 @@ function Bell({ state, board }: { state: State; board: Board }) {
         : <ReviewPanel key={r.id} r={r} label={label} />
     })}
     {merges.length > 0 && <div className="font-semibold text-zinc-400">Waiting for you to merge</div>}
-    {merges.map(({ t, a }) => { const node = `t:${t.id}`; return <div key={t.id} className="flex items-center gap-2 rounded-md border border-zinc-800 p-2"><span className="min-w-0 grow truncate text-indigo-300" title={`${t.key}: ${t.title}`}>{t.key} · {t.title}</span>
-      <MergeAct a={a} t={t} />{board.has(node) && <button className="btn-sm" onClick={() => { b.focus(node); close() }}>Show</button>}</div> })}
+    {merges.map(({ t, acts }) => { const node = `t:${t.id}`; return <div key={t.id} className="flex items-center gap-2 rounded-md border border-zinc-800 p-2"><span className="min-w-0 grow truncate text-indigo-300" title={`${t.key}: ${t.title}`}>{t.key} · {t.title}</span>
+      {acts.map((a, i) => <MergeAct key={i} a={a} t={t} />)}{board.has(node) && <button className="btn-sm" onClick={() => { b.focus(node); close() }}>Show</button>}</div> })}
     {state.attention.length > 0 && <div className="font-semibold text-zinc-400">Attention</div>}
     <AttentionList items={state.attention} show={(a) => { const node = board.attNode(a); return node ? () => { b.focus(node, 'attention'); close() } : null }} />
   </div>}</Menu>

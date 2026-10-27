@@ -33,7 +33,8 @@ export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>): voi
 
 export type LaunchSpec = {
   role: Role; featureId?: string; ticketId?: string; reviewRequestId?: string; model: string; cwd: string; displayName: string
-  launchPrompt: string; worktreeName?: string; extraEnv?: Record<string, string>; extraFlags?: string[]; repoAllowlist?: string[]; editOverrides?: string[]; size?: string
+  launchPrompt: string; worktreeName?: string; permissionMode?: 'plan' | 'acceptEdits'
+  extraEnv?: Record<string, string>; extraFlags?: string[]; repoAllowlist?: string[]; editOverrides?: string[]; size?: string
 }
 
 export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
@@ -48,12 +49,14 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   const sessionId = randomUUID()
   const env: Record<string, string> = { HQ_AGENT_ID: agentId, HQ_BACKEND: `http://127.0.0.1:${PORTS.hooks}`, HQ_TOKEN_FILE: path.join(dir, 'token'), DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_ENABLE_TODO_TOOLS: '1', ...(spec.extraEnv ?? {}) }
   const flags = ['--session-id', sessionId, '--name', spec.displayName, '--settings', path.join(dir, 'settings.json'), '--strict-mcp-config', '--mcp-config', path.join(dir, 'mcp.json'),
-    '--plugin-dir', PATHS.plugin, '--append-system-prompt-file', rolePromptPath(spec.role), ...roleFlags(spec.role, { worktreeName: spec.worktreeName, model: spec.model }), ...(spec.extraFlags ?? [])]
+    '--plugin-dir', PATHS.plugin, '--append-system-prompt-file', rolePromptPath(spec.role),
+    ...roleFlags(spec.role, { worktreeName: spec.worktreeName, model: spec.model, permissionMode: spec.permissionMode }), ...(spec.extraFlags ?? [])]
   const script = ['#!/bin/bash', ...Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}`), `cd ${shq(spec.cwd)}`, `exec ${shq(CLAUDE_BIN)} ${flags.map(shq).join(' ')}`].join('\n') + '\n'
   const scriptPath = path.join(dir, 'launch.sh'); fs.writeFileSync(scriptPath, script, { mode: 0o700 })
   const t = now()
   run(`INSERT INTO agents(id, role, feature_id, ticket_id, review_request_id, model_alias, claude_session_id, tmux_session, cwd, token_hash, status, in_plan_mode, started_at, launch_prompt, display_name)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agentId, spec.role, spec.featureId ?? null, spec.ticketId ?? null, spec.reviewRequestId ?? null, spec.model, sessionId, tmuxName(agentId), spec.cwd, sha(token), 'launching', spec.role === 'engineer' ? 1 : 0, t, spec.launchPrompt, spec.displayName)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agentId, spec.role, spec.featureId ?? null, spec.ticketId ?? null, spec.reviewRequestId ?? null, spec.model, sessionId, tmuxName(agentId), spec.cwd, sha(token), 'launching',
+       spec.role === 'engineer' && spec.permissionMode !== 'acceptEdits' ? 1 : 0, t, spec.launchPrompt, spec.displayName)
   run('INSERT INTO sessions(id, agent_id, claude_session_id, started_at) VALUES (?,?,?,?)', id('ses'), agentId, sessionId, t)
   run('INSERT INTO batches(id, agent_id, text, created_at, method) VALUES (?,?,?,?,?)', id('B'), agentId, spec.launchPrompt, t, 'launch')
   try {

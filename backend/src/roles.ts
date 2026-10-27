@@ -72,11 +72,12 @@ export function buildMcp(token: string): Record<string, unknown> {
   return { mcpServers: { hq: { type: 'http', url: `http://127.0.0.1:${PORTS.mcp}/mcp`, headers: { Authorization: `Bearer ${token}` } } } }
 }
 
-/** CLI flags per role (excluding the common ones the launcher adds). */
-export function roleFlags(role: Role, opts: { worktreeName?: string; model: string }): string[] {
+/** CLI flags per role (excluding the common ones the launcher adds). Engineers start in plan mode; one fixing a merge conflict on
+ *  finished work starts in acceptEdits (no plan to review; spike 2026-10-26: no gate, and Bash git merge runs sandboxed). */
+export function roleFlags(role: Role, opts: { worktreeName?: string; model: string; permissionMode?: 'plan' | 'acceptEdits' }): string[] {
   if (role === 'engineer') {
     return ['--worktree', opts.worktreeName!, '--restricted', '--tools', ENGINEER_TOOLS.join(','), '--setting-sources', 'user', '--disable-slash-commands',
-      '--disallowedTools', ...ENGINEER_DISALLOWED, '--permission-mode', 'plan', '--model', opts.model]
+      '--disallowedTools', ...ENGINEER_DISALLOWED, '--permission-mode', opts.permissionMode ?? 'plan', '--model', opts.model]
   }
   return ['--disallowedTools', ...PLANNER_DISALLOWED, '--permission-mode', 'default', '--model', opts.model]
 }

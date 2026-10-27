@@ -31,10 +31,17 @@ function AttChip({ id, n }: { id: string; n: number }) {
   const open = b.pop?.node === id && b.pop.kind === 'attention'
   return <button className="nopan shrink-0 rounded bg-rose-500/20 px-1 text-[10px] leading-4 text-rose-300 hover:bg-rose-500/30" title="Needs you: click for details" onClick={() => open ? b.setPop(null) : b.focus(id, 'attention')}>⚠ {n}</button>
 }
-/** Attention items with ✓ (and Show, in the top-bar menu). */
+/** Fix conflicts: HQ checks again, then the ticket's engineer (or a fresh one on the same branch) merges main in. */
+export function FixAct({ t }: { t: any }) {
+  return <ActBtn primary label="Fix conflicts" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
+    title={'HQ checks the branch against main again. If it still conflicts, its engineer merges main in, keeps both sides, runs the tests and commits;'
+      + ' if that engineer has stopped, a new one starts on the same branch. You merge it afterwards.'} />
+}
+/** Attention items with ✓ (and Show, in the top-bar menu). A merge conflict also gets Fix conflicts. */
 export function AttentionList({ items, show }: { items: any[]; show?: (a: any) => (() => void) | null }) {
   return <div className="flex flex-col gap-1">{items.map((a) => { const go = show?.(a); return <div key={a.id} className="rounded-md border border-zinc-800 bg-zinc-950/60 p-2 text-xs">
-    <div className="flex items-start justify-between gap-2"><span className="min-w-0 break-words font-medium text-rose-300">{a.kind}</span><span className="flex shrink-0 gap-1">{go && <button className="btn-sm" onClick={go}>Show</button>}<ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} /></span></div>
+    <div className="flex items-start justify-between gap-2"><span className="min-w-0 break-words font-medium text-rose-300">{a.kind}</span><span className="flex shrink-0 gap-1">
+      {a.kind === 'merge_conflict' && a.ticket_id && <FixAct t={{ id: a.ticket_id }} />}{go && <button className="btn-sm" onClick={go}>Show</button>}<ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} /></span></div>
     <div className="mt-1 break-words text-zinc-400"><Linked text={a.detail} /></div></div> })}</div>
 }
 /** The plan under review with Approve / Revise. On a box it closes with × or Esc; in the top-bar menu it has no ×. */
@@ -124,8 +131,9 @@ function TicketAct({ a, v, id }: { a: Act; v: TicketView; id: string }) {
   if (a.kind === 'approve') return <ActBtn primary label="Approve" busyLabel="Approving…" title="Approve the plan without opening it" run={() => answerReview(v.review, 'approve')} />
   return <MergeAct a={a} t={v.t} />
 }
-/** Merge into main (local repos: HQ merges, or refuses and says why) or the PR link (GitHub). On the box and in the ⚠ menu. */
+/** Merge into main (local repos: HQ merges, or refuses and says why), the PR link (GitHub), or Fix conflicts. On the box and in the ⚠ menu. */
 export function MergeAct({ a, t }: { a: Act; t: any }) {
+  if (a.kind === 'fix') return <FixAct t={t} />
   if (a.kind === 'merge') return <ActBtn primary label={`Merge into ${a.into}`} busyLabel="Merging…" title={`HQ merges ${t.branch} into ${a.into} in your checkout. If that isn't safe it changes nothing and tells you why.`} run={() => api(`tickets/${t.id}/merge`, {})} />
   if (a.kind === 'link') return <a className={`btn-sm nopan ${a.primary ? 'btn-primary' : ''}`} href={a.href} target="_blank" rel="noreferrer">{a.label}</a>
   return null

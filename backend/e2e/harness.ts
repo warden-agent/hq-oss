@@ -23,14 +23,15 @@ const freePort = (): Promise<number> => new Promise((resolve, reject) => {
 })
 
 export type Hq = Awaited<ReturnType<typeof startHq>>
-export async function startHq() {
+/** `env`: extra environment for the backend (a fake `gh` on PATH, say). */
+export async function startHq(o: { env?: NodeJS.ProcessEnv } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-e2e-')))
   const tmuxDir = fs.mkdtempSync('/tmp/hq-e2e-') // unix socket paths must stay short
   const home = path.join(root, 'home'), hqHome = path.join(root, 'hq'); fs.mkdirSync(home)
   fs.writeFileSync(path.join(home, '.claude.json'), '{ "projects": {} }') // HQ marks workspaces trusted in it
   const ports = { ui: await freePort(), hooks: await freePort(), mcp: await freePort() }
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, HQ_HOME: hqHome, HQ_UI_PORT: String(ports.ui), HQ_HOOKS_PORT: String(ports.hooks), HQ_MCP_PORT: String(ports.mcp), HQ_CLAUDE_BIN: FAKE, TMUX_TMPDIR: tmuxDir,
-    GIT_AUTHOR_NAME: 'HQ e2e', GIT_AUTHOR_EMAIL: 'e2e@hq.test', GIT_COMMITTER_NAME: 'HQ e2e', GIT_COMMITTER_EMAIL: 'e2e@hq.test', GIT_CONFIG_NOSYSTEM: '1' }
+    GIT_AUTHOR_NAME: 'HQ e2e', GIT_AUTHOR_EMAIL: 'e2e@hq.test', GIT_COMMITTER_NAME: 'HQ e2e', GIT_COMMITTER_EMAIL: 'e2e@hq.test', GIT_CONFIG_NOSYSTEM: '1', ...o.env }
   delete env.TMUX; delete env.TMUX_PANE // inside tmux these would point every tmux call at the live server
   let proc: ChildProcess | null = null; let log = ''
   const uiToken = () => { try { return fs.readFileSync(path.join(hqHome, 'ui-token'), 'utf8').trim() } catch { return '' } }

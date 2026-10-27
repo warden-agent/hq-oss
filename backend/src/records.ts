@@ -20,7 +20,8 @@ export type Ticket = {
   id: string; feature_id: string; key: string; slug: string; title: string; size: string; status: TicketStatus; prior_status: TicketStatus | null
   assignee_agent_id: string | null; expected_files: string; deps: string; edit_overrides: string; branch: string | null; worktree_path: string | null
   pr_number: number | null; pr_url: string | null; pr_state: string | null; plan_round: number; handoff_updated_at: number | null
-  last_handoff_hash: string | null; spec: string | null; go_ahead: number; created_at: number; updated_at: number
+  last_handoff_hash: string | null; spec: string | null; go_ahead: number; conflict_files: string | null; conflict_with: string | null
+  created_at: number; updated_at: number
 }
 
 export const repos = (): Repo[] => q<Repo>('SELECT * FROM repos ORDER BY created_at')

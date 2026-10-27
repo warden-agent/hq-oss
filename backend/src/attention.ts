@@ -16,6 +16,10 @@ export function resolveAttention(attId: string): void { run('UPDATE needs_attent
 export function resolveKind(kind: string, agentId: string | null): void {
   for (const r of q<Attention>("SELECT * FROM needs_attention WHERE kind = ? AND resolved_at IS NULL AND IFNULL(agent_id, '') = IFNULL(?, '')", kind, agentId)) resolveAttention(r.id)
 }
+/** Open notices of one kind about one ticket (attention() keys on the agent; a ticket can outlive its engineer). */
+export function resolveKindForTicket(kind: string, ticketId: string): void {
+  for (const r of q<Attention>('SELECT * FROM needs_attention WHERE kind = ? AND ticket_id = ? AND resolved_at IS NULL', kind, ticketId)) resolveAttention(r.id)
+}
 /** Every open notice about one ticket: moot once that ticket is merged. */
 export function resolveForTicket(ticketId: string): void { for (const r of q<Attention>('SELECT * FROM needs_attention WHERE ticket_id = ? AND resolved_at IS NULL', ticketId)) resolveAttention(r.id) }
 export function openAttention(): Attention[] { return q<Attention>('SELECT * FROM needs_attention WHERE resolved_at IS NULL ORDER BY created_at DESC') }

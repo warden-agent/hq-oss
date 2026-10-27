@@ -43,6 +43,7 @@ test('parsePrs / decidingPr: merged beats open beats closed', () => {
   assert.equal(decidingPr(prs.filter((p) => p.state !== 'MERGED'))?.number, 5)
   assert.equal(decidingPr([{ number: 3, url: 'u3', state: 'CLOSED' }])?.state, 'CLOSED')
   assert.equal(decidingPr([]), null)
+  assert.equal(parsePrs(JSON.stringify([{ number: 7, url: 'u7', state: 'OPEN', mergeable: 'CONFLICTING' }]))[0]!.mergeable, 'CONFLICTING') // the early warning reads it
 })
 
 test('pushBranch pushes the ticket branch and never overwrites a different one', async () => {

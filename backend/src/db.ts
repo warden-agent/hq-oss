@@ -86,6 +86,8 @@ UPDATE review_requests SET status = 'abandoned', closed_reason = 'superseded', a
 // A batch the mod reported getting (received_at), or one HQ gave up on and put back in the queue (dropped_at).
 `ALTER TABLE batches ADD COLUMN received_at INTEGER; ALTER TABLE batches ADD COLUMN dropped_at INTEGER;
 UPDATE batches SET received_at = handed_at WHERE handed_at IS NOT NULL;`, // older batches: never handed out again
+// A finished ticket that would conflict with main: the files (JSON list) and the tickets that merged first (JSON keys). NULL: clean.
+`ALTER TABLE tickets ADD COLUMN conflict_files TEXT; ALTER TABLE tickets ADD COLUMN conflict_with TEXT;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

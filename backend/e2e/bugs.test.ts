@@ -111,7 +111,7 @@ test('Bug 6: Merge into main for a local repo: refuses with the reason and chang
   fs.writeFileSync(path.join(dir, 'version.txt'), 'edited\n'); await unchanged(/^bug6 has uncommitted changes in version\.txt\. Commit or stash them/); sh(dir, 'checkout', '--', 'version.txt')
   sh(dir, 'checkout', '-qb', 'side'); await unchanged(/^bug6 is on branch side, not main/); sh(dir, 'checkout', '-q', 'main')
   fs.writeFileSync(path.join(dir, 'api.txt'), 'mine\n'); sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'mine')
-  await unchanged(/^hq\/bug6\/T-01-api conflicts with main in api\.txt\. Nothing was changed\./); sh(dir, 'reset', '-q', '--hard', 'HEAD~1')
+  await unchanged(/^T-01 conflicts with main in api\.txt\. Nothing was changed\. Press Fix conflicts/); sh(dir, 'reset', '-q', '--hard', 'HEAD~1')
   assert.equal(sh(dir, 'status', '--porcelain'), '')
   // Now it's safe: one merge commit, and everything that follows a merge happens at once.
   const r = await merge(); assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.already, false)

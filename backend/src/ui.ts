@@ -8,7 +8,7 @@ import { q, getSetting, setSetting, now, one } from './db.ts'
 import { bus, emit, type Patch, type HqEvent } from './events.ts'
 import { allAgents, getAgent, stopAgent, update, type Agent } from './agents.ts'
 import { openTerminal, openPreviewTerminal, type Term } from './terminal.ts'
-import { createFeature, createTicket, launchEngineer, restartTpm, startReady, fillSlots, cancelTicket, cancelFeature } from './tickets.ts'
+import { createFeature, createTicket, launchEngineer, restartTpm, startReady, fillSlots, cancelTicket, cancelFeature, fixConflicts } from './tickets.ts'
 import { repos, features, tickets, getTicket } from './records.ts'
 import { addRepo, pickRepo, syncRepo } from './repos.ts'
 import { mergeTicket } from './mergewatch.ts'
@@ -59,6 +59,7 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'features' && req.method === 'POST') return json(res, 200, await createFeature(String(body.repoId), String(body.title), String(body.request)))
     if (r0 === 'tickets' && !r1 && req.method === 'POST') return json(res, 200, createTicket(String(body.featureId), { title: String(body.title), size: String(body.size ?? 'M'), spec: String(body.spec ?? ''), expected_files: (body.expected_files as string[]) ?? [], depends_on: (body.depends_on as string[]) ?? [] }))
     if (r0 === 'tickets' && r1 && r2 === 'cancel') { try { return json(res, 200, await cancelTicket(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
+    if (r0 === 'tickets' && r1 && r2 === 'fix-conflicts') { try { return json(res, 200, await fixConflicts(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'merge') { try { return json(res, 200, await mergeTicket(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'launch') { try { return json(res, 200, agentView(await launchEngineer(r1))) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'agents' && r1 && r2 === 'message') { const a = getAgent(r1); if (!a) return json(res, 404, {}); if (body.urgent) { await tmux.sendEscape(a.tmux_session); emit({ agentId: a.id, source: 'ui', kind: 'urgent.interrupt', payload: {} }) } return json(res, 200, sendMessage({ featureId: a.feature_id, channel: 'dm', from: 'user', to: a.id, reason: body.urgent ? 'urgent' : String(body.reason ?? 'fyi'), body: String(body.body ?? '') })) }

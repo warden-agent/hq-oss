@@ -7,8 +7,8 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { git } from './reposync.ts'
 
-export type MergeResult = { ok: true; sha: string; already: boolean } | { ok: false; why: string }
-const names = (files: string[]): string => files.length > 5 ? `${files.slice(0, 5).join(', ')} and ${files.length - 5} more` : files.join(', ')
+export type MergeResult = { ok: true; sha: string; already: boolean } | { ok: false; why: string; conflicts?: string[] }
+export const names = (files: string[]): string => files.length > 5 ? `${files.slice(0, 5).join(', ')} and ${files.length - 5} more` : files.join(', ')
 
 /** Merge `branch` into `into` in the checkout at `repoPath` with a merge commit (subject, then each body paragraph). */
 export async function mergeIntoMain(repoPath: string, o: { branch: string; into: string; subject: string; body: string[] }): Promise<MergeResult> {
@@ -28,7 +28,11 @@ export async function mergeIntoMain(repoPath: string, o: { branch: string; into:
   if (dirty.length) return { ok: false, why: `${repo} has uncommitted changes in ${names(dirty)}. Commit or stash them, then press Merge again.` }
   const m = await mergeTree(repoPath, main, tip)
   if ('error' in m) return { ok: false, why: `git couldn't work out the merge: ${m.error}` }
-  if ('conflicts' in m) return { ok: false, why: `${o.branch} conflicts with ${o.into} in ${names(m.conflicts)}. Nothing was changed. Merge it by hand; HQ notices within 2 minutes.` }
+  if ('conflicts' in m) {
+    const why = `${o.branch} conflicts with ${o.into} in ${names(m.conflicts)}. Nothing was changed.`
+      + ` Press Fix conflicts to have its engineer merge ${o.into} in, or merge it by hand; HQ notices within 2 minutes.`
+    return { ok: false, conflicts: m.conflicts, why }
+  }
   const sha = await git(repoPath, ['commit-tree', m.tree, '-p', main, '-p', tip, '-m', o.subject, ...o.body.flatMap((b) => ['-m', b])])
   try { await git(repoPath, ['merge', '--ff-only', '-q', sha]) } catch (e) {
     const s = (e as Error).message; const files = s.split('\n').filter((l) => l.startsWith('\t')).map((l) => l.trim())
@@ -37,12 +41,19 @@ export async function mergeIntoMain(repoPath: string, o: { branch: string; into:
   return { ok: true, sha, already: false }
 }
 
-/** `git merge-tree --write-tree`: the merged tree (exit 0), or the conflicted files (exit 1). Touches no checkout. */
+/** The files `branch` would conflict in if merged into `base` (any refs or commits): [] when it merges cleanly, null when git
+ *  couldn't tell (a ref is missing, say). Touches no checkout. */
+export async function conflictsWith(repoPath: string, base: string, branch: string): Promise<string[] | null> {
+  const m = await mergeTree(repoPath, base, branch)
+  return 'tree' in m ? [] : 'conflicts' in m ? m.conflicts : null
+}
+/** `git merge-tree --write-tree`: the merged tree (exit 0), or the conflicted files (exit 1, after the tree's id; a bad ref also
+ *  exits 1, with no tree). Touches no checkout. */
 function mergeTree(repoPath: string, a: string, b: string): Promise<{ tree: string } | { conflicts: string[] } | { error: string }> {
   return new Promise((resolve) => execFile('git', ['-c', 'core.hooksPath=/dev/null', 'merge-tree', '--write-tree', '--name-only', '--no-messages', a, b], { cwd: repoPath }, (err, out, errOut) => {
     const lines = String(out).split('\n'); const code = err ? (err as { code?: number }).code : 0
     if (code === 0) resolve({ tree: lines[0]!.trim() })
-    else if (code === 1) resolve({ conflicts: [...new Set(lines.slice(1).map((l) => l.trim()).filter(Boolean))] })
+    else if (code === 1 && /^[0-9a-f]{40,64}$/.test(lines[0]!.trim())) resolve({ conflicts: [...new Set(lines.slice(1).map((l) => l.trim()).filter(Boolean))] })
     else resolve({ error: String(errOut || err?.message).trim().split('\n')[0] ?? 'unknown error' })
   }))
 }

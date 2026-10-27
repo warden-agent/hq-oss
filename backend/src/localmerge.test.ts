@@ -6,7 +6,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { mergeIntoMain } from './localmerge.ts'
+import { conflictsWith, mergeIntoMain } from './localmerge.ts'
 
 const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 process.env.GIT_AUTHOR_NAME = process.env.GIT_COMMITTER_NAME = 'Sam'; process.env.GIT_AUTHOR_EMAIL = process.env.GIT_COMMITTER_EMAIL = 'k@x'
@@ -52,7 +52,9 @@ test('refusals leave everything as it was', async () => {
   { const d = repo(); fs.writeFileSync(path.join(d, 'a.txt'), 'edited\n'); await refused(d, /has uncommitted changes in a\.txt\. Commit or stash them/) }
   { const d = repo(); fs.writeFileSync(path.join(d, 'keep.txt'), 'staged\n'); sh(d, 'add', 'keep.txt'); await refused(d, /uncommitted changes in keep\.txt/) }
   { const d = repo({ theirs: (x) => fs.writeFileSync(path.join(x, 'a.txt'), 'theirs\n'), ours: (x) => fs.writeFileSync(path.join(x, 'a.txt'), 'ours\n') })
-    await refused(d, new RegExp(`^${B.replace(/\//g, '\\/')} conflicts with main in a\\.txt\\. Nothing was changed\\. Merge it by hand; HQ notices within 2 minutes\\.$`)) }
+    const rest = 'Press Fix conflicts to have its engineer merge main in, or merge it by hand; HQ notices within 2 minutes\\.$'
+    await refused(d, new RegExp(`^${B.replace(/\//g, '\\/')} conflicts with main in a\\.txt\\. Nothing was changed\\. ${rest}`))
+    assert.deepEqual(((await mergeIntoMain(d, opts)) as { conflicts?: string[] }).conflicts, ['a.txt']) }
   { const d = repo({ theirs: (x) => fs.rmSync(path.join(x, 'keep.txt')), ours: (x) => fs.writeFileSync(path.join(x, 'keep.txt'), 'changed\n') }); await refused(d, /conflicts with main in keep\.txt/) }
   { const d = repo(); fs.writeFileSync(path.join(d, 'api.txt'), 'my own\n') // untracked, and the merge would bring a tracked api.txt
     await refused(d, /would overwrite files in .* that git doesn't track: api\.txt\. Move them away/); assert.equal(fs.readFileSync(path.join(d, 'api.txt'), 'utf8'), 'my own\n') }
@@ -63,4 +65,14 @@ test('refusals leave everything as it was', async () => {
 
 test('a missing branch is refused', async () => {
   const d = repo(); assert.deepEqual(await mergeIntoMain(d, { ...opts, branch: 'nope' }), { ok: false, why: "Branch nope is gone, so there's nothing to merge." })
+})
+
+test('conflictsWith: [] when it merges cleanly, the files when it conflicts (all of them), null when git can\'t tell', async () => {
+  const clean = repo({ ours: (x) => fs.writeFileSync(path.join(x, 'c.txt'), 'main\n') })
+  assert.deepEqual(await conflictsWith(clean, 'main', B), [])
+  const both = (x: string, s: string) => { for (const f of ['a.txt', 'keep.txt', 'b1.txt', 'b2.txt', 'b3.txt', 'b4.txt']) fs.writeFileSync(path.join(x, f), `${s}\n`) }
+  const d = repo({ theirs: (x) => both(x, 'theirs'), ours: (x) => both(x, 'ours') })
+  assert.deepEqual(await conflictsWith(d, 'main', B), ['a.txt', 'b1.txt', 'b2.txt', 'b3.txt', 'b4.txt', 'keep.txt'])
+  const head = sh(d, 'rev-parse', 'HEAD'); assert.equal(sh(d, 'status', '--porcelain'), ''); assert.equal(sh(d, 'rev-parse', 'HEAD'), head) // nothing touched
+  assert.equal(await conflictsWith(d, 'main', 'no-such-branch'), null)
 })

@@ -6,7 +6,8 @@ import { api, errText, jsonList, showError, unmergedDeps, waitingFor, type Agent
 
 export type Tone = 'plain' | 'muted' | 'amber' | 'rose' | 'sky' | 'emerald' | 'indigo'
 export type Line = { text: string; tone: Tone }
-export type Act = { kind: 'launch'; waits: string[] } | { kind: 'read-plan' } | { kind: 'approve' } | { kind: 'merge'; into: string } | { kind: 'link'; label: string; href: string; primary: boolean }
+export type Act = { kind: 'launch'; waits: string[] } | { kind: 'read-plan' } | { kind: 'approve' } | { kind: 'merge'; into: string }
+  | { kind: 'link'; label: string; href: string; primary: boolean } | { kind: 'fix' }
 export type FeatureView = { f: any; tpm: Agent | null; repoName: string; lines: Line[]; att: any[]; ready: number; total: number; collapsed: boolean; startReady: boolean; startTpm: boolean; border: string }
 export type TicketView = { t: any; eng: Agent | null; review: any | null; titleRows: 1 | 2; lines: Line[]; acts: Act[]; att: any[]; compact: boolean; border: string }
 export type Board = { nodes: Node[]; edges: Edge[]; has: (node: string) => boolean; attNode: (a: any) => string | null; agentNode: (agentId: string) => string | null }
@@ -37,17 +38,30 @@ export const W = { user: 220, feature: 260, ticket: 220 }
 const ROW = 16, CHROME = 18, ACTS = 28, COL_GAP = 48, ROW_GAP = 16, GROUP_GAP = 72, TIER_GAP = 56
 const USER_H = CHROME + ROW + ACTS
 const agentColor: Record<string, string> = { working: '#10b981', idle: '#71717a', plan_review: '#f59e0b', blocked: '#f43f5e', paused: '#f43f5e', launching: '#0ea5e9', exited: '#3f3f46' }
-const ticketColor: Record<string, string> = { queued: '#3f3f46', planning: '#0ea5e9', plan_review: '#f59e0b', implementing: '#10b981', awaiting_answer: '#f59e0b', escalated: '#f43f5e', pr_ready: '#6366f1', pr_open: '#6366f1', merged: '#065f46' }
+const ticketColor: Record<string, string> = { queued: '#3f3f46', planning: '#0ea5e9', plan_review: '#f59e0b', implementing: '#10b981', awaiting_answer: '#f59e0b', escalated: '#f43f5e', pr_ready: '#6366f1', pr_open: '#6366f1',
+  resolving: '#f59e0b', merged: '#065f46' }
 
-/** How the user merges a finished ticket: HQ's Merge into main button (local repos), or the PR on GitHub. Null when nothing waits. */
-export function mergeAct(t: any, base: string): Act | null {
-  if (t.status === 'pr_ready' && t.pr_state === 'local') return { kind: 'merge', into: base }
-  if (t.status === 'pr_ready' && t.pr_url) return { kind: 'link', label: 'Create PR ↗', href: t.pr_url, primary: true }
-  if (t.status === 'pr_open' && t.pr_url && t.pr_number && t.pr_state !== 'closed') return { kind: 'link', label: `Merge PR #${t.pr_number} ↗`, href: t.pr_url, primary: true }
-  return null
+/** What the user can do with a finished ticket: HQ's Merge into main (local repos) or the PR on GitHub; Fix conflicts instead of
+ *  Merge when it conflicts with main (on GitHub the PR link stays, second), or when its fix stalled (the engineer stopped, or went
+ *  idle without finishing: pressing it again re-sends HQ's instructions). `eng`: the ticket's live engineer, if any. */
+export function mergeActs(t: any, base: string, eng: Agent | null): Act[] {
+  if (t.status === 'resolving') return !eng || eng.status === 'idle' ? [{ kind: 'fix' }] : []
+  const conflict = t.conflict_files != null && (t.status === 'pr_ready' || t.status === 'pr_open')
+  if (t.status === 'pr_ready' && t.pr_state === 'local') return [conflict ? { kind: 'fix' } : { kind: 'merge', into: base }]
+  const fix: Act[] = conflict ? [{ kind: 'fix' }] : []
+  if (t.status === 'pr_ready' && t.pr_url) return [...fix, { kind: 'link', label: 'Create PR ↗', href: t.pr_url, primary: !conflict }]
+  if (t.status === 'pr_open' && t.pr_url && t.pr_number && t.pr_state !== 'closed') return [...fix, { kind: 'link', label: `Merge PR #${t.pr_number} ↗`, href: t.pr_url, primary: !conflict }]
+  return fix
 }
-/** A ticket's status in words where the stored one would mislead (a local branch has no PR). */
-export const ticketLabel = (t: any): string => t.status === 'pr_ready' && t.pr_state === 'local' ? 'ready to merge' : t.status
+/** A ticket's status in words where the stored one would mislead (a local branch has no PR; a finished one may conflict). */
+export const ticketLabel = (t: any): string => (t.status === 'pr_ready' || t.status === 'pr_open') && t.conflict_files != null ? 'conflicts'
+  : t.status === 'pr_ready' && t.pr_state === 'local' ? 'ready to merge' : t.status === 'resolving' ? 'fixing conflicts' : t.status
+/** "conflicts with main in a, b (T-01 merged first)", or null when the ticket merges cleanly. */
+export function conflictText(t: any, base: string): string | null {
+  if (t.conflict_files == null) return null
+  const files = jsonList(t.conflict_files), first = jsonList(t.conflict_with)
+  return `conflicts with ${base}${files.length ? ` in ${files.join(', ')}` : ''}${first.length ? ` (${first.join(', ')} merged first)` : ''}`
+}
 const live = (a: Agent | null | undefined): a is Agent => !!a && a.status !== 'exited'
 /** The engineer running a ticket right now, if any. */
 export const liveEngineer = (t: any, s: State): Agent | null => { const a = s.agents.find((x) => x.id === t.assignee_agent_id); return live(a) ? a : s.agents.find((x) => x.role === 'engineer' && x.ticket_id === t.id && live(x)) ?? null }
@@ -116,6 +130,9 @@ export function buildBoard(s: State, now = Date.now()): Board {
     const waits = t.status === 'queued' ? unmerged(t, all) : [], dead = waits.filter((k) => !all.some((x) => x.key === k))
     const detail: Line | null = review ? { text: `Plan R-${review.round} waiting for you`, tone: 'amber' }
       : t.pr_state === 'closed' ? { text: `PR #${t.pr_number} was closed without merging`, tone: 'rose' }
+      : t.status === 'resolving' ? (!eng ? { text: 'fixing conflicts · its engineer stopped', tone: 'rose' }
+        : eng.status === 'idle' ? { text: 'its engineer went idle before finishing', tone: 'rose' } : { text: `its engineer is merging ${base} in`, tone: 'amber' })
+      : conflictText(t, base) && (t.status === 'pr_ready' || t.status === 'pr_open') ? { text: conflictText(t, base)!, tone: 'rose' }
       : t.status === 'pr_ready' && t.pr_state === 'local' ? { text: 'done · waiting for you to merge it', tone: 'indigo' }
       : t.status === 'pr_ready' ? { text: "HQ couldn't open the PR: open it yourself", tone: 'indigo' }
       : t.status === 'pr_open' ? { text: `PR #${t.pr_number} is open: merge it on GitHub`, tone: 'indigo' }
@@ -129,7 +146,7 @@ export function buildBoard(s: State, now = Date.now()): Board {
     const acts: Act[] = []
     if (t.status === 'queued' && !t.assignee_agent_id) acts.push({ kind: 'launch', waits })
     if (review) acts.push({ kind: 'read-plan' }, { kind: 'approve' })
-    const merge = mergeAct(t, base); if (merge) acts.push(merge)
+    acts.push(...mergeActs(t, base, eng))
     return { t, eng, review, titleRows: titleRows(t.title), lines, acts, att, compact: t.status === 'merged', border: eng ? agentColor[eng.status] ?? '#3f3f46' : ticketColor[t.status] ?? '#3f3f46' }
   }
   const ticketH = (v: TicketView) => v.compact ? CHROME + ROW : CHROME + ROW + v.titleRows * ROW + v.lines.length * ROW + (v.acts.length ? ACTS : 0)

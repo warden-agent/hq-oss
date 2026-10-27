@@ -3,7 +3,7 @@ import { useBusy } from './board'
 import { onError } from './api'
 
 const statusColor: Record<string, string> = { working: 'bg-emerald-500/20 text-emerald-300', idle: 'bg-zinc-700/50 text-zinc-300', plan_review: 'bg-amber-500/20 text-amber-300', blocked: 'bg-rose-500/20 text-rose-300', paused: 'bg-rose-500/20 text-rose-300', launching: 'bg-sky-500/20 text-sky-300', exited: 'bg-zinc-800 text-zinc-500',
-  planning: 'bg-sky-500/20 text-sky-300', implementing: 'bg-emerald-500/20 text-emerald-300', awaiting_answer: 'bg-amber-500/20 text-amber-300', pr_ready: 'bg-indigo-500/20 text-indigo-300', pr_open: 'bg-indigo-500/20 text-indigo-300', merged: 'bg-emerald-500/30 text-emerald-200' }
+  planning: 'bg-sky-500/20 text-sky-300', implementing: 'bg-emerald-500/20 text-emerald-300', awaiting_answer: 'bg-amber-500/20 text-amber-300', pr_ready: 'bg-indigo-500/20 text-indigo-300', pr_open: 'bg-indigo-500/20 text-indigo-300', resolving: 'bg-amber-500/20 text-amber-300', merged: 'bg-emerald-500/30 text-emerald-200' }
 export const Pill = ({ s, label, className = '' }: { s: string; label?: string; className?: string }) => <span className={`pill shrink-0 whitespace-nowrap ${statusColor[s] ?? 'bg-zinc-800 text-zinc-300'} ${className}`}>{label ?? s}</span>
 /** Text with its URLs turned into short links (attention items carry "Create PR" links that are too long to show). */
 export const Linked = ({ text }: { text: string }) => <>{String(text).split(/(https?:\/\/\S+)/).map((p, i) => /^https?:\/\//.test(p) ? <a key={i} className="text-indigo-300 underline" href={p} target="_blank" rel="noreferrer">open ↗</a> : p)}</>

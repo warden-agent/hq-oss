@@ -1,7 +1,8 @@
 // Which tickets may start (pure, no DB): a ticket starts only when every ticket it depends on is merged into the default branch.
 /** Every status a ticket can have. queued → planning → plan_review → implementing (⇄ awaiting_answer; escalated) → pr_ready →
- *  pr_open → merged; cancelled from any but merged. */
-export const TICKET_STATUSES = ['queued', 'planning', 'plan_review', 'implementing', 'awaiting_answer', 'escalated', 'pr_ready', 'pr_open', 'merged', 'cancelled'] as const
+ *  pr_open → merged; pr_ready/pr_open → resolving (its engineer merges main in after a conflict) → pr_ready/pr_open again;
+ *  cancelled from any but merged. */
+export const TICKET_STATUSES = ['queued', 'planning', 'plan_review', 'implementing', 'awaiting_answer', 'escalated', 'pr_ready', 'pr_open', 'resolving', 'merged', 'cancelled'] as const
 export type TicketStatus = (typeof TICKET_STATUSES)[number]
 export type TicketLike = { key: string; status: string; assignee_agent_id: string | null; deps: string }
 /** Statuses where the ticket's engineer is finished; those engineers don't use a parallel slot. */

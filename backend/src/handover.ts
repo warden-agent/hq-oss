@@ -15,6 +15,7 @@ function standing(t: Ticket, all: Ticket[]): string {
     case 'escalated': return 'escalated to the user'
     case 'pr_ready': return t.pr_state === 'local' ? 'finished; waits for the user to merge it' : 'finished and pushed; its PR still needs opening'
     case 'pr_open': return `finished; PR #${t.pr_number} waits for the user's merge`
+    case 'resolving': return 'its engineer is merging main in to fix conflicts'
     default: return t.status
   }
 }
