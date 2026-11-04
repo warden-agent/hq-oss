@@ -7,7 +7,8 @@ import { emit, patch } from './events.ts'
 import { id, short } from './util.ts'
 import { update, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
-import { setTicket } from './records.ts'
+import { autoOn, getFeature, getTicket, setTicket } from './records.ts'
+import { tellTpm } from './mergewatch.ts'
 
 export type PlanRevision = {
   id: string; ticket_id: string; agent_id: string; round: number; plan_text: string; plan_hash: string; plan_file_path: string | null
@@ -95,6 +96,9 @@ export function onExitPlanMode(agent: Agent, body: Record<string, unknown>, res:
   held.set(review.id, { res, timer, agentId: agent.id })
   res.on('close', () => { const h = held.get(review!.id); if (h && h.res === res) { clearTimeout(h.timer); held.delete(review!.id) } })
   update(agent.id, { status: 'plan_review' })
+  // Auto mode: the engineer planned as usual and its plan stays on record; nobody is waited for. Only here, once the hold is set, or the allow has nowhere to go
+  const tk = getTicket(ticketId), repoId = tk ? getFeature(tk.feature_id)?.repo_id : null
+  if (autoOn(repoId)) answerReview(review.id, 'approve', { by: 'auto' })
 }
 
 /** A changed plan replaces the ticket's open review: it closes as superseded (its plan can't be approved any more), and a
@@ -123,7 +127,8 @@ export const revisesUsed = (ticketId: string): number =>
 export const revisionCap = (): number => getSetting('revision_cap', DEFAULTS.revision_cap)
 const sendsBack = (v: Verdict) => v === 'revise' || v === 'user_architect'
 
-export function answerReview(reviewId: string, verdict: Verdict, opts: { plan?: string; message?: string; by: string }): { ok: boolean; held: boolean; error?: string } {
+/** `note`: the user's own words when they send a plan back; the TPM hears them too, so it knows what they asked for (Bug 35). */
+export function answerReview(reviewId: string, verdict: Verdict, opts: { plan?: string; message?: string; note?: string; by: string }): { ok: boolean; held: boolean; error?: string } {
   const review = getReview(reviewId); if (!review || review.status !== 'open') return { ok: false, held: false, error: 'review not open' }
   const rev = getRevision(review.plan_revision_id)!; const t = now()
   if (sendsBack(verdict) && revisesUsed(review.ticket_id) >= revisionCap()) {
@@ -146,6 +151,9 @@ export function answerReview(reviewId: string, verdict: Verdict, opts: { plan?: 
   if (approve) resolveKind('cap_reached', rev.agent_id) // the escalation it raised is settled
   const h = held.get(reviewId); held.delete(reviewId)
   emit({ agentId: rev.agent_id, source: 'system', kind: 'gate.verdict', payload: { review: reviewId, verdict, by: opts.by, held: !!h } })
+  const tk = getTicket(review.ticket_id), f = tk ? getFeature(tk.feature_id) : undefined
+  if (!approve && opts.note?.trim() && tk && f) tellTpm(f, `HQ: the user sent ${tk.key}'s plan back (round ${review.round}) with: "${opts.note.trim()}". The engineer is revising it. `
+    + 'If this changes what the ticket builds, keep its spec and title in step (update_ticket_spec).')
   if (h) {
     const no = verdict === 'escalate' ? 'Plan escalated to the user; wait for a message from HQ.' : 'Plan not approved. Revise and call ExitPlanMode again.'
     clearTimeout(h.timer); jsonEnd(h.res, approve ? allowAnswer(planText, rev.plan_file_path) : denyAnswer(opts.message ?? no))

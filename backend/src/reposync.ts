@@ -9,6 +9,7 @@ export type SyncResult = {
   kind: 'local' | 'github'; ok: boolean
   status: 'local' | 'up_to_date' | 'pulled' | 'fetched' | 'error'
   detail: string; path: string; slug: string | null; remote: string | null; defaultBranch: string; head: string | null
+  empty: boolean // the default branch has no files (a new project, or no commits yet)
 }
 export type SyncOpts = { ghConfigDir: string; account: string; fetchUrl?: string /* tests: fetch from here instead of github.com */; timeoutMs?: number }
 
@@ -69,13 +70,16 @@ export async function findRepos(p: string): Promise<RepoCandidate[]> {
   return found.sort((a, b) => Number(!a.github) - Number(!b.github) || a.name.localeCompare(b.name))
 }
 
+/** No files at `commit` (or no commit at all). */
+const noFiles = async (root: string, commit: string | null): Promise<boolean> => !commit || (await tryGit(root, ['ls-tree', '--name-only', commit])) === ''
 export async function syncCheckout(p: string, o: SyncOpts): Promise<SyncResult> {
   const root = await repoRoot(p)
   const origin = await tryGit(root, ['remote', 'get-url', 'origin'])
   const slug = parseGithubRemote(origin)
   if (!slug) {
     const branch = (await tryGit(root, ['symbolic-ref', '--short', 'HEAD'])) || 'main'
-    return { kind: 'local', ok: true, status: 'local', detail: origin ? `Local only (origin ${origin} is not GitHub); nothing to pull` : 'Local only (no GitHub remote); nothing to pull', path: root, slug: null, remote: null, defaultBranch: branch, head: await tryGit(root, ['rev-parse', 'HEAD']) || null }
+    const head = await tryGit(root, ['rev-parse', '--verify', '--quiet', 'HEAD']) || null
+    return { kind: 'local', ok: true, status: 'local', detail: origin ? `Local only (origin ${origin} is not GitHub); nothing to pull` : 'Local only (no GitHub remote); nothing to pull', path: root, slug: null, remote: null, defaultBranch: branch, head, empty: await noFiles(root, head) }
   }
   const url = o.fetchUrl ?? `https://github.com/${slug}.git`
   const base = { kind: 'github' as const, path: root, slug, remote: url }
@@ -86,11 +90,12 @@ export async function syncCheckout(p: string, o: SyncOpts): Promise<SyncResult> 
     branch = m[1]!
     await git(root, ['fetch', '--no-tags', url, `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { net: o })
   } catch (e) {
-    return { ...base, ok: false, status: 'error', detail: explain(e, slug, o.account), defaultBranch: 'main', head: null }
+    return { ...base, ok: false, status: 'error', detail: explain(e, slug, o.account), defaultBranch: 'main', head: null, empty: false }
   }
   await tryGit(root, ['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${branch}`])
   const remoteSha = await git(root, ['rev-parse', `refs/remotes/origin/${branch}`])
-  const done = (status: SyncResult['status'], detail: string): SyncResult => ({ ...base, ok: true, status, detail, defaultBranch: branch, head: remoteSha })
+  const empty = await noFiles(root, remoteSha)
+  const done = (status: SyncResult['status'], detail: string): SyncResult => ({ ...base, ok: true, status, detail, defaultBranch: branch, head: remoteSha, empty })
   const short = (s: string) => s.slice(0, 7)
   const localSha = await tryGit(root, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
   if (localSha === remoteSha) return done('up_to_date', `${branch} is up to date with GitHub (${short(remoteSha)})`)

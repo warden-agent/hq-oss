@@ -39,15 +39,18 @@ test('Bug 9 on GitHub: flagged, fixed against origin/main, pushed onto the same 
     return hq.mcp(e.id, 'open_pr', { title: 'Add a line', body: 'Adds a line.\n\n## Deviations from approved plan\nNone' })
   }
   const commit = (t: any, text: string) => { fs.writeFileSync(path.join(wt(t), 'version.txt'), text); sh(wt(t), 'add', '.'); sh(wt(t), 'commit', '-qm', 'line') }
-  const t1 = await ticket('Recipes'), t2 = await ticket('Shopping')
+  const t1 = await ticket('Orders'), t2 = await ticket('Invoices')
   await hq.api(`tickets/${t1.id}/launch`, {}); await hq.api(`tickets/${t2.id}/launch`, {})
   const e1 = await eng(t1), e2 = await eng(t2)
-  commit(t1, 'v1\nrecipes\n'); assert.match((await openPr(e1)).text, /^Pushed hq\/gh9\/T-01-recipes and opened PR #1\./)
-  commit(t2, 'v1\nshopping\n'); assert.match((await openPr(e2)).text, /^Pushed hq\/gh9\/T-02-shopping and opened PR #2\./)
+  commit(t1, 'v1\norders\n'); assert.match((await openPr(e1)).text, /^Pushed hq\/gh9\/T-01-orders\. The user tries it/)
+  commit(t2, 'v1\ninvoices\n'); assert.match((await openPr(e2)).text, /^Pushed hq\/gh9\/T-02-invoices\. The user tries it/)
+  assert.deepEqual([(await tk(t1)).pr_state, gh.read().next], ['waiting', 1]) // Bug 45: no PR until the user asks for one
+  for (const t of [t1, t2]) { const m = await hq.api(`tickets/${t.id}/make-pr`, {}); assert.equal(m.status, 200, JSON.stringify(m.json)) }
+  assert.deepEqual([(await tk(t1)).pr_number, (await tk(t2)).pr_number], [1, 2])
   // T-01 is merged on GitHub; GitHub now calls PR #2 conflicting.
   const gc = path.join(hq.root, 'gh-clone'); sh(hq.root, 'clone', '-q', bare, gc)
-  sh(gc, 'merge', '-q', '--no-ff', '--no-edit', 'origin/hq/gh9/T-01-recipes'); sh(gc, 'push', '-q', 'origin', 'main')
-  setPr('hq/gh9/T-01-recipes', { state: 'MERGED' }); setPr('hq/gh9/T-02-shopping', { mergeable: 'CONFLICTING' })
+  sh(gc, 'merge', '-q', '--no-ff', '--no-edit', 'origin/hq/gh9/T-01-orders'); sh(gc, 'push', '-q', 'origin', 'main')
+  setPr('hq/gh9/T-01-orders', { state: 'MERGED' }); setPr('hq/gh9/T-02-invoices', { mergeable: 'CONFLICTING' })
   await hq.api(`repos/${repo.id}/sync`, {}) // what the 2-minute watcher would see
   await waitFor('T-01 merged', async () => (await tk(t1)).status === 'merged')
   await waitFor('T-02 flagged', async () => (await tk(t2)).conflict_files === '["version.txt"]')
@@ -62,11 +65,11 @@ test('Bug 9 on GitHub: flagged, fixed against origin/main, pushed onto the same 
   await hq.api(`repos/${repo.id}/sync`, {}); await new Promise((res) => setTimeout(res, 500))
   assert.equal((await tk(t2)).status, 'resolving')
   try { sh(wt(t2), 'merge', '--no-edit', 'origin/main') } catch { /* the conflict */ }
-  fs.writeFileSync(path.join(wt(t2), 'version.txt'), 'v1\nrecipes\nshopping\n'); sh(wt(t2), 'add', 'version.txt'); sh(wt(t2), 'commit', '--no-edit', '-q')
+  fs.writeFileSync(path.join(wt(t2), 'version.txt'), 'v1\norders\ninvoices\n'); sh(wt(t2), 'add', 'version.txt'); sh(wt(t2), 'commit', '--no-edit', '-q')
   const pr = await openPr(e2); assert.equal(pr.isError, false, pr.text)
-  assert.match(pr.text, /^Pushed hq\/gh9\/T-02-shopping and opened PR #2\./) // the same PR: GitHub said one is already open
+  assert.match(pr.text, /^Pushed hq\/gh9\/T-02-invoices\./) // onto the same open PR
   const done = await tk(t2); assert.deepEqual([done.status, done.pr_number, done.conflict_files], ['pr_open', 2, null])
-  assert.equal(sh(bare, 'rev-parse', 'refs/heads/hq/gh9/T-02-shopping'), sh(dir, 'rev-parse', 'refs/heads/hq/gh9/T-02-shopping')) // pushed, fast-forward
-  assert.ok((await hq.state()).attention.some((a: any) => a.ticket_id === t2.id && a.kind === 'conflicts_fixed' && /PR #2 merges cleanly again/.test(a.detail)))
-  assert.equal(gh.read().prs['hq/gh9/T-02-shopping'].length, 1)
+  assert.equal(sh(bare, 'rev-parse', 'refs/heads/hq/gh9/T-02-invoices'), sh(dir, 'rev-parse', 'refs/heads/hq/gh9/T-02-invoices')) // pushed, fast-forward
+  assert.ok((await hq.state()).attention.some((a: any) => a.ticket_id === t2.id && a.kind === 'conflicts_fixed' && /Ready to merge again/.test(a.detail)))
+  assert.equal(gh.read().prs['hq/gh9/T-02-invoices'].length, 1)
 })

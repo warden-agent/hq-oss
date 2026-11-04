@@ -1,0 +1,80 @@
+// What needs the user, across every repo (Bug 24): the tab title counts it, and new items pop up a browser notification while
+// HQ's tab is in the background. Pure and self-contained, so the backend's test runner unit-tests it (src/needs.test.ts).
+
+import { FINISHED, readyTickets } from '../../backend/src/readiness.ts'
+
+type S = { repos: any[]; features: any[]; tickets: any[]; agents: any[]; reviews: any[]; attention: any[]; asks?: any[]; settings?: Record<string, any>; defaults?: Record<string, any>
+  working?: number }
+/** Engineers using a parallel slot (finished ones don't). */
+export const workingEngineers = (s: { agents: any[]; tickets: any[] }): number =>
+  s.agents.filter((a) => a.role === 'engineer' && a.status !== 'exited' && !FINISHED.includes(s.tickets.find((t) => t.id === a.ticket_id)?.status ?? '')).length
+/** A question the TPM asked with ask_user, its choices as a list. */
+export type Ask = { id: string; question: string; choices: string[]; action?: boolean }
+/** What the project waits on the user for (Bug 43, on the TPM box since Bug 52): the TPM's open questions, and the ready
+ *  tickets of every feature (each in its merge order) when an engineer slot is free. A full parallel limit doesn't nag: those
+ *  tickets start as engineers finish. */
+export type Turn = { asks: Ask[]; start: string[]; auto?: boolean }
+const list = (v: unknown): string[] => { try { const x = JSON.parse(String(v || '[]')); return Array.isArray(x) ? x.map(String) : [] } catch { return [] } }
+export function yourTurn(s: S, repoId: string | null): Turn {
+  const open = (s.asks ?? []).filter((a) => a.repo_id === repoId && !a.answered_at)
+  const asks = open.map((a) => ({ id: a.id, question: String(a.question), choices: list(a.choices), action: !!a.action }))
+  const going = new Set(open.map((a) => { try { return a.action ? String(JSON.parse(a.action).ticket) : '' } catch { return '' } })) // Bug 50: asked to remove it
+  const ready = s.features.filter((f) => f.repo_id === repoId && f.status !== 'cancelled').sort((a, b) => a.created_at - b.created_at)
+    .flatMap((f) => readyTickets(s.tickets.filter((t) => t.feature_id === f.id && !going.has(t.id)), list(f.merge_order)).map((t) => t.key))
+  const cap = Number(s.settings?.concurrency_cap ?? s.defaults?.concurrency_cap ?? 2), r = s.repos?.find((x) => x.id === repoId)
+  const auto = !!r?.auto_mode && !r.auto_stopped_why // HQ starts them itself
+  return { asks, start: !auto && ready.length && (s.working ?? workingEngineers(s)) < cap ? ready : [], ...(r?.auto_mode ? { auto: true } : {}) }
+}
+/** "T1", "T1 and T2", "T1, T2 and T3". */
+export const keysText = (keys: string[]): string => keys.length < 2 ? keys.join('') : `${keys.slice(0, -1).join(', ')} and ${keys.at(-1)}`
+/** `ref` says which box to open when the user clicks the notification. */
+export type Need = { key: string; text: string; repoId: string | null; ref: { review: string } | { ticket: string } | { attention: string } | { tpm: string } }
+/** Notices that alert: an agent is stuck, blocked, asking the user, sent back too often or stopped when it shouldn't have, or
+ *  finished work can't go further. Information (merged, memory filling up, model notes) is left to the ⚠ menu. */
+export const ALERT_KINDS = new Set(['stuck', 'blocked', 'dialog', 'message_for_user', 'cap_reached', 'engineer_exited', 'agent_exited', 'launch_failed',
+  'fresh_start_failed', 'merge_conflict', 'delivery_failed', 'dm_refused', 'tpm_away', 'unexpected_prompt', 'usage_limit', 'rate_limit', 'api_error', 'pr_failed', 'push_failed', 'auto_parked'])
+/** Good news: green, not red, because nothing is wrong (Bug 61). */
+export const goodNews = (kind: string): boolean => kind === 'merged' || kind === 'conflicts_fixed' || kind.startsWith('auto_finished:')
+/** Auto mode's own notices name their project in the kind. */
+const autoKind = (k: string): string | null => /^auto_(stopped|finished):(.+)$/.exec(k)?.[2] ?? null
+
+/** Everything that needs the user right now, oldest kind first: the TPM's questions and tickets ready to start (Bug 43), plans
+ *  waiting for review, finished tickets waiting for their merge (or for Fix conflicts), then alerting notices. `mergeAct` says what a finished ticket waits for (board.ts mergeActs). */
+export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Need[] {
+  const feature = (id: unknown) => s.features.find((f) => f.id === id)
+  const repoOf = (t: any): string | null => feature(t?.feature_id)?.repo_id ?? null
+  const where = (repoId: string | null) => { const r = s.repos.find((x) => x.id === repoId); return r ? `${r.name}: ` : '' }
+  const out: Need[] = []
+  for (const r of s.repos) {
+    const turn = yourTurn(s, r.id), ref = { tpm: r.id }
+    for (const a of turn.asks) out.push({ key: `ask:${a.id}`, text: `${where(r.id)}the TPM asked: ${a.question.slice(0, 160)}`, repoId: r.id, ref })
+    const are = turn.start.length > 1 ? 'are' : 'is'
+    if (turn.start.length) out.push({ key: `start:${r.id}:${turn.start.join(',')}`, text: `${where(r.id)}${keysText(turn.start)} ${are} ready to start`, repoId: r.id, ref })
+  }
+  for (const r of s.reviews.filter((x) => x.status === 'open')) {
+    const t = s.tickets.find((x) => x.id === r.ticket_id), repo = repoOf(t)
+    out.push({ key: `review:${r.id}`, text: `${where(repo)}${t?.key ?? 'a ticket'}'s plan is waiting for you`, repoId: repo, ref: { review: r.id } })
+  }
+  for (const t of s.tickets) {
+    const f = feature(t.feature_id); if (!f || f.status === 'cancelled') continue
+    const act = mergeAct(t); if (!act) continue
+    out.push({ key: `${act}:${t.id}`, repoId: f.repo_id, ref: { ticket: t.id },
+      text: act === 'merge' ? `${where(f.repo_id)}${t.key} is finished and waiting for you to merge it` : `${where(f.repo_id)}${t.key} clashes with main: press Fix conflicts` })
+  }
+  for (const a of s.attention.filter((x) => !x.resolved_at && (ALERT_KINDS.has(x.kind) || autoKind(x.kind)))) {
+    const t = s.tickets.find((x) => x.id === a.ticket_id), ag = s.agents.find((x) => x.id === a.agent_id)
+    const repo = autoKind(a.kind) ?? (t ? repoOf(t) : ag?.repo_id ?? feature(ag?.feature_id)?.repo_id ?? null)
+    out.push({ key: `attention:${a.id}`, text: `${where(repo)}${String(a.detail ?? a.kind).slice(0, 160)}`, repoId: repo, ref: { attention: a.id } })
+  }
+  return out
+}
+
+/** The items in `now` that weren't there before (`seen`, null on the first look: then nothing is new, so loading or reloading the
+ *  page never pops anything up). Returns them and the keys to remember next time. */
+export function newNeeds(seen: Set<string> | null, now: Need[]): { fresh: Need[]; seen: Set<string> } {
+  const keys = new Set(now.map((n) => n.key))
+  return { fresh: seen ? now.filter((n) => !seen.has(n.key)) : [], seen: keys }
+}
+
+/** The tab title: "(2) HQ" while two things need the user. */
+export const titleFor = (n: number): string => n ? `(${n}) HQ` : 'HQ'

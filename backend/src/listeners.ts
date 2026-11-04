@@ -5,6 +5,8 @@ import { releaseFor, releaseSlot } from './slots.ts'
 import { checkMerges } from './mergewatch.ts'
 import { fillSlots } from './tickets.ts'
 import { onTicketMerged } from './preview.ts'
+import { onAgentGone } from './launchhelper.ts'
+import { autoSoon } from './auto.ts'
 
 let started = false
 export function startListeners(): void {
@@ -12,16 +14,19 @@ export function startListeners(): void {
   started = true
   const freed = (agentId: string | null) => { if (agentId) releaseSlot(agentId); void fillSlots().catch(() => {}) }
   bus.on('event:agent.stopped', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId) })
-  bus.on('event:agent.lost', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId) })
+  bus.on('event:agent.lost', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId) })
   bus.on('event:hook.SessionEnd', (e: HqEvent) => {
     if (e.payload.reason === 'clear') return
     freed(e.agentId); setTimeout(() => releaseFor(e.agentId), 5000) // Claude Code may still be exiting
+    onAgentGone(e.agentId) // a Launch helper that quit by itself
   })
   /** An engineer's question was answered: its ticket goes back to what it was doing. */
   bus.on('event:question.answered', (e: HqEvent) => {
     const t = typeof e.payload.ticket === 'string' ? getTicket(e.payload.ticket) : undefined
     if (t?.status === 'awaiting_answer') setTicket(t.id, { status: t.prior_status ?? 'implementing', prior_status: null })
   })
+  for (const kind of ['hook.Stop', 'ticket.pr_ready', 'ticket.merged', 'question.answered', 'agent.stopped', 'agent.lost', 'hook.SessionEnd', 'attention.launch_failed',
+    'attention.blocked', 'attention.stuck']) bus.on(`event:${kind}`, autoSoon)
   bus.on('event:ticket.merged', onTicketMerged)
   bus.on('event:ticket.merged', () => { void checkMerges().catch(() => {}) }) // main moved: do the tickets still waiting merge cleanly?
   bus.on('slot.freed', () => { void fillSlots().catch(() => {}) }) // a finished engineer no longer counts against the limit

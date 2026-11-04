@@ -10,7 +10,7 @@ import { conflictsWith, mergeIntoMain } from './localmerge.ts'
 
 const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 process.env.GIT_AUTHOR_NAME = process.env.GIT_COMMITTER_NAME = 'Sam'; process.env.GIT_AUTHOR_EMAIL = process.env.GIT_COMMITTER_EMAIL = 'k@x'
-const B = 'hq/kl/PAN-1-api'
+const B = 'hq/kl/APP-1-api'
 /** main (a.txt, keep.txt) and branch B adding api.txt; `ours`/`theirs` change things on main / on B. */
 function repo(o: { theirs?: (d: string) => void; ours?: (d: string) => void } = {}): string {
   const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-merge-'))); sh(d, 'init', '-q', '-b', 'main')
@@ -20,7 +20,7 @@ function repo(o: { theirs?: (d: string) => void; ours?: (d: string) => void } = 
   sh(d, 'checkout', '-q', 'main'); if (o.ours) { o.ours(d); sh(d, 'add', '-A'); sh(d, 'commit', '-qm', 'main moved') }
   return d
 }
-const opts = { branch: B, into: 'main', subject: 'Merge PAN-1: Kitchen items API', body: ['Adds the API.\n\n## Deviations from approved plan\nNone', `HQ ticket PAN-1 · ${B}`] }
+const opts = { branch: B, into: 'main', subject: 'Merge APP-1: Items API', body: ['Adds the API.\n\n## Deviations from approved plan\nNone', `HQ ticket APP-1 · ${B}`] }
 /** HEAD, status and file contents: what "nothing changed" means. */
 const snap = (d: string) => ({ head: sh(d, 'rev-parse', 'HEAD'), branch: sh(d, 'rev-parse', '--abbrev-ref', 'HEAD'), status: sh(d, 'status', '--porcelain'), files: fs.readdirSync(d).filter((f) => f !== '.git').sort().map((f) => [f, fs.statSync(path.join(d, f)).isFile() ? fs.readFileSync(path.join(d, f), 'utf8') : 'dir']) })
 async function refused(d: string, why: RegExp): Promise<void> {
@@ -38,11 +38,11 @@ test('a clean merge: one commit, both parents, the message as given, main and th
   const { sha, already } = r as { sha: string; already: boolean }
   assert.equal(already, false); assert.equal(sh(d, 'rev-parse', 'HEAD'), sha); assert.equal(sh(d, 'rev-parse', 'main'), sha)
   assert.equal(sh(d, 'log', '-1', '--format=%P', sha), `${main} ${tip}`)
-  assert.equal(sh(d, 'log', '-1', '--format=%B', sha), `Merge PAN-1: Kitchen items API\n\nAdds the API.\n\n## Deviations from approved plan\nNone\n\nHQ ticket PAN-1 · ${B}`)
+  assert.equal(sh(d, 'log', '-1', '--format=%B', sha), `Merge APP-1: Items API\n\nAdds the API.\n\n## Deviations from approved plan\nNone\n\nHQ ticket APP-1 · ${B}`)
   assert.equal(sh(d, 'log', '-1', '--format=%an', sha), 'Sam')
   assert.equal(fs.readFileSync(path.join(d, 'api.txt'), 'utf8'), 'api\n'); assert.equal(fs.readFileSync(path.join(d, 'c.txt'), 'utf8'), 'main\n')
   assert.equal(sh(d, 'status', '--porcelain'), '?? notes.txt'); assert.equal(fs.readFileSync(path.join(d, 'data', 'items.json'), 'utf8'), '[]')
-  assert.match(sh(d, 'branch', '--list', B), /PAN-1/)
+  assert.match(sh(d, 'branch', '--list', B), /APP-1/)
   const again = await mergeIntoMain(d, opts); assert.deepEqual(again, { ok: true, sha, already: true }) // already in main: nothing to do
 })
 

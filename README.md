@@ -1,10 +1,10 @@
 # HQ — local multi-agent coding control room
 
-HQ runs real, interactive Claude Code sessions on your machine and coordinates them from one web page: a **TPM** per feature, which splits a request into tickets, and an **engineer** per ticket, which plans, builds and opens a PR. You review every plan and merge every PR. Each session lives in its own tmux session, so you can watch or type into any of them. It runs locally for one user on one Claude subscription: no API keys, no cloud VMs.
+HQ runs real, interactive Claude Code sessions on your machine and coordinates them from one web page: a **TPM** per project, which turns each request into a feature split into tickets, and an **engineer** per ticket, which plans, builds and opens a PR. You review every plan and merge every PR. Each session lives in its own tmux session, so you can watch or type into any of them. It runs locally for one user on one Claude subscription: no API keys, no cloud VMs.
 
 ## How work flows
 
-1. **New feature** (on your box in the graph): HQ starts a TPM with your request, worded however you like. The TPM splits it into tickets, each with a size, a spec with acceptance criteria, expected files, dependencies and a merge order.
+1. **Ask the TPM** (the box always at the top of the graph): write what you want, worded however you like. The project's TPM starts with your first message and stays; each new request becomes a feature (a branch of the graph), which it splits into tickets, each with a size, a spec with acceptance criteria, expected files, dependencies and a merge order.
 2. **Start ready** (on the feature's box): every ticket whose dependencies are merged starts, up to the parallel limit. Merge comes first: a ticket never starts before the tickets it depends on are merged.
 3. **Plan review.** Each engineer starts in plan mode in its own git worktree. When it calls `ExitPlanMode`, HQ holds that call (a `PermissionRequest` hook) until you answer on the ticket's box. You can **Approve**, or **Revise** with the blocking issues. After `revision_cap` send-backs (default 2) the next round escalates the ticket, and at that point it can only be approved or cancelled. If you approve from the engineer's own terminal menu instead, HQ notices and flags it.
 4. **Finished** (`open_pr`):
@@ -21,17 +21,26 @@ The schema and an Architect role prompt (`backend/roles/architect.prompt.md`) ar
   - `gate.ts` is the plan gate
   - `tickets.ts`, `records.ts`, `repos.ts`, `slots.ts`, `mergewatch.ts` and `handover.ts` handle features, tickets, repos, parallel slots, PRs and merges
   - `delivery.ts` carries messages between you, the TPM and engineers
-  - `preview.ts` is the live preview
+  - `preview.ts` is the live preview: it runs a repo's launch recipe (`apprun.ts`) with `supervise.mjs` in a tmux pane
+  - `launchhelper.ts` is the Launch helper: a one-off Claude session that works out a repo's recipe, which you OK once
   - `trust.ts` pre-accepts Claude Code's trust dialog
   - `listeners.ts` holds what happens on events, wired once at startup
-- `frontend/`: Vite + React + Tailwind. A React Flow graph with a box per feature and ticket, xterm.js terminals, and the live preview pane.
+- `frontend/`: Vite + React + Tailwind. A React Flow graph with the project's TPM on top and a box per feature and ticket, xterm.js terminals, and the live preview pane.
 - `plugin/`: the `hq` Claude Code mod loaded into every agent (`--plugin-dir`). It handles message delivery (`$.prompt.submit` when the session is idle), telemetry and the model guard.
 - `backend/roles/`: the role prompts appended to each agent's system prompt. They are copied to `~/.hq/roles/` on every start.
 - State lives in `~/.hq/`: the SQLite DB, per-agent files, TPM workspaces, logs, and the pinned binary `~/.hq/bin/claude-2.1.300`.
 
 ## Run
 
-Prerequisites: Node 25, tmux, `gh`, and the pinned Claude Code binary at `~/.hq/bin/claude-2.1.300`.
+Prerequisites: Node 25, tmux, `lsof`, `gh`, and the pinned Claude Code binary at `~/.hq/bin/claude-2.1.300`.
+
+HQ runs on macOS and Linux:
+- **macOS** needs nothing else, and is where HQ gets its everyday use.
+- **Linux** also needs `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`): engineers and auto mode's tests are sandboxed with them. The folder picker is macOS-only, so type a project's path by hand. HQ's automated tests pass on Ubuntu and Debian with a fake Claude Code, but HQ hasn't been run with real engineers on Linux yet.
+
+If bubblewrap can't run, auto mode won't turn on and says why. Some systems block what it needs:
+- **Ubuntu:** if you see a permission error, `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts the block. It loosens a setting for the whole machine, so it's your call; HQ never changes it. Ubuntu 26.04 didn't need it in our tests.
+- **Docker:** start the container with `--security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined`. These weaken the container's own protection, so only use them on a container you trust.
 
 ```bash
 npm install
@@ -50,7 +59,7 @@ Ports, all bound to 127.0.0.1:
 
 - `npm --workspace @hq/backend test`: unit tests, using a real SQLite DB in a temp `HQ_HOME`.
 - `cd backend && npm run e2e`: end to end with no tokens. It runs a real backend against a fake Claude Code (`backend/e2e/fake-claude.mjs`) with its own `HOME`, `HQ_HOME`, ports and tmux socket, and the tests act as the agents through hooks and MCP.
-- CI (`.github/workflows/ci.yml`) runs the backend typecheck and unit tests, the frontend typecheck and lint, and a check that the number of lines over 200 characters doesn't go up (`scripts/long-lines.mjs`).
+- CI (`.github/workflows/ci.yml`) runs the backend typecheck and unit tests, auto mode's end-to-end tests on Linux, the sandbox tests on macOS, the frontend typecheck and lint, and a check that the number of lines over 200 characters doesn't go up (`scripts/long-lines.mjs`).
 
 ## Key decisions
 
@@ -59,6 +68,11 @@ Ports, all bound to 127.0.0.1:
   - `--worktree`, `--restricted`, a strict sandbox and plan mode until their plan is approved
   - they can't edit `CLAUDE.md` or `.github/workflows` unless the TPM asks for an override and you approve it
   - the TPM runs read-only in its own workspace
+- **Auto mode tests code nobody has read,** so each ticket's tests run sandboxed with no credentials, in a throwaway checkout of main plus that ticket:
+  - The run can't write outside its checkout and package caches, can't read `~/.ssh`, cloud or package-manager logins or HQ's own files, and can't reach other programs' sockets in the usual places.
+  - The test step has no network beyond localhost. The install step has open network, because neither sandbox can filter by site, so a package's install script can reach the internet (with no credentials to send).
+  - A test's Unix sockets must live in its own checkout.
+  - This protects your machine from accidents and careless code. It isn't a security boundary against a determined attacker.
 - **Messages** reach an agent through the `hq` mod when the session is idle. An agent can also pull them with `read_inbox`. Real typing in HQ's terminal holds delivery for a while.
 - **Plan gate:**
   - the hook is held for up to 30 minutes

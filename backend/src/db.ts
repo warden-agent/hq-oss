@@ -88,6 +88,68 @@ UPDATE review_requests SET status = 'abandoned', closed_reason = 'superseded', a
 UPDATE batches SET received_at = handed_at WHERE handed_at IS NOT NULL;`, // older batches: never handed out again
 // A finished ticket that would conflict with main: the files (JSON list) and the tickets that merged first (JSON keys). NULL: clean.
 `ALTER TABLE tickets ADD COLUMN conflict_files TEXT; ALTER TABLE tickets ADD COLUMN conflict_with TEXT;`,
+// Fresh start: the agent asked to write its handoff note (when, then 'continue' | 'park', and the HQ message that asked), and a
+// ticket or feature whose agent left a note and stopped, waiting for Resume.
+`ALTER TABLE agents ADD COLUMN fresh_start_at INTEGER; ALTER TABLE agents ADD COLUMN fresh_start_then TEXT; ALTER TABLE agents ADD COLUMN fresh_start_msg TEXT;
+ALTER TABLE tickets ADD COLUMN parked_at INTEGER; ALTER TABLE features ADD COLUMN tpm_parked_at INTEGER;`,
+// Try it: the preview runs a finished ticket's worktree instead of main (NULL: main).
+`ALTER TABLE previews ADD COLUMN ticket_id TEXT;`,
+// Clear project: set while the repo's agents write their handoff notes, before its board is archived and deleted (NULL: not clearing).
+`ALTER TABLE repos ADD COLUMN clearing_at INTEGER;`,
+// New project: the default branch has no files yet (set by each sync; 1 + no features → the UI shows the first-request page).
+`ALTER TABLE repos ADD COLUMN empty INTEGER;`,
+// Launch helper (Bug 37): the recipe the user OK'd (JSON, apprun.ts Recipe), one waiting for their OK, and the helper working it
+// out (its agent, where it is: working | needs_ok | trying | failed | cant_start | port_taken, a note for the user, saves so far,
+// its throwaway worktree).
+`ALTER TABLE previews ADD COLUMN recipe TEXT; ALTER TABLE previews ADD COLUMN draft_recipe TEXT; ALTER TABLE previews ADD COLUMN helper_agent_id TEXT;
+ALTER TABLE previews ADD COLUMN helper_state TEXT; ALTER TABLE previews ADD COLUMN helper_note TEXT; ALTER TABLE previews ADD COLUMN helper_saves INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE previews ADD COLUMN helper_worktree TEXT;`,
+// Bug 42: who holds the recipe's fixed ports when a start was refused (JSON, preview.ts PortHolder[]), so the UI can name them
+// and offer to stop them.
+`ALTER TABLE previews ADD COLUMN port_holders TEXT;`,
+// Bug 43: questions a TPM asks the user with ask_user (choices: JSON list of button answers); open until answered or cancelled.
+`CREATE TABLE IF NOT EXISTS asks (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, agent_id TEXT NOT NULL, question TEXT NOT NULL, choices TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL, answered_at INTEGER, answer TEXT);
+CREATE INDEX IF NOT EXISTS asks_open ON asks(feature_id, answered_at);`,
+// Bug 46: the ticket a Launch helper works out start steps for (Try it on a repo with no steps yet); its first run tries that ticket.
+`ALTER TABLE previews ADD COLUMN helper_ticket_id TEXT;`,
+// Bug 50: what HQ does itself once the user picks a choice (JSON, asks.ts AskAction), e.g. cancel_ticket's "Remove it".
+`ALTER TABLE asks ADD COLUMN action TEXT;`,
+// Bug 52: one TPM per project. The TPM belongs to the repo (its box is always on the board); features are the branches it makes,
+// with a handle per project (F-1…), and ticket keys count up per project and never repeat (their worktree folder is the key).
+// Agents, messages and asks carry the repo, so the project TPM (no feature) is found everywhere a feature's TPM was.
+`ALTER TABLE repos ADD COLUMN tpm_agent_id TEXT; ALTER TABLE repos ADD COLUMN tpm_parked_at INTEGER;
+ALTER TABLE repos ADD COLUMN next_ticket INTEGER NOT NULL DEFAULT 1; ALTER TABLE repos ADD COLUMN next_feature INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE features ADD COLUMN handle TEXT; ALTER TABLE agents ADD COLUMN repo_id TEXT; ALTER TABLE messages ADD COLUMN repo_id TEXT;
+UPDATE agents SET repo_id = (SELECT repo_id FROM features WHERE features.id = agents.feature_id) WHERE feature_id IS NOT NULL;
+UPDATE agents SET repo_id = (SELECT id FROM previews WHERE previews.helper_agent_id = agents.id) WHERE repo_id IS NULL AND role = 'launcher';
+UPDATE messages SET repo_id = (SELECT repo_id FROM features WHERE features.id = messages.feature_id) WHERE feature_id IS NOT NULL;
+UPDATE messages SET repo_id = (SELECT repo_id FROM agents WHERE agents.id = messages.from_id) WHERE repo_id IS NULL;
+UPDATE messages SET repo_id = (SELECT repo_id FROM agents WHERE agents.id = messages.to_id) WHERE repo_id IS NULL;
+UPDATE features SET handle = 'F-' || (SELECT COUNT(*) FROM features g WHERE g.repo_id = features.repo_id
+  AND (g.created_at < features.created_at OR (g.created_at = features.created_at AND g.id <= features.id)));
+UPDATE repos SET next_feature = 1 + (SELECT COUNT(*) FROM features WHERE features.repo_id = repos.id);
+UPDATE repos SET next_ticket = 1 + COALESCE((SELECT MAX(CAST(substr(t.key, instr(t.key, '-') + 1) AS INTEGER)) FROM tickets t
+  JOIN features f ON f.id = t.feature_id WHERE f.repo_id = repos.id), 0);
+CREATE TABLE asks_new (id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, feature_id TEXT, agent_id TEXT NOT NULL, question TEXT NOT NULL,
+  choices TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, answered_at INTEGER, answer TEXT, action TEXT);
+INSERT INTO asks_new SELECT a.id, COALESCE((SELECT repo_id FROM features f WHERE f.id = a.feature_id), ''), a.feature_id, a.agent_id, a.question,
+  a.choices, a.created_at, a.answered_at, a.answer, a.action FROM asks a;
+DROP TABLE asks; ALTER TABLE asks_new RENAME TO asks;
+CREATE INDEX IF NOT EXISTS asks_open ON asks(repo_id, answered_at);`,
+// Auto mode: per project, so not in settings. test_cmd is the user's own (empty: HQ works it out); auto_stopped_why stops new starts
+// and merges until Resume; auto_waiting only says why nothing is moving (usage, no tests). A run is one stretch of auto work.
+`ALTER TABLE repos ADD COLUMN auto_mode INTEGER NOT NULL DEFAULT 0; ALTER TABLE repos ADD COLUMN auto_stopped_why TEXT;
+ALTER TABLE repos ADD COLUMN auto_waiting TEXT; ALTER TABLE repos ADD COLUMN test_cmd TEXT;
+ALTER TABLE tickets ADD COLUMN auto_tries INTEGER NOT NULL DEFAULT 0; ALTER TABLE tickets ADD COLUMN auto_parked_why TEXT;
+CREATE TABLE auto_runs (id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running', start_sha TEXT, end_sha TEXT,
+  started_at INTEGER NOT NULL, ended_at INTEGER, summary TEXT);
+CREATE INDEX auto_runs_repo ON auto_runs(repo_id, started_at);`,
+// Bug 53: migration 18 read the number after the first dash, so keys like T1 counted as 0 and the next ticket could reuse a number.
+// Now the last run of digits in any key (T1, T-03, XY-12x), and it only ever raises the counter.
+`UPDATE repos SET next_ticket = MAX(next_ticket, 1 + COALESCE((SELECT MAX(CAST(substr(k.s, length(rtrim(k.s, '0123456789')) + 1) AS INTEGER))
+  FROM (SELECT rtrim(lower(t.key), 'abcdefghijklmnopqrstuvwxyz-_') AS s, f.repo_id AS repo FROM tickets t JOIN features f ON f.id = t.feature_id) k
+  WHERE k.repo = repos.id), 0));`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

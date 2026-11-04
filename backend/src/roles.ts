@@ -1,21 +1,27 @@
 // Role definitions: models, permission mode, tools, settings generator. Mirrors the plan §2.3/§2.4 and the M0-validated spike settings.
 import os from 'node:os'
 import path from 'node:path'
-import { PATHS, PORTS, DEFAULTS } from './config.ts'
+import { PATHS, PORTS, DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR } from './config.ts'
 import { getSetting } from './db.ts'
 
-export type Role = 'tpm' | 'architect' | 'engineer'
+export type Role = 'tpm' | 'architect' | 'engineer' | 'launcher'
 const HOME = os.homedir()
 const HOOK = (token: string) => `http://127.0.0.1:${PORTS.hooks}/hooks/${token}`
 
 export const ENGINEER_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'LSP', 'ToolSearch', 'EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'Agent']
 export const ENGINEER_DISALLOWED = ['EnterWorktree', 'ExitWorktree', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'AskUserQuestion', 'Monitor', 'Skill']
+/** Where engineers may download packages from: npm and PyPI (index + files). */
+export const PACKAGE_REGISTRIES = ['registry.npmjs.org', 'registry.yarnpkg.com', 'pypi.org', 'files.pythonhosted.org']
+/** The Launch helper looks around and tries things in its sandbox; it never changes the project (launchhelper.ts). */
+export const LAUNCHER_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'ToolSearch']
+export const LAUNCHER_DISALLOWED = ['Edit', 'Write', 'NotebookEdit', 'Agent', ...ENGINEER_DISALLOWED]
 export const PLANNER_DISALLOWED = ['Edit', 'Write', 'NotebookEdit', 'Bash', 'Monitor', 'EnterWorktree', 'ExitWorktree', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'AskUserQuestion', 'Skill']
 
 export function modelFor(role: Role, size?: string): string {
   const m = getSetting('models', DEFAULTS.models)
   if (role === 'tpm') return m.tpm
   if (role === 'architect') return m.architect
+  if (role === 'launcher') return (m as Partial<typeof m>).launcher ?? m.engineer_s // saved before the helper existed: the S engineer's
   return size === 'S' ? m.engineer_s : m.engineer_ml
 }
 
@@ -43,7 +49,7 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
     crossSessionInbound: 'refuse',
     hooks,
   }
-  if (role !== 'engineer') return base
+  if (role !== 'engineer' && role !== 'launcher') return base // the Launch helper gets the engineer's sandbox, and runs no git writes
   const overrides = new Set(opts.editOverrides ?? [])
   const deny = [
     'Read(~/.claude/**)', 'Read(~/.claude.json)', `Read(//${HOME}/.hq/**)`, 'Read(.env)', 'Read(.env.*)', 'Read(**/secrets/**)', 'Read(~/.ssh/**)', 'Read(~/.aws/**)',
@@ -53,20 +59,37 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
     // The Bash(...) prefixes below are a convenience (they stop the obvious command), not a boundary: `env git push`, `git -C`
     // and friends get past them. What holds is the sandbox (no github.com on the network allowlist, ~/.hq and gh config unreadable,
     // the main repo's .git/config and .git/hooks unwritable: spike S1, 2026-10-25) and engineers holding no credentials.
+    ...(role === 'launcher' ? ['Bash(git commit*)', 'Bash(git add*)'] : []),
     'Cd', 'Bash(claude *)', 'Bash(tmux *)', 'Bash(sudo *)', 'Bash(gh *)', 'Bash(git push*)', 'Bash(git config core.hooksPath*)', 'Bash(open *)', 'Bash(osascript *)',
   ]
   return {
     ...base,
     permissions: { ...(base.permissions as object), blockReadsOutsideWorkingDirectories: true, allow: ['mcp__hq__*'], deny },
     plansDirectory: '.hq-plans',
+    // Every package cache sits in ENGINEER_CACHE, outside home: npm's (with the log npm writes on every run), Go's (spike S5) and
+    // Python's. Spike 2026-10-31 (`-p` runs with these settings): `npm test` passed with and without npm_config_cache, so the old
+    // "exit 255 in the spike HQ" isn't explained by the npm cache; with it set, nothing is written under ~/.npm at all.
+    // Python venvs live in the worktree; uv uses the machine's Python, since downloading one needs github.com, which stays off
+    // the allowlist (spike 2026-10-29: uv sync + pytest pass in this sandbox).
+    env: cacheEnv(),
     sandbox: {
       enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true,
-      network: { allowedDomains: ['127.0.0.1', 'localhost', '[::1]', 'registry.npmjs.org', 'registry.yarnpkg.com', ...(opts.repoAllowlist ?? [])], strictAllowlist: true, allowLocalBinding: true },
-      filesystem: { denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, PATHS.home, `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`] },
+      network: { allowedDomains: ['127.0.0.1', 'localhost', '[::1]', ...PACKAGE_REGISTRIES, ...(opts.repoAllowlist ?? [])], strictAllowlist: true, allowLocalBinding: true },
+      // On a Linux with no keyring, gh keeps its token in a file in GH_CONFIG_DIR.
+      filesystem: { allowWrite: [ENGINEER_CACHE], denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, PATHS.home, `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`,
+        GH_CONFIG_DIR] },
       credentials: { envVars: [{ name: 'HQ_AGENT_ID', mode: 'deny' }, { name: 'HQ_BACKEND', mode: 'deny' }, { name: 'ANTHROPIC_API_KEY', mode: 'deny' }, { name: 'GH_TOKEN', mode: 'deny' }, { name: 'GITHUB_TOKEN', mode: 'deny' }] },
     },
   }
 }
+
+/** Where package tools keep their caches, for anything that runs sandboxed (engineers, and auto mode's test runs). */
+export const cacheEnv = (): Record<string, string> => ({
+  npm_config_cache: path.join(ENGINEER_CACHE, 'npm'),
+  GOCACHE: path.join(ENGINEER_CACHE, 'go-build'), GOMODCACHE: path.join(ENGINEER_CACHE, 'gomod'), GOPATH: path.join(ENGINEER_CACHE, 'gopath'),
+  UV_CACHE_DIR: path.join(ENGINEER_CACHE, 'uv'), PIP_CACHE_DIR: path.join(ENGINEER_CACHE, 'pip'),
+  UV_PYTHON_INSTALL_DIR: path.join(ENGINEER_CACHE, 'python'), UV_PYTHON_DOWNLOADS: 'never',
+})
 
 export function buildMcp(token: string): Record<string, unknown> {
   return { mcpServers: { hq: { type: 'http', url: `http://127.0.0.1:${PORTS.mcp}/mcp`, headers: { Authorization: `Bearer ${token}` } } } }
@@ -78,6 +101,10 @@ export function roleFlags(role: Role, opts: { worktreeName?: string; model: stri
   if (role === 'engineer') {
     return ['--worktree', opts.worktreeName!, '--restricted', '--tools', ENGINEER_TOOLS.join(','), '--setting-sources', 'user', '--disable-slash-commands',
       '--disallowedTools', ...ENGINEER_DISALLOWED, '--permission-mode', opts.permissionMode ?? 'plan', '--model', opts.model]
+  }
+  if (role === 'launcher') {
+    return ['--worktree', opts.worktreeName!, '--restricted', '--tools', LAUNCHER_TOOLS.join(','), '--setting-sources', 'user', '--disable-slash-commands',
+      '--disallowedTools', ...LAUNCHER_DISALLOWED, '--permission-mode', 'default', '--model', opts.model]
   }
   return ['--disallowedTools', ...PLANNER_DISALLOWED, '--permission-mode', 'default', '--model', opts.model]
 }

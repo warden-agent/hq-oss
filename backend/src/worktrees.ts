@@ -1,6 +1,7 @@
-// Ticket worktrees under <repo>/.claude/worktrees/. Claude Code's --worktree locks its worktree ("claude session PAN-1 (pid
+// Ticket worktrees under <repo>/.claude/worktrees/. Claude Code's --worktree locks its worktree ("claude session APP-1 (pid
 // 12974 start …)") and a killed session leaves that lock behind; HQ clears such locks once the session is gone, and removes
 // a merged ticket's worktree when nothing in it would be lost. Git only, no DB. Never forced.
+import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { branchMerged, git } from './reposync.ts'
@@ -54,4 +55,36 @@ export async function removeMerged(repoPath: string, wtPath: string, branch: str
   }
   await git(repoPath, ['worktree', 'remove', wtPath]) // git itself refuses if anything would be lost
   return { removed: true }
+}
+
+/** A new ticket worktree has no installed packages (git leaves ignored folders out), so every engineer used to run `npm ci`
+ *  first, and one skipped the tests. Give the worktree a copy of the main checkout's `node_modules`, at the root and in each
+ *  top-level folder with its own package.json. Only where the worktree has none yet and git ignores it there: a copy must
+ *  never show up as new files to commit (the trailing / matters: a `node_modules/` rule only matches a folder). On macOS
+ *  `cp -c` clones on APFS (fast, no extra disk); elsewhere a plain copy. `-p` keeps times, so the preview's install check
+ *  still sees the packages as current. Returns the folders seeded. */
+export async function seedPackages(repoPath: string, wtPath: string): Promise<string[]> {
+  const subs = fs.readdirSync(wtPath, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules').map((d) => d.name)
+  const done: string[] = []
+  for (const rel of ['.', ...subs]) {
+    const from = path.join(repoPath, rel, 'node_modules'), to = path.join(wtPath, rel, 'node_modules')
+    if (!fs.existsSync(path.join(wtPath, rel, 'package.json')) || !fs.existsSync(from) || fs.existsSync(to)) continue
+    if (!(await git(wtPath, ['check-ignore', '-q', path.join(rel, 'node_modules') + '/']).then(() => true, () => false))) continue
+    await copyTree(from, to); done.push(rel)
+  }
+  return done
+}
+const cp = (args: string[]): Promise<void> => new Promise((resolve, reject) => execFile('cp', args, (err) => err ? reject(err) : resolve()))
+/** Copy a folder: an APFS clone if the system can, else a plain copy (Linux's cp has no -c). */
+export async function copyTree(from: string, to: string): Promise<void> {
+  try { await cp(['-cRp', from, to]) } catch { fs.rmSync(to, { recursive: true, force: true }); await cp(['-Rp', from, to]) }
+}
+
+/** HQ's own folders (plans, worktrees) never show up as changes in the repo: listed in its .git/info/exclude. */
+export async function excludeHqFolders(repoPath: string): Promise<void> {
+  const excl = await git(repoPath, ['rev-parse', '--git-path', 'info/exclude'])
+  const exclPath = path.isAbsolute(excl) ? excl : path.join(repoPath, excl)
+  fs.mkdirSync(path.dirname(exclPath), { recursive: true }); const cur = fs.existsSync(exclPath) ? fs.readFileSync(exclPath, 'utf8') : ''
+  const missing = ['.hq-plans/', '.claude/worktrees/'].filter((p) => !cur.split('\n').includes(p))
+  if (missing.length) fs.appendFileSync(exclPath, (cur.endsWith('\n') || !cur ? '' : '\n') + missing.map((p) => `${p}\n`).join(''))
 }

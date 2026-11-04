@@ -22,9 +22,9 @@ function hookCall() {
 }
 const pending = (p: Promise<unknown>) => Promise.race([p.then(() => false), new Promise<boolean>((r) => setTimeout(() => r(true), 50))])
 const now = Date.now()
-run("INSERT INTO repos(id, name, path, created_at) VALUES ('r1', 'pantry', '/tmp/pantry', ?)", now)
-run("INSERT INTO features(id, repo_id, slug, title, request_text, status, created_at, updated_at) VALUES ('f1', 'r1', 'kl', 'kitchen list', 'x', 'planning', ?, ?)", now, now)
-run("INSERT INTO tickets(id, feature_id, key, slug, title, status, created_at, updated_at) VALUES ('t1', 'f1', 'PAN-1', 'api', 'API', 'planning', ?, ?)", now, now)
+run("INSERT INTO repos(id, name, path, created_at) VALUES ('r1', 'demo', '/tmp/demo', ?)", now)
+run("INSERT INTO features(id, repo_id, slug, title, request_text, status, created_at, updated_at) VALUES ('f1', 'r1', 'kl', 'item list', 'x', 'planning', ?, ?)", now, now)
+run("INSERT INTO tickets(id, feature_id, key, slug, title, status, created_at, updated_at) VALUES ('t1', 'f1', 'APP-1', 'api', 'API', 'planning', ?, ?)", now, now)
 run("INSERT INTO agents(id, role, feature_id, ticket_id, model_alias, token_hash, status, started_at) VALUES ('e1', 'engineer', 'f1', 't1', 'sonnet', 'h', 'working', ?)", now)
 const agent = () => one<any>("SELECT * FROM agents WHERE id = 'e1'")!
 const submit = (plan: string) => { const c = hookCall(); onExitPlanMode(agent(), { tool_input: { plan, planFilePath: null } }, c.res); return c }
@@ -73,7 +73,7 @@ test('a client that hangs up leaves nothing held; an approval from the terminal 
 
 /** A second ticket and engineer, so these tests don't depend on t1's rounds. */
 function fresh(n: number) {
-  run('INSERT INTO tickets(id, feature_id, key, slug, title, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)', `t${n}`, 'f1', `PAN-${n}`, `s${n}`, `T${n}`, 'planning', now, now)
+  run('INSERT INTO tickets(id, feature_id, key, slug, title, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)', `t${n}`, 'f1', `APP-${n}`, `s${n}`, `T${n}`, 'planning', now, now)
   run('INSERT INTO agents(id, role, feature_id, ticket_id, model_alias, token_hash, status, started_at) VALUES (?,?,?,?,?,?,?,?)', `e${n}`, 'engineer', 'f1', `t${n}`, 'sonnet', 'h', 'working', now)
   const ag = () => one<any>('SELECT * FROM agents WHERE id = ?', `e${n}`)!
   const send = (plan: string) => { const c = hookCall(); onExitPlanMode(ag(), { tool_input: { plan, planFilePath: null } }, c.res); return c }
@@ -101,7 +101,7 @@ test('revision_cap: after 2 send-backs the next round escalates; it can only be 
   const p2 = x.send('Plan 2'); answerReview(x.rounds()[1]!.id, 'user_architect', { by: 'user', message: 'no' }); await p2.answer
   const p3 = x.send('Plan 3')
   assert.equal(x.status(), 'escalated')
-  assert.match(one<any>("SELECT detail FROM needs_attention WHERE kind = 'cap_reached' AND agent_id = 'e4' AND resolved_at IS NULL")!.detail, /PAN-4: plan sent back 2 times/)
+  assert.match(one<any>("SELECT detail FROM needs_attention WHERE kind = 'cap_reached' AND agent_id = 'e4' AND resolved_at IS NULL")!.detail, /APP-4: plan sent back 2 times/)
   const r3 = x.rounds()[2]!.id
   for (const v of ['revise', 'user_architect'] as const) {
     const res = answerReview(r3, v, { by: 'user', message: 'again' })
@@ -114,7 +114,7 @@ test('revision_cap: after 2 send-backs the next round escalates; it can only be 
 })
 
 test('migration 6 closes older open rounds left by the old gate, and only those', () => {
-  run("INSERT INTO tickets(id, feature_id, key, slug, title, status, created_at, updated_at) VALUES ('t2', 'f1', 'PAN-2', 'page', 'Page', 'plan_review', ?, ?)", now, now)
+  run("INSERT INTO tickets(id, feature_id, key, slug, title, status, created_at, updated_at) VALUES ('t2', 'f1', 'APP-2', 'page', 'Page', 'plan_review', ?, ?)", now, now)
   for (const n of [1, 2, 3]) {
     run('INSERT INTO plan_revisions(id, ticket_id, agent_id, round, plan_text, plan_hash, submitted_at) VALUES (?,?,?,?,?,?,?)', `p${n}`, 't2', 'e1', n, `plan ${n}`, `h${n}`, now)
     run('INSERT INTO review_requests(id, ticket_id, plan_revision_id, round, status, opened_at) VALUES (?,?,?,?,?,?)', `R${n}`, 't2', `p${n}`, n, n === 2 ? 'answered' : 'open', now)

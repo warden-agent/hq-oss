@@ -21,8 +21,8 @@ function setup(): { bare: string; clone: string; push: (msg: string) => string }
 }
 
 test('parseGithubRemote', () => {
-  assert.equal(parseGithubRemote('https://github.com/warden-agent/hq.git'), 'warden-agent/hq')
-  assert.equal(parseGithubRemote('https://github.com/warden-agent/hq'), 'warden-agent/hq')
+  assert.equal(parseGithubRemote('https://github.com/octo/app.git'), 'octo/app')
+  assert.equal(parseGithubRemote('https://github.com/octo/app'), 'octo/app')
   assert.equal(parseGithubRemote('https://x-token@github.com/o/r.git'), 'o/r')
   assert.equal(parseGithubRemote('git@github.com:o/my.repo.git'), 'o/my.repo')
   assert.equal(parseGithubRemote('ssh://git@github.com/o/r'), 'o/r')
@@ -64,7 +64,15 @@ test('branchMerged: yes after a merge commit, no before; unknown branch is no', 
 test('no remote → local, no network', async () => {
   const d = tmp(); sh(d, 'init', '-b', 'trunk'); fs.writeFileSync(path.join(d, 'a'), 'a'); sh(d, 'add', '.'); sh(d, 'commit', '-m', 'a')
   const r = await syncCheckout(d, opts('/nonexistent'))
-  assert.equal(r.kind, 'local'); assert.equal(r.ok, true); assert.equal(r.defaultBranch, 'trunk'); assert.equal(r.remote, null)
+  assert.equal(r.kind, 'local'); assert.equal(r.ok, true); assert.equal(r.defaultBranch, 'trunk'); assert.equal(r.remote, null); assert.equal(r.empty, false)
+})
+
+test('empty: no commits or an empty first commit is empty; a committed file is not', async () => {
+  const d = tmp(); sh(d, 'init', '-b', 'main')
+  assert.equal((await syncCheckout(d, opts('/nonexistent'))).empty, true)
+  sh(d, 'commit', '--allow-empty', '-m', 'Start'); assert.equal((await syncCheckout(d, opts('/nonexistent'))).empty, true)
+  fs.writeFileSync(path.join(d, 'a'), 'a'); sh(d, 'add', '.'); sh(d, 'commit', '-m', 'a'); assert.equal((await syncCheckout(d, opts('/nonexistent'))).empty, false)
+  const { clone } = setup(); assert.equal((await syncCheckout(clone, opts(path.join(path.dirname(clone), 'r.git')))).empty, false)
 })
 
 test('non-GitHub origin → local', async () => {

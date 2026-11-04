@@ -22,6 +22,36 @@ const freePort = (): Promise<number> => new Promise((resolve, reject) => {
   const s = net.createServer(); s.on('error', reject); s.listen(0, '127.0.0.1', () => { const p = (s.address() as net.AddressInfo).port; s.close(() => resolve(p)) })
 })
 
+const answers = (port: number, host: string): Promise<boolean> => new Promise((resolve) => {
+  const c = net.connect({ host, port }); c.once('connect', () => { c.destroy(); resolve(true) }); c.once('error', () => resolve(false))
+})
+/** Ten ports nothing listens on (IPv4 or IPv6), for this test HQ's previews alone (Bug 44): test HQs that run at the same time,
+ *  and the live HQ, never hand out the same port. */
+async function previewRange(): Promise<string> {
+  for (;;) {
+    const base = await freePort(); if (base + 9 > 65535) continue
+    const ports = Array.from({ length: 10 }, (_, i) => base + i)
+    if ((await Promise.all(ports.flatMap((p) => [answers(p, '127.0.0.1'), answers(p, '::1')]))).some(Boolean)) continue
+    return `${base}-${base + 9}`
+  }
+}
+/** SIGKILLs every process group that has a process naming `root` on its command line (a preview's supervisor runs a spec under
+ *  HQ_HOME), except this test process's own group. Bug 47: nothing a run started outlives it, even when tmux's hang-up doesn't
+ *  reach it. Synchronous, so it also works in an exit handler. */
+function killLeftovers(root: string): void {
+  const rows = execFileSync('ps', ['-axo', 'pid=,pgid=,command='], { encoding: 'utf8' }).split('\n')
+    .map((l) => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(l)).filter((m) => !!m).map((m) => ({ pid: Number(m[1]), pgid: Number(m[2]), cmd: m[3]! }))
+  const mine = rows.find((r) => r.pid === process.pid)?.pgid
+  for (const g of new Set(rows.filter((r) => r.cmd.includes(root) && r.pgid > 1 && r.pgid !== mine).map((r) => r.pgid))) {
+    try { process.kill(-g, 'SIGKILL') } catch { /* gone */ }
+  }
+}
+/** Test HQs still running: an interrupted run (Ctrl-C, a crash before `after`) stops them on its way out. */
+const live = new Set<() => void>()
+const abortAll = () => { for (const f of live) f() }
+process.once('exit', abortAll)
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.once(sig, () => { abortAll(); process.exit(130) })
+
 export type Hq = Awaited<ReturnType<typeof startHq>>
 /** `env`: extra environment for the backend (a fake `gh` on PATH, say). */
 export async function startHq(o: { env?: NodeJS.ProcessEnv } = {}) {
@@ -30,7 +60,7 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv } = {}) {
   const home = path.join(root, 'home'), hqHome = path.join(root, 'hq'); fs.mkdirSync(home)
   fs.writeFileSync(path.join(home, '.claude.json'), '{ "projects": {} }') // HQ marks workspaces trusted in it
   const ports = { ui: await freePort(), hooks: await freePort(), mcp: await freePort() }
-  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, HQ_HOME: hqHome, HQ_UI_PORT: String(ports.ui), HQ_HOOKS_PORT: String(ports.hooks), HQ_MCP_PORT: String(ports.mcp), HQ_CLAUDE_BIN: FAKE, TMUX_TMPDIR: tmuxDir,
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, HQ_HOME: hqHome, HQ_UI_PORT: String(ports.ui), HQ_HOOKS_PORT: String(ports.hooks), HQ_MCP_PORT: String(ports.mcp), HQ_PREVIEW_PORTS: await previewRange(), HQ_CLAUDE_BIN: FAKE, TMUX_TMPDIR: tmuxDir,
     GIT_AUTHOR_NAME: 'HQ e2e', GIT_AUTHOR_EMAIL: 'e2e@hq.test', GIT_COMMITTER_NAME: 'HQ e2e', GIT_COMMITTER_EMAIL: 'e2e@hq.test', GIT_CONFIG_NOSYSTEM: '1', ...o.env }
   delete env.TMUX; delete env.TMUX_PANE // inside tmux these would point every tmux call at the live server
   let proc: ChildProcess | null = null; let log = ''
@@ -52,6 +82,12 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv } = {}) {
     const p = proc; proc = null; if (!p || p.exitCode !== null) return
     const gone = new Promise((r) => p.once('exit', r)); p.kill('SIGTERM'); await gone
   }
+  const abort = () => {
+    try { proc?.kill('SIGKILL') } catch { /* gone */ }
+    try { execFileSync('tmux', ['kill-server'], { env, stdio: 'ignore' }) } catch { /* no server left */ }
+    killLeftovers(root)
+  }
+  live.add(abort)
   await startBackend()
 
   return {
@@ -61,6 +97,7 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv } = {}) {
     /** Stops everything and deletes the temp dirs; the backend's output stays in <tmpdir>/hq-e2e-last.log. */
     async stop(): Promise<void> {
       await stopBackend(); fs.writeFileSync(path.join(os.tmpdir(), 'hq-e2e-last.log'), log)
+      live.delete(abort); killLeftovers(root) // previews first: HQ leaves them running on purpose (a restart picks them up)
       try { execFileSync('tmux', ['kill-server'], { env, stdio: 'ignore' }) } catch { /* no server left */ }
       fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(tmuxDir, { recursive: true, force: true })
     },

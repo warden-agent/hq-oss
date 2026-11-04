@@ -1,4 +1,4 @@
-// HQ bugs 4–8 end to end, against a real backend with fake agents (see harness.ts). Each test uses its own repo and feature.
+// HQ bugs 4–8 and 40 end to end, against a real backend with fake agents (see harness.ts). Each test uses its own repo and feature.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -89,7 +89,7 @@ test('Worktree locks: a stopped engineer\'s lock is cleared; stale ones at start
   // A session that died while HQ was down left its lock; another session is still running when HQ starts again.
   await launch(t2); await liveEngineer(t2)
   const old = path.join(dir, '.claude', 'worktrees', 'OLD'); sh(dir, 'worktree', 'add', '-q', '-b', 'hq/locks/OLD', old)
-  sh(dir, 'worktree', 'lock', '--reason', 'claude session OLD (pid 999999 start Thu Oct 22 01:38:44 2026)', old)
+  sh(dir, 'worktree', 'lock', '--reason', 'claude session OLD (pid 999999 start Thu Oct 22 15:38:44 2026)', old)
   const held = lockOf(dir, wtOf(dir, t2))
   await hq.restart()
   await waitFor('the stale lock to clear at startup', () => lockOf(dir, old) === null)
@@ -98,10 +98,14 @@ test('Worktree locks: a stopped engineer\'s lock is cleared; stale ones at start
 
 test('Bug 6: Merge into main for a local repo: refuses with the reason and changes nothing, then merges and moves everything on', async () => {
   const { dir, repo, f } = await setup('bug6')
+  await hq.api(`previews/${repo.id}/command`, { command: 'npm start' }) // the user's own command: no Launch helper, no OK
   assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200)
   await waitFor('the preview', async () => (await hq.state()).previews.find((p: any) => p.id === repo.id && p.status === 'running'), 20_000)
   const t1 = await ticket(f, 'Api'), t2 = await ticket(f, 'Page', ['T-01'])
+  fs.writeFileSync(path.join(dir, 'node_modules', 'marker.js'), 'installed\n')
   await launch(t1); const e1 = await liveEngineer(t1)
+  // Bug 30: the worktree starts with main's installed packages, and they never count as changes
+  assert.equal(fs.readFileSync(path.join(wtOf(dir, t1), 'node_modules', 'marker.js'), 'utf8'), 'installed\n')
   assert.match(await finish(e1, wtOf(dir, t1), 'api.txt'), /^Done\. The user merges hq\/bug6\/T-01-api into main from HQ\./)
   let s = await hq.state(), tk = s.tickets.find((x: any) => x.id === t1.id)
   assert.deepEqual([tk.status, tk.pr_state], ['pr_ready', 'local'])
@@ -130,8 +134,8 @@ test('Bug 6: Merge into main for a local repo: refuses with the reason and chang
   assert.equal((await launch(t2)).status, 200) // T-02 may start now
 })
 
-test('Bug 7: Start TPM again: a fresh TPM briefed from HQ\'s records gets what was waiting for the old one', async () => {
-  const { f } = await setup('bug7')
+test('Bug 7: Start TPM again: a fresh project TPM briefed from HQ\'s records gets what was waiting for the old one (Bug 52)', async () => {
+  const { repo, f } = await setup('bug7')
   const oldTpm = f.tpm_agent_id
   const t1 = await ticket(f, 'Api'); await launch(t1); const e1 = await liveEngineer(t1)
   await hq.api(`agents/${oldTpm}/stop`, {})
@@ -139,25 +143,42 @@ test('Bug 7: Start TPM again: a fresh TPM briefed from HQ\'s records gets what w
   await hq.api('settings', { key: 'dm_per_peer_min', value: 0 })
   const asked = await hq.mcp(e1.id, 'send_message', { to: 'tpm', reason: 'question', body: 'Which file should hold the items?' })
   assert.equal(asked.isError, false, asked.text)
-  const q = (await hq.state()).messages.find((m: any) => m.body === 'Which file should hold the items?')
-  assert.equal(q.to_id, oldTpm); assert.equal(q.delivered_at, null) // nobody will read it
+  let s = await hq.state(); const q = s.messages.find((m: any) => m.body === 'Which file should hold the items?')
+  assert.equal(q.to_id, oldTpm); assert.equal(q.delivered_at, null) // it waits for the TPM, which starts on the user's message, not an engineer's
+  assert.match(s.attention.find((a: any) => a.kind === 'tpm_away').detail, /question is waiting for the TPM, which isn't running: send the TPM a message to start it/)
   // Start TPM again, double-clicked: one new TPM.
-  const both = await Promise.all([hq.api(`features/${f.id}/restart-tpm`, {}), hq.api(`features/${f.id}/restart-tpm`, {})])
+  const both = await Promise.all([hq.api(`repos/${repo.id}/restart-tpm`, {}), hq.api(`repos/${repo.id}/restart-tpm`, {})])
   assert.deepEqual(both.map((r) => r.status).sort(), [200, 409])
   const fresh = both.find((r) => r.status === 200)!.json
-  assert.match(both.find((r) => r.status === 409)!.json.error, /already (starting|has a TPM running)/)
+  assert.match(both.find((r) => r.status === 409)!.json.error, /starting right now|already running/)
   await waitFor('the new TPM', async () => (await hq.state()).agents.find((a: any) => a.id === fresh.id && a.status === 'working'))
-  const s = await hq.state()
-  assert.equal(s.features.find((x: any) => x.id === f.id).tpm_agent_id, fresh.id)
+  s = await hq.state()
+  assert.equal(s.repos.find((x: any) => x.id === repo.id).tpm_agent_id, fresh.id)
   assert.equal(s.messages.find((m: any) => m.id === q.id).to_id, fresh.id) // the question now waits for the new TPM
   const prompt = fs.readFileSync(path.join(hq.hqHome, 'agents', fresh.id, 'prompt.md'), 'utf8')
-  assert.match(prompt, new RegExp(`^You are taking over as TPM for the feature "bug7" in repo "bug7".*The previous TPM session \\(${oldTpm}\\) has ended`))
-  assert.match(prompt, /"""\nBuild bug7\n"""/); assert.match(prompt, /- T-01 \(S\) Api: its engineer waits for an answer · branch hq\/bug7\/T-01-api/)
-  assert.match(fs.readFileSync(path.join(hq.hqHome, 'workspaces', f.id, 'tpm', 'FEATURE.md'), 'utf8'), /## Ticket specs\n\n### T-01: Api\nApi\./)
-  assert.match((await hq.api(`features/${f.id}/restart-tpm`, {})).json.error, new RegExp(`^bug7 already has a TPM running \\(${fresh.id}\\)$`))
+  assert.match(prompt, new RegExp(`^You are taking over as the TPM of project "bug7".*The previous TPM session \\(${oldTpm}\\) has ended`))
+  assert.match(prompt, /On the board now:\n- F-1 bug7\n  - T-01 \(S\) Api: its engineer waits for an answer · branch hq\/bug7\/T-01-api/)
+  const ws = path.join(hq.hqHome, 'workspaces', `repo-${repo.id}`, 'tpm')
+  assert.match(fs.readFileSync(path.join(ws, 'features', 'F-1.md'), 'utf8'), /## Request \(verbatim\)\n\nBuild bug7\n[\s\S]*## Ticket specs\n\n### T-01: Api\nApi\./)
+  assert.match(fs.readFileSync(path.join(ws, 'PROJECT.md'), 'utf8'), /### F-1 bug7 \(features\/F-1\.md\)\n\n> Build bug7\n\n- T-01 \(S\) Api: awaiting_answer/)
+  assert.match((await hq.api(`repos/${repo.id}/restart-tpm`, {})).json.error, new RegExp(`^bug7's TPM is already running \\(${fresh.id}\\)\\.$`))
   // An engineer that still has the old TPM's id reaches the new one.
   assert.equal((await hq.mcp(e1.id, 'send_message', { to: oldTpm, reason: 'fyi', body: 'Started on the store.' })).isError, false)
   assert.equal((await hq.state()).messages.find((m: any) => m.body === 'Started on the store.').to_id, fresh.id)
+})
+
+test('Bug 61: pressing Merge on a ticket nothing waits on leaves no "merged" alert; a merge outside HQ still says so', async () => {
+  const { dir, repo, f } = await setup('bug61')
+  const t1 = await ticket(f, 'Api'), t2 = await ticket(f, 'Page')
+  await launch(t1); const e1 = await liveEngineer(t1); await finish(e1, wtOf(dir, t1), 'api.txt')
+  assert.equal((await hq.api(`tickets/${t1.id}/merge`, {})).status, 200)
+  const merged = async (t: any) => (await hq.state()).attention.filter((a: any) => a.kind === 'merged' && a.ticket_id === t.id)
+  assert.deepEqual(await merged(t1), [])
+  assert.ok((await hq.state()).messages.some((m: any) => m.to_id === f.tpm_agent_id && /T-01 merged/.test(m.body)), 'the TPM still hears')
+  await launch(t2); const e2 = await liveEngineer(t2); await finish(e2, wtOf(dir, t2), 'page.txt')
+  sh(dir, 'merge', '--no-edit', (await hq.state()).tickets.find((x: any) => x.id === t2.id).branch)
+  await hq.api(`repos/${repo.id}/sync`, {}) // a sync re-checks merges (as the 2-minute watcher would)
+  await waitFor('the outside merge to be noticed', async () => (await merged(t2)).length === 1)
 })
 
 test('Bug 8: notices clear themselves: a merge clears what was said about its ticket, and "Ready now" goes once those have started', async () => {
@@ -175,4 +196,17 @@ test('Bug 8: notices clear themselves: a merge clears what was said about its ti
   assert.equal((await launch(t2)).status, 200); await liveEngineer(t2)
   mine = (await open()).filter((a: any) => a.ticket_id === t1.id)
   assert.deepEqual(mine, []) // nothing left to start: no click needed
+})
+
+test('Bug 40: a newer notice of the same kind takes the open one\'s place; the same words again add nothing', async () => {
+  const { f } = await setup('bug40')
+  const t = await ticket(f, 'Api'); await launch(t); const eng = await liveEngineer(t)
+  const mine = async () => (await hq.state()).attention.filter((a: any) => !a.resolved_at && a.kind === 'blocked' && a.agent_id === eng.id)
+  assert.equal((await hq.mcp(eng.id, 'report_blocked', { reason: 'need a hand' })).isError, false)
+  const [first] = await mine(); assert.match(first.detail, /: need a hand$/)
+  assert.equal((await hq.mcp(eng.id, 'report_blocked', { reason: 'need an API key' })).isError, false)
+  const now = await mine()
+  assert.equal(now.length, 1); assert.notEqual(now[0].id, first.id); assert.match(now[0].detail, /: need an API key$/) // the user sees the new reason
+  assert.equal((await hq.mcp(eng.id, 'report_blocked', { reason: 'need an API key' })).isError, false)
+  assert.deepEqual((await mine()).map((a: any) => a.id), [now[0].id]) // said again: nothing changes
 })

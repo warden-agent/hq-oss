@@ -1,4 +1,5 @@
-# Typecheck, unit tests and lint on every PR and on main. The e2e suite (tmux + fake Claude Code) stays local for now.
+# Typecheck, unit tests and lint on every PR and on main. Of the e2e suite (tmux + fake Claude Code) only auto mode runs here, because it
+# needs a real sandbox: Linux's in `check`, macOS's in `sandbox-mac`. The rest stays local for now.
 name: CI
 on:
   pull_request:
@@ -15,11 +16,15 @@ jobs:
         with:
           node-version: 25 # node:sqlite and --experimental-strip-types, as HQ runs locally
           cache: npm
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat tmux
       - run: npm ci
       - name: Backend typecheck
         run: npm --workspace @hq/backend run typecheck
       - name: Backend unit tests
         run: npm --workspace @hq/backend test
+      - name: Auto mode end to end, in the real sandbox
+        working-directory: backend
+        run: node --experimental-strip-types --test --test-timeout=120000 e2e/auto.test.ts e2e/auto-github.test.ts
       - name: Frontend typecheck
         working-directory: frontend
         run: npx tsc -b
@@ -27,3 +32,15 @@ jobs:
         run: npm --workspace frontend run lint -- --deny-warnings
       - name: No new lines over 200 characters
         run: node scripts/long-lines.mjs
+  sandbox-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 25
+          cache: npm
+      - run: npm ci
+      - name: Sandbox tests
+        working-directory: backend
+        run: node --experimental-strip-types --test --test-timeout=60000 src/testrun.test.ts

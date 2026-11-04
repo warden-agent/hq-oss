@@ -11,10 +11,11 @@ import { buildMcp, buildSettings, roleFlags, rolePromptPath, type Role } from '.
 import { ensureTrusted } from './trust.ts'
 
 export type Agent = {
-  id: string; role: Role; feature_id: string | null; ticket_id: string | null; review_request_id: string | null; model_alias: string; model_live: string | null
+  id: string; role: Role; repo_id: string | null; feature_id: string | null; ticket_id: string | null; review_request_id: string | null; model_alias: string; model_live: string | null
   claude_session_id: string | null; transcript_path: string | null; tmux_session: string; cwd: string; token_hash: string; token_revoked_at: number | null
   status: string; in_plan_mode: number; last_event_at: number | null; takeover_locked_until: number | null; mod_seen_at: number | null; last_gate_allow_at: number | null
   paused_reason: string | null; started_at: number; ended_at: number | null; exit_code: number | null; launch_prompt: string | null; display_name: string | null
+  fresh_start_at: number | null; fresh_start_then: string | null; fresh_start_msg: string | null
 }
 export const agentDir = (agentId: string): string => path.join(PATHS.agents, agentId)
 export const tmuxName = (agentId: string): string => `hq-${agentId}`
@@ -32,13 +33,13 @@ export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>): voi
 }
 
 export type LaunchSpec = {
-  role: Role; featureId?: string; ticketId?: string; reviewRequestId?: string; model: string; cwd: string; displayName: string
+  role: Role; repoId?: string; featureId?: string; ticketId?: string; reviewRequestId?: string; model: string; cwd: string; displayName: string
   launchPrompt: string; worktreeName?: string; permissionMode?: 'plan' | 'acceptEdits'
   extraEnv?: Record<string, string>; extraFlags?: string[]; repoAllowlist?: string[]; editOverrides?: string[]; size?: string
 }
 
 export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
-  const agentId = id(spec.role === 'engineer' ? 'eng' : spec.role === 'architect' ? 'arch' : 'tpm')
+  const agentId = id(({ engineer: 'eng', architect: 'arch', tpm: 'tpm', launcher: 'launch' } as const)[spec.role])
   const token = newToken()
   const dir = agentDir(agentId)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -54,8 +55,8 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   const script = ['#!/bin/bash', ...Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}`), `cd ${shq(spec.cwd)}`, `exec ${shq(CLAUDE_BIN)} ${flags.map(shq).join(' ')}`].join('\n') + '\n'
   const scriptPath = path.join(dir, 'launch.sh'); fs.writeFileSync(scriptPath, script, { mode: 0o700 })
   const t = now()
-  run(`INSERT INTO agents(id, role, feature_id, ticket_id, review_request_id, model_alias, claude_session_id, tmux_session, cwd, token_hash, status, in_plan_mode, started_at, launch_prompt, display_name)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agentId, spec.role, spec.featureId ?? null, spec.ticketId ?? null, spec.reviewRequestId ?? null, spec.model, sessionId, tmuxName(agentId), spec.cwd, sha(token), 'launching',
+  run(`INSERT INTO agents(id, role, repo_id, feature_id, ticket_id, review_request_id, model_alias, claude_session_id, tmux_session, cwd, token_hash, status, in_plan_mode, started_at, launch_prompt, display_name)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, agentId, spec.role, spec.repoId ?? null, spec.featureId ?? null, spec.ticketId ?? null, spec.reviewRequestId ?? null, spec.model, sessionId, tmuxName(agentId), spec.cwd, sha(token), 'launching',
        spec.role === 'engineer' && spec.permissionMode !== 'acceptEdits' ? 1 : 0, t, spec.launchPrompt, spec.displayName)
   run('INSERT INTO sessions(id, agent_id, claude_session_id, started_at) VALUES (?,?,?,?)', id('ses'), agentId, sessionId, t)
   run('INSERT INTO batches(id, agent_id, text, created_at, method) VALUES (?,?,?,?,?)', id('B'), agentId, spec.launchPrompt, t, 'launch')

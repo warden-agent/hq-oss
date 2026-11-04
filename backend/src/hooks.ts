@@ -1,11 +1,12 @@
 // Hook + mod + tmux ingress server (127.0.0.1:PORTS.hooks). Every record is logged to `events`, then applied.
 import http from 'node:http'
 import { BIND, PORTS, DEFAULTS } from './config.ts'
+import { checkContext } from './freshstart.ts'
 import { run, now, getSetting, one } from './db.ts'
 import { emit, patch } from './events.ts'
 import { agentByToken, getAgent, update, tmuxToken, revokeToken, type Agent } from './agents.ts'
 import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
-import { ackBatchFromPrompt, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor } from './delivery.ts'
+import { ackBatchFromPrompt, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor } from './delivery.ts'
 import { onPostModelSwitch, onTurnStep } from './modelguard.ts'
 import { attention, resolveKind } from './attention.ts'
 import { getTicket } from './records.ts'
@@ -29,6 +30,9 @@ function describeTool(tool: string, input: Record<string, unknown>): string {
   return tool
 }
 
+/** When each agent's main loop last started a turn (UserPromptSubmit) and last ended one (Stop). Memory only: after a restart
+ *  the stuck loop's screen check covers the gap. */
+const turns = new Map<string, { prompt: number; stop: number }>()
 function handleHook(agent: Agent, body: Record<string, unknown>, res: http.ServerResponse): void {
   const ev = String(body.hook_event_name ?? ''); const tool = String(body.tool_name ?? ''); const input = (body.tool_input ?? {}) as Record<string, unknown>
   const mode = body.permission_mode as string | undefined; const t = now()
@@ -37,13 +41,24 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (mode) fields.in_plan_mode = mode === 'plan' ? 1 : 0
   const payload: Record<string, unknown> = { event: ev, tool, mode }
   const cleared = ev === 'SessionEnd' && body.reason === 'clear' // /clear: the same session goes on with a fresh context
+  // Bug 25: hooks from a helper agent (a subagent, or Claude Code's own background helpers) carry agent_id. They can run after
+  // the main turn has ended, so they never make the agent "working"; only the main loop's turns do.
+  const sub = typeof body.agent_id === 'string' && body.agent_id !== ''
+  if (sub) payload.sub = true
+  const turn = turns.get(agent.id) ?? { prompt: 0, stop: 0 }; turns.set(agent.id, turn)
   switch (ev) {
     case 'SessionStart': Object.assign(payload, { source: body.source, model: body.model, cwd: body.cwd }); Object.assign(fields, { claude_session_id: String(body.session_id ?? '') || null, transcript_path: (body.transcript_path as string | undefined) ?? null, status: 'working' }); run('UPDATE sessions SET claude_session_id = ?, transcript_path = ? WHERE agent_id = ? AND ended_at IS NULL', body.session_id as string, body.transcript_path as string, agent.id); break
-    case 'UserPromptSubmit': { payload.prompt = trim(body.prompt, 200); fields.status = 'working'; live.activity = 'Thinking'; const acked = ackBatchFromPrompt(agent, String(body.prompt ?? '')); payload.acked = acked; break }
-    case 'PreToolUse': payload.input = trim(input, 300); live.activity = describeTool(tool, input); fields.status = 'working'; break
+    case 'UserPromptSubmit': { turn.prompt = t; payload.prompt = trim(body.prompt, 200); fields.status = 'working'; live.activity = 'Thinking'
+      payload.acked = ackBatchFromPrompt(agent, String(body.prompt ?? '')); break }
+    case 'PreToolUse': payload.input = trim(input, 300); if (!sub) fields.status = 'working'
+      if (!sub || agent.status === 'working') live.activity = describeTool(tool, input); break
+    // A helper that finishes after the main turn ended (Stop, and no prompt since) leaves the agent idle, whatever set it working
+    case 'SubagentStop': if (turn.stop > turn.prompt && agent.status === 'working') { fields.status = 'idle'; live.activity = null } break
     case 'PostToolUse': payload.input = trim(input, 200); if (tool === 'ExitPlanMode') payload.responsePlanLen = String((body.tool_response as { plan?: string } | undefined)?.plan ?? '').length; break
     case 'PostToolUseFailure': Object.assign(payload, { input: trim(input, 200), error: trim(body.error, 300), is_interrupt: body.is_interrupt }); break
-    case 'Stop': payload.last = trim(body.last_assistant_message, 600); fields.status = 'idle'; Object.assign(live, { activity: null, last_message: trim(body.last_assistant_message, 2000) }); break
+    case 'Stop': turn.stop = t; payload.last = trim(body.last_assistant_message, 600); fields.status = 'idle'
+      Object.assign(live, { activity: null, last_message: trim(body.last_assistant_message, 2000) })
+      if (agent.role === 'tpm') recordReply(agent, String(body.last_assistant_message ?? '')); break
     case 'StopFailure': payload.error = trim(body.error ?? body, 400); fields.status = 'blocked'; break
     case 'Notification': Object.assign(payload, { ntype: body.notification_type, message: trim(body.message, 200) }); break
     case 'PostModelSwitch': case 'PreModelSwitch': Object.assign(payload, { from: body.from_model, to: body.to_model, source: body.source, requested: body.requested_model }); break
@@ -62,15 +77,15 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     if (tool === 'ExitPlanMode') return onExitPlanMode(agent, body, res)
     const inPlan = mode === 'plan'
     if (tool.startsWith('mcp__hq__')) return json(res, 200, allow())
-    if (tool === 'Bash' && !inPlan && agent.role === 'engineer') return json(res, 200, allow())
+    if (tool === 'Bash' && !inPlan && (agent.role === 'engineer' || agent.role === 'launcher')) return json(res, 200, allow()) // sandboxed either way
     if (tool === 'Bash' && inPlan) return json(res, 200, deny(`HQ: '${trim(input.command, 80)}' is not allowed during planning; run it after plan approval.`))
     attention('unexpected_prompt', `${agent.display_name ?? agent.id}: ${tool} needed approval (${trim(input, 120)}); denied by policy`, { agentId: agent.id, ticketId: agent.ticket_id })
     return json(res, 200, deny(`HQ: '${tool}' would need approval and is not allowed here. Continue without it, or report_blocked if you cannot.`))
   }
   if (ev === 'PreModelSwitch') return json(res, 200, { hookSpecificOutput: { hookEventName: 'PreModelSwitch', permissionDecision: 'deny', permissionDecisionReason: 'HQ controls models for this agent.' } })
   if (ev === 'PostModelSwitch') { onPostModelSwitch(agent, body); return json(res, 200, {}) }
-  if (ev === 'ConfigChange') return json(res, 200, agent.role === 'engineer' ? { decision: 'block', reason: 'HQ: configuration changes are not allowed' } : {})
-  if (ev === 'PreCompact' && agent.role === 'tpm' && body.trigger === 'auto') { attention('tpm_rotate', `TPM ${agent.id}: auto-compaction blocked; rotate the TPM session`, { agentId: agent.id }); return json(res, 200, { decision: 'block', reason: 'HQ rotates the TPM instead of compacting' }) }
+  if (ev === 'ConfigChange') return json(res, 200, agent.role === 'engineer' || agent.role === 'launcher' ? { decision: 'block', reason: 'HQ: configuration changes are not allowed' } : {})
+  if (ev === 'PreCompact' && agent.role === 'tpm' && body.trigger === 'auto') { attention('tpm_rotate', `TPM ${agent.id}: Claude Code wanted to compact its memory; HQ blocked it. Fresh start the TPM`, { agentId: agent.id }); return json(res, 200, { decision: 'block', reason: 'HQ fresh-starts the TPM instead of compacting' }) }
   if (ev === 'PostToolUse' && tool === 'ExitPlanMode') { onPostExitPlanMode(agent, body); return json(res, 200, {}) }
   if (ev === 'PostToolUse' && (tool === 'TaskCreate' || tool === 'TaskUpdate')) { recordTask(agent, tool, input, body.tool_response as Record<string, unknown> | undefined) }
   if (ev === 'UserPromptSubmit' || ev === 'Stop') {
@@ -90,7 +105,7 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   }
   if (ev === 'StopFailure') { attention('api_error', `${agent.display_name ?? agent.id}: turn ended with an API error: ${trim(body.error ?? body, 200)}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
   if (ev === 'SessionEnd' && !cleared) revokeToken(agent.id) // the session is over: its token is no good to anyone now
-  if (ev === 'SessionEnd' && !cleared && agent.role === 'engineer' && agent.ticket_id) { const tk = getTicket(agent.ticket_id); if (tk && !['pr_ready', 'pr_open', 'merged', 'cancelled'].includes(tk.status)) attention('engineer_exited', `${agent.display_name ?? agent.id} exited with ticket ${tk.key} in status ${tk.status}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
+  if (ev === 'SessionEnd' && !cleared && !agent.fresh_start_at && agent.role === 'engineer' && agent.ticket_id) { const tk = getTicket(agent.ticket_id); if (tk && !['pr_ready', 'pr_open', 'merged', 'cancelled'].includes(tk.status)) attention('engineer_exited', `${agent.display_name ?? agent.id} exited with ticket ${tk.key} in status ${tk.status}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
   return json(res, 200, {})
 }
 
@@ -137,8 +152,8 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
       const fh = u.rateLimits?.find((r) => r.kind === 'five_hour')?.percentUsed ?? null; const sd = u.rateLimits?.find((r) => r.kind === 'seven_day')?.percentUsed ?? null
       run('INSERT INTO usage_samples(agent_id, at, context_tokens, context_pct, five_hour_pct, seven_day_pct, cost_usd) VALUES (?,?,?,?,?,?,?)', agent.id, t, u.context?.tokens ?? null, u.context?.percent ?? null, fh, sd, u.cost?.usd ?? null)
       patch('agent', agent.id, { context_tokens: u.context?.tokens ?? null, five_hour_pct: fh, seven_day_pct: sd })
-      if (agent.role === 'tpm' && (u.context?.tokens ?? 0) > getSetting('rotation_context_tokens', DEFAULTS.rotation_context_tokens)) attention('tpm_rotate', `TPM ${agent.id} context is ${u.context?.tokens} tokens; rotate`, { agentId: agent.id })
-      if ((fh ?? 0) >= getSetting('pause_five_hour_pct', DEFAULTS.pause_five_hour_pct) || (sd ?? 0) >= getSetting('pause_seven_day_pct', DEFAULTS.pause_seven_day_pct)) attention('rate_limit', `Usage at five-hour ${fh}% / seven-day ${sd}%: new launches paused`, {})
+      checkContext(agent, u.context?.tokens)
+      if ((fh ?? 0) >= getSetting('pause_five_hour_pct', DEFAULTS.pause_five_hour_pct) || (sd ?? 0) >= getSetting('pause_seven_day_pct', DEFAULTS.pause_seven_day_pct)) attention('rate_limit', `Usage at five-hour ${fh}% / seven-day ${sd}%: new launches paused`, { keep: true }) // the percentages change every sample
     }
     return json(res, 200, { ok: true })
   }

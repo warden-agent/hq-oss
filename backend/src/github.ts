@@ -1,4 +1,4 @@
-// GitHub plumbing as the HQ account (warden-agent): push a ticket branch, open and find its PR, build the "Create PR" link
+// GitHub plumbing as the HQ account (warden-agent): push a ticket branch, open, find and merge its PR, build the "Create PR" link
 // (the fallback when opening fails), check push access. Same credential setup as reposync (gh's credential helper with the HQ account's GH_CONFIG_DIR). No DB access here.
 import { execFile } from 'node:child_process'
 import { git, explain, type SyncOpts } from './reposync.ts'
@@ -64,6 +64,17 @@ export async function createPr(slug: string, base: string, branch: string, title
     throw new Error(`GitHub refused the PR: ${s.replace(/^gh: /, '')}`)
   }
 }
+/** Merge PR `number` on GitHub as the HQ account, with a normal merge commit (what GitHub's Merge button does by default).
+ *  Returns the merge commit. GitHub's refusals come back in plain words (Bug 45: the user merges from HQ). */
+export async function mergePr(slug: string, number: number, o: SyncOpts): Promise<string> {
+  try { return await gh(['api', '-X', 'PUT', `repos/${slug}/pulls/${number}/merge`, '-f', 'merge_method=merge', '--jq', '.sha'], o) } catch (e) {
+    const s = (e as Error).message.replace(/^gh: /, ''), why = s.replace(/\s*\(HTTP \d+\)\s*$/, '')
+    if (/HTTP 405/.test(s)) throw new Error(`GitHub won't merge PR #${number}: ${why}. A required check, a review rule or a conflict is in the way; see the PR on GitHub.`)
+    if (/HTTP 409/.test(s)) throw new Error(`PR #${number}'s branch changed while it was being merged; try again.`)
+    if (/HTTP 403|HTTP 404|permission|not accessible/i.test(s)) throw new Error(`${o.account} can't merge PRs on ${slug}: give it Write access (GitHub → ${slug} → Settings → Collaborators)`)
+    throw new Error(`GitHub refused the merge: ${s}`)
+  }
+}
 /** Open the PR; if GitHub refuses, hand back the pre-filled "Create PR" link and the reason instead, so the user is never stuck. */
 export async function openOrLink(slug: string, base: string, branch: string, title: string, body: string, o: SyncOpts, create = createPr): Promise<{ pr: Pr } | { link: string; error: string }> {
   try { return { pr: await create(slug, base, branch, title, body, o) } } catch (e) { return { link: compareUrl(slug, base, branch, title, body), error: (e as Error).message } }
@@ -73,3 +84,22 @@ export async function openOrLink(slug: string, base: string, branch: string, tit
 export async function canPush(slug: string, o: SyncOpts): Promise<boolean | null> {
   try { return (await gh(['api', `repos/${slug}`, '--jq', '.permissions.push'], o)) === 'true' } catch { return null }
 }
+
+/** The login gh is using in the HQ account's config dir; null when it isn't logged in (or GitHub can't be reached). */
+export async function githubLogin(o: SyncOpts): Promise<string | null> {
+  try { return (await gh(['api', 'user', '--jq', '.login'], { ...o, timeoutMs: o.timeoutMs ?? 10_000 })) || null } catch { return null }
+}
+/** New project: a private, empty repo `name` under the HQ account. A name already taken there is refused before asking GitHub
+ *  to make it (GitHub's own answer is just "creation failed"). */
+export async function createGithubRepo(name: string, o: SyncOpts): Promise<{ slug: string; ownerId: number }> {
+  if ((await githubLogin(o)) !== o.account) throw new Error(`HQ isn't logged in to GitHub as ${o.account}, so it can't make the repo`)
+  const taken = await gh(['api', `repos/${o.account}/${name}`, '--jq', '.full_name'], o).then(() => true, (e: Error) => /HTTP 404/.test(e.message) ? false : Promise.reject(e))
+    .catch((e: Error) => { throw new Error(`couldn't ask GitHub whether ${o.account}/${name} exists: ${e.message.replace(/^gh: /, '')}`) })
+  if (taken) throw new Error(`${o.account} already has a GitHub repo called ${name}: pick another name`)
+  try {
+    const made = await gh(['api', '-X', 'POST', 'user/repos', '-f', `name=${name}`, '-F', 'private=true', '-F', 'auto_init=false', '--jq', '{slug: .full_name, ownerId: .owner.id}'], o)
+    return JSON.parse(made) as { slug: string; ownerId: number }
+  } catch (e) { throw new Error(`GitHub didn't make the repo: ${(e as Error).message.replace(/^gh: /, '')}`) }
+}
+/** Undo createGithubRepo when the rest of a new project fails (only ever a repo HQ made moments ago, still empty). */
+export function deleteGithubRepo(slug: string, o: SyncOpts): Promise<string> { return gh(['api', '-X', 'DELETE', `repos/${slug}`], o) }

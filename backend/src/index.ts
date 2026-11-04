@@ -11,10 +11,15 @@ import { startMergeWatcher } from './mergewatch.ts'
 import { sweepWorktrees } from './slots.ts'
 import { startListeners } from './listeners.ts'
 import { recoverPreviews } from './preview.ts'
+import { recoverHelpers } from './launchhelper.ts'
+import { repos } from './records.ts'
 import { emit } from './events.ts'
 import { attention } from './attention.ts'
 import { startRetention } from './retention.ts'
+import { startFreshStartLoop } from './freshstart.ts'
 import { ensureTrusted } from './trust.ts'
+import { startAutoLoop } from './auto.ts'
+import { sweepTestWorktrees } from './testrun.ts'
 
 /** The repo's role prompts and mod are what agents get: copied into HQ's home on every start when they differ (new agents
  *  pick them up; running ones keep what they started with). Extra files already in the plugin folder are left alone. */
@@ -30,7 +35,7 @@ function ensureAssets(): void {
       if (f.isFile()) { const src = path.join(f.parentPath, f.name); sync(src, path.join(PATHS.plugin, path.relative(repoPlugin, src))) }
     }
   }
-  for (const f of ['tpm', 'engineer', 'architect']) { const src = path.join(repoRoles, `${f}.prompt.md`); if (fs.existsSync(src)) sync(src, path.join(PATHS.roles, `${f}.prompt.md`)) }
+  for (const f of ['tpm', 'engineer', 'architect', 'launcher']) { const src = path.join(repoRoles, `${f}.prompt.md`); if (fs.existsSync(src)) sync(src, path.join(PATHS.roles, `${f}.prompt.md`)) }
   if (changed.length) emit({ agentId: null, source: 'system', kind: 'assets.updated', payload: { files: changed } })
   if (!fs.existsSync(CLAUDE_BIN)) { console.error(`Pinned Claude Code binary missing: ${CLAUDE_BIN}`); process.exit(1) }
 }
@@ -40,9 +45,11 @@ async function main(): Promise<void> {
   try { await ensureTrusted(PATHS.workspaces) } catch (e) { emit({ agentId: null, source: 'system', kind: 'trust.error', payload: { error: String(e) } }) }
   await recoverAgents()
   await sweepWorktrees().catch((e) => emit({ agentId: null, source: 'system', kind: 'worktree.sweep.error', payload: { error: String(e) } }))
+  for (const r of repos()) await sweepTestWorktrees(r.path).catch(() => {}) // a test run the last backend didn't finish
   await recoverPreviews() // before the merge watcher: its first check can restart a preview
+  await recoverHelpers(repos()).catch((e) => console.error('launch helper recovery failed', e))
   startListeners()
-  startHooksServer(); startMcpServer(); startUiServer(); startStuckLoop(); startMergeWatcher(); startRetention()
+  startHooksServer(); startMcpServer(); startUiServer(); startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
   emit({ agentId: null, source: 'system', kind: 'backend.started', payload: { ports: PORTS } })
   console.log(`HQ backend up. UI: http://127.0.0.1:${PORTS.ui}/?token=${uiToken()}  hooks :${PORTS.hooks}  mcp :${PORTS.mcp}  state ${PATHS.home}`)
 }

@@ -3,94 +3,77 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { PATHS } from './config.ts'
 import { attention, resolveForTicket, resolveKind, resolveKindForTicket } from './attention.ts'
-import { launchBlocker, readyTickets, unmergedDeps } from './readiness.ts'
+import { depsProblem, launchBlocker, readyTickets, unmergedDeps } from './readiness.ts'
 import { canLaunch, starting } from './scheduler.ts'
 import { one, q, run, now, tx } from './db.ts'
 import { emit, patch } from './events.ts'
 import { id, j } from './util.ts'
+import type { TicketStatus } from './readiness.ts'
 import { getAgent, launchAgent, stopAgent, type Agent } from './agents.ts'
 import { sendMessage, type Message } from './delivery.ts'
 import { modelFor } from './roles.ts'
-import { features, getFeature, getRepo, getTicket, setTicket, sweepNotices, ticketByKey, tickets, type Feature, type Ticket } from './records.ts'
+import { features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTicket, sweepNotices, ticketInRepo, tickets, type Feature, type Ticket } from './records.ts'
 import { ensureFresh, git } from './repos.ts'
 import { nextWorkerSlot, releaseSlot } from './slots.ts'
 import { tellTpm } from './mergewatch.ts'
-import { handoverPrompt } from './handover.ts'
-import { clearConflict, fixConflictsText, mergeBase, whoMergedFirst } from './conflicts.ts'
+import { engineerResumePrompt } from './handover.ts'
+import { handOver, keepFirstRequest, messageTpm, tpmStarting } from './tpm.ts'
+import { writeFeatureMd, writeProjectMd } from './projectmd.ts'
+import { gitFacts, readNote } from './notes.ts'
+import { clearConflict, fixConflictsText, fixTestsText, mergeBase, whoMergedFirst } from './conflicts.ts'
 import { conflictsWith } from './localmerge.ts'
 import * as tmux from './tmux.ts'
+import { excludeHqFolders, seedPackages } from './worktrees.ts'
+import { actionOf, closeAsks, openAsks } from './asks.ts'
 
 export const slugify = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'item'
 
+/** A new feature (one request) in the project: a branch of the board, named by its handle (F-1…). Made by the TPM with
+ *  start_feature; `POST /api/features` (scripts, tests) also tells the project's TPM, starting it with the request if needed. */
+export function addFeature(repoId: string, title: string, request: string): Feature {
+  const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
+  notClearing(repoId)
+  const name = title.trim() || request.trim().split(/\s+/).slice(0, 5).join(' '); if (!name) throw new Error('Give the feature a title.')
+  const t = now(), handle = `F-${repo.next_feature}`
+  const f: Feature = { id: id('feat'), repo_id: repoId, slug: slugify(name), title: name, request_text: request, status: 'planning', tpm_agent_id: null,
+    merge_order: '[]', stacked_branches: 0, created_at: t, updated_at: t, tpm_parked_at: null, handle }
+  tx(() => {
+    run('INSERT INTO features(id, repo_id, slug, title, request_text, status, merge_order, stacked_branches, created_at, updated_at, handle) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      f.id, repoId, f.slug, f.title, request, 'planning', '[]', 0, t, t, handle)
+    run('UPDATE repos SET next_feature = next_feature + 1 WHERE id = ?', repoId)
+  })
+  patch('feature', f.id, f as unknown as Record<string, unknown>); writeFeatureMd(f)
+  emit({ agentId: null, source: 'system', kind: 'feature.created', payload: { feature: f.id, handle, title: f.title } })
+  return f
+}
 export async function createFeature(repoId: string, title: string, request: string): Promise<Feature> {
   if (!getRepo(repoId)) throw new Error('unknown repo')
-  await ensureFresh(repoId)
-  const slug = slugify(title); const t = now()
-  const f: Feature = {
-    id: id('feat'), repo_id: repoId, slug, title, request_text: request, status: 'planning', tpm_agent_id: null, merge_order: '[]', stacked_branches: 0,
-    created_at: t, updated_at: t,
-  }
-  run('INSERT INTO features(id, repo_id, slug, title, request_text, status, merge_order, stacked_branches, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-    f.id, repoId, slug, title, request, 'planning', '[]', 0, t, t)
-  patch('feature', f.id, f as unknown as Record<string, unknown>)
-  await launchTpm(f)
-  return getFeature(f.id)!
+  notClearing(repoId); const repo = await ensureFresh(repoId)
+  if (repo.empty && !repo.context_doc_path && !one('SELECT 1 AS x FROM features WHERE repo_id = ?', repoId)) keepFirstRequest(repo, request)
+  const f = addFeature(repoId, title, request)
+  const tell = `New request from the user. HQ made feature ${f.handle} "${f.title}" for it; add its tickets with create_ticket(feature: "${f.handle}").\n\n${request}`
+  const live = liveTpm(repoId)
+  const tpm = live ? (tellTpm(f, `HQ: ${tell}`), live) : (await messageTpm(repoId, tell, { keepAsks: true })).agent
+  return { ...getFeature(f.id)!, tpm_agent_id: tpm.id }
 }
-/** The TPM's FEATURE.md: the request, the tickets, the decisions recorded with write_feature, and every ticket's spec. */
-export function writeFeatureMd(f: Feature, extra = ''): string {
-  const ws = path.join(PATHS.workspaces, f.id, 'tpm'); fs.mkdirSync(ws, { recursive: true })
-  const tk = tickets(f.id), decisions = q<{ key: string; text: string }>('SELECT key, text FROM docs WHERE scope = ? ORDER BY updated_at', `feature:${f.id}`)
-  const md = `---\nfeature: ${f.slug}\nrepo: ${getRepo(f.repo_id)?.name}\nstatus: ${f.status}\nmerge_order: ${f.merge_order}\n---\n## Request (verbatim)\n\n${f.request_text}\n\n## Tickets\n\n| Key | Size | Status | Depends on | Expected files | Title |\n|---|---|---|---|---|---|\n${tk.map((x) => `| ${x.key} | ${x.size} | ${x.status} | ${x.deps} | ${x.expected_files} | ${x.title} |`).join('\n')}\n`
-    + (decisions.length ? `\n## Decisions\n\n${decisions.map((d) => `### ${d.key}\n${d.text}`).join('\n\n')}\n` : '')
-    + (tk.length ? `\n## Ticket specs\n\n${tk.map((x) => `### ${x.key}: ${x.title}\n${x.spec ?? ''}`).join('\n\n')}\n` : '') + extra
-  fs.writeFileSync(path.join(ws, 'FEATURE.md'), md)
-  const ctx = getRepo(f.repo_id)?.context_doc_path; if (ctx && fs.existsSync(ctx)) fs.copyFileSync(ctx, path.join(ws, 'CONTEXT.md'))
-  return ws
-}
-export async function launchTpm(f: Feature, handover?: string): Promise<Agent> {
-  const repo = getRepo(f.repo_id)!; const ws = writeFeatureMd(f)
-  const prompt = handover ?? `New feature for repo "${repo.name}" (read-only copy at ${repo.path}; your workspace is ${ws} with FEATURE.md).\n\nThe user's request, verbatim:\n"""\n${f.request_text}\n"""\n\nExplore the repo as needed, then split this into tickets with create_ticket (S/M/L, spec with acceptance criteria, expected_files, depends_on), set the merge order with set_merge_order, and tell the user the breakdown in a few lines. Do not assign tickets yet unless the user asked you to start immediately.`
-  const a = await launchAgent({ role: 'tpm', featureId: f.id, model: modelFor('tpm'), cwd: ws, displayName: `TPM ${f.slug}`, launchPrompt: prompt, extraFlags: ['--add-dir', repo.path] })
-  run('UPDATE features SET tpm_agent_id = ?, updated_at = ? WHERE id = ?', a.id, now(), f.id); patch('feature', f.id, { tpm_agent_id: a.id })
-  return a
-}
-const tpmStarting = new Set<string>() // features whose TPM is being started right now
-/** "Start TPM again": a fresh TPM for a feature whose TPM has exited, briefed from HQ's records. Messages still waiting for the
- *  old TPM, and engineers' open questions to it, move to the new one. */
-export async function restartTpm(featureId: string): Promise<Agent> {
-  const f = getFeature(featureId); if (!f || f.status === 'cancelled') throw new Error('unknown feature')
-  const old = f.tpm_agent_id ? getAgent(f.tpm_agent_id) : undefined
-  if (old && old.status !== 'exited') throw new Error(`${f.title} already has a TPM running (${old.id})`)
-  if (tpmStarting.has(f.id)) throw new Error(`${f.title}'s TPM is already starting`)
-  tpmStarting.add(f.id)
-  try {
-    const repo = await ensureFresh(f.repo_id), ws = writeFeatureMd(f)
-    const talk = old ? q<Message>(`SELECT * FROM messages WHERE delivered_at IS NOT NULL
-      AND ((from_id = 'user' AND to_id = ?) OR (from_id = ? AND to_id = 'user')) ORDER BY created_at DESC LIMIT 10`, old.id, old.id).reverse() : []
-    const a = await launchTpm(f, handoverPrompt(f, { repo, ws, previous: old?.id ?? null, tickets: tickets(f.id), messages: talk }))
-    if (old) {
-      const moved = q<{ id: string }>('SELECT id FROM messages WHERE to_id = ? AND delivered_at IS NULL', old.id)
-      tx(() => {
-        run('UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered_at IS NULL', a.id, old.id)
-        run('UPDATE questions SET to_target = ? WHERE to_target = ? AND answered_at IS NULL', a.id, old.id)
-      })
-      for (const m of moved) patch('message', m.id, { to_id: a.id })
-      resolveKind('agent_exited', old.id)
-    }
-    emit({ agentId: a.id, source: 'ui', kind: 'tpm.restarted', payload: { feature: f.id, previous: old?.id ?? null } })
-    return a
-  } finally { tpmStarting.delete(f.id) }
-}
+/** A ticket or feature with an engineer launch or Fix conflicts under way, or a repo whose TPM is starting (Clear waits for those). */
+export const launching = (id: string): boolean => starting.has(id) || fixing.has(id) || tpmStarting(id)
+/** A ticket in a feature. Keys are unique in the project (their worktree folder is the key) and HQ's count up and never repeat,
+ *  not even after a Clear (Bug 52): T-01, T-02… across every feature. */
 export function createTicket(featureId: string, t: { key?: string; title: string; size: string; spec: string; expected_files?: string[]; depends_on?: string[] }): Ticket {
   const f = getFeature(featureId); if (!f) throw new Error('unknown feature')
-  const n = tickets(featureId).length + 1; const key = t.key ?? `T-${String(n).padStart(2, '0')}`
-  if (ticketByKey(featureId, key)) throw new Error(`ticket ${key} exists`)
+  if (f.status === 'cancelled') throw new Error(`${f.handle ?? f.title} is cancelled; start a new feature for this`)
+  notClearing(f.repo_id)
+  let n = getRepo(f.repo_id)!.next_ticket, key = t.key?.trim()
+  if (key && ticketInRepo(f.repo_id, key)) throw new Error(`ticket ${key} exists`)
+  while (!key || ticketInRepo(f.repo_id, key)) { key = `T-${String(n).padStart(2, '0')}`; if (ticketInRepo(f.repo_id, key)) { key = undefined; n++ } else n++ }
+  run('UPDATE repos SET next_ticket = MAX(next_ticket, ?) WHERE id = ?', n, f.repo_id)
   const ts = now()
   const row: Ticket = {
     id: id('tkt'), feature_id: featureId, key, slug: slugify(t.title), title: t.title, size: (t.size || 'M').toUpperCase(), status: 'queued',
     prior_status: null, assignee_agent_id: null, expected_files: JSON.stringify(t.expected_files ?? []), deps: JSON.stringify(t.depends_on ?? []),
     edit_overrides: '[]', branch: null, worktree_path: null, pr_number: null, pr_url: null, pr_state: null, plan_round: 0, handoff_updated_at: null,
-    last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, created_at: ts, updated_at: ts,
+    last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, parked_at: null, created_at: ts, updated_at: ts,
   }
   run(`INSERT INTO tickets(id, feature_id, key, slug, title, size, status, expected_files, deps, edit_overrides, plan_round, spec, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec, ts, ts)
@@ -112,11 +95,11 @@ export async function launchEngineer(ticketId: string, opts: { synced?: boolean 
 }
 /** `fix`: an engineer that merges main into finished work (Fix conflicts): it starts in acceptEdits with HQ's instructions as its
  *  prompt (no plan to review), and the ticket goes to `resolving`. */
-async function startEngineer(t: Ticket, opts: { synced?: boolean; fix?: (worktree: string) => string }): Promise<Agent> {
-  const f = getFeature(t.feature_id)!; const repo = opts.synced ? getRepo(f.repo_id)! : await ensureFresh(f.repo_id)
+type Resume = { prompt: (worktree: string) => Promise<string>; mode: 'plan' | 'acceptEdits'; status: TicketStatus }
+async function startEngineer(t: Ticket, opts: { synced?: boolean; fix?: (worktree: string) => string; resume?: Resume }): Promise<Agent> {
+  const f = getFeature(t.feature_id)!; notClearing(f.repo_id); const repo = opts.synced ? getRepo(f.repo_id)! : await ensureFresh(f.repo_id)
   const branch = t.branch ?? `hq/${f.slug}/${t.key}-${t.slug}`
   const wtName = t.key; const wtPath = path.join(repo.path, '.claude', 'worktrees', wtName)
-  const hasRemote = !!repo.remote
   if (fs.existsSync(wtPath)) {
     const cur = await git(wtPath, 'rev-parse', '--abbrev-ref', 'HEAD').catch(() => '')
     if (cur !== branch) {
@@ -127,33 +110,96 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; fix?: (worktre
     }
   }
   if (!fs.existsSync(wtPath)) {
-    const base = hasRemote ? `origin/${repo.default_branch}` : repo.default_branch
+    const base = mergeBase(repo).name // local main for a local-only repo, so a ticket builds on what was merged here
     const exists = await git(repo.path, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).catch(() => '')
     if (exists) await git(repo.path, 'worktree', 'add', wtPath, branch); else await git(repo.path, 'worktree', 'add', '-b', branch, wtPath, base)
   }
-  const excl = await git(repo.path, 'rev-parse', '--git-path', 'info/exclude') // HQ's own folders never show up as changes in the repo
-  const exclPath = path.isAbsolute(excl) ? excl : path.join(repo.path, excl)
-  fs.mkdirSync(path.dirname(exclPath), { recursive: true }); const cur = fs.existsSync(exclPath) ? fs.readFileSync(exclPath, 'utf8') : ''
-  const missing = ['.hq-plans/', '.claude/worktrees/'].filter((p) => !cur.split('\n').includes(p))
-  if (missing.length) fs.appendFileSync(exclPath, (cur.endsWith('\n') || !cur ? '' : '\n') + missing.map((p) => `${p}\n`).join(''))
+  await excludeHqFolders(repo.path)
+  // Installed packages come from the main checkout, so the engineer can run the tests straight away (never blocks the launch)
+  await seedPackages(repo.path, wtPath).then((dirs) => { if (dirs.length) emit({ agentId: null, source: 'system', kind: 'worktree.packages', payload: { path: wtPath, dirs } }) },
+    (e) => emit({ agentId: null, source: 'system', kind: 'worktree.packages_failed', payload: { path: wtPath, error: String(e) } }))
   const spec = t.spec ?? ''
-  const prompt = opts.fix ? opts.fix(wtPath)
+  const prompt = opts.fix ? opts.fix(wtPath) : opts.resume ? await opts.resume.prompt(wtPath)
     : `Ticket ${t.key} (${t.size}): ${t.title}\nFeature: ${f.title}\nBranch: ${branch} (your worktree: ${wtPath})\nExpected files: ${t.expected_files}\nDepends on: ${t.deps}\n\n## Spec\n${spec}\n\nStart by calling get_ticket, explore the code, write your plan, and call ExitPlanMode.`
   const slot = nextWorkerSlot(`pending-${t.id}`) // a fix runs on the S model below: no plan, so no opusplan plan→exec switch
   const a = await launchAgent({
-    role: 'engineer', featureId: f.id, ticketId: t.id, model: modelFor('engineer', opts.fix ? 'S' : t.size), cwd: repo.path, displayName: `eng ${t.key}`, launchPrompt: prompt,
+    role: 'engineer', repoId: f.repo_id, featureId: f.id, ticketId: t.id, model: modelFor('engineer', opts.fix || opts.resume?.status === 'resolving' ? 'S' : t.size), cwd: repo.path, displayName: `eng ${t.key}`, launchPrompt: prompt,
     worktreeName: wtName, size: t.size, repoAllowlist: j<string[]>(repo.network_allowlist, []), editOverrides: j<string[]>(t.edit_overrides, []), extraEnv: slot.env,
-    permissionMode: opts.fix ? 'acceptEdits' : 'plan',
+    permissionMode: opts.fix ? 'acceptEdits' : opts.resume?.mode ?? 'plan',
   }).catch((e) => { releaseSlot(`pending-${t.id}`); throw e })
   run('UPDATE worker_slots SET agent_id = ? WHERE idx = ?', a.id, slot.idx)
-  setTicket(t.id, { status: opts.fix ? 'resolving' : 'planning', prior_status: null, assignee_agent_id: a.id, branch, worktree_path: wtPath })
+  setTicket(t.id, { status: opts.fix ? 'resolving' : opts.resume?.status ?? 'planning', prior_status: opts.resume ? t.prior_status : null, assignee_agent_id: a.id, branch, worktree_path: wtPath, parked_at: null })
   emit({ agentId: a.id, source: 'system', kind: 'ticket.launched', payload: { ticket: t.id, branch, worktree: wtPath, slot: slot.idx, fix: !!opts.fix } })
-  const why = opts.fix ? ` to merge ${repo.default_branch} in and fix its conflicts` : ''
+  const why = opts.fix ? ` to merge ${repo.default_branch} in and fix its conflicts` : opts.resume ? ' to take over after a fresh start (the last engineer left a handoff note)' : ''
   tellTpm(f, `HQ: engineer ${a.id} started on ${t.key}${why} (branch ${branch}). Address messages for this ticket to id ${a.id}.`)
   return a
 }
 
+/** A fresh engineer for a ticket whose engineer left a handoff note: same worktree and branch, briefed with the note, what git
+ *  shows and the approved plan (or HQ's conflict instructions). `replace`: it takes the place of the one that just stopped, so
+ *  the parallel limit doesn't hold it back; a Resume from parked respects the limit. */
+export async function resumeEngineer(ticketId: string, o: { replace?: boolean } = {}): Promise<Agent> {
+  const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
+  if (!['planning', 'implementing', 'awaiting_answer', 'resolving'].includes(t.status) || !t.branch) throw new Error(`${t.key} has nothing to resume (${t.status}).`)
+  const old = t.assignee_agent_id ? getAgent(t.assignee_agent_id) : undefined
+  if (old && old.status !== 'exited') throw new Error(`${t.key} still has an engineer running (${old.id}).`)
+  if (starting.has(t.id)) throw new Error(`${t.key} is already starting.`)
+  notClearing(getFeature(t.feature_id)?.repo_id ?? '')
+  const cap = canLaunch({ ignoreCap: !!o.replace }); if (!cap.ok) throw new Error(cap.why)
+  starting.add(t.id)
+  try {
+    const f = getFeature(t.feature_id)!; const repo = await ensureFresh(f.repo_id); const base = mergeBase(repo)
+    const note = readNote(`resume:ticket:${t.id}`)
+    const rev = one<{ edited_plan_text: string | null; plan_text: string }>(`SELECT edited_plan_text, plan_text FROM plan_revisions
+      WHERE ticket_id = ? AND verdict IN ('approve', 'approve_with_edits') ORDER BY round DESC, submitted_at DESC`, t.id)
+    const plan = t.status === 'planning' || t.status === 'resolving' ? null : rev ? rev.edited_plan_text ?? rev.plan_text : null
+    const a = await startEngineer(t, { synced: true, resume: { mode: t.status === 'planning' ? 'plan' : 'acceptEdits', status: t.status, prompt: async (wt) => {
+      let fix: string | null = null
+      if (t.status === 'resolving') {
+        const mh = await git(wt, 'rev-parse', '--git-path', 'MERGE_HEAD').catch(() => '')
+        fix = fixConflictsText({ t, base: base.name, files: j<string[]>(t.conflict_files, []), merged: j<string[]>(t.conflict_with, []), inProgress: !!mh && fs.existsSync(path.resolve(wt, mh)) })
+      }
+      return engineerResumePrompt(t, { feature: f.title, worktree: wt, base: base.name, note, git: await gitFacts(wt, base.ref), plan, fix })
+    } } })
+    if (old) { handOver(old.id, a.id); for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
+    emit({ agentId: a.id, source: 'system', kind: 'ticket.resumed', payload: { ticket: t.id, key: t.key, previous: old?.id ?? null, note: !!note } })
+    return a
+  } finally { starting.delete(t.id) }
+}
+
 const fixing = new Set<string>() // tickets whose Fix conflicts is under way
+/** A finished ticket goes back to its engineer with HQ's instructions: as a message when it still runs, else a fresh engineer on
+ *  the same worktree and branch starts with them. */
+async function sendBack(t: Ticket, featureId: string, live: Agent | undefined, text: (launch?: { worktree: string }) => string): Promise<{ via: 'message' | 'launch'; engineer: string }> {
+  if (live) {
+    setTicket(t.id, { status: 'resolving', prior_status: null })
+    sendMessage({ featureId, channel: 'dm', from: 'hq', to: live.id, reason: 'fyi', body: text() }); return { via: 'message', engineer: live.id }
+  }
+  starting.add(t.id)
+  try {
+    const engineer = (await startEngineer(t, { synced: true, fix: (worktree) => text({ worktree }) })).id
+    if (t.assignee_agent_id) for (const k of ['engineer_exited', 'agent_exited', 'stuck']) resolveKind(k, t.assignee_agent_id) // the old engineer's notices
+    return { via: 'launch', engineer }
+  } finally { starting.delete(t.id) }
+}
+/** Auto mode: the tests failed on main plus this ticket, so it goes back to its engineer, even over the parallel limit (like Fix conflicts). */
+export async function fixTests(ticketId: string, test: string, output: string): Promise<{ via: 'message' | 'launch'; engineer: string }> {
+  const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
+  if (!['pr_ready', 'pr_open'].includes(t.status) || !t.branch) throw new Error(`${t.key} has nothing to fix (${t.status}).`)
+  if (fixing.has(t.id) || starting.has(t.id)) throw new Error(`${t.key} is already being fixed`)
+  fixing.add(t.id)
+  try {
+    const f = getFeature(t.feature_id)!, repo = getRepo(f.repo_id)!, base = mergeBase(repo).name
+    const liveId = one<{ id: string }>("SELECT id FROM agents WHERE role = 'engineer' AND status != 'exited' AND ticket_id = ? ORDER BY started_at DESC", t.id)?.id
+    const live = liveId ? getAgent(liveId) : undefined
+    if (live && !(await tmux.hasSession(live.tmux_session))) throw new Error(`${t.key}'s engineer (${live.id}) can't be reached right now`)
+    if (!live) { const cap = canLaunch({ ignoreCap: true }); if (!cap.ok) throw new Error(cap.why) }
+    const r = await sendBack(t, f.id, live, (launch) => fixTestsText({ t, base, test, output, launch }))
+    emit({ agentId: r.engineer, source: 'system', kind: 'ticket.fix_tests', payload: { ticket: t.id, key: t.key, via: r.via, test } })
+    return r
+  } finally { fixing.delete(t.id) }
+}
+
 /** "Fix conflicts" for a finished ticket that conflicts with main (or a resolving one whose engineer has gone). HQ checks
  *  again first (GitHub repos fetch); clean now → nothing starts. Otherwise its engineer gets HQ's instructions: as a message
  *  when it still runs, else a fresh engineer on the same worktree and branch starts with them, even over the parallel limit. */
@@ -161,6 +207,7 @@ export async function fixConflicts(ticketId: string): Promise<{ key: string; cle
   const t0 = getTicket(ticketId); if (!t0) throw new Error('unknown ticket')
   if (!['pr_ready', 'pr_open', 'resolving'].includes(t0.status) || !t0.branch) throw new Error(`${t0.key} has nothing to fix (${t0.status}).`)
   if (fixing.has(t0.id) || starting.has(t0.id)) throw new Error(`${t0.key}'s conflicts are already being fixed`)
+  notClearing(getFeature(t0.feature_id)?.repo_id ?? '')
   fixing.add(t0.id)
   try {
     const f = getFeature(t0.feature_id)!; if (f.status === 'cancelled') throw new Error(`${f.title} is cancelled`)
@@ -184,15 +231,7 @@ export async function fixConflicts(ticketId: string): Promise<{ key: string; cle
     const merged = files.length ? await whoMergedFirst(repo, t, files, base.ref) : []
     const mh = t.worktree_path && fs.existsSync(t.worktree_path) ? await git(t.worktree_path, 'rev-parse', '--git-path', 'MERGE_HEAD').catch(() => '') : ''
     const text = (launch?: { worktree: string }) => fixConflictsText({ t, base: base.name, files, merged, inProgress: !!mh && fs.existsSync(path.resolve(t.worktree_path!, mh)), launch })
-    let via: 'message' | 'launch', engineer: string
-    if (live) {
-      setTicket(t.id, { status: 'resolving', prior_status: null })
-      sendMessage({ featureId: f.id, channel: 'dm', from: 'hq', to: live.id, reason: 'fyi', body: text() }); via = 'message'; engineer = live.id
-    } else {
-      starting.add(t.id)
-      try { engineer = (await startEngineer(t, { synced: true, fix: (worktree) => text({ worktree }) })).id; via = 'launch' } finally { starting.delete(t.id) }
-      if (t.assignee_agent_id) for (const k of ['engineer_exited', 'agent_exited', 'stuck']) resolveKind(k, t.assignee_agent_id) // the old engineer's notices
-    }
+    const { via, engineer } = await sendBack(t, f.id, live, text)
     for (const k of ['merge_conflict', 'conflicts_fixed']) resolveKindForTicket(k, t.id) // a later conflict gets a fresh notice
     emit({ agentId: engineer, source: 'ui', kind: 'ticket.fix_conflicts', payload: { ticket: t.id, key: t.key, clean: false, via, files, merged } })
     if (via === 'message') tellTpm(f, `HQ: ${t.key} conflicts with ${base.name}${merged.length ? ` after ${merged.join(', ')} merged` : ''}; its engineer ${engineer} is merging ${base.name} in now.`)
@@ -202,7 +241,25 @@ export async function fixConflicts(ticketId: string): Promise<{ key: string; cle
 
 /** Cancel a ticket: it can't start again, its engineer (if one runs) stops, an open plan review closes, notices about it go,
  *  and the TPM hears it from HQ. Its branch and worktree are kept. A merged ticket can't be cancelled; a cancelled one is left. */
-export async function cancelTicket(ticketId: string, opts: { tell?: boolean } = {}): Promise<{ key: string; stopped: string | null }> {
+/** "T4", "T4 and T5", "T4, T5 and T6". */
+const listKeys = (ks: string[]): string => ks.length < 2 ? ks.join('') : `${ks.slice(0, -1).join(', ')} and ${ks.at(-1)}`
+/** Tickets not merged or cancelled that wait on `key`: they can't start until the TPM rewires them (Bug 50). */
+export const waitingOn = (featureId: string, key: string): string[] =>
+  tickets(featureId).filter((x) => x.status !== 'merged' && x.status !== 'cancelled' && j<string[]>(x.deps, []).includes(key)).map((x) => x.key)
+
+/** set_dependencies (Bug 50): which tickets must merge before this one may start, replacing its list. Only before it starts. */
+export function setDependencies(ticketId: string, keys: string[]): string[] {
+  const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
+  if (t.status !== 'queued' || t.assignee_agent_id) throw new Error(`${t.key} has already started (${t.status}); its dependencies don't matter any more`)
+  const want = [...new Set(keys.map((k) => k.trim()).filter(Boolean))]
+  const bad = depsProblem(t.key, want, tickets(t.feature_id)); if (bad) throw new Error(bad)
+  setTicket(t.id, { deps: JSON.stringify(want) })
+  const f = getFeature(t.feature_id); if (f) writeFeatureMd(f)
+  emit({ agentId: null, source: 'mcp', kind: 'ticket.deps_changed', payload: { ticket: t.id, key: t.key, depends_on: want } })
+  return want
+}
+
+export async function cancelTicket(ticketId: string, opts: { tell?: boolean; asked?: boolean } = {}): Promise<{ key: string; stopped: string | null }> {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
   if (t.status === 'merged') throw new Error(`${t.key} is already merged`)
   if (t.status === 'cancelled') return { key: t.key, stopped: null }
@@ -220,34 +277,43 @@ export async function cancelTicket(ticketId: string, opts: { tell?: boolean } = 
   const stopped = eng && eng.status !== 'exited' ? eng.id : null
   if (stopped) await stopAgent(stopped, 'cancelled')
   emit({ agentId: stopped, source: 'ui', kind: 'ticket.cancelled', payload: { ticket: t.id, key: t.key, stopped } })
-  const f = getFeature(t.feature_id)
+  const f = getFeature(t.feature_id); if (f) writeFeatureMd(f)
   if (f && opts.tell !== false) {
-    tellTpm(f, `HQ: The user cancelled ${t.key}${stopped ? ` and its engineer ${stopped} was stopped` : ''}.`
-      + " Don't assign it again; tickets that depend on it can't start until you change their dependencies.")
+    const waiting = waitingOn(f.id, t.key), them = waiting.length === 1 ? 'it' : 'them'
+    tellTpm(f, `HQ: ${opts.asked ? `The user OK'd removing ${t.key}; it is cancelled` : `The user cancelled ${t.key}`}${stopped ? ` and its engineer ${stopped} was stopped` : ''}.`
+      + ` Don't assign it again.${waiting.length ? ` ${listKeys(waiting)} waited on it and can't start until you rewire ${them} with set_dependencies (or remove ${them} with cancel_ticket).` : ''}`)
   }
   return { key: t.key, stopped }
 }
-/** Cancel a feature: every ticket not merged yet is cancelled (engineers stop), then its TPM stops. */
+/** Cancel a feature: every ticket not merged yet is cancelled (engineers stop). The project's TPM stays (Bug 52) and is told. */
 export async function cancelFeature(featureId: string): Promise<{ tickets: string[]; stopped: string[] }> {
   const f = getFeature(featureId); if (!f) throw new Error('unknown feature')
   if (f.status === 'cancelled') return { tickets: [], stopped: [] }
-  if (tpmStarting.has(f.id)) throw new Error(`${f.title}'s TPM is starting right now; try again in a moment`)
   const done: string[] = [], stopped: string[] = []
   for (const t of tickets(f.id)) {
     if (t.status === 'merged' || t.status === 'cancelled') continue
     const r = await cancelTicket(t.id, { tell: false }); done.push(r.key); if (r.stopped) stopped.push(r.stopped)
   }
-  run("UPDATE features SET status = 'cancelled', updated_at = ? WHERE id = ?", now(), f.id); patch('feature', f.id, { status: 'cancelled' })
-  const tpm = f.tpm_agent_id ? getAgent(f.tpm_agent_id) : undefined
-  if (tpm && tpm.status !== 'exited') { await stopAgent(tpm.id, 'cancelled'); stopped.push(tpm.id) }
-  sweepNotices()
+  run("UPDATE features SET status = 'cancelled', updated_at = ? WHERE id = ?", now(), f.id); patch('feature', f.id, { status: 'cancelled' }); closeAsks(f.id)
+  writeProjectMd(f.repo_id); sweepNotices()
+  tellTpm(f, `HQ: The user cancelled feature ${f.handle ?? ''} "${f.title}"${done.length ? `: ${listKeys(done)} ${done.length === 1 ? 'is' : 'are'} cancelled` : ''}. Don't add to it.`)
   emit({ agentId: null, source: 'ui', kind: 'feature.cancelled', payload: { feature: f.id, tickets: done, stopped } })
   return { tickets: done, stopped }
+}
+/** "Start" on the TPM box's Your turn (Bug 52): every feature's ready tickets in the project. */
+export async function startReadyRepo(repoId: string): Promise<{ started: string[]; queued: string[] }> {
+  const out = { started: [] as string[], queued: [] as string[] }
+  for (const f of features().filter((x) => x.repo_id === repoId && x.status !== 'cancelled')) {
+    const r = await startReady(f.id); out.started.push(...r.started); out.queued.push(...r.queued)
+  }
+  return out
 }
 /** "Start ready": every ticket of the feature that may start now gets the go-ahead; they start as parallel slots allow. */
 export async function startReady(featureId: string): Promise<{ started: string[]; queued: string[]; blocked: { key: string; on: string[] }[] }> {
   const f = getFeature(featureId); if (!f || f.status === 'cancelled') throw new Error('unknown feature')
-  for (const t of readyTickets(tickets(featureId), j<string[]>(f.merge_order, []))) setTicket(t.id, { go_ahead: 1 })
+  notClearing(f.repo_id)
+  const going = new Set(openAsks().map((a) => actionOf(a)?.ticket)) // Bug 50: the user is being asked whether to remove it
+  for (const t of readyTickets(tickets(featureId), j<string[]>(f.merge_order, []))) if (!going.has(t.id)) setTicket(t.id, { go_ahead: 1 })
   const started = await fillSlots()
   const all = tickets(featureId)
   return {
@@ -264,8 +330,9 @@ export function fillSlots(): Promise<string[]> {
     const started: string[] = []; const synced = new Set<string>()
     for (;;) {
       if (!canLaunch().ok) break
-      const next = features().filter((f) => f.status !== 'cancelled').reverse()
-        .flatMap((f) => readyTickets(tickets(f.id), j<string[]>(f.merge_order, [])).filter((t) => t.go_ahead && !starting.has(t.id)))[0]
+      const asking = new Set(openAsks().map((a) => actionOf(a)?.ticket)) // Bug 50: not while the user is asked whether to remove it
+      const next = features().filter((f) => f.status !== 'cancelled' && !getRepo(f.repo_id)?.clearing_at).reverse()
+        .flatMap((f) => readyTickets(tickets(f.id), j<string[]>(f.merge_order, [])).filter((t) => t.go_ahead && !starting.has(t.id) && !asking.has(t.id)))[0]
       if (!next) break
       const repoId = getFeature(next.feature_id)!.repo_id
       try { await launchEngineer(next.id, { synced: synced.has(repoId) }); synced.add(repoId); started.push(next.key) } catch (e) {

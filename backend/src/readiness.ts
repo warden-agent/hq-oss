@@ -29,3 +29,22 @@ export function readyTickets<T extends TicketLike>(all: T[], mergeOrder: string[
 export function readyDependents<T extends TicketLike>(key: string, all: T[], mergeOrder: string[]): T[] { return readyTickets(all, mergeOrder).filter((t) => keys(t.deps).includes(key)) }
 /** Whether any ticket in the feature waits on `key` (cancelled ones don't count). */
 export function hasDependents(key: string, all: TicketLike[]): boolean { return all.some((t) => t.status !== 'cancelled' && keys(t.deps).includes(key)) }
+/** Why `key` may not wait on `want` (Bug 50: the TPM rewires tickets that waited on a removed one), or null. Every key must be
+ *  another ticket of the feature that isn't cancelled (a cancelled one never merges), and the result must have no loop. */
+export function depsProblem(key: string, want: string[], all: TicketLike[]): string | null {
+  if (want.includes(key)) return `${key} can't wait on itself`
+  for (const k of want) {
+    const t = all.find((x) => x.key === k)
+    if (!t) return `there's no ticket ${k} in this feature`
+    if (t.status === 'cancelled') return `${k} was removed (cancelled); it will never be merged`
+  }
+  const deps = new Map(all.map((t) => [t.key, t.key === key ? want : keys(t.deps)]))
+  const path = (from: string, seen: string[]): string[] | null => { // a way from `from` back to `key`
+    if (from === key) return [...seen, from]
+    if (seen.includes(from)) return null
+    for (const d of deps.get(from) ?? []) { const p = path(d, [...seen, from]); if (p) return p }
+    return null
+  }
+  for (const k of want) { const p = path(k, [key]); if (p) return `that makes a loop: ${p.join(' → ')}` }
+  return null
+}

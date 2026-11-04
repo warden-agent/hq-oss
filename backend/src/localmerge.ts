@@ -18,14 +18,7 @@ export async function mergeIntoMain(repoPath: string, o: { branch: string; into:
   const main = await git(repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${o.into}^{commit}`]).catch(() => '')
   if (!main) return { ok: false, why: `${repo} has no ${o.into} branch.` }
   if (await git(repoPath, ['merge-base', '--is-ancestor', tip, main]).then(() => true, () => false)) return { ok: true, sha: main, already: true }
-  const head = await git(repoPath, ['symbolic-ref', '--short', '-q', 'HEAD']).catch(() => '')
-  if (head !== o.into) return { ok: false, why: `${repo} is on ${head ? `branch ${head}` : 'a detached HEAD'}, not ${o.into}. Switch it back (git switch ${o.into}) and press Merge again.` }
-  for (const [p, what] of [['MERGE_HEAD', 'merge'], ['rebase-merge', 'rebase'], ['rebase-apply', 'rebase'], ['CHERRY_PICK_HEAD', 'cherry-pick'], ['REVERT_HEAD', 'revert']]) {
-    const gp = await git(repoPath, ['rev-parse', '--git-path', p!])
-    if (fs.existsSync(path.isAbsolute(gp) ? gp : path.join(repoPath, gp))) return { ok: false, why: `A ${what} is in progress in ${repo}. Finish or abort it, then press Merge again.` }
-  }
-  const dirty = (await git(repoPath, ['diff', '--name-only', 'HEAD'])).split('\n').filter(Boolean) // tracked files, staged or not
-  if (dirty.length) return { ok: false, why: `${repo} has uncommitted changes in ${names(dirty)}. Commit or stash them, then press Merge again.` }
+  const busy = await checkoutProblem(repoPath, o.into, 'press Merge again'); if (busy) return { ok: false, why: busy }
   const m = await mergeTree(repoPath, main, tip)
   if ('error' in m) return { ok: false, why: `git couldn't work out the merge: ${m.error}` }
   if ('conflicts' in m) {
@@ -47,9 +40,38 @@ export async function conflictsWith(repoPath: string, base: string, branch: stri
   const m = await mergeTree(repoPath, base, branch)
   return 'tree' in m ? [] : 'conflicts' in m ? m.conflicts : null
 }
+/** Why the checkout at `repoPath` can't safely move `into` right now, or null. */
+async function checkoutProblem(repoPath: string, into: string, press: string): Promise<string | null> {
+  const repo = path.basename(repoPath)
+  const head = await git(repoPath, ['symbolic-ref', '--short', '-q', 'HEAD']).catch(() => '')
+  if (head !== into) return `${repo} is on ${head ? `branch ${head}` : 'a detached HEAD'}, not ${into}. Switch it back (git switch ${into}) and ${press}.`
+  for (const [p, what] of [['MERGE_HEAD', 'merge'], ['rebase-merge', 'rebase'], ['rebase-apply', 'rebase'], ['CHERRY_PICK_HEAD', 'cherry-pick'], ['REVERT_HEAD', 'revert']]) {
+    const gp = await git(repoPath, ['rev-parse', '--git-path', p!])
+    if (fs.existsSync(path.isAbsolute(gp) ? gp : path.join(repoPath, gp))) return `A ${what} is in progress in ${repo}. Finish or abort it, then ${press}.`
+  }
+  const dirty = (await git(repoPath, ['diff', '--name-only', 'HEAD'])).split('\n').filter(Boolean) // tracked files, staged or not
+  return dirty.length ? `${repo} has uncommitted changes in ${names(dirty)}. Commit or stash them, then ${press}.` : null
+}
+/** One new commit on `into` whose files are `start`'s: main goes back with nothing rewritten. Same rules as a merge. */
+export async function restoreMain(repoPath: string, into: string, start: string, subject: string): Promise<MergeResult> {
+  const busy = await checkoutProblem(repoPath, into, 'press Undo again'); if (busy) return { ok: false, why: busy }
+  const main = await git(repoPath, ['rev-parse', `refs/heads/${into}`])
+  const sha = await git(repoPath, ['commit-tree', `${start}^{tree}`, '-p', main, '-m', subject])
+  try { await git(repoPath, ['merge', '--ff-only', '-q', sha]) } catch (e) { return { ok: false, why: `git wouldn't move ${into}: ${(e as Error).message.split('\n')[0]}` } }
+  return { ok: true, sha, already: false }
+}
+/** The commit `branch` would make merged into `base`, for testing: nothing points at it and no checkout changes. */
+export async function combinedCommit(repoPath: string, base: string, branch: string): Promise<{ sha: string } | { conflicts: string[] } | { error: string }> {
+  const m = await mergeTree(repoPath, base, branch)
+  if (!('tree' in m)) return m
+  // HQ's own name: it's thrown away after the test, and a machine with no git identity must still be able to test
+  const who = ['-c', 'user.name=HQ', '-c', 'user.email=hq@localhost']
+  try { return { sha: await git(repoPath, [...who, 'commit-tree', m.tree, '-p', base, '-p', branch, '-m', `HQ test: ${branch} on ${base}`]) } }
+  catch (e) { return { error: (e as Error).message } }
+}
 /** `git merge-tree --write-tree`: the merged tree (exit 0), or the conflicted files (exit 1, after the tree's id; a bad ref also
  *  exits 1, with no tree). Touches no checkout. */
-function mergeTree(repoPath: string, a: string, b: string): Promise<{ tree: string } | { conflicts: string[] } | { error: string }> {
+export function mergeTree(repoPath: string, a: string, b: string): Promise<{ tree: string } | { conflicts: string[] } | { error: string }> {
   return new Promise((resolve) => execFile('git', ['-c', 'core.hooksPath=/dev/null', 'merge-tree', '--write-tree', '--name-only', '--no-messages', a, b], { cwd: repoPath }, (err, out, errOut) => {
     const lines = String(out).split('\n'); const code = err ? (err as { code?: number }).code : 0
     if (code === 0) resolve({ tree: lines[0]!.trim() })

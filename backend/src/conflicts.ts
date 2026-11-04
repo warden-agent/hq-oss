@@ -2,15 +2,14 @@
 // conflicts), naming the tickets that merged first, and HQ's message to the engineer that merges main in. Git and records only.
 import { attention, resolveKindForTicket } from './attention.ts'
 import { names } from './localmerge.ts'
-import { git, parseGithubRemote } from './reposync.ts'
+import { git } from './reposync.ts'
 import { q } from './db.ts'
 import { j } from './util.ts'
-import { getTicket, setTicket, type Repo, type Ticket } from './records.ts'
+import { getTicket, setTicket, usesGithub, type Repo, type Ticket } from './records.ts'
 
-/** What a ticket's branch merges into: `main` for a local repo; `origin/main` for a GitHub one (HQ fetches it; engineers can't). */
+/** What a ticket's branch merges into: `main` for a local (or local-only) repo; `origin/main` for a GitHub one (HQ fetches it; engineers can't). */
 export function mergeBase(repo: Repo): { name: string; ref: string } {
-  const github = repo.kind === 'github' && !!parseGithubRemote(repo.remote ?? '')
-  return github ? { name: `origin/${repo.default_branch}`, ref: `refs/remotes/origin/${repo.default_branch}` } : { name: repo.default_branch, ref: `refs/heads/${repo.default_branch}` }
+  return usesGithub(repo) ? { name: `origin/${repo.default_branch}`, ref: `refs/remotes/origin/${repo.default_branch}` } : { name: repo.default_branch, ref: `refs/heads/${repo.default_branch}` }
 }
 const ok = (p: Promise<unknown>): Promise<boolean> => p.then(() => true, () => false)
 
@@ -47,6 +46,17 @@ export function clearConflict(ticketId: string): void {
   resolveKindForTicket('merge_conflict', t.id)
 }
 export const conflictFiles = (t: Ticket): string[] => j<string[]>(t.conflict_files, [])
+
+/** HQ's instructions to the engineer when auto mode's test of its ticket on main fails: alone it passed, together it doesn't. */
+export function fixTestsText(o: { t: Ticket; base: string; test: string; output: string; launch?: { worktree: string } }): string {
+  const { t, base } = o
+  const intro = o.launch ? `You are the engineer for ticket ${t.key} (${t.size}): ${t.title}. Its work is committed on branch ${t.branch}`
+    + ` in your worktree ${o.launch.worktree}; call get_ticket for its spec and the handoff so far.\n\n` : ''
+  const steps = [`git merge --no-edit ${base} (merge, never rebase, never push).`, `Run \`${o.test}\` and fix what fails, keeping your ticket's work and what is on ${base}.`,
+    'Commit.', 'Call update_handoff(kind: before_pr) saying what was wrong.', 'Call open_pr again with the same title and body, keeping the "## Deviations from approved plan" section.']
+  return `${intro}HQ: ${t.branch} merged with ${base} fails its tests, so HQ didn't merge it. Another ticket may have merged first. \`${o.test}\` said:\n\n${o.output.slice(-3000)}\n\n`
+    + `Fix it now, in your worktree:\n${steps.map((x, i) => `${i + 1}. ${x}`).join('\n')}\nIf you can't fix it from this ticket, call report_blocked and say why.`
+}
 
 /** HQ's instructions to the engineer that fixes the conflict: to a live engineer as a message, or as a fresh one's launch prompt.
  *  No `files`: the branch already merges cleanly (a fix the last engineer didn't finish), so only the finishing steps are left. */

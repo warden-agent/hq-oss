@@ -1,16 +1,21 @@
 // Stuck detection: quiet (no events) + static pane for longer than the threshold; dead pane; missing mod heartbeat.
 import { getSetting, now } from './db.ts'
 import { DEFAULTS } from './config.ts'
-import { liveAgents, lost } from './agents.ts'
+import { liveAgents, lost, update } from './agents.ts'
+import { paneLooksIdle } from './screen.ts'
 import * as tmux from './tmux.ts'
 import { attention, resolveKind } from './attention.ts'
-import { emit } from './events.ts'
+import { emit, patch } from './events.ts'
 const lastHash = new Map<string, { hash: string; since: number }>()
 // Gone on two checks in a row before it counts as lost: being lost revokes the agent's token, so one failed tmux call (which
 // hasSession and paneDead read as "gone") must not cut off a session that is still running.
 const missed = new Set<string>()
+// Bug 25: an agent HQ thinks is working but whose screen has sat at Claude Code's idle prompt, untouched, for IDLE_FIX_MS, on
+// two checks in a row: a hook was missed, so HQ sets it idle (which also lets queued messages reach it).
+const IDLE_FIX_MS = Number(process.env.HQ_IDLE_FIX_S ?? 180) * 1000
+const idleSeen = new Set<string>()
 export function startStuckLoop(): NodeJS.Timeout {
-  return setInterval(() => { tick().catch((e) => emit({ agentId: null, source: 'system', kind: 'stuck.error', payload: { error: String(e) } })) }, 60_000)
+  return setInterval(() => { tick().catch((e) => emit({ agentId: null, source: 'system', kind: 'stuck.error', payload: { error: String(e) } })) }, Number(process.env.HQ_STUCK_TICK_S ?? 60) * 1000)
 }
 export async function tick(): Promise<void> {
   const t = now()
@@ -23,8 +28,16 @@ export async function tick(): Promise<void> {
     const h = await tmux.paneHash(a.tmux_session); const prev = lastHash.get(a.id)
     if (!prev || prev.hash !== h) { lastHash.set(a.id, { hash: h, since: t }); resolveKind('stuck', a.id) }
     const quietMs = t - (a.last_event_at ?? a.started_at); const staticMs = t - (lastHash.get(a.id)?.since ?? t)
+    if (a.status === 'working' && quietMs > IDLE_FIX_MS && staticMs > IDLE_FIX_MS && paneLooksIdle(await tmux.capturePane(a.tmux_session, 80))) {
+      if (idleSeen.has(a.id)) {
+        idleSeen.delete(a.id); update(a.id, { status: 'idle' }); patch('agent', a.id, { activity: null }); resolveKind('stuck', a.id)
+        emit({ agentId: a.id, source: 'system', kind: 'agent.idle_fixed', payload: { quietMin: Math.round(quietMs / 60_000) } }); continue
+      }
+      idleSeen.add(a.id)
+    } else idleSeen.delete(a.id)
     const thresholdMin = a.status === 'idle' ? getSetting('stuck_idle_min', DEFAULTS.stuck_idle_min) : getSetting('stuck_working_min', DEFAULTS.stuck_working_min)
-    if (a.status !== 'idle' && a.status !== 'exited' && quietMs > thresholdMin * 60_000 && staticMs > thresholdMin * 60_000) attention('stuck', `${a.display_name ?? a.id}: no events for ${Math.round(quietMs / 60_000)} min and the screen has not changed (status ${a.status})`, { agentId: a.id, ticketId: a.ticket_id })
+    // keep: the minutes in the text change every sweep, and one open 'stuck' per agent is enough (it clears when the screen changes)
+    if (a.status !== 'idle' && a.status !== 'exited' && quietMs > thresholdMin * 60_000 && staticMs > thresholdMin * 60_000) attention('stuck', `${a.display_name ?? a.id}: no events for ${Math.round(quietMs / 60_000)} min and the screen has not changed (status ${a.status})`, { agentId: a.id, ticketId: a.ticket_id, keep: true })
     if (a.claude_session_id && !a.mod_seen_at && t - a.started_at > 90_000) attention('mod_missing', `${a.display_name ?? a.id}: the hq mod never reported in; message delivery falls back to the Stop hook`, { agentId: a.id })
   }
 }

@@ -36,7 +36,7 @@ test('fake agents report in, hooks and MCP work as the agent, the plan gate hold
   assert.match(hq.tmux('ls'), new RegExp(`hq-${eng.id}`))
   const live = (() => { const e = { ...process.env }; delete e.TMUX_TMPDIR; delete e.TMUX; try { return execFileSync('tmux', ['ls'], { env: e, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) } catch { return '' } })()
   assert.doesNotMatch(live, new RegExp(`hq-${eng.id}`))
-  const trusted = (file: string) => Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')).projects ?? {})
+  const trusted = (file: string) => fs.existsSync(file) ? Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')).projects ?? {}) : []
   assert.ok(trusted(path.join(hq.home, '.claude.json')).some((p) => p.startsWith(path.dirname(hq.home))))
   assert.ok(!trusted(path.join(os.homedir(), '.claude.json')).some((p) => p.startsWith(path.dirname(hq.home))))
 })

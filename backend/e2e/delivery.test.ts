@@ -107,6 +107,25 @@ test('only an answer answers an engineer\'s question; HQ\'s notices come from HQ
   await hq.api('settings', { key: 'dm_per_peer_min', value: 5 })
 })
 
+test('a blocker always reaches the TPM; one the hourly cap refuses goes to the user', async () => {
+  const { f, tpm } = await setup('blocker-limit')
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Tests', size: 'S', spec: 'Run them.' })).json
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  const send = (reason: string, body: string) => hq.mcp(eng.id, 'send_message', { to: 'tpm', reason, body })
+  const refused = async () => (await hq.state()).attention.filter((a: any) => a.kind === 'dm_refused' && !a.resolved_at)
+  assert.equal((await send('fyi', 'Code written.')).isError, false)
+  const chatter = await send('fyi', 'Still going.') // the per-recipient window holds back chatter, quietly
+  assert.equal(chatter.isError, true); assert.match(chatter.text, /one per 5 min/); assert.equal((await refused()).length, 0)
+  assert.equal((await send('blocker', "Can't install pytest.")).isError, false, 'a blocker gets through the window')
+  assert.equal((await send('question', 'May I use the main venv?')).isError, false, 'so does a question')
+  await hq.api('settings', { key: 'dm_per_hour', value: 3 })
+  const capped = await send('blocker', 'Still blocked.')
+  assert.equal(capped.isError, true); assert.match(capped.text, /showed this blocker to the user/)
+  const [a] = await refused(); assert.equal(a.agent_id, eng.id); assert.equal(a.ticket_id, t.id); assert.match(a.detail, /blocker to .*: Still blocked\./)
+  await hq.api('settings', { key: 'dm_per_hour', value: 6 }); await hq.api(`agents/${eng.id}/stop`, {}) // frees its slot
+})
+
 test('engineers have no respond_to_issues tool', async () => {
   const { f } = await setup('no-respond')
   const t = (await hq.api('tickets', { featureId: f.id, title: 'Jar', size: 'S', spec: 'A jar.' })).json
@@ -146,4 +165,19 @@ test('a stopped agent\'s token stops working; /clear keeps a session alive; a lo
   await hq.api(`agents/${e2.id}/stop`, {})
   const mcp = await fetch(`http://127.0.0.1:${hq.ports.mcp}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${tok2}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: '{}' })
   assert.equal(mcp.status, 401)
+})
+
+test('Bug 33: the TPM can retitle a ticket after a change of mind; the engineer is told', async () => {
+  const { f, tpm } = await setup('retitle')
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Reports tab', size: 'S', spec: 'A new tab.' })).json
+  const r = await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Totals line on the Home page', spec: 'A line on the Home page.' })
+  assert.equal(r.isError, false, r.text)
+  assert.deepEqual([(await ticketOf(t)).title, (await ticketOf(t)).spec], ['Totals line on the Home page', 'A line on the Home page.'])
+  assert.equal((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Only the title' })).isError, false)
+  assert.equal((await ticketOf(t)).spec, 'A line on the Home page.') // a title alone keeps the spec
+  assert.match((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key })).text, /give a new spec, a new title, or both/)
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Totals line' })
+  await waitFor('the engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /title \(now "Totals line"\) updated/.test(m.body)))
 })

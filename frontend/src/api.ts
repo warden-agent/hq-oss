@@ -1,5 +1,10 @@
 export type Agent = Record<string, any> & { id: string; role: string; status: string }
-export type State = { repos: any[]; features: any[]; tickets: any[]; agents: Agent[]; messages: any[]; reviews: any[]; attention: any[]; settings: Record<string, any>; defaults: Record<string, any>; held: number; ports: Record<string, number>; previews: any[] }
+export type State = { autoRuns?: any[]; repos: any[]; features: any[]; tickets: any[]; agents: Agent[]; messages: any[]; reviews: any[]; attention: any[]; asks: any[];
+  settings: Record<string, any>; defaults: Record<string, any>; held: number; ports: Record<string, number>; previews: any[]
+  /** The frontend build HQ serves now (Bug 48): a tab running another one is out of date. */
+  build?: string | null
+  /** Engineers working in every repo (forRepo sets it: the parallel limit counts them all). */
+  working?: number }
 export async function api<T = any>(path: string, body?: unknown): Promise<T> {
   const r = await fetch(`/api/${path}`, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined })
   if (!r.ok) throw new Error(await r.text())

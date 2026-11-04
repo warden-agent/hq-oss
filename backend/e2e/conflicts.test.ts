@@ -45,9 +45,9 @@ function mergeMain(wt: string, resolved: string): void {
 
 test('Bug 9: the early warning, a refusal that names who merged first, and Fix conflicts through the live engineer', async () => {
   const { dir, f } = await setup('c1')
-  const t1 = await ticket(f, 'Recipes'), t2 = await ticket(f, 'Shopping')
+  const t1 = await ticket(f, 'Orders'), t2 = await ticket(f, 'Invoices')
   await launch(t1); await launch(t2); const e1 = await liveEngineer(t1), e2 = await liveEngineer(t2)
-  await finish(e1, wtOf(dir, t1), 'v1\nrecipes\n'); await finish(e2, wtOf(dir, t2), 'v1\nshopping\n')
+  await finish(e1, wtOf(dir, t1), 'v1\norders\n'); await finish(e2, wtOf(dir, t2), 'v1\ninvoices\n')
   assert.equal((await tk(t2)).conflict_files, null) // nothing has merged yet: both merge cleanly
   assert.equal((await merge(t1)).status, 200)
   // The early warning: T-02 is flagged as soon as T-01 lands, before anyone presses Merge.
@@ -72,7 +72,7 @@ test('Bug 9: the early warning, a refusal that names who merged first, and Fix c
   assert.deepEqual(both.find((x) => x.status === 200)!.json, { key: 'T-02', clean: false, via: 'message', engineer: e2.id })
   assert.match(both.find((x) => x.status === 409)!.json.error, /already being fixed/)
   const msgs = await fromHq(e2.id); assert.equal(msgs.length, 1)
-  assert.match(msgs[0].body, /^HQ: main has moved on since you finished T-02\. T-01 merged first, and now hq\/c1\/T-02-shopping conflicts with main in version\.txt\./)
+  assert.match(msgs[0].body, /^HQ: main has moved on since you finished T-02\. T-01 merged first, and now hq\/c1\/T-02-invoices conflicts with main in version\.txt\./)
   assert.match(msgs[0].body, /\. Fix it now, in your worktree:\n1\. git merge --no-edit main \(merge, never rebase, never push\)\./)
   assert.match(msgs[0].body, /\n6\. Call open_pr again with the same title and body/)
   assert.equal((await tk(t2)).status, 'resolving'); assert.equal((await engineers(t2)).length, 1)
@@ -88,10 +88,10 @@ test('Bug 9: the early warning, a refusal that names who merged first, and Fix c
   assert.match((await merge(t2)).json.error, /^T-02's engineer is fixing its conflicts with main; merge it once that's done\.$/)
   // The engineer finishing too early is told what's left; the ticket stays resolving.
   let pr = await openPr(e2); assert.equal(pr.isError, true)
-  assert.match(pr.text, /^hq\/c1\/T-02-shopping conflicts with main in version\.txt: main has moved on\. Merge it in \(git merge --no-edit main; merge, never rebase\)/)
+  assert.match(pr.text, /^hq\/c1\/T-02-invoices conflicts with main in version\.txt: main has moved on\. Merge it in \(git merge --no-edit main; merge, never rebase\)/)
   try { sh(wtOf(dir, t2), 'merge', '--no-edit', 'main') } catch { /* the conflict */ }
   pr = await openPr(e2); assert.equal(pr.isError, true); assert.match(pr.text, /^A merge is in progress in your worktree/)
-  fs.writeFileSync(path.join(wtOf(dir, t2), 'version.txt'), 'v1\nrecipes\nshopping\n'); sh(wtOf(dir, t2), 'add', 'version.txt'); sh(wtOf(dir, t2), 'commit', '--no-edit', '-q')
+  fs.writeFileSync(path.join(wtOf(dir, t2), 'version.txt'), 'v1\norders\ninvoices\n'); sh(wtOf(dir, t2), 'add', 'version.txt'); sh(wtOf(dir, t2), 'commit', '--no-edit', '-q')
   pr = await openPr(e2); assert.equal(pr.isError, false, pr.text); assert.match(pr.text, /^Done\./)
   const done = await tk(t2); assert.deepEqual([done.status, done.pr_state, done.conflict_files, done.conflict_with], ['pr_ready', 'local', null, null])
   assert.equal((await notices(t2, 'merge_conflict')).length, 0)
@@ -100,18 +100,18 @@ test('Bug 9: the early warning, a refusal that names who merged first, and Fix c
   // Not auto-merged (the user's call): the user presses Merge.
   assert.equal(sh(dir, 'rev-parse', 'HEAD'), head)
   assert.equal((await merge(t2)).status, 200)
-  assert.equal(fs.readFileSync(path.join(dir, 'version.txt'), 'utf8'), 'v1\nrecipes\nshopping\n')
+  assert.equal(fs.readFileSync(path.join(dir, 'version.txt'), 'utf8'), 'v1\norders\ninvoices\n')
   assert.equal((await notices(t2, 'conflicts_fixed')).length, 0) // merged: moot
 })
 
 test('Bug 9: a stopped engineer is replaced (over the limit, no plan gate), survives an HQ restart, and a merge by hand ends it', async () => {
   const { dir, repo, f } = await setup('c2')
   await hq.api('settings', { key: 'concurrency_cap', value: 10 })
-  const t1 = await ticket(f, 'Recipes'), t2 = (await hq.api('tickets', { featureId: f.id, title: 'Shopping', size: 'L', spec: 'Shopping.' })).json // L: opusplan
-  const t3 = await ticket(f, 'Planner')
+  const t1 = await ticket(f, 'Orders'), t2 = (await hq.api('tickets', { featureId: f.id, title: 'Invoices', size: 'L', spec: 'Invoices.' })).json // L: opusplan
+  const t3 = await ticket(f, 'Billing')
   await launch(t1); await launch(t2); await launch(t3)
   const e1 = await liveEngineer(t1), e2 = await liveEngineer(t2), e3 = await liveEngineer(t3)
-  await finish(e1, wtOf(dir, t1), 'v1\nrecipes\n'); await finish(e2, wtOf(dir, t2), 'v1\nshopping\n')
+  await finish(e1, wtOf(dir, t1), 'v1\norders\n'); await finish(e2, wtOf(dir, t2), 'v1\ninvoices\n')
   assert.equal((await merge(t1)).status, 200)
   await waitFor('T-02 flagged', async () => (await tk(t2)).conflict_files)
   await hq.api(`agents/${e2.id}/stop`, {})
@@ -119,10 +119,10 @@ test('Bug 9: a stopped engineer is replaced (over the limit, no plan gate), surv
   const r = await fix(t2); assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.equal(r.json.via, 'launch'); assert.notEqual(r.json.engineer, e2.id)
   const e2b = await liveEngineer(t2, e2.id); assert.equal(e2b.id, r.json.engineer)
-  const t = await tk(t2); assert.deepEqual([t.status, t.assignee_agent_id, t.worktree_path, t.branch], ['resolving', e2b.id, wtOf(dir, t2), 'hq/c2/T-02-shopping'])
+  const t = await tk(t2); assert.deepEqual([t.status, t.assignee_agent_id, t.worktree_path, t.branch], ['resolving', e2b.id, wtOf(dir, t2), 'hq/c2/T-02-invoices'])
   assert.equal(e2b.in_plan_mode, 0); assert.deepEqual([e2.model_alias, e2b.model_alias], ['opusplan', 'sonnet']) // a fix runs on the S model
   assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', e2b.id, 'launch.sh'), 'utf8'), /'--permission-mode' 'acceptEdits'/)
-  assert.match(e2b.launch_prompt, /^You are the engineer for ticket T-02 \(L\): Shopping\. Its work is already finished and committed on branch hq\/c2\/T-02-shopping/)
+  assert.match(e2b.launch_prompt, /^You are the engineer for ticket T-02 \(L\): Invoices\. Its work is already finished and committed on branch hq\/c2\/T-02-invoices/)
   assert.match(e2b.launch_prompt, /HQ: main has moved on since you finished T-02\. T-01 merged first/)
   assert.match(lockOf(dir, wtOf(dir, t2)) ?? '', /^claude session T-02 /) // the same worktree, now held by the new session
   assert.equal((await hq.state()).reviews.filter((x: any) => x.ticket_id === t2.id).length, 0) // no plan, no review
@@ -134,15 +134,15 @@ test('Bug 9: a stopped engineer is replaced (over the limit, no plan gate), surv
   const again = await fix(t2); assert.equal(again.status, 200, JSON.stringify(again.json)); assert.equal(again.json.via, 'launch')
   const e2c = await liveEngineer(t2, e2b.id); assert.equal(e2c.id, again.json.engineer)
   // Merged by hand while its engineer works on it: HQ notices, the engineer stops, the ticket is merged.
-  try { sh(dir, 'merge', '--no-edit', 'hq/c2/T-02-shopping') } catch { /* the conflict */ }
-  fs.writeFileSync(path.join(dir, 'version.txt'), 'v1\nrecipes\nshopping\n'); sh(dir, 'add', 'version.txt'); sh(dir, 'commit', '--no-edit', '-q')
+  try { sh(dir, 'merge', '--no-edit', 'hq/c2/T-02-invoices') } catch { /* the conflict */ }
+  fs.writeFileSync(path.join(dir, 'version.txt'), 'v1\norders\ninvoices\n'); sh(dir, 'add', 'version.txt'); sh(dir, 'commit', '--no-edit', '-q')
   await hq.api(`repos/${repo.id}/sync`, {}) // a sync re-checks merges (as the 2-minute watcher would)
   await waitFor('T-02 merged', async () => (await tk(t2)).status === 'merged')
   await waitFor('its engineer stopped', async () => (await engineers(t2)).every((a: any) => a.status === 'exited'))
   assert.deepEqual([(await tk(t2)).conflict_files, (await notices(t2, 'merge_conflict')).length], [null, 0])
   // A ticket finishing after main moved under it is told to merge main first, before it ever reaches the user.
-  await commit(wtOf(dir, t3), 'v1\nplanner\n')
-  const pr = await openPr(e3); assert.equal(pr.isError, true); assert.match(pr.text, /^hq\/c2\/T-03-planner conflicts with main in version\.txt: main has moved on/)
+  await commit(wtOf(dir, t3), 'v1\nbilling\n')
+  const pr = await openPr(e3); assert.equal(pr.isError, true); assert.match(pr.text, /^hq\/c2\/T-03-billing conflicts with main in version\.txt: main has moved on/)
   assert.notEqual((await tk(t3)).status, 'pr_ready')
   await hq.api('settings', { key: 'concurrency_cap', value: 10 })
 })
@@ -150,13 +150,13 @@ test('Bug 9: a stopped engineer is replaced (over the limit, no plan gate), surv
 test('Bug 9: fixed by hand before the click starts nothing; cancelling a resolving ticket stops its engineer', async () => {
   const { dir, f } = await setup('c3')
   await hq.api('settings', { key: 'concurrency_cap', value: 10 })
-  const t1 = await ticket(f, 'Recipes'), t2 = await ticket(f, 'Shopping'), t3 = await ticket(f, 'Planner')
+  const t1 = await ticket(f, 'Orders'), t2 = await ticket(f, 'Invoices'), t3 = await ticket(f, 'Billing')
   await launch(t1); await launch(t2); const e1 = await liveEngineer(t1), e2 = await liveEngineer(t2)
   await launch(t3); const e3 = await liveEngineer(t3)
-  await finish(e1, wtOf(dir, t1), 'v1\nrecipes\n'); await finish(e2, wtOf(dir, t2), 'v1\nshopping\n'); await finish(e3, wtOf(dir, t3), 'v1\nplanner\n')
+  await finish(e1, wtOf(dir, t1), 'v1\norders\n'); await finish(e2, wtOf(dir, t2), 'v1\ninvoices\n'); await finish(e3, wtOf(dir, t3), 'v1\nbilling\n')
   assert.equal((await merge(t1)).status, 200)
   await waitFor('T-02 and T-03 flagged', async () => (await tk(t2)).conflict_files && (await tk(t3)).conflict_files)
-  mergeMain(wtOf(dir, t2), 'v1\nrecipes\nshopping\n') // the user fixed T-02 by hand in its worktree
+  mergeMain(wtOf(dir, t2), 'v1\norders\ninvoices\n') // the user fixed T-02 by hand in its worktree
   const r = await fix(t2); assert.deepEqual(r.json, { key: 'T-02', clean: true })
   const t = await tk(t2); assert.deepEqual([t.status, t.conflict_files], ['pr_ready', null])
   assert.equal((await notices(t2, 'merge_conflict')).length, 0); assert.equal((await fromHq(e2.id)).length, 0); assert.equal((await engineers(t2)).length, 1)
