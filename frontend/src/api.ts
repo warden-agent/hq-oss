@@ -26,8 +26,11 @@ export function waitingFor(a: Agent, s: State, now = Date.now()): { count: numbe
 export { FINISHED, unmergedDeps } from '../../backend/src/readiness.ts'
 /** A JSON list column (deps, expected_files, merge_order) as strings; anything unreadable is an empty list instead of a blank page. */
 export const jsonList = (s: unknown): string[] => { try { const v = JSON.parse(String(s || '[]')); return Array.isArray(v) ? v.map(String) : [] } catch { return [] } }
-/** The backend's error text from a failed api() call (it sends `{ error }` JSON). */
-export const errText = (e: Error): string => { try { return JSON.parse(e.message).error ?? e.message } catch { return e.message } }
+/** The backend's error text from a failed api() call (it sends `{ error }` JSON). A TypeError means nothing answered, and browsers word that differently. */
+export const errText = (e: Error): string => {
+  if (e instanceof TypeError) return "Can't reach HQ. It may be restarting."
+  try { return JSON.parse(e.message).error ?? e.message } catch { return e.message }
+}
 let errorSink: ((msg: string) => void) | null = null
 /** Shows an error in the bar under the top bar (ErrorBar in ui.tsx), instead of alert(). */
 export function showError(msg: string): void { if (errorSink) errorSink(msg); else console.error(msg) }

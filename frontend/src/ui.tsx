@@ -84,7 +84,21 @@ export function NewProjectDialog({ onClose, onMade }: { onClose: () => void; onM
   const [setup, setSetup] = useState<{ parent: string; account: string; githubReady: boolean } | null>(null)
   const [name, setName] = useState(''), [parent, setParent] = useState(''), [github, setGithub] = useState(false)
   const [busy, setBusy] = useState<null | 'pick' | 'make'>(null), [err, setErr] = useState('')
-  useEffect(() => { api('repos/new-setup', {}).then((x) => { setSetup(x); setParent((p) => p || x.parent) }).catch((e) => setErr(errText(e))) }, [])
+  const [away, setAway] = useState(false)
+  // Bug 51: HQ may be restarting as the box opens, so keep asking until it answers
+  useEffect(() => {
+    let timer = 0, gone = false
+    const check = () => api('repos/new-setup', {}).then((x) => {
+      if (gone) return
+      setAway(false); setSetup(x); setParent((p) => p || x.parent)
+    }, (e) => {
+      if (gone) return
+      if (e instanceof TypeError) { setAway(true); timer = window.setTimeout(check, 1500) } // nothing answered
+      else { setAway(false); setErr(errText(e)) } // HQ refused: asking again won't help
+    })
+    void check()
+    return () => { gone = true; clearTimeout(timer) }
+  }, [])
   useEffect(() => {
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && busy !== 'make') onClose() }
     document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
@@ -111,6 +125,7 @@ export function NewProjectDialog({ onClose, onMade }: { onClose: () => void; onM
         {opt(false, 'No, just this Mac')}
         {opt(true, `Yes, a private repo on ${setup?.account ?? 'GitHub'}`, !setup?.githubReady)}
         {setup && !setup.githubReady && <div className="text-amber-300/80">HQ isn't logged in to GitHub as {setup.account}, so it can only make local projects.</div>}</div>
+      {away && <div role="status" className="text-amber-300/80">Can't reach HQ. It may be restarting. Trying again…</div>}
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex flex-wrap justify-end gap-1.5"><button type="button" className="btn" onClick={onClose} disabled={busy === 'make'}>Cancel</button>
         <button type="submit" className="btn btn-primary" disabled={!ok}>{busy === 'make' ? (github ? 'Making it on GitHub…' : 'Making it…') : 'Create'}</button></div>
