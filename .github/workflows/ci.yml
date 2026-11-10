@@ -41,6 +41,8 @@ jobs:
           node-version: 25
           cache: npm
       - run: npm ci
+      - name: A real terminal after a fresh install
+        run: node -e "const p=require('node-pty').spawn('/bin/echo',['ok'],{});p.onExit(({exitCode})=>process.exit(exitCode))"
       - name: Sandbox tests
         working-directory: backend
         run: node --experimental-strip-types --test --test-timeout=60000 src/testrun.test.ts

@@ -47,8 +47,8 @@ export function keepBuilt(repoId: string, lines: string[]): void {
 
 /** PROJECT.md (and CONTEXT.md) in the TPM's workspace, from HQ's records. Returns the workspace. */
 export function writeProjectMd(repoId: string): string {
-  const ws = tpmWorkspace(repoId); fs.mkdirSync(ws, { recursive: true })
-  const repo = getRepo(repoId); if (!repo) return ws
+  const ws = tpmWorkspace(repoId), repo = getRepo(repoId); if (!repo) return ws // removed from HQ: no folder to bring back
+  fs.mkdirSync(ws, { recursive: true })
   const mine = features().filter((f) => f.repo_id === repoId && f.status !== 'cancelled').reverse() // oldest first
   const open = mine.filter((f) => { const tk = tickets(f.id).filter((t) => t.status !== 'cancelled'); return !tk.length || tk.some((t) => t.status !== 'merged') })
   const built = [keptBuilt(repoId).trimEnd(), ...builtLines(mine)].filter(Boolean).join('\n')

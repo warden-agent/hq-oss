@@ -2,13 +2,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { PATHS, PORTS, CLAUDE_BIN, newToken } from './config.ts'
+import { agentTmpDir, PATHS, PORTS, CLAUDE_BIN, newToken } from './config.ts'
 import { db, one, q, run, now } from './db.ts'
 import { emit, patch } from './events.ts'
 import { id, sha, shq } from './util.ts'
 import * as tmux from './tmux.ts'
 import { buildMcp, buildSettings, roleFlags, rolePromptPath, type Role } from './roles.ts'
 import { ensureTrusted } from './trust.ts'
+import { resolveKind } from './attention.ts'
 
 export type Agent = {
   id: string; role: Role; repo_id: string | null; feature_id: string | null; ticket_id: string | null; review_request_id: string | null; model_alias: string; model_live: string | null
@@ -24,6 +25,9 @@ export function agentByToken(token: string): Agent | undefined {
   const a = one<Agent>('SELECT * FROM agents WHERE token_hash = ?', sha(token)); if (!a || a.token_revoked_at) return undefined; return a
 }
 export function agentBySession(sessionId: string): Agent | undefined { return one<Agent>('SELECT * FROM agents WHERE claude_session_id = ?', sessionId) }
+/** An agent as the page gets it: without its token's hash, and without its launch prompt (long, and nothing shows it: it's the
+ *  agent's prompt.md). */
+export const pageAgent = (a: Agent) => ({ ...a, token_hash: undefined, launch_prompt: undefined })
 export function liveAgents(): Agent[] { return q<Agent>("SELECT * FROM agents WHERE status != 'exited' ORDER BY started_at") }
 /** Writes agent columns (a key that isn't one is a type error, not a failed UPDATE at runtime). */
 export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>): void {
@@ -38,6 +42,13 @@ export type LaunchSpec = {
   extraEnv?: Record<string, string>; extraFlags?: string[]; repoAllowlist?: string[]; editOverrides?: string[]; size?: string
 }
 
+/** The agent's own temp folder (Bug 81), private as Claude Code wants it; null when something not ours is already there (/tmp is
+ *  everyone's): then the agent uses Claude Code's shared one, as before. */
+function agentTmp(agentId: string): string | null {
+  const d = agentTmpDir(agentId)
+  try { fs.mkdirSync(d, { mode: 0o700 }); return d } catch { /* there already */ }
+  try { const s = fs.lstatSync(d); if (!s.isDirectory() || s.uid !== process.getuid?.()) return null; fs.chmodSync(d, 0o700); return d } catch { return null }
+}
 export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   const agentId = id(({ engineer: 'eng', architect: 'arch', tpm: 'tpm', launcher: 'launch' } as const)[spec.role])
   const token = newToken()
@@ -45,10 +56,11 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   fs.writeFileSync(path.join(dir, 'token'), token, { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(buildSettings(spec.role, token, { agentDir: dir, repoAllowlist: spec.repoAllowlist, editOverrides: spec.editOverrides }), null, 2), { mode: 0o600 })
-  fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(buildMcp(token), null, 2), { mode: 0o600 })
+  fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(buildMcp(path.join(dir, 'token')), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'prompt.md'), spec.launchPrompt)
-  const sessionId = randomUUID()
-  const env: Record<string, string> = { HQ_AGENT_ID: agentId, HQ_BACKEND: `http://127.0.0.1:${PORTS.hooks}`, HQ_TOKEN_FILE: path.join(dir, 'token'), DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_ENABLE_TODO_TOOLS: '1', ...(spec.extraEnv ?? {}) }
+  const sessionId = randomUUID(), tmp = agentTmp(agentId) // made in the same tick as the agent's row below: a sweep never sees one without the other
+  const env: Record<string, string> = { HQ_AGENT_ID: agentId, HQ_BACKEND: `http://127.0.0.1:${PORTS.hooks}`, HQ_TOKEN_FILE: path.join(dir, 'token'), DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_ENABLE_TODO_TOOLS: '1',
+    ...(tmp ? { CLAUDE_CODE_TMPDIR: tmp } : {}), ...(spec.extraEnv ?? {}) }
   const flags = ['--session-id', sessionId, '--name', spec.displayName, '--settings', path.join(dir, 'settings.json'), '--strict-mcp-config', '--mcp-config', path.join(dir, 'mcp.json'),
     '--plugin-dir', PATHS.plugin, '--append-system-prompt-file', rolePromptPath(spec.role),
     ...roleFlags(spec.role, { worktreeName: spec.worktreeName, model: spec.model, permissionMode: spec.permissionMode }), ...(spec.extraFlags ?? [])]
@@ -70,19 +82,19 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   await tmux.setHook(tmuxName(agentId), 'client-attached', `curl -s -m 2 -X POST http://127.0.0.1:${PORTS.hooks}/tmux/${agentId}/${tk}/attached`)
   await tmux.setHook(tmuxName(agentId), 'client-detached', `curl -s -m 2 -X POST http://127.0.0.1:${PORTS.hooks}/tmux/${agentId}/${tk}/detached`)
   emit({ agentId, source: 'system', kind: 'agent.launched', payload: { role: spec.role, model: spec.model, cwd: spec.cwd, sessionId } })
-  const a = getAgent(agentId)!; patch('agent', agentId, a as unknown as Record<string, unknown>); return a
+  const a = getAgent(agentId)!; patch('agent', agentId, pageAgent(a)); return a
 }
 
 export async function stopAgent(agentId: string, reason = 'stopped'): Promise<void> {
   const a = getAgent(agentId); if (!a) return
   await tmux.killSession(a.tmux_session)
-  update(agentId, { status: 'exited', ended_at: now() }); revokeToken(agentId)
+  update(agentId, { status: 'exited', ended_at: now() }); revokeToken(agentId); resolveKind('dialog', agentId) // a session that's over has no dialog (Bug 62)
   run('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE agent_id = ? AND ended_at IS NULL', now(), reason, agentId)
   emit({ agentId, source: 'system', kind: 'agent.stopped', payload: { reason } })
 }
 /** An agent whose process is gone without HQ stopping it: exited, token revoked, and `agent.lost` for whoever cleans up. */
 export function lost(agentId: string, payload: Record<string, unknown> = {}): void {
-  update(agentId, { status: 'exited', ended_at: now() }); revokeToken(agentId); emit({ agentId, source: 'system', kind: 'agent.lost', payload })
+  update(agentId, { status: 'exited', ended_at: now() }); revokeToken(agentId); resolveKind('dialog', agentId); emit({ agentId, source: 'system', kind: 'agent.lost', payload })
 }
 export function revokeToken(agentId: string): void { update(agentId, { token_revoked_at: now() }); try { fs.rmSync(path.join(agentDir(agentId), 'token')) } catch {} }
 export function tmuxToken(agentId: string): string | null { try { return fs.readFileSync(path.join(agentDir(agentId), 'tmux-token'), 'utf8').trim() } catch { return null } }

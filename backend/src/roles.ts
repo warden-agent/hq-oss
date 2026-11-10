@@ -1,8 +1,10 @@
 // Role definitions: models, permission mode, tools, settings generator. Mirrors the plan §2.3/§2.4 and the M0-validated spike settings.
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { PATHS, PORTS, DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR } from './config.ts'
+import { PATHS, PORTS, DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR, TURN_WAIT_S } from './config.ts'
 import { getSetting } from './db.ts'
+import { real } from './util.ts'
 
 export type Role = 'tpm' | 'architect' | 'engineer' | 'launcher'
 const HOME = os.homedir()
@@ -50,6 +52,9 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
     hooks,
   }
   if (role !== 'engineer' && role !== 'launcher') return base // the Launch helper gets the engineer's sandbox, and runs no git writes
+  // A build or test run can be held at this hook until its turn comes (heavy.ts), so a Bash command's hook gets longer than that wait. Past it, Claude Code runs
+  // the command anyway (spike 2026-11-09: a hook that times out counts as no answer).
+  hooks.PreToolUse = [{ matcher: 'Bash', hooks: [{ type: 'http', url: HOOK(token), timeout: TURN_WAIT_S + 60 }] }, { matcher: '^(?!Bash$).*', hooks: hookGroup(token)[0]!.hooks }]
   const overrides = new Set(opts.editOverrides ?? [])
   const deny = [
     'Read(~/.claude/**)', 'Read(~/.claude.json)', `Read(//${HOME}/.hq/**)`, 'Read(.env)', 'Read(.env.*)', 'Read(**/secrets/**)', 'Read(~/.ssh/**)', 'Read(~/.aws/**)',
@@ -66,7 +71,7 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
     ...base,
     permissions: { ...(base.permissions as object), blockReadsOutsideWorkingDirectories: true, allow: ['mcp__hq__*'], deny },
     plansDirectory: '.hq-plans',
-    // Every package cache sits in ENGINEER_CACHE, outside home: npm's (with the log npm writes on every run), Go's (spike S5) and
+    // Every package cache sits in ENGINEER_CACHE, outside home: npm's (with the log npm writes on every run), Go's (spike S5), Rust's and
     // Python's. Spike 2026-10-31 (`-p` runs with these settings): `npm test` passed with and without npm_config_cache, so the old
     // "exit 255 in the spike HQ" isn't explained by the npm cache; with it set, nothing is written under ~/.npm at all.
     // Python venvs live in the worktree; uv uses the machine's Python, since downloading one needs github.com, which stays off
@@ -75,8 +80,8 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
     sandbox: {
       enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true,
       network: { allowedDomains: ['127.0.0.1', 'localhost', '[::1]', ...PACKAGE_REGISTRIES, ...(opts.repoAllowlist ?? [])], strictAllowlist: true, allowLocalBinding: true },
-      // On a Linux with no keyring, gh keeps its token in a file in GH_CONFIG_DIR.
-      filesystem: { allowWrite: [ENGINEER_CACHE], denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, PATHS.home, `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`,
+      // On a Linux with no keyring, gh keeps its token in a file in GH_CONFIG_DIR. HQ's own folder by its real path: that's what the sandbox compares (Bug 59).
+      filesystem: { allowWrite: [ENGINEER_CACHE], denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, real(PATHS.home), `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`,
         GH_CONFIG_DIR] },
       credentials: { envVars: [{ name: 'HQ_AGENT_ID', mode: 'deny' }, { name: 'HQ_BACKEND', mode: 'deny' }, { name: 'ANTHROPIC_API_KEY', mode: 'deny' }, { name: 'GH_TOKEN', mode: 'deny' }, { name: 'GITHUB_TOKEN', mode: 'deny' }] },
     },
@@ -87,12 +92,18 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
 export const cacheEnv = (): Record<string, string> => ({
   npm_config_cache: path.join(ENGINEER_CACHE, 'npm'),
   GOCACHE: path.join(ENGINEER_CACHE, 'go-build'), GOMODCACHE: path.join(ENGINEER_CACHE, 'gomod'), GOPATH: path.join(ENGINEER_CACHE, 'gopath'),
+  CARGO_HOME: path.join(ENGINEER_CACHE, 'cargo'), // where crates download to; cargo itself is still found on PATH (~/.cargo/bin), and rustup's toolchains stay put
   UV_CACHE_DIR: path.join(ENGINEER_CACHE, 'uv'), PIP_CACHE_DIR: path.join(ENGINEER_CACHE, 'pip'),
   UV_PYTHON_INSTALL_DIR: path.join(ENGINEER_CACHE, 'python'), UV_PYTHON_DOWNLOADS: 'never',
 })
 
-export function buildMcp(token: string): Record<string, unknown> {
-  return { mcpServers: { hq: { type: 'http', url: `http://127.0.0.1:${PORTS.mcp}/mcp`, headers: { Authorization: `Bearer ${token}` } } } }
+const RELAY = path.join(import.meta.dirname, 'mcprelay.mjs')
+/** An agent's "hq" MCP server: the relay (mcprelay.mjs), which Claude Code starts itself and which passes each call on to the backend.
+ *  Bug 78: connected to the backend directly, an agent lost HQ's tools for good once the backend had been down for 15 s. The relay
+ *  reads the agent's token from its file; the backend's own node runs it, or the one on PATH when that binary has since been replaced. */
+export function buildMcp(tokenFile: string): Record<string, unknown> {
+  const node = fs.existsSync(process.execPath) ? process.execPath : 'node'
+  return { mcpServers: { hq: { type: 'stdio', command: node, args: [RELAY], env: { HQ_MCP_URL: `http://127.0.0.1:${PORTS.mcp}/mcp`, HQ_TOKEN_FILE: tokenFile } } } }
 }
 
 /** CLI flags per role (excluding the common ones the launcher adds). Engineers start in plan mode; one fixing a merge conflict on

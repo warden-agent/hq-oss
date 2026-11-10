@@ -9,12 +9,16 @@ import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
 import { ackBatchFromPrompt, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor } from './delivery.ts'
 import { onPostModelSwitch, onTurnStep } from './modelguard.ts'
 import { attention, resolveKind } from './attention.ts'
-import { getTicket } from './records.ts'
+import { getRepo, getTicket, repoOfAgent } from './records.ts'
+import { gateBash, laneMoved } from './heavy.ts'
+import { addRun, endRuns, waitingText, watchedTask } from './bgruns.ts'
 import { isBridgePid } from './terminal.ts'
 import * as tmux from './tmux.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
 
 const TAKEOVER_ATTACHED_MS = 365 * 86_400_000 // "until they detach"
+/** Notification types that mean a dialog is open and waiting for a person (checked on 2.1.300). */
+const DIALOGS = new Set(['permission_prompt', 'elicitation_dialog', 'elicitation_url_dialog', 'agent_needs_input', 'worker_permission_prompt'])
 
 const json = (res: http.ServerResponse, code: number, obj: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)) }
 const deny = (message: string) => ({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message } } })
@@ -30,9 +34,19 @@ function describeTool(tool: string, input: Record<string, unknown>): string {
   return tool
 }
 
-/** When each agent's main loop last started a turn (UserPromptSubmit) and last ended one (Stop). Memory only: after a restart
- *  the stuck loop's screen check covers the gap. */
+/** When each agent's main loop last started a turn (UserPromptSubmit) and last ended one (Stop), as steps of one counter, not
+ *  clock times: a prompt and its Stop can share a millisecond (Bug 80). Memory only: after a restart the stuck loop's screen
+ *  check covers the gap. */
 const turns = new Map<string, { prompt: number; stop: number }>()
+let turnSeq = 0
+/** Bug 94: the helpers each agent's main loop started in the background itself (the Agent tool), helper id → description. While
+ *  one runs the agent is working, even after its turn ended. Claude Code's own helpers never get here (Bug 25). Memory only. */
+const helpers = new Map<string, Map<string, string>>()
+const helperActivity = (m: Map<string, string>): string => `Subagent: ${[...m.values()].at(-1)}${m.size > 1 ? ` (+${m.size - 1} more)` : ''}`
+/** What the agent still waits on once its turn has ended: a helper (Bug 94) or a run in the background (Bug 95, bgruns.ts). Null: nothing. */
+const stillOn = (id: string, m: Map<string, string>): string | null => m.size ? helperActivity(m) : waitingText(id)
+/** The stuck loop saw the agent's idle prompt for minutes: nothing HQ thought was running is. */
+export function forgetHelpers(agentId: string): void { helpers.delete(agentId) }
 function handleHook(agent: Agent, body: Record<string, unknown>, res: http.ServerResponse): void {
   const ev = String(body.hook_event_name ?? ''); const tool = String(body.tool_name ?? ''); const input = (body.tool_input ?? {}) as Record<string, unknown>
   const mode = body.permission_mode as string | undefined; const t = now()
@@ -46,27 +60,44 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   const sub = typeof body.agent_id === 'string' && body.agent_id !== ''
   if (sub) payload.sub = true
   const turn = turns.get(agent.id) ?? { prompt: 0, stop: 0 }; turns.set(agent.id, turn)
+  const bg = helpers.get(agent.id) ?? new Map<string, string>(); helpers.set(agent.id, bg); const helperId = String(body.agent_id ?? '')
   switch (ev) {
-    case 'SessionStart': Object.assign(payload, { source: body.source, model: body.model, cwd: body.cwd }); Object.assign(fields, { claude_session_id: String(body.session_id ?? '') || null, transcript_path: (body.transcript_path as string | undefined) ?? null, status: 'working' }); run('UPDATE sessions SET claude_session_id = ?, transcript_path = ? WHERE agent_id = ? AND ended_at IS NULL', body.session_id as string, body.transcript_path as string, agent.id); break
-    case 'UserPromptSubmit': { turn.prompt = t; payload.prompt = trim(body.prompt, 200); fields.status = 'working'; live.activity = 'Thinking'
+    case 'SessionStart': bg.clear(); endRuns(agent.id, 'all', 'session'); Object.assign(payload, { source: body.source, model: body.model, cwd: body.cwd }); Object.assign(fields, { claude_session_id: String(body.session_id ?? '') || null, transcript_path: (body.transcript_path as string | undefined) ?? null, status: 'working' }); run('UPDATE sessions SET claude_session_id = ?, transcript_path = ? WHERE agent_id = ? AND ended_at IS NULL', body.session_id as string, body.transcript_path as string, agent.id); break
+    case 'UserPromptSubmit': { turn.prompt = ++turnSeq; payload.prompt = trim(body.prompt, 200); fields.status = 'working'; live.activity = 'Thinking'
+      const done = [...String(body.prompt ?? '').matchAll(/<task-id>([\w-]+)<\/task-id>/g)].map((m) => m[1]!) // a helper's or a background run's "done" notice
+      for (const task of done) bg.delete(task); endRuns(agent.id, done, 'done') // Bugs 94, 95
       payload.acked = ackBatchFromPrompt(agent, String(body.prompt ?? '')); break }
     case 'PreToolUse': payload.input = trim(input, 300); if (!sub) fields.status = 'working'
-      if (!sub || agent.status === 'working') live.activity = describeTool(tool, input); break
-    // A helper that finishes after the main turn ended (Stop, and no prompt since) leaves the agent idle, whatever set it working
-    case 'SubagentStop': if (turn.stop > turn.prompt && agent.status === 'working') { fields.status = 'idle'; live.activity = null } break
-    case 'PostToolUse': payload.input = trim(input, 200); if (tool === 'ExitPlanMode') payload.responsePlanLen = String((body.tool_response as { plan?: string } | undefined)?.plan ?? '').length; break
-    case 'PostToolUseFailure': Object.assign(payload, { input: trim(input, 200), error: trim(body.error, 300), is_interrupt: body.is_interrupt }); break
-    case 'Stop': turn.stop = t; payload.last = trim(body.last_assistant_message, 600); fields.status = 'idle'
-      Object.assign(live, { activity: null, last_message: trim(body.last_assistant_message, 2000) })
-      if (agent.role === 'tpm') recordReply(agent, String(body.last_assistant_message ?? '')); break
+      if (tool === 'Bash') Object.assign(payload, { use: body.tool_use_id, timeout: input.timeout }) // leftovers.ts: which command, and how long it may run
+      if (sub && bg.has(helperId)) live.activity = `Subagent: ${bg.get(helperId)} · ${describeTool(tool, input)}`
+      else if (!sub || agent.status === 'working') live.activity = describeTool(tool, input); break
+    // A helper that finishes after the main turn ended (Stop, and no prompt since) leaves the agent idle, whatever set it working,
+    // unless a background helper the agent started is still running (Bug 94)
+    case 'SubagentStop': bg.delete(helperId)
+      if (turn.stop > turn.prompt && agent.status === 'working') { const on = stillOn(agent.id, bg); if (on) live.activity = on; else { fields.status = 'idle'; live.activity = null } } break
+    case 'PostToolUse': Object.assign(payload, { input: trim(input, 200), use: body.tool_use_id })
+      if (tool === 'ExitPlanMode') payload.responsePlanLen = String((body.tool_response as { plan?: string } | undefined)?.plan ?? '').length
+      if (tool === 'Agent' && !sub) { const r = (body.tool_response ?? {}) as { isAsync?: boolean; agentId?: unknown; description?: unknown }
+        if (r.isAsync && typeof r.agentId === 'string') { bg.set(r.agentId, trim(r.description ?? input.description, 60)); payload.helper = r.agentId } }
+      if (tool === 'Bash' && !sub) { // Bug 95: still running in the background, and the agent waits on it
+        const task = watchedTask(input, body.tool_response, getRepo(repoOfAgent(agent) ?? '')?.test_cmd ?? null)
+        if (task) { addRun(agent.id, { task, use: String(body.tool_use_id ?? ''), command: String(input.command ?? '') }); payload.bg = task } } break
+    case 'PostToolUseFailure': Object.assign(payload, { input: trim(input, 200), use: body.tool_use_id, error: trim(body.error, 300), is_interrupt: body.is_interrupt }); break
+    case 'Stop': { turn.stop = ++turnSeq; payload.last = trim(body.last_assistant_message, 600); const on = stillOn(agent.id, bg); fields.status = on ? 'working' : 'idle'
+      Object.assign(live, { activity: on, last_message: trim(body.last_assistant_message, 2000) })
+      if (agent.role === 'tpm') recordReply(agent, String(body.last_assistant_message ?? '')); break }
     case 'StopFailure': payload.error = trim(body.error ?? body, 400); fields.status = 'blocked'; break
     case 'Notification': Object.assign(payload, { ntype: body.notification_type, message: trim(body.message, 200) }); break
     case 'PostModelSwitch': case 'PreModelSwitch': Object.assign(payload, { from: body.from_model, to: body.to_model, source: body.source, requested: body.requested_model }); break
     case 'PreCompact': case 'PostCompact': payload.trigger = body.trigger; break
     case 'ConfigChange': Object.assign(payload, { csource: body.source, file: body.file_path }); break
-    case 'SessionEnd': payload.reason = body.reason; if (cleared) break
+    case 'SessionEnd': payload.reason = body.reason; bg.clear(); if (cleared) break
+      endRuns(agent.id, 'all', 'session')
       Object.assign(fields, { status: 'exited', ended_at: t }); live.activity = null; run('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE agent_id = ? AND ended_at IS NULL', t, String(body.reason ?? ''), agent.id); break
     case 'TaskCreated': case 'TaskCompleted': payload.task = trim(body.task ?? body, 300); break
+  }
+  if (fields.status && fields.status !== 'paused' && agent.paused_reason?.startsWith('quota_auto_resume')) { // the usage wait is over: a turn moved on
+    fields.paused_reason = null; resolveKind('usage_limit', agent.id)
   }
   if (agent.status === 'exited') delete fields.status // a late hook from a session HQ already counts as gone doesn't bring it back
   update(agent.id, fields); if (agent.status !== 'exited' && Object.keys(live).length) patch('agent', agent.id, live)
@@ -82,6 +113,12 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     attention('unexpected_prompt', `${agent.display_name ?? agent.id}: ${tool} needed approval (${trim(input, 120)}); denied by policy`, { agentId: agent.id, ticketId: agent.ticket_id })
     return json(res, 200, deny(`HQ: '${tool}' would need approval and is not allowed here. Continue without it, or report_blocked if you cannot.`))
   }
+  // Bug 76: a build or a full test run waits here for its turn; the answer is what lets the command start. The agent itself and each helper of its run one tool
+  // at a time, so the next tool starting (or a helper finishing) means the turn its last command held is free
+  const lane = sub ? String(body.agent_id) : 'main'
+  if (ev === 'PreToolUse' || ev === 'SubagentStop') laneMoved(agent.id, lane)
+  if (ev === 'PreToolUse' && tool === 'Bash' && gateBash(agent, { use: String(body.tool_use_id ?? ''), command: String(input.command ?? ''), timeout: input.timeout,
+    background: input.run_in_background === true, lane, plan: mode === 'plan', activity: describeTool(tool, input) }, res, () => json(res, 200, {}))) return
   if (ev === 'PreModelSwitch') return json(res, 200, { hookSpecificOutput: { hookEventName: 'PreModelSwitch', permissionDecision: 'deny', permissionDecisionReason: 'HQ controls models for this agent.' } })
   if (ev === 'PostModelSwitch') { onPostModelSwitch(agent, body); return json(res, 200, {}) }
   if (ev === 'ConfigChange') return json(res, 200, agent.role === 'engineer' || agent.role === 'launcher' ? { decision: 'block', reason: 'HQ: configuration changes are not allowed' } : {})
@@ -96,15 +133,21 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
       if (!modAlive && pend.length && !(agent.takeover_locked_until && agent.takeover_locked_until > t)) { const b = nextBatchFor(agent); if (b) { run('UPDATE batches SET method = ?, submitted_at = ?, received_at = ? WHERE id = ?', 'stop_hook', t, t, b.id); return json(res, 200, { decision: 'block', reason: `HQ message batch ${b.id}:\n${b.text}` }) } } }
     return json(res, 200, ctx.length ? { hookSpecificOutput: { hookEventName: ev, additionalContext: ctx.join('\n') } } : {})
   }
-  if (ev === 'Notification') {
-    const nt = String(body.notification_type ?? '')
+  if (ev === 'Notification') { // Bug 62: exact names. elicitation_response and _complete mean a dialog ended, and quota_auto_resume_fired that Claude Code carries on
+    const nt = String(body.notification_type ?? ''), who = agent.display_name ?? agent.id
     if (nt === 'permission_prompt' && /plan/i.test(String(body.message ?? ''))) { /* gate open; not stuck */ }
-    else if (nt === 'permission_prompt' || nt.startsWith('elicitation') || nt === 'agent_needs_input') { update(agent.id, { status: 'blocked' }); attention('dialog', `${agent.display_name ?? agent.id}: ${trim(body.message, 160)}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
-    else if (nt.startsWith('quota_auto_resume')) { update(agent.id, { status: 'paused', paused_reason: nt }); attention('usage_limit', `${agent.display_name ?? agent.id}: ${nt} ${trim(body.message, 160)}`, { agentId: agent.id }) }
+    else if (DIALOGS.has(nt)) { update(agent.id, { status: 'blocked' }); attention('dialog', `${who}: ${trim(body.message, 160)}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
+    else if (nt === 'quota_auto_resume_stale' || nt === 'quota_auto_resume_disabled') {
+      update(agent.id, { status: 'paused', paused_reason: nt }); attention('usage_limit', `${who}: ${trim(body.message, 160)}`, { agentId: agent.id })
+    } else if (nt === 'quota_auto_resume_fired') {
+      if (agent.status === 'paused') update(agent.id, { status: 'working' })
+      if (agent.paused_reason?.startsWith('quota_auto_resume')) update(agent.id, { paused_reason: null })
+      resolveKind('usage_limit', agent.id)
+    }
     return json(res, 200, {})
   }
   if (ev === 'StopFailure') { attention('api_error', `${agent.display_name ?? agent.id}: turn ended with an API error: ${trim(body.error ?? body, 200)}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
-  if (ev === 'SessionEnd' && !cleared) revokeToken(agent.id) // the session is over: its token is no good to anyone now
+  if (ev === 'SessionEnd' && !cleared) { revokeToken(agent.id); resolveKind('dialog', agent.id) } // the session is over: its token is no good to anyone now, and it has no dialog
   if (ev === 'SessionEnd' && !cleared && !agent.fresh_start_at && agent.role === 'engineer' && agent.ticket_id) { const tk = getTicket(agent.ticket_id); if (tk && !['pr_ready', 'pr_open', 'merged', 'cancelled'].includes(tk.status)) attention('engineer_exited', `${agent.display_name ?? agent.id} exited with ticket ${tk.key} in status ${tk.status}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
   return json(res, 200, {})
 }

@@ -35,8 +35,9 @@ export function LaunchBtn({ all, repo, p, open, setOpen }: { all: State; repo: a
 }
 
 /** The live preview: the app HQ runs from the repo's checkout (normally main), in a frame, with its server output a tab away. */
-export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed }: {
-  all: State; p: any; repo: any; prefs: Prefs; setPrefs: (p: Partial<Prefs>, save?: boolean) => void; ws: WebSocket | null; feed: (id: string, cb: (d: string) => void) => () => void }) {
+export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo }: {
+  all: State; p: any; repo: any; prefs: Prefs; setPrefs: (p: Partial<Prefs>, save?: boolean) => void; ws: WebSocket | null; feed: (id: string, cb: (d: string) => void) => () => void
+  onRepo: (id: string) => void }) {
   const [picked, setTab] = useState<'app' | 'server' | 'claude'>('app')
   const [reloads, setReloads] = useState(0)
   const can = runnable(p), helper = helperOn(p) ? p.helper_agent_id : null
@@ -77,7 +78,7 @@ export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed }: {
       {/* The frame stays mounted behind the Server tab, so switching tabs doesn't reload the app. */}
       <div className={`absolute inset-0 ${tab === 'app' ? '' : 'invisible'}`}>
         {running && p.frameable !== 0 ? <Frame key={`${p.started_at}-${reloads}`} url={p.url} phone={prefs.device === 'phone'} title={`${repo.name} preview`} />
-          : <Notice p={p} repo={repo} can={can} start={start} toServer={() => setTab('server')} toClaude={() => setTab('claude')} />}
+          : <Notice p={p} repo={repo} can={can} start={start} toServer={() => setTab('server')} toClaude={() => setTab('claude')} onRepo={onRepo} />}
       </div>
       {tab === 'server' && (stopped ? <div className="p-4 text-sm text-zinc-500">Not running. Start it to see its output here.</div>
         : <AgentTerminal key={p.started_at} agentId={`preview:${p.id}`} ws={ws} feed={feed} />)}
@@ -89,8 +90,21 @@ export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed }: {
 /** " from T1's version" when the Launch helper works from a ticket (Try it before any start steps, Bug 46). */
 const fromTicket = (p: any): string => p.helper_ticket_key ? ` from ${p.helper_ticket_key}'s version` : ''
 
+/** A project with no files (Bug 67): nothing to start, and no Claude to ask. If it sits inside another repo, that's probably the one that was meant. */
+function NoFiles({ repo, onRepo }: { repo: any; onRepo: (id: string) => void }) {
+  const [around, setAround] = useState<{ path: string; name: string; repoId: string | null } | null>(null)
+  useEffect(() => { let gone = false; api(`repos/${repo.id}/around`, {}).then((r) => { if (!gone) setAround(r.around) }, () => {}); return () => { gone = true } }, [repo.id])
+  return <>
+    <div>{repo.name} has no files yet, so there's nothing to start.</div>
+    {around ? <><div className="text-xs">Its folder is inside {around.name}, which is a repo of its own.</div>
+      <ActBtn primary label={around.repoId ? `Open ${around.name}` : `Add ${around.name} to HQ`} busyLabel="Opening…" run={() => api('repos', { path: around.path }).then((r) => onRepo(r.id))} /></>
+      : <div className="text-xs text-zinc-500">Tell the TPM what to build. Once something is merged, Launch can start it.</div>}
+  </>
+}
+
 /** What the App tab says when there's no page to show. */
-function Notice({ p, repo, can, start, toServer, toClaude }: { p: any; repo: any; can: boolean; start: () => Promise<unknown>; toServer: () => void; toClaude: () => void }) {
+function Notice({ p, repo, can, start, toServer, toClaude, onRepo }: { p: any; repo: any; can: boolean; start: () => Promise<unknown>; toServer: () => void; toClaude: () => void
+  onRepo: (id: string) => void }) {
   const asking = useLaunching(repo.id)
   const server = <button className="text-indigo-300 underline" onClick={toServer}>Server output</button>
   const fix = <ActBtn label="Ask Claude to fix it" busyLabel="Asking…" run={() => api(`previews/${p.id}/setup`, { why: 'fix' })}
@@ -105,7 +119,7 @@ function Notice({ p, repo, can, start, toServer, toClaude }: { p: any; repo: any
       {!p.port_holders?.length && <ActBtn label={`Start ${repo.name}`} busyLabel="Starting…" primary run={start} />}
       <div className="text-xs text-zinc-500">Runs <code className="break-all text-zinc-300">{p.command ?? recipeSummary(p.recipe)}</code> in {p.path}.</div>
       {p.port_holders?.length ? <PortBox p={p} repo={repo} /> : p.detail && <div className="text-xs text-amber-300">{p.detail}</div>}
-    </> : asking ? <div>Getting Claude ready to work out how to start {repo.name}…</div> : <>
+    </> : asking ? <div>Getting Claude ready to work out how to start {repo.name}…</div> : repo.empty ? <NoFiles repo={repo} onRepo={onRepo} /> : <>
       <div>HQ doesn't know how to start {repo.name} yet.</div>
       <ActBtn label="Ask Claude to work it out" busyLabel="Asking…" primary run={() => api(`previews/${p.id}/setup`, {})} />
       <div className="text-xs text-zinc-500">You OK its steps once; HQ runs them every time after. Or set your own command with ⚙.</div>

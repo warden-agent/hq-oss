@@ -4,7 +4,7 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { GH_CONFIG_DIR, GITHUB_ACCOUNT } from './config.ts'
 import { attention, resolveKind } from './attention.ts'
-import { findRepos, repoRoot, syncCheckout, type RepoCandidate } from './reposync.ts'
+import { findRepos, repoAround, repoRoot, syncCheckout, type RepoCandidate } from './reposync.ts'
 import { canPush } from './github.ts'
 import { pickFolder } from './picker.ts'
 import { one, run, now } from './db.ts'
@@ -18,13 +18,25 @@ export const git = (cwd: string, ...args: string[]): Promise<string> => new Prom
   execFile('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd }, (err, out, errOut) => err ? reject(new Error(errOut || err.message)) : resolve(out.trim())))
 
 const syncing = new Map<string, Promise<Repo>>() // one sync per repo at a time (git index/ref locks)
+/** The first ticket number free of what's in the folder: `refs` are hq/ branches (hq/<feature>/T-03-add-it), `dirs` worktree folders (T-03). Clear and Remove from HQ leave those
+ *  behind, and a repo added again would otherwise start at 1, where launchEngineer picks up a folder or branch of the same name. */
+export function firstFreeTicket(refs: string[], dirs: string[]): number {
+  const nums = [...refs.map((r) => /^[a-z]+-?(\d+)/i.exec(r.split('/').at(-1) ?? '')?.[1]), ...dirs.map((d) => /^[a-z]+-?(\d+)$/i.exec(d)?.[1])]
+  return 1 + Math.max(0, ...nums.map(Number).filter((n) => Number.isFinite(n)))
+}
+async function nextFree(root: string): Promise<number> {
+  const refs = await git(root, 'for-each-ref', '--format=%(refname)', 'refs/heads/hq', 'refs/remotes/origin/hq').catch(() => ''), wt = path.join(root, '.claude', 'worktrees')
+  return firstFreeTicket(refs.split('\n').filter(Boolean), fs.existsSync(wt) ? fs.readdirSync(wt) : [])
+}
+/** The repo HQ has at this folder (a repo's top, as git gives it). */
+export const repoAt = (root: string): Repo | undefined => one<Repo>('SELECT * FROM repos WHERE path = ?', root)
 export async function addRepo(p: string, name?: string): Promise<Repo> {
   const root = await repoRoot(path.resolve(p.trim().replace(/^~(?=$|\/)/, process.env.HOME ?? '')))
-  const existing = one<Repo>('SELECT * FROM repos WHERE path = ?', root); if (existing) return syncRepo(existing.id)
+  const existing = repoAt(root); if (existing) return syncRepo(existing.id)
   if (!(await git(root, 'rev-parse', '--verify', '--quiet', 'HEAD').catch(() => ''))) await startCommit(root, 'Start') // worktrees need a commit
   const r = { id: id('repo'), name: name ?? path.basename(root), path: root, default_branch: 'main' }
-  run('INSERT INTO repos(id, name, path, remote, default_branch, context_doc_path, network_allowlist, ignore_patterns, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
-    r.id, r.name, r.path, null, 'main', null, '[]', '[]', now())
+  run('INSERT INTO repos(id, name, path, remote, default_branch, context_doc_path, network_allowlist, ignore_patterns, created_at, next_ticket) VALUES (?,?,?,?,?,?,?,?,?,?)',
+    r.id, r.name, r.path, null, 'main', null, '[]', '[]', now(), await nextFree(root))
   patch('repo', r.id, getRepo(r.id) as unknown as Record<string, unknown>)
   return syncRepo(r.id)
 }
@@ -36,19 +48,32 @@ export async function startCommit(root: string, message: string, email = 'hq@loc
   const c = await git(root, ...who, 'commit-tree', await git(root, 'hash-object', '-t', 'tree', '/dev/null'), '-m', message)
   await git(root, 'update-ref', `refs/heads/${branch}`, c, '') // '' = only if the branch still has no commit
 }
-/** Where a folder dialog starts, and where a new project goes unless the user picks elsewhere: next to the last repo added. */
-export function defaultParent(): string {
+/** Where a folder dialog starts, and where a new project goes unless the user picks elsewhere: next to the last repo added, but
+ *  never inside another repo (Bug 65: a project made inside a clone must not pull the next one in too). A home folder that is
+ *  itself a repo (dotfiles) doesn't count: stepping out of it would land in /Users. */
+export async function defaultParent(): Promise<string> {
   const last = repos().at(-1); const home = process.env.HOME ?? '/'
-  return [last && path.dirname(last.path), path.join(home, 'Documents')].find((d): d is string => !!d && fs.existsSync(d)) ?? home
+  let d = [last && path.dirname(last.path), path.join(home, 'Documents')].find((x): x is string => !!x && fs.existsSync(x)) ?? home
+  const top = fs.existsSync(home) ? fs.realpathSync(home) : home
+  for (let up = await repoAround(d); up && up !== top; up = await repoAround(d)) d = path.dirname(up)
+  return d
+}
+/** The repo a project's folder sits inside, if any (Bug 67: a project made inside a clone by mistake has no files, and the code is one level up). A home folder
+ *  that is itself a repo (dotfiles) doesn't count. */
+export async function repoAroundProject(repoId: string): Promise<{ path: string; name: string; repoId: string | null } | null> {
+  const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
+  const up = await repoAround(path.dirname(repo.path)), home = process.env.HOME ?? '/'
+  if (!up || up === (fs.existsSync(home) ? fs.realpathSync(home) : home)) return null
+  const known = repoAt(up); return { path: up, name: known?.name ?? path.basename(up), repoId: known?.id ?? null }
 }
 /** New project's Choose…: the folder dialog alone (the folder the project goes in). */
 export async function pickParent(start: string): Promise<{ path: string } | { cancelled: true }> {
-  const picked = await pickFolder(fs.existsSync(start) ? start : defaultParent(), undefined, 'Choose where to make the new project')
+  const picked = await pickFolder(fs.existsSync(start) ? start : await defaultParent(), undefined, 'Choose where to make the new project')
   return picked ? { path: picked } : { cancelled: true }
 }
 /** "Add repo…": native folder dialog, then the repo in (or directly inside) the chosen folder. Several found → the UI asks. */
 export async function pickRepo(): Promise<Repo | { cancelled: true } | { choose: RepoCandidate[]; in: string }> {
-  const picked = await pickFolder(defaultParent()); if (!picked) return { cancelled: true }
+  const picked = await pickFolder(await defaultParent()); if (!picked) return { cancelled: true }
   const found = await findRepos(picked)
   if (found.length === 1) return addRepo(found[0]!.path)
   if (found.length > 1) return { choose: found, in: picked }
@@ -66,6 +91,7 @@ export function syncRepo(repoId: string): Promise<Repo> {
     if (r.ok && r.kind === 'github' && r.slug) { // decides local-only (records.ts usesGithub); GitHub couldn't be asked → keep what was known
       const cp = await canPush(r.slug, ghOpts()); if (cp !== null) fields.can_push = cp ? 1 : 0
     }
+    if (!getRepo(repoId)) return repo // removed from HQ during the fetch
     const keys = Object.keys(fields); run(`UPDATE repos SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => fields[k]!), repoId)
     patch('repo', repoId, fields)
     emit({ agentId: null, source: 'system', kind: `repo.sync.${r.status}`, payload: { repo: repo.name, detail: r.detail } })
@@ -76,6 +102,8 @@ export function syncRepo(repoId: string): Promise<Repo> {
   })().finally(() => syncing.delete(repoId))
   syncing.set(repoId, job); return job
 }
+/** Resolves once a sync under way is over. */
+export const syncDone = (repoId: string): Promise<unknown> => (syncing.get(repoId) ?? Promise.resolve()).catch(() => {})
 /** Tells the user when a repo's work turns local-only (HQ can't push to it) or goes back to PRs. */
 function noticePushChange(before: Repo, after: Repo): void {
   const kind = `repo_local:${after.id}`

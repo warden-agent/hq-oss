@@ -11,7 +11,7 @@ process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-gate-'))
 const { migrate, run, one, q, setSetting } = await import('./db.ts')
 migrate()
 setSetting('gate_timeout_s', 65) // held calls give up after 5s, so a failing test can't keep the run alive for 29 minutes
-const { onExitPlanMode, onPostExitPlanMode, answerReview, heldCount } = await import('./gate.ts')
+const { onExitPlanMode, onPostExitPlanMode, answerReview, heldCount, pageReviews } = await import('./gate.ts')
 
 /** A hook response the gate can hold: `answer` resolves with what HQ sends back; `drop` is the client hanging up. */
 function hookCall() {
@@ -125,4 +125,22 @@ test('migration 6 closes older open rounds left by the old gate, and only those'
   assert.deepEqual(q<any>("SELECT r.round, r.status, r.closed_reason, p.verdict FROM review_requests r JOIN plan_revisions p ON p.id = r.plan_revision_id WHERE r.ticket_id = 't2' ORDER BY r.round").map((r) => [r.round, r.status, r.closed_reason, r.verdict]),
     [[1, 'abandoned', 'superseded', 'superseded'], [2, 'answered', null, 'revise'], [3, 'open', null, null]])
   assert.equal(one<any>("SELECT value FROM meta WHERE key = 'schema_version'")!.value, '6')
+})
+
+test('the page gets a plan\'s text only while its review is open, and newer closed reviews never push an open one out', () => {
+  run("INSERT INTO tickets(id, feature_id, key, slug, title, status, created_at, updated_at) VALUES ('tp', 'f1', 'APP-9', 'old', 'Old', 'plan_review', ?, ?)", now, now)
+  const add = (n: number, status: string, at: number) => {
+    run('INSERT INTO plan_revisions(id, ticket_id, agent_id, round, plan_text, plan_hash, submitted_at, verdict) VALUES (?,?,?,?,?,?,?,?)', `q${n}`, 'tp', 'e1', n, `long plan ${n}`, `g${n}`, at,
+      status === 'open' ? null : 'revise')
+    run('INSERT INTO review_requests(id, ticket_id, plan_revision_id, round, status, opened_at) VALUES (?,?,?,?,?,?)', `Q${n}`, 'tp', `q${n}`, n, status, at)
+  }
+  add(0, 'open', now - 1_000_000) // older than everything else
+  for (let n = 1; n <= 60; n++) add(n, 'answered', now + 1_000_000 + n) // newer than everything else
+  const got = pageReviews(), open = got.filter((r) => r.status === 'open'), closed = got.filter((r) => r.status !== 'open')
+  assert.equal(got.length, 50)
+  assert.deepEqual(open.map((r) => r.id).sort(), q<any>("SELECT id FROM review_requests WHERE status = 'open'").map((r) => r.id).sort())
+  const mine = got.find((r) => r.id === 'Q0')!; assert.deepEqual([mine.plan_text, mine.revises_used, mine.agent_id, mine.verdict], ['long plan 0', 60, 'e1', null])
+  for (const r of open) assert.equal(typeof r.plan_text, 'string')
+  assert.ok(closed.length > 40); for (const r of closed) assert.equal(r.plan_text, null)
+  assert.deepEqual([closed[0]!.id, closed[0]!.verdict, 'edited_plan_text' in closed[0]!], ['Q60', 'revise', false]) // newest first, as before
 })

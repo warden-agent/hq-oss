@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { emit } from './events.ts'
-import { sleep } from './util.ts'
+import { real, sleep } from './util.ts'
 
 type Projects = Record<string, Record<string, unknown>>
 const cfgPath = () => path.join(os.homedir(), '.claude.json')
@@ -38,9 +38,10 @@ export async function withConfigLock<T>(fn: () => T, waitMs = 5000): Promise<T> 
 }
 
 /** Make sure Claude Code won't show its trust dialog in `dir`. Writes ~/.claude.json only when it isn't trusted yet; throws
- *  when it can't, because an agent launched into the dialog would sit there unseen. */
+ *  when it can't, because an agent launched into the dialog would sit there unseen. Claude Code asks about the real path, and a
+ *  Mac's /tmp is a link, so a path through a link would be trusted and asked about anyway (Bug 59). */
 export async function ensureTrusted(dir: string, waitMs = 5000): Promise<void> {
-  dir = path.resolve(dir)
+  dir = real(path.resolve(dir))
   try { if (isTrusted(readProjects(), dir)) return } catch (e) { throw new Error(`can't read ~/.claude.json to trust ${dir}: ${(e as Error).message}`) }
   await withConfigLock(() => {
     const file = cfgPath(); const cfg = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown> // re-read under the lock

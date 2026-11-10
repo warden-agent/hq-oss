@@ -1,4 +1,5 @@
 // The briefings HQ writes for new sessions: the project's TPM (Bug 52) and an engineer taking over a ticket, from HQ's records.
+import { fixWords } from './conflicts.ts'
 import { unmergedDeps } from './readiness.ts'
 import type { Message } from './delivery.ts'
 import type { Feature, Repo, Ticket } from './records.ts'
@@ -15,7 +16,7 @@ function standing(t: Ticket, all: Ticket[]): string {
     case 'escalated': return 'escalated to the user'
     case 'pr_ready': return t.pr_state === 'local' ? 'finished; waits for the user to merge it' : 'finished and pushed; its PR still needs opening'
     case 'pr_open': return `finished; PR #${t.pr_number} waits for the user's merge`
-    case 'resolving': return 'its engineer is merging main in to fix conflicts'
+    case 'resolving': return `its engineer is ${fixWords(t.fixing, 'main').ing}`
     default: return t.status
   }
 }
@@ -52,10 +53,10 @@ export function tpmPrompt(repo: Repo, o: { ws: string; previous: string | null; 
 /** What HQ read from git about a ticket's branch for the engineer taking over (each part already cut to size). */
 export type GitFacts = { status: string; diffStat: string; log: string }
 /** The launch prompt of an engineer taking over a ticket after a fresh start: the goal, the last engineer's note, what git
- *  shows, and the approved plan or HQ's conflict instructions. Not the update_handoff log: get_ticket has it if needed. */
+ *  shows, and the approved plan or HQ's instructions for what it went back for (conflicts or its tests, Bug 84). Not the update_handoff log: get_ticket has it if needed. */
 export function engineerResumePrompt(t: Ticket, o: { feature: string; worktree: string; base: string; note: string | null; git: GitFacts; plan: string | null; fix: string | null }): string {
   const where = t.status === 'planning' ? 'Its plan was not written or not approved yet: finish exploring, write the plan and call ExitPlanMode.'
-    : o.fix ? 'It was merging main in to fix conflicts; HQ\'s instructions for that are below.'
+    : o.fix ? `It was ${fixWords(t.fixing, o.base).ing}; HQ's instructions for that are below.`
     : 'Its plan is approved (below) and the work is under way: carry on from where the last engineer stopped. Don\'t redo finished steps.'
   return `You are taking over ticket ${t.key} (${t.size}): ${t.title}
 Feature: ${o.feature}
@@ -79,5 +80,5 @@ ${o.git.log || '(none)'}
 
 Changed files since ${o.base}:
 ${o.git.diffStat || '(none)'}
-${o.plan ? `\n## Approved plan\n${o.plan}\n` : ''}${o.fix ? `\n## HQ's conflict instructions\n${o.fix}\n` : ''}`
+${o.plan ? `\n## Approved plan\n${o.plan}\n` : ''}${o.fix ? `\n## HQ's instructions\n${o.fix}\n` : ''}`
 }

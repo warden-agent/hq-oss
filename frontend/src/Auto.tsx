@@ -1,7 +1,7 @@
 // Auto mode on screen: the switch in the top bar, the dialog that says what happens the moment it goes on, the banner when it stops,
 // waits or finishes, and "Do the rest automatically" at every stop (it opens the same dialog). HQ does the work (backend auto.ts).
 import { useEffect, useState } from 'react'
-import { api, errText, type State } from './api'
+import { api, askUntilAnswered, errText, type State } from './api'
 import { DO_REST, OPEN_SUMMARY, openSummary, undoConfirm, useBusy } from './board'
 import { Md } from './ui'
 import { yourTurn } from './needs.ts'
@@ -46,14 +46,16 @@ function autoPreview(all: State, repoId: string): string[] {
 /** Turning auto mode on: what happens right now, and how HQ will test. */
 export function AutoDialog({ all }: { all: State }) {
   const [repoId, setRepoId] = useState<string | null>(null), [check, setCheck] = useState<{ custom: string | null; found: string | null; sandbox: string | null } | null>(null)
-  const [cmd, setCmd] = useState(''), [busy, setBusy] = useState(false), [err, setErr] = useState('')
+  const [cmd, setCmd] = useState(''), [busy, setBusy] = useState(false), [err, setErr] = useState(''), [away, setAway] = useState(false)
   const repo = all.repos.find((r) => r.id === repoId)
-  const close = () => { setRepoId(null); setCheck(null); setErr('') }
+  const close = () => { setRepoId(null); setCheck(null); setErr(''); setAway(false) }
   useEffect(() => {
-    const open = (e: Event) => { const id = (e as CustomEvent<string>).detail; setRepoId(id); setCmd(''); setCheck(null); api(`repos/${id}/auto-check`, {}).then((c) =>
-      { setCheck(c); setCmd(c.custom ?? '') }).catch((e2: unknown) => setErr(errText(e2 as Error))) }
+    const open = (e: Event) => { setRepoId((e as CustomEvent<string>).detail); setCmd(''); setCheck(null); setErr(''); setAway(false) }
     window.addEventListener(OPEN_AUTO, open); return () => window.removeEventListener(OPEN_AUTO, open)
   }, [])
+  // Bug 64: HQ may be restarting as the box opens. Closing the box stops the asking, so a late answer can't land on the next open. What was typed meanwhile stays.
+  useEffect(() => repoId ? askUntilAnswered(`repos/${repoId}/auto-check`, { away: setAway, answer: (c) => { setCheck(c); setCmd((t) => t || (c.custom ?? '')) },
+    refused: (e) => setErr(errText(e)) }) : undefined, [repoId])
   useEffect(() => {
     if (!repoId) return
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) close() }
@@ -82,6 +84,7 @@ export function AutoDialog({ all }: { all: State }) {
       {noTests && <div className="text-amber-300/80">HQ found no tests here, so it will build but not merge. The TPM can add tests, or write a command above.</div>}
       {repo.kind === 'github' && repo.can_push !== 0 && <div>Merges go to {repo.default_branch} on GitHub as {all.defaults?.github_account ?? 'the HQ account'}.</div>}
       {!refused && <div>Your computer stays awake during a run, but closing a laptop's lid still sleeps it.</div>}
+      {away && <div role="status" className="text-amber-300/80">Can't reach HQ. It may be restarting. Trying again…</div>}
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex flex-wrap justify-end gap-1.5"><button type="button" className="btn" onClick={close} disabled={busy}>Cancel</button>
         <button type="submit" className="btn btn-primary" autoFocus disabled={busy || !check || !!refused}>{busy ? 'Saving…' : repo.auto_mode ? 'Save' : 'Turn on auto'}</button></div>
@@ -90,8 +93,8 @@ export function AutoDialog({ all }: { all: State }) {
 }
 
 function SummaryDialog({ run, name, onClose }: { run: any; name: string; onClose: () => void }) {
-  const [busy, go] = useBusy()
-  const undo = () => go(async () => { if (await undoConfirm(name)) { await api(`auto-runs/${run.id}/undo`, {}); onClose() } })
+  const [busy, go] = useBusy(), [err, setErr] = useState('') // shown in this box: the page's error strip is behind it
+  const undo = () => go(async () => { setErr(''); if (await undoConfirm(name)) await api(`auto-runs/${run.id}/undo`, {}).then(onClose, (e: Error) => setErr(errText(e))) })
   useEffect(() => { // busy: Undo's are-you-sure is up, and its Escape is only for that
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onClose() }
     document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
@@ -102,6 +105,7 @@ function SummaryDialog({ run, name, onClose }: { run: any; name: string; onClose
       className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-300 shadow-xl">
       <div className="break-words text-sm font-medium text-zinc-100">What auto mode did in {name}</div>
       <div className="break-words"><Md text={run.summary ?? ''} /></div>
+      {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex flex-wrap justify-end gap-1.5">{(run.status === 'finished' || run.status === 'off') && run.start_sha && run.end_sha !== run.start_sha
         && <button className="btn" disabled={busy} title="Put main back where this run started. The work stays on its branches." onClick={undo}>{busy ? 'Undoing…' : 'Undo this run'}</button>}
         <button className="btn btn-primary" autoFocus disabled={busy} onClick={onClose}>Close</button></div>
@@ -112,6 +116,7 @@ function SummaryDialog({ run, name, onClose }: { run: any; name: string; onClose
 export function AutoBanner({ all, repo }: { all: State; repo: any }) {
   const [busy, run] = useBusy(), [shownId, setShownId] = useState<string | null>(null)
   const done = finishedNotice(all, repo.id), last = latestRun(all, repo.id), shown = runsOf(all, repo.id).find((r) => r.id === shownId)
+  const proposed = repo.test_cmd_proposed ? JSON.parse(repo.test_cmd_proposed) as { now: string; left_out: string } : null
   useEffect(() => {
     const open = (e: Event) => { if ((e as CustomEvent<string>).detail === repo.id) setShownId(latestRun(all, repo.id)?.id ?? null) }
     window.addEventListener(OPEN_SUMMARY, open); return () => window.removeEventListener(OPEN_SUMMARY, open)
@@ -126,6 +131,9 @@ export function AutoBanner({ all, repo }: { all: State; repo: any }) {
       <button className="btn-sm" disabled={busy} onClick={() => run(() => api(`repos/${repo.id}/auto`, { on: false }))}>Turn off</button></>)}
     {!repo.auto_stopped_why && repo.auto_waiting && row('border-amber-500/40 bg-amber-950/30 text-amber-200', repo.auto_waiting,
       /^No tests/.test(repo.auto_waiting) ? <button className="btn-sm" onClick={() => openAuto(repo.id)}>Add a test command</button> : null)}
+    {proposed && row('border-amber-500/40 bg-amber-950/30 text-amber-200', `A repair wants to change the test command to: ${proposed.now}. It leaves out: ${proposed.left_out}`, <>
+      <button className="btn-sm" disabled={busy} onClick={() => run(() => api(`repos/${repo.id}/test-cmd-answer`, { use: true }))}>Use it</button>
+      <button className="btn-sm" disabled={busy} onClick={() => run(() => api(`repos/${repo.id}/test-cmd-answer`, { use: false }))}>Keep the old one</button></>)}
     {done && last && row('border-emerald-500/40 bg-emerald-950/30 text-emerald-200', `Auto mode finished in ${repo.name}.`, <>
       <button className="btn-sm" onClick={() => openSummary(repo.id)}>Read the summary</button>
       <button className="btn-sm" disabled={busy} onClick={() => run(() => api(`attention/${done.id}/resolve`, {}))}>Dismiss</button></>)}

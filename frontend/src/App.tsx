@@ -4,13 +4,13 @@ import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
 import { AttentionList, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
 import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, hasParked, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel,
-  openSummary, useBoard, type Board, type Pop, type PopKind } from './board'
+  removeConfirm, openSummary, useBoard, type Board, type Pop, type PopKind } from './board'
 import { ActBtn, ErrorBar, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
 import { LaunchBtn, PreviewPane } from './Preview'
-import { clampH, clampW, rightWidth, usePreviewPrefs } from './previewPrefs'
+import { clampH, clampW, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
 import { useAlerts } from './alerts'
 import { AlertsLine } from './AlertsLine'
-import { goodNews, keysText, yourTurn, type Need } from './needs.ts'
+import { goodNews, keysText, splitNeeds, yourTurn, type Need } from './needs.ts'
 import { AutoBanner, AutoDialog, AutoSwitch, DoRestBtn, LastRunBtn } from './Auto'
 
 type Tab = 'agent' | 'ticket' | 'messages' | 'events'
@@ -93,7 +93,7 @@ export default function App() {
   const state = useMemo(() => all && forRepo(all, repoNow?.id ?? null), [all, repoNow?.id]) // each repo is its own slate
   const board = useMemo(() => state ? buildBoard(state, now, state.repos.find((r) => r.id === repoNow?.id) ?? null) : null, [state, now, repoNow?.id])
   const showNeed = useRef<(n: Need) => void>(() => {}) // set below, once the board is known
-  useAlerts(all, (n) => showNeed.current(n))
+  const needs = useAlerts(all, (n) => showNeed.current(n))
   // A clicked notification opens its box when it's in the repo on screen; another repo's is only named (switching parks agents).
   useEffect(() => {
     showNeed.current = (n: Need) => {
@@ -115,7 +115,7 @@ export default function App() {
   useEffect(() => { if (pvMissing && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'snapshot' })) }, [pvMissing, ws])
   const connText = conn === 'token' ? "HQ didn't accept this page's token. Open the URL the backend printed (it carries the token)." : conn === 'down' ? "Can't reach the HQ backend. Retrying…" : conn === 'connecting' && state ? 'Reconnecting to HQ…' : ''
   if (!state || !board) return <div className={`p-8 ${conn === 'token' || conn === 'down' ? 'text-rose-300' : 'text-zinc-400'}`}>{connText || 'Connecting to HQ…'}</div>
-  const repo = repoNow
+  const repo = repoNow, { here, elsewhere } = splitNeeds(needs, repo?.id ?? null)
   /** Picking another repo stops the other repos' apps (after HQ's stop dialog, which can stop the old repo's agents too) and is
    *  remembered across reloads. */
   const switchRepo = async (id: string) => {
@@ -124,6 +124,11 @@ export default function App() {
     // Coming back: work parked when the user left picks up from its handoff notes, unless they chose to press Resume themselves.
     const clearing = !!all!.repos.find((r) => r.id === id)?.clearing_at // its work is being archived, not picked up
     if (hasParked(all!, id) && !clearing && (all!.settings.after_fresh_start ?? all!.defaults.after_fresh_start) !== 'wait') api(`repos/${id}/resume`, {}).catch((e) => showError(errText(e)))
+  }
+  /** A project removed from HQ. Not switchRepo: there's nothing left to park, and the project it lands on wasn't picked, so its parked work stays parked. */
+  const removed = (id: string, next: string | null) => {
+    setRepoId(next); try { if (next) localStorage.setItem(REPO_KEY, next); else localStorage.removeItem(REPO_KEY) } catch { /* private window */ }
+    setSel({ node: null, agentId: null, ticketId: null }); setPop(null); forgetPrefs(id)
   }
   const selAgent = state.agents.find((a) => a.id === sel.agentId) ?? null, selTicket = state.tickets.find((t) => t.id === sel.ticketId) ?? null
   const showPanel = (open: boolean, tab?: Tab) => { setPanel((p) => ({ open, tab: tab ?? p.tab })); saveOpen(open) }
@@ -139,7 +144,6 @@ export default function App() {
   const pvOpen = !!repo && !!pv && prefs.open, pvBelow = prefs.dock === 'bottom'
   const tabLabel: Record<Tab, string> = { agent: `Agent${selAgent ? `: ${selAgent.display_name ?? selAgent.id}` : ''}`, ticket: `Ticket${selTicket ? `: ${selTicket.key}` : ''}`, messages: 'Messages', events: 'Events' }
   return <BoardCtx.Provider value={{ state, repo, pop, setPop, focus, selected: sel.node }}>
-    <ErrorBar />
     {updated && <UpdatedBar />}
     <StopDialog />
     <AutoDialog all={all!} />
@@ -148,9 +152,10 @@ export default function App() {
       <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-zinc-800 px-3 py-1.5 text-xs">
         <h1 className="font-semibold tracking-wide text-zinc-400">HQ <span className="text-zinc-600">· {live(state)} live
           {live(all!) > live(state) ? ` (+${live(all!) - live(state)} in other repos)` : ''}</span></h1>
-        <RepoBar state={state} all={all!} repo={repo} onRepo={switchRepo} now={now} />
+        <RepoBar state={state} all={all!} repo={repo} onRepo={switchRepo} onRemoved={removed} now={now} />
         {connText && <span className="text-rose-300" role="status">{connText}</span>}
         <ParallelLimit state={all!} /* the limit counts engineers in every repo */ />
+        <TestLimit state={all!} />
         {repo && <AutoSwitch all={all!} repo={repo} />}
         {repo && <LastRunBtn all={all!} repo={repo} />}
         <Sessions state={state} repo={repo} />
@@ -158,16 +163,18 @@ export default function App() {
         <AgentsMenu state={state} selected={sel.agentId} onPick={pickAgent} />
         {repo && <LaunchBtn all={all!} repo={repo} p={pv} open={prefs.open} setOpen={(open) => setPrefs({ open })} />}
         <button className={`btn ${panel.open ? 'btn-primary' : ''}`} title="Show or hide the panel on the right" onClick={() => showPanel(!panel.open)}>Panel</button>
-        <Bell state={state} board={board} />
+        <Elsewhere all={all!} repo={repo} needs={elsewhere} onRepo={switchRepo} />
+        <Bell state={state} board={board} count={here.length} />
       </header>
       {repo && <AutoBanner all={all!} repo={repo} />}
+      <ErrorBar />
       </div>
       <div className="grid min-h-0" style={{ gridTemplateColumns: panel.open ? `minmax(0,1fr) 6px ${panelW}px` : 'minmax(0,1fr)' }}>
         <main className="grid min-h-0 min-w-0" style={!pvOpen ? { gridTemplateRows: 'minmax(0,1fr)' } : pvBelow ? { gridTemplateRows: `minmax(0,1fr) 6px ${clampH(prefs.h)}px` } : { gridTemplateColumns: `minmax(0,1fr) 6px ${clampW(prefs.w)}px` }}>
           <div className="min-h-0 min-w-0"><Graph nodes={board.nodes} edges={board.edges} fit={board.active} focus={focusReq} onSelect={selectNode} onPane={() => setPop(null)} /></div>
           {pvOpen && <><Splitter dir={pvBelow ? 'row' : 'col'} label="Resize preview" size={pvBelow ? clampH(prefs.h) : clampW(prefs.w)} def={pvBelow ? Math.round(window.innerHeight * 0.45) : rightWidth(prefs.device)}
             set={(n) => { const c = pvBelow ? clampH(n) : clampW(n); setPrefs(pvBelow ? { h: c } : { w: c }, false); return c }} save={(n) => setPrefs(pvBelow ? { h: n } : { w: n })} />
-            <PreviewPane all={all!} p={pv} repo={repo} prefs={prefs} setPrefs={setPrefs} ws={ws} feed={feed} /></>}
+            <PreviewPane all={all!} p={pv} repo={repo} prefs={prefs} setPrefs={setPrefs} ws={ws} feed={feed} onRepo={switchRepo} /></>}
         </main>
         {panel.open && <><Splitter dir="col" label="Resize panel" size={panelW} def={PANEL_DEFAULT} set={(w) => { const c = clampPanel(w); setPanelW(c); return c }} save={(w) => { try { localStorage.setItem(PANEL_KEY, String(w)) } catch { /* private window: width just isn't remembered */ } }} />
           <aside className="flex min-h-0 min-w-0 flex-col gap-2 p-2">
@@ -188,6 +195,7 @@ function applyPatch(s: State, m: { entity: string; id: string; patch: Record<str
     ask: 'asks', auto_run: 'autoRuns' } as Record<string, keyof State>)[m.entity]
   if (!key) return s
   const list = (s[key] as any[]) ?? []; const i = list.findIndex((x) => x.id === m.id)
+  if (m.entity === 'repo' && i < 0 && !m.patch?.name) return s // a late change to a project just removed from HQ
   let next: any[]
   if (m.patch === null) next = list.filter((x) => x.id !== m.id)
   else if (i >= 0) next = list.map((x) => x.id === m.id ? { ...x, ...m.patch } : x)
@@ -222,8 +230,9 @@ function Splitter({ dir, size, set, save, def, label }: { dir: 'col' | 'row'; si
   </div>
 }
 /** Repo picker, sync status, Sync, Clear… and + Project (New project…, Add repo…). */
-function RepoBar({ state, all, repo, onRepo, now }: { state: State; all: State; repo: any | null; onRepo: (id: string) => void; now: number }) {
-  const [busy, setBusy] = useState<null | 'pick' | 'add' | 'sync' | 'clear'>(null), [making, setMaking] = useState(false)
+function RepoBar({ state, all, repo, onRepo, onRemoved, now }: { state: State; all: State; repo: any | null; onRepo: (id: string) => void
+  onRemoved: (id: string, next: string | null) => void; now: number }) {
+  const [busy, setBusy] = useState<null | 'pick' | 'add' | 'sync' | 'clear' | 'remove'>(null), [making, setMaking] = useState(false)
   const [choices, setChoices] = useState<{ in: string; repos: { path: string; name: string; github: string | null }[] } | null>(null) // a picked folder held several repos
   const account = state.defaults.github_account ?? 'warden-agent'
   const addRepo = () => { if (busy) return; setBusy('pick'); setChoices(null); api('repos/pick', {}).then((r) => { if (r.choose) setChoices({ in: r.in, repos: r.choose }); else if (!r.cancelled) onRepo(r.id) }).catch((e) => showError(errText(e))).finally(() => setBusy(null)) }
@@ -232,6 +241,11 @@ function RepoBar({ state, all, repo, onRepo, now }: { state: State; all: State; 
   const clear = async () => {
     if (!repo || busy || !(await clearConfirm(all, repo))) return
     setBusy('clear'); await api(`repos/${repo.id}/clear`, {}).catch((e) => showError(errText(e))).finally(() => setBusy(null))
+  }
+  const remove = async () => {
+    if (!repo || busy || !(await removeConfirm(all, repo))) return
+    const next = all.repos.filter((r) => r.id !== repo.id).at(-1)?.id ?? null
+    setBusy('remove'); await api(`repos/${repo.id}/remove`, { landing: next }).then(() => onRemoved(repo.id, next), (e) => showError(errText(e))).finally(() => setBusy(null))
   }
   const noting = repo?.clearing_at ? state.agents.filter((a) => a.status !== 'exited' && a.fresh_start_at).length : 0
   const ago = (t: number) => { const m = Math.round((now - t) / 60_000); return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago` }
@@ -250,12 +264,15 @@ function RepoBar({ state, all, repo, onRepo, now }: { state: State; all: State; 
         Clearing…{noting ? ` ${noting} note${noting === 1 ? '' : 's'} to go` : ''}</span>
       : <button className="btn" onClick={() => void clear()} disabled={!!busy} title={`Clear ${repo.name}: archive and delete its board, and start fresh`}>Clear…</button>)}
     {making && <NewProjectDialog onClose={() => setMaking(false)} onMade={(id) => { setMaking(false); onRepo(id) }} />}
-    <div className="relative">{busy === 'pick' || busy === 'add' ? <button className="btn" disabled>{busy === 'pick' ? 'Choose a folder…' : 'Adding…'}</button>
-      : <Menu label="+ Project" align="left" title="Start a new project, or add a repo you already have">{(close) => <div className="flex w-64 flex-col gap-1 text-xs">
+    <div className="relative">{busy === 'pick' || busy === 'add' || busy === 'remove'
+      ? <button className="btn" disabled>{busy === 'pick' ? 'Choose a folder…' : busy === 'add' ? 'Adding…' : 'Removing…'}</button>
+      : <Menu label="+ Project" align="left" title="Start a new project, add a repo you already have, or take this one off HQ's list">{(close) => <div className="flex w-64 flex-col gap-1 text-xs">
         <button className="btn text-left" disabled={!!busy} onClick={() => { close(); setMaking(true) }}>
           New project…<div className="text-zinc-500">A new folder and repo, on this Mac or on GitHub too</div></button>
         <button className="btn text-left" disabled={!!busy} onClick={() => { close(); addRepo() }}>
-          Add repo…<div className="text-zinc-500">A folder that's already a git repo</div></button></div>}</Menu>}
+          Add repo…<div className="text-zinc-500">A folder that's already a git repo</div></button>
+        {repo && <button className="btn break-words text-left text-rose-300!" disabled={!!busy || !!repo.clearing_at} onClick={() => { close(); void remove() }}>
+          Remove {repo.name} from HQ…<div className="text-zinc-500">Takes it off this list. Its folder stays as it is</div></button>}</div>}</Menu>}
       {choices && <div className="absolute left-0 top-full z-50 mt-1 flex w-72 flex-col gap-1 rounded-lg border border-zinc-700 bg-zinc-900 p-2 shadow-xl"><div className="text-zinc-400">Several repos in {choices.in.split('/').pop()}. Pick one:</div>
         {choices.repos.map((c) => <button key={c.path} className="btn text-left" title={c.path} onClick={() => choose(c.path)}>{c.name} <span className="text-zinc-500">· {c.github ?? 'local'}</span></button>)}
         <button className="btn" onClick={() => setChoices(null)}>Cancel</button></div>}</div>
@@ -267,6 +284,17 @@ function ParallelLimit({ state }: { state: State }) {
   const working = state.agents.filter((a) => a.role === 'engineer' && a.status !== 'exited' && !FINISHED.includes(state.tickets.find((t) => t.id === a.ticket_id)?.status ?? '')).length
   const set = (n: number) => { if (!Number.isInteger(n) || n < 1) return; setDraft(n); api('settings', { key: 'concurrency_cap', value: n }).catch((e) => showError(errText(e))) }
   return <div className="flex items-center gap-1.5 text-zinc-400" title="How many engineers may work at the same time">Engineers at once <input type="number" min={1} max={10} className="input w-14! py-0.5! text-xs!" value={cap} onChange={(e) => set(Number(e.target.value))} /><span className="text-zinc-600" title={`${working} of ${cap} engineers are working`}>{working}/{cap} busy</span></div>
+}
+/** Bug 76: how many builds and full test runs go at once on this computer, engineers' own and HQ's together. The rest wait their turn, and their boxes say so. */
+function TestLimit({ state }: { state: State }) {
+  const [draft, setDraft] = useState<number | null>(null) // shown until the next snapshot carries the saved value
+  const cap = draft ?? Number(state.settings.heavy_at_once ?? state.defaults.heavy_at_once ?? 1)
+  const waiting = state.agents.filter((a) => a.status !== 'exited' && String(a.activity ?? '').startsWith('Waiting its turn')).length
+  const set = (n: number) => { if (!Number.isInteger(n) || n < 1) return; setDraft(n); api('settings', { key: 'heavy_at_once', value: n }).catch((e) => showError(errText(e))) }
+  const why = 'How many builds and full test runs may run at the same time on this computer. The others wait their turn, so the computer stays usable'
+  return <div className="flex items-center gap-1.5 text-zinc-400" title={why}>
+    Test runs at once <input type="number" min={1} max={10} aria-label="Test runs at once" className="input w-14! py-0.5! text-xs!" value={cap} onChange={(e) => set(Number(e.target.value))} />
+    {waiting > 0 && <span className="text-zinc-600" title={`${waiting} engineer${waiting === 1 ? ' is' : 's are'} waiting for a turn`}>{waiting} waiting</span>}</div>
 }
 /** Every agent, including ones with no box on the graph (exited, architects, engineers on cancelled tickets). */
 function AgentsMenu({ state, selected, onPick }: { state: State; selected: string | null; onPick: (a: Agent) => void }) {
@@ -280,9 +308,24 @@ function AgentsMenu({ state, selected, onPick }: { state: State; selected: strin
       {w && <div className={`mt-1 ${w.held ? 'text-amber-300' : 'text-zinc-400'}`}>✉ {w.count} waiting · {w.why}</div>}
     </button> })}</div>}</Menu>
 }
+/** What other projects need, beside ⚠ (Bug 63): ⚠ is about this project, and a project stopped elsewhere has to be impossible to miss. Stopped comes from the
+ *  project itself, not a notice. Go is the picker's switch, so its stop dialog still protects agents. */
+function Elsewhere({ all, repo, needs, onRepo }: { all: State; repo: any | null; needs: Need[]; onRepo: (id: string) => void }) {
+  const stopped = all.repos.filter((r) => r.id !== repo?.id && r.auto_stopped_why)
+  const others = needs.filter((n) => !('attention' in n.ref && String(all.attention.find((a) => a.id === (n.ref as { attention: string }).attention)?.kind).startsWith('auto_stopped:')))
+  if (!stopped.length && !others.length) return null
+  const label = stopped.length ? `${stopped.length === 1 ? stopped[0].name : `${stopped.length} projects`} stopped${others.length ? ` +${others.length}` : ''}` : `+${others.length} elsewhere`
+  const row = (key: string, text: string, id: string, close: () => void, tone: string) => <div key={key} className="flex items-start gap-2 rounded-md border border-zinc-800 p-2">
+    <span className={`min-w-0 grow break-words ${tone}`}>{text}</span><button className="btn-sm shrink-0" title="Go to this project" onClick={() => { close(); onRepo(id) }}>Go</button></div>
+  return <Menu label={label} title="What your other projects need" className={`btn ${stopped.length ? 'border-rose-500/50! text-rose-300!' : 'border-amber-500/50! text-amber-300!'}`}>{(close) =>
+    <div className="flex max-h-[75vh] w-[440px] max-w-[90vw] flex-col gap-1.5 overflow-y-auto text-xs"><div className="font-semibold text-zinc-400">Other projects</div>
+      {stopped.map((r) => row(`stopped:${r.id}`, `${r.name}: auto mode stopped. ${r.auto_stopped_why}`, r.id, close, 'text-rose-300'))}
+      {others.map((n) => row(n.key, n.text, n.repoId!, close, 'text-zinc-300'))}</div>}</Menu>
+}
 /** Everything that needs the user: open plan reviews, finished tickets waiting for their merge (shown until they're merged, so
- *  nothing to tick away), then every attention item. Show pans to the box; a review whose ticket has no box gets its form right here. */
-function Bell({ state, board }: { state: State; board: Board }) {
+ *  nothing to tick away), then every attention item. Show pans to the box; a review whose ticket has no box gets its form right here.
+ *  `count` is what the tab title counts for this project (Bug 63), so plain information in the list doesn't light it up. */
+function Bell({ state, board, count }: { state: State; board: Board; count: number }) {
   const b = useBoard()
   const reviews = state.reviews.filter((r) => r.status === 'open').sort((x, y) => (y.opened_at ?? 0) - (x.opened_at ?? 0))
   const base = (t: any) => { const f = state.features.find((x) => x.id === t.feature_id); return { cancelled: f?.status === 'cancelled', branch: state.repos.find((r) => r.id === f?.repo_id)?.default_branch ?? 'main' } }
@@ -298,8 +341,8 @@ function Bell({ state, board }: { state: State; board: Board }) {
     if (repo && a.kind === `auto_finished:${repo.id}`) return () => { openSummary(repo.id); close() }
     const node = board.attNode(a); return node ? () => { b.focus(node, 'attention'); close() } : null
   }
-  const tone = good ? 'border-emerald-500/50! text-emerald-300!' : n ? 'border-rose-500/50! text-rose-300!' : ''
-  return <Menu label={`${good ? '✓' : '⚠'} ${n}`} title="Plan reviews and things that need you" className={`btn ${tone}`}>{(close) => <div className="flex max-h-[75vh] w-[440px] max-w-[90vw] flex-col gap-2 overflow-y-auto text-xs">
+  const tone = good ? 'border-emerald-500/50! text-emerald-300!' : count ? 'border-rose-500/50! text-rose-300!' : ''
+  return <Menu label={good ? `✓ ${n}` : count ? `⚠ ${count}` : n ? `ℹ ${n}` : '⚠ 0'} title="Plan reviews and things that need you" className={`btn ${tone}`}>{(close) => <div className="flex max-h-[75vh] w-[440px] max-w-[90vw] flex-col gap-2 overflow-y-auto text-xs">
     <AlertsLine />
     {!n && <div className="p-1 text-zinc-500">Nothing needs you right now.</div>}
     {repo && !repo.auto_mode && (turn.asks.length > 0 || turn.start.length > 0 || reviews.length > 0 || merges.length > 0) && <div className="flex justify-end"><DoRestBtn repoId={repo.id} /></div>}

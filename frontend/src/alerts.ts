@@ -20,7 +20,7 @@ function mergeAct(all: State) {
 }
 
 /** `all`: everything HQ sends, every repo. `show`: open the item's box (the caller knows the board and the picked repo). */
-export function useAlerts(all: State | null, show: (n: Need) => void): number {
+export function useAlerts(all: State | null, show: (n: Need) => void): Need[] {
   const needs = useMemo(() => all ? needsYou(all, mergeAct(all)) : [], [all])
   const seen = useRef<Set<string> | null>(null), showRef = useRef(show), popped = useRef(new Map<string, Notification>())
   useEffect(() => { showRef.current = show })
@@ -40,5 +40,5 @@ export function useAlerts(all: State | null, show: (n: Need) => void): number {
     if (fresh.length <= 3) for (const n of fresh) pop('HQ needs you', n.text, n.key, n)
     else pop('HQ needs you', `${fresh.length} things are waiting for you`, 'hq-many', null)
   }, [needs, all])
-  return needs.length
+  return needs
 }

@@ -72,17 +72,32 @@ function AttChip({ id, items }: { id: string; items: any[] }) {
   return <button className={`nopan shrink-0 rounded px-1 text-[10px] leading-4 ${look}`}
     title={ok ? 'News: click for details' : 'Needs you: click for details'} onClick={() => open ? b.setPop(null) : b.focus(id, 'attention')}>{ok ? '✓' : '⚠'} {items.length}</button>
 }
-/** Fix conflicts: HQ checks again, then the ticket's engineer (or a fresh one on the same branch) merges main in. */
-export function FixAct({ t }: { t: any }) {
+/** Fix conflicts: HQ checks again, then the ticket's engineer (or a fresh one on the same branch) merges main in. `why` tests: Fix tests,
+ *  for one auto mode sent back for its tests whose fix stalled: the same instructions again, with what the tests printed (Bug 84).
+ *  `why` change: Build the change, for one whose spec the TPM changed after it was finished and whose engineer stopped before building it. */
+export function FixAct({ t, why }: { t: any; why?: 'tests' | 'change' }) {
+  if (why === 'change') return <ActBtn primary label="Build the change" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
+    title={'Its spec changed after it was finished, and its engineer stopped before building the change. HQ sends the instructions again;'
+      + ' if that engineer has stopped, a new one starts on the same branch.'} />
+  if (why === 'tests') return <ActBtn primary label="Fix tests" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
+    title={"Its tests failed or never finished on main, and its engineer stopped before fixing them. HQ sends it what the tests printed again;"
+      + ' if that engineer has stopped, a new one starts on the same branch.'} />
   return <ActBtn primary label="Fix conflicts" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
     title={'HQ checks the branch against main again. If it still conflicts, its engineer merges main in, keeps both sides, runs the tests and commits;'
       + ' if that engineer has stopped, a new one starts on the same branch. You merge it afterwards.'} />
 }
-/** Attention items with ✓ (and Show, in the top-bar menu). A merge conflict also gets Fix conflicts. */
+/** A run the agent waits on in the background that has done nothing for minutes (Bug 96): HQ stops it and tells the agent what to run instead. */
+const StopRunAct = ({ agentId }: { agentId: string }) => <ActBtn primary label="Stop it and tell the engineer" busyLabel="Stopping…"
+  run={() => api(`agents/${agentId}/stop-frozen-runs`, {})}
+  title="HQ stops the frozen run (the agent is woken when it ends) and tells the agent to run only its own tests, with a time limit: HQ runs the full suite at merge." />
+/** Attention items with ✓ (and Show, in the top-bar menu). A merge conflict also gets Fix conflicts, a frozen run Stop it. */
+/** A stop or a question that stays until it's answered: ticking it away would hide a project that's still stopped (Bug 63). Resume, Turn off or Use it clear it. */
+const answerOnly = (kind: string): boolean => /^(auto_stopped|test_cmd_proposed):/.test(kind)
+const FIX_KINDS = new Set(['merge_conflict', 'fix_stalled', 'change_stalled']) // notices with the ticket's fix button
 export function AttentionList({ items, show }: { items: any[]; show?: (a: any) => (() => void) | null }) {
   return <div className="flex flex-col gap-1">{items.map((a) => { const go = show?.(a); return <div key={a.id} className="rounded-md border border-zinc-800 bg-zinc-950/60 p-2 text-xs">
     <div className="flex items-start justify-between gap-2"><span className={`min-w-0 break-words font-medium ${goodNews(a.kind) ? 'text-emerald-300' : 'text-rose-300'}`}>{kindLabel(a.kind)}</span><span className="flex shrink-0 gap-1">
-      {a.kind === 'merge_conflict' && a.ticket_id && <FixAct t={{ id: a.ticket_id }} />}{go && <button className="btn-sm" onClick={go}>Show</button>}<ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} /></span></div>
+      {FIX_KINDS.has(a.kind) && a.ticket_id && <FixAct t={{ id: a.ticket_id }} why={a.kind === 'fix_stalled' ? 'tests' : a.kind === 'change_stalled' ? 'change' : undefined} />}{a.kind === 'bg_stalled' && a.agent_id && <StopRunAct agentId={a.agent_id} />}{go && <button className="btn-sm" onClick={go}>Show</button>}{!answerOnly(a.kind) && <ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} />}</span></div>
     <div className="mt-1 break-words text-zinc-400"><Linked text={a.detail} /></div></div> })}</div>
 }
 /** A box's notices, under it. Only while it has some: a reply can clear the last one, and an empty popover has no chip to close it. */
@@ -253,7 +268,7 @@ function TryAct({ on, t }: { on: boolean; t: any }) {
  *  why), Make PR, the PR link, or Fix conflicts. On the box and in the ⚠ menu. */
 export function MergeAct({ a, t }: { a: Act; t: any }) {
   const { state } = useBoard()
-  if (a.kind === 'fix') return <FixAct t={t} />
+  if (a.kind === 'fix') return <FixAct t={t} why={a.why} />
   if (a.kind === 'merge') {
     const go = async () => { if (await mergeConfirm(t, a, state.defaults.github_account ?? 'the HQ account')) await api(`tickets/${t.id}/merge`, {}) }
     return <ActBtn primary label={`Merge into ${a.into}`} busyLabel="Merging…" run={go} title={a.github

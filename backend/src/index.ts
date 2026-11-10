@@ -7,6 +7,7 @@ import { startHooksServer } from './hooks.ts'
 import { startMcpServer } from './mcp.ts'
 import { startUiServer } from './ui.ts'
 import { startStuckLoop } from './stuck.ts'
+import { startBgRuns } from './bgruns.ts'
 import { startMergeWatcher } from './mergewatch.ts'
 import { sweepWorktrees } from './slots.ts'
 import { startListeners } from './listeners.ts'
@@ -19,7 +20,8 @@ import { startRetention } from './retention.ts'
 import { startFreshStartLoop } from './freshstart.ts'
 import { ensureTrusted } from './trust.ts'
 import { startAutoLoop } from './auto.ts'
-import { sweepTestWorktrees } from './testrun.ts'
+import { killTestRuns, sweepRunTmp, sweepTestWorktrees } from './testrun.ts'
+import { startLeftoverSweeps, sweepAgentTmp, sweepNow } from './leftovers.ts'
 
 /** The repo's role prompts and mod are what agents get: copied into HQ's home on every start when they differ (new agents
  *  pick them up; running ones keep what they started with). Extra files already in the plugin folder are left alone. */
@@ -46,10 +48,17 @@ async function main(): Promise<void> {
   await recoverAgents()
   await sweepWorktrees().catch((e) => emit({ agentId: null, source: 'system', kind: 'worktree.sweep.error', payload: { error: String(e) } }))
   for (const r of repos()) await sweepTestWorktrees(r.path).catch(() => {}) // a test run the last backend didn't finish
+  try { // and its temp files (Bug 81)
+    const tmps = sweepRunTmp(); if (tmps.length) emit({ agentId: null, source: 'system', kind: 'testrun.tmp_swept', payload: { folders: tmps } })
+  } catch { /* the next start */ }
   await recoverPreviews() // before the merge watcher: its first check can restart a preview
   await recoverHelpers(repos()).catch((e) => console.error('launch helper recovery failed', e))
+  startBgRuns() // before the first sweep and any hook: it reads back what agents wait on in the background (Bug 96)
+  await sweepNow() // what agents' commands left running while HQ was down (Bug 75)
+  await sweepAgentTmp() // and the temp folders of agents that ended meanwhile (Bug 81)
   startListeners()
   startHooksServer(); startMcpServer(); startUiServer(); startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
+  startLeftoverSweeps()
   emit({ agentId: null, source: 'system', kind: 'backend.started', payload: { ports: PORTS } })
   console.log(`HQ backend up. UI: http://127.0.0.1:${PORTS.ui}/?token=${uiToken()}  hooks :${PORTS.hooks}  mcp :${PORTS.mcp}  state ${PATHS.home}`)
 }
@@ -63,4 +72,6 @@ const crashed = (what: string) => (e: unknown) => {
 }
 process.on('unhandledRejection', crashed('unhandledRejection'))
 process.on('uncaughtException', crashed('uncaughtException'))
+// tmux kill-session hangs up, a test HQ's stop() sends SIGTERM, Ctrl-C SIGINT. Agents and previews run on in tmux and a restart picks them up; test runs don't (Bug 69).
+for (const [sig, code] of [['SIGTERM', 143], ['SIGHUP', 129], ['SIGINT', 130]] as const) process.once(sig, () => { killTestRuns(); process.exit(code) })
 main().catch((e) => { console.error(e); process.exit(1) })

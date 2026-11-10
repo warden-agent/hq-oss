@@ -4,7 +4,7 @@
 // Claude Code leaves that lock behind, and so does this. The tests act as the agent themselves, with its token.
 import fs from 'node:fs'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 
 const args = process.argv.slice(2)
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined }
@@ -20,4 +20,15 @@ await fetch(hookUrl, { method: 'POST', headers: { 'content-type': 'application/j
 console.log(`fake-claude ${flag('--name') ?? ''} up (pid ${process.pid})`)
 // Claude Code 2.1.300's screen when it waits at its prompt (Bug 25 tests): the input box and a footer with no "esc to interrupt"
 if (process.env.HQ_FAKE_IDLE_SCREEN) console.log(`\n✻ Baked for 2s · done\n\n${'─'.repeat(60)}\n❯ \n${'─'.repeat(60)}\n  ⏸ manual mode on · ? for shortcuts · ← for agents`)
-setInterval(() => {}, 1 << 30)
+// Claude Code's own status file (Bug 62, presence.ts), which the tests then change as Claude Code would: hq.session()
+const sessions = path.join(process.env.HOME, '.claude', 'sessions'); fs.mkdirSync(sessions, { recursive: true })
+fs.writeFileSync(path.join(sessions, `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: flag('--session-id'), status: 'busy', statusUpdatedAt: Date.now() }))
+// A screen a test draws (hq.screen()), shown whenever it changes: a dialog's menu, say
+const drawn = process.env.HQ_FAKE_SCREEN_DIR && path.join(process.env.HQ_FAKE_SCREEN_DIR, `${flag('--session-id')}.txt`); let shown = ''
+setInterval(() => { if (!drawn) return; let t = ''; try { t = fs.readFileSync(drawn, 'utf8') } catch { return } if (t !== shown) { shown = t; process.stdout.write(`\x1b[2J\x1b[H${t}`) } }, 200)
+// A command a test starts as this agent's Bash command (hq.spawn()): like Claude Code, a shell child of this process in a process group of its own (Bug 96)
+const asked = process.env.HQ_FAKE_SCREEN_DIR && path.join(process.env.HQ_FAKE_SCREEN_DIR, `${flag('--session-id')}.spawn`)
+setInterval(() => {
+  if (!asked) return; let cmd = ''; try { cmd = fs.readFileSync(asked, 'utf8'); fs.rmSync(asked) } catch { return }
+  const c = spawn('/bin/sh', ['-c', cmd], { detached: true, stdio: 'ignore' }); fs.writeFileSync(`${asked}ed`, String(c.pid))
+}, 100)

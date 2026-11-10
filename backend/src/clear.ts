@@ -9,13 +9,14 @@ import path from 'node:path'
 import { PATHS } from './config.ts'
 import { one, q, run, now, tx } from './db.ts'
 import { bus, emit, patch } from './events.ts'
+import { rememberGone, sweepNow } from './leftovers.ts'
 import { attention, resolveKind } from './attention.ts'
 import { agentDir, liveAgents, stopAgent, update, type Agent } from './agents.ts'
 import { features, getRepo, repoOfAgent, setTicket, tickets, type Feature, type Repo, type Ticket } from './records.ts'
 import { fallbackNote, freshStart, freshStartBlocker, inRepo } from './freshstart.ts'
 import { readNote, saveNote } from './notes.ts'
 import { launching } from './tickets.ts'
-import { builtLines, dropFeatureMd, keepBuilt, writeFeatureMd, writeProjectMd } from './projectmd.ts'
+import { builtLines, dropFeatureMd, keepBuilt, tpmWorkspace, writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { restartTpm, tpmStarting } from './tpm.ts'
 import { stopPreview } from './preview.ts'
 import { git } from './repos.ts'
@@ -27,15 +28,21 @@ const ofRepo = (repoId: string) => (a: Agent): boolean => a.role !== 'launcher' 
 const tpmWasOn = new Set<string>()
 const UNFINISHED = ['planning', 'implementing', 'awaiting_answer', 'resolving', 'plan_review']
 
+/** What of the repo is starting right now: stopping it halfway could leave an agent behind. */
+export function startingNow(repoId: string): string[] {
+  const fids = inRepo(repoId), mine = features().filter((f) => fids.has(f.id)), tks = tickets().filter((t) => fids.has(t.feature_id))
+  return [...(tpmStarting(repoId) ? ['the TPM'] : []), ...mine.filter((f) => launching(f.id)).map((f) => f.title), ...tks.filter((t) => launching(t.id)).map((t) => t.key)]
+}
+export const startingWhy = (busy: string[]): string => `${busy.join(', ')} ${busy.length > 1 ? 'are' : 'is'} starting right now; try again in a moment.`
+
 /** Clear `repoId`: lock it, stop its app, and have each running TPM and engineer write a handoff note and stop (`noting`). Ones
  *  that can't write one now (waiting on a dialog or a plan review, or done) stop at once, with a note from HQ when their work
  *  was unfinished (`stopped`, with why). The rest happens in finishClear once the last of them has stopped. */
 export async function clearRepo(repoId: string): Promise<{ noting: string[]; stopped: string[]; done: boolean }> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
   if (repo.clearing_at) throw new Error(`${repo.name} is already being cleared.`)
-  const fids = inRepo(repoId), mine = features().filter((f) => fids.has(f.id)), tks = tickets().filter((t) => fids.has(t.feature_id))
-  const busy = [...(tpmStarting(repoId) ? ['the TPM'] : []), ...mine.filter((f) => launching(f.id)).map((f) => f.title), ...tks.filter((t) => launching(t.id)).map((t) => t.key)]
-  if (busy.length) throw new Error(`${busy.join(', ')} ${busy.length > 1 ? 'are' : 'is'} starting right now; try again in a moment.`)
+  const fids = inRepo(repoId), tks = tickets().filter((t) => fids.has(t.feature_id))
+  const busy = startingNow(repoId); if (busy.length) throw new Error(startingWhy(busy))
   const at = now()
   tx(() => { // locked first: a stop below frees a slot, and nothing of this repo may start in it
     run('UPDATE repos SET clearing_at = ? WHERE id = ?', at, repoId)
@@ -56,7 +63,7 @@ export async function clearRepo(repoId: string): Promise<{ noting: string[]; sto
   const done = !noting.length && await maybeFinishClear(repoId)
   return { noting, stopped, done }
 }
-const unfinished = (a: Agent, tks: Ticket[]): boolean => a.role === 'tpm' ? true
+export const unfinished = (a: Agent, tks: Ticket[]): boolean => a.role === 'tpm' ? true
   : a.role === 'engineer' && UNFINISHED.includes(tks.find((t) => t.id === a.ticket_id)?.status ?? '')
 
 const finishing = new Set<string>()
@@ -82,13 +89,14 @@ async function finishClear(repo: Repo): Promise<void> {
   const saved = await saveWork(repo, tks)
   const dir = archive(repo, fs0, tks, saved)
   const built = builtLines(fs0)
+  rememberGone(repo.id) // its tickets go next, and with them the names that say which folders are HQ's
   tx(() => { keepBuilt(repo.id, built); deleteRows(repo.id, F, T, A) })
   for (const a of A) fs.rmSync(agentDir(a), { recursive: true, force: true })
   for (const f of fs0) dropFeatureMd(f)
   writeProjectMd(repo.id)
   const failed = [...saved.values()].filter((s) => s.failed).map((s) => `${s.key}: ${s.failed}`)
   emit({ agentId: null, source: 'system', kind: 'repo.cleared', payload: { repo: repo.id, archive: dir, features: F.length, tickets: T.length, agents: A.length, failed } })
-  for (const kind of ['repo_cleared', 'auto_finished', 'auto_stopped']) resolveKind(`${kind}:${repo.id}`, null) // the runs they're about are gone
+  for (const kind of ['repo_cleared', 'auto_finished', 'auto_stopped', 'test_cmd_proposed']) resolveKind(`${kind}:${repo.id}`, null) // the runs they're about are gone
   attention(`repo_cleared:${repo.id}`, `Cleared ${repo.name}: ${F.length} feature${F.length === 1 ? '' : 's'} and ${T.length} ticket${T.length === 1 ? '' : 's'}. `
     + `Notes and a summary are in ${dir.replace(process.env.HOME ?? '\0', '~')}.`
     + (failed.length ? ` These worktrees couldn't be removed (their code is safe on its branch): ${failed.join('; ')}.` : ''))
@@ -102,6 +110,7 @@ async function finishClear(repo: Repo): Promise<void> {
 /** Each ticket worktree: changes not committed yet go into a "WIP (HQ clear)" commit on its branch, then the worktree is
  *  removed. The branch stays. Keys repeat across features (T1…), so a folder is handled once, for whatever it holds now. */
 async function saveWork(repo: Repo, tks: Ticket[]): Promise<Map<string, Saved>> {
+  await sweepNow() // what the stopped engineers left running there (Bug 75)
   const out = new Map<string, Saved>(), seen = new Set<string>()
   for (const t of tks) {
     const wt = t.worktree_path; if (!wt || seen.has(wt) || !fs.existsSync(wt)) continue
@@ -129,17 +138,24 @@ const stamp = (t: number): string => new Date(t).toISOString().replace(/[-:]/g, 
 const safe = (s: string): string => s.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'repo'
 /** ~/.hq/archive/<repo>/<time>/: each feature's workspace (FEATURE.md brought up to date, CONTEXT.md, the handoff notes), any
  *  note, update_handoff log or plan not in it yet, and SUMMARY.md: the requests, tickets, branches and where their code is. */
-function archive(repo: Repo, fs0: Feature[], tks: Ticket[], saved: Map<string, Saved>): string {
+export function archive(repo: Repo, fs0: Feature[], tks: Ticket[], saved: Map<string, Saved>, how: 'cleared' | 'removed' = 'cleared'): string {
   const dir = path.join(PATHS.archive, safe(repo.name), stamp(now())); fs.mkdirSync(dir, { recursive: true })
   const put = (file: string, text: string | null | undefined) => {
     if (!text || fs.existsSync(file)) return
     fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, text.endsWith('\n') ? text : `${text}\n`)
   }
-  const lines = [`# ${repo.name}: cleared ${new Date().toLocaleString('en-GB')}`, '',
-    `HQ's Clear project archived this board. Each feature's folder has FEATURE.md (the request, tickets, decisions and specs) and the engineers' handoff notes`
-      + ' (HANDOFF.md); tpm/HANDOFF.md is the TPM\'s note at the time.',
-    'No code was deleted: changes that were not committed are in a "WIP (HQ clear)" commit on the ticket\'s branch, and every branch is kept.', '']
+  const lines = [`# ${repo.name}: ${how} ${new Date().toLocaleString('en-GB')}`, '',
+    `HQ's ${how === 'cleared' ? 'Clear project' : 'Remove from HQ'} archived this ${how === 'cleared' ? 'board' : "project's records"}. Each feature's folder has FEATURE.md`
+      + " (the request, tickets, decisions and specs) and the engineers' handoff notes (HANDOFF.md); tpm/HANDOFF.md is the TPM's note at the time.",
+    how === 'cleared' ? 'No code was deleted: changes that were not committed are in a "WIP (HQ clear)" commit on the ticket\'s branch, and every branch is kept.'
+      : `Nothing in ${repo.path} was touched: worktrees, branches and uncommitted work are where they were, and HQ has forgotten them.`, '']
   put(path.join(dir, 'tpm', 'HANDOFF.md'), readNote(`resume:repo:${repo.id}`)) // copied: the TPM keeps it (Bug 52)
+  if (how === 'removed') { // nothing keeps these any more, and start steps cost tokens to work out again
+    for (const f of ['PROJECT.md', 'CONTEXT.md']) { const from = path.join(tpmWorkspace(repo.id), f); if (fs.existsSync(from)) fs.copyFileSync(from, path.join(dir, f)) }
+    const p = one<{ command: string | null; recipe: string | null }>('SELECT command, recipe FROM previews WHERE id = ?', repo.id)
+    lines.push('## Settings', '', `- Test command: ${repo.test_cmd ?? 'the one HQ finds'}`, `- Start command: ${p?.command ?? 'none set'}`,
+      ...(p?.recipe ? [`- Start steps you OK'd: ${p.recipe}`] : []), '')
+  }
   for (const f of fs0) {
     const folder = `${f.handle ? `${f.handle}-` : ''}${f.slug}-${f.id.replace(/^feat-/, '')}`, fdir = path.join(dir, folder), ws = path.join(PATHS.workspaces, f.id)
     if (fs.existsSync(ws)) fs.renameSync(ws, fdir); else fs.mkdirSync(fdir, { recursive: true }) // engineers' notes (the TPM's workspace stays)
@@ -159,7 +175,8 @@ function archive(repo: Repo, fs0: Feature[], tks: Ticket[], saved: Map<string, S
     lines.push('| Ticket | Status | Branch | Code | PR | Note |', '|---|---|---|---|---|---|')
     for (const t of mine) {
       const s = saved.get(t.id), note = readNote(`resume:ticket:${t.id}`)
-      const code = !s ? (t.branch ? 'on its branch' : 'never started') : s.failed ? `worktree kept: ${s.failed}` : `${s.head}${s.wip ? ' (WIP commit)' : ''}`
+      const code = !s ? (how === 'removed' && t.worktree_path && fs.existsSync(t.worktree_path) ? `in its worktree (${t.worktree_path})` : t.branch ? 'on its branch' : 'never started')
+        : s.failed ? `worktree kept: ${s.failed}` : `${s.head}${s.wip ? ' (WIP commit)' : ''}`
       const noted = !note ? '' : note.startsWith('(Written by HQ') ? "HQ's (the engineer couldn't)" : 'yes'
       const branch = s?.branch && s.branch !== t.branch ? `${t.branch ?? ''} (folder was on ${s.branch})` : t.branch ?? ''
       lines.push(`| ${t.key} ${t.title.replace(/\|/g, '/')} | ${t.status} | ${branch} | ${code} | ${t.pr_url ?? ''} | ${noted} |`)
@@ -170,10 +187,10 @@ function archive(repo: Repo, fs0: Feature[], tks: Ticket[], saved: Map<string, S
   return dir
 }
 
-const inList = (col: string, ids: string[]): string => ids.length ? `${col} IN (${ids.map(() => '?').join(',')})` : '0'
+export const inList = (col: string, ids: string[]): string => ids.length ? `${col} IN (${ids.map(() => '?').join(',')})` : '0'
 /** Every row of the repo's work, children first (only features→repos, tickets→features and sessions→agents are real foreign
  *  keys; everything else points by convention). The repo row, its app's start command and port, and its sync notices stay. */
-function deleteRows(repoId: string, F: string[], T: string[], A: string[]): void {
+export function deleteRows(repoId: string, F: string[], T: string[], A: string[]): void {
   const del = (table: string, where: string, ...ids: string[]) => run(`DELETE FROM ${table} WHERE ${where}`, ...ids)
   for (const table of ['events', 'task_progress', 'model_switches', 'usage_samples', 'batches', 'sessions', 'jobs']) del(table, inList('agent_id', A), ...A)
   del('jobs', inList('ticket_id', T), ...T)
@@ -193,6 +210,14 @@ function deleteRows(repoId: string, F: string[], T: string[], A: string[]): void
   del('features', inList('id', F), ...F)
   run("UPDATE previews SET ticket_id = NULL, status = 'stopped', updated_at = ? WHERE id = ?", now(), repoId)
   del('auto_runs', 'repo_id = ?', repoId)
-  run('UPDATE repos SET clearing_at = NULL, tpm_agent_id = NULL, tpm_parked_at = NULL, auto_mode = 0, auto_stopped_why = NULL, auto_waiting = NULL WHERE id = ?',
+  run('UPDATE repos SET clearing_at = NULL, tpm_agent_id = NULL, tpm_parked_at = NULL, auto_mode = 0, auto_stopped_why = NULL, auto_waiting = NULL, test_cmd_proposed = NULL WHERE id = ?',
     repoId) // its sessions' rows went with the board
+}
+/** What only goes when the repo itself does (Remove from HQ): Clear keeps all of it. */
+export function deleteRepoRows(repoId: string): void {
+  run('DELETE FROM messages WHERE repo_id = ?', repoId)
+  run('DELETE FROM docs WHERE scope IN (?, ?)', `repo:${repoId}`, `resume:repo:${repoId}`)
+  run('DELETE FROM needs_attention WHERE kind LIKE ?', `%:${repoId}`)
+  run('DELETE FROM previews WHERE id = ?', repoId)
+  run('DELETE FROM repos WHERE id = ?', repoId)
 }

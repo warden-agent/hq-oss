@@ -3,10 +3,13 @@ import { bus, type HqEvent } from './events.ts'
 import { getTicket, setTicket } from './records.ts'
 import { releaseFor, releaseSlot } from './slots.ts'
 import { checkMerges } from './mergewatch.ts'
-import { fillSlots } from './tickets.ts'
+import { fillSlots, stopFinished, FINISHED_STOP_MS } from './tickets.ts'
 import { onTicketMerged } from './preview.ts'
 import { onAgentGone } from './launchhelper.ts'
 import { autoSoon } from './auto.ts'
+import { startTurns } from './heavy.ts'
+
+const FINISHED_TICK_MS = Number(process.env.HQ_FINISHED_TICK_S ?? 60) * 1000 // the backstop for stopping finished engineers
 
 let started = false
 export function startListeners(): void {
@@ -27,8 +30,14 @@ export function startListeners(): void {
   })
   for (const kind of ['hook.Stop', 'ticket.pr_ready', 'ticket.merged', 'question.answered', 'agent.stopped', 'agent.lost', 'hook.SessionEnd', 'attention.launch_failed',
     'attention.blocked', 'attention.stuck']) bus.on(`event:${kind}`, autoSoon)
+  // An engineer whose ticket is finished stops once its turn has ended: it isn't kept (with its memory) until the merge. The look comes just
+  // after the wait stopFinished gives it, and looks at every engineer, so it must not be what cuts another one's wait short (stopFinished checks).
+  const leave = () => { setTimeout(stopFinished, FINISHED_STOP_MS + 50).unref() }
+  for (const kind of ['hook.Stop', 'hook.SubagentStop', 'ticket.pr_ready', 'ticket.pr_open', 'agent.idle_fixed']) bus.on(`event:${kind}`, leave)
+  setInterval(stopFinished, FINISHED_TICK_MS).unref()
   bus.on('event:ticket.merged', onTicketMerged)
   bus.on('event:ticket.merged', () => { void checkMerges().catch(() => {}) }) // main moved: do the tickets still waiting merge cleanly?
   bus.on('slot.freed', () => { void fillSlots().catch(() => {}) }) // a finished engineer no longer counts against the limit
   bus.on('repo.synced', () => { void checkMerges().catch(() => {}) }) // a fresh fetch may show a merge
+  startTurns()
 }

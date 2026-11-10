@@ -2,7 +2,7 @@
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 
 export const HQ_HOME = process.env.HQ_HOME ?? path.join(os.homedir(), '.hq')
 export const PATHS = {
@@ -26,6 +26,14 @@ export const ENGINEER_CACHE = (() => {
   fs.mkdirSync(p, { recursive: true, mode: 0o700 }); return fs.realpathSync(p)
 })()
 
+/** Each agent's own temp folder is this followed by its id: Claude Code's scratch files and every command's TMPDIR go there
+ *  (`CLAUDE_CODE_TMPDIR`), so what a killed test run leaves goes when the agent does instead of piling up in the shared
+ *  /tmp/claude-<uid> (Bug 81). Claude Code ignores one longer than about 30 bytes for its commands (it keeps sockets inside), and
+ *  says so only in its debug log: /tmp/hq123456-launch-abcdefghij, 31 bytes, still worked on 2.1.300 (2026-11-09). So flat in /tmp,
+ *  with a prefix per HQ (an isolated HQ shares /tmp): /tmp/hq6ae1a5-launch-1234abcd is 29. Tests give their own with HQ_AGENT_TMP. */
+export const AGENT_TMP = process.env.HQ_AGENT_TMP || `/tmp/hq${createHash('sha256').update(path.resolve(HQ_HOME)).digest('hex').slice(0, 6)}-`
+export const agentTmpDir = (agentId: string): string => AGENT_TMP + agentId
+
 export const PORTS = {
   ui: Number(process.env.HQ_UI_PORT ?? 4780),      // REST + WebSocket + static UI
   hooks: Number(process.env.HQ_HOOKS_PORT ?? 4781), // http hooks ingress
@@ -46,6 +54,7 @@ export const DEFAULTS = {
   gate_answer_margin_s: 60,
   stuck_working_min: 10,
   stuck_idle_min: 45,
+  bg_stall_min: 10, // a run an agent waits on in the background that uses no CPU and writes nothing this long is frozen (Bug 96)
   context_limit: 150_000, // the TPM's context warning; engineers get ENGINEER_LIMIT of it
   context_action: 'warn', // at the limit: 'warn' (a notice) or 'auto' (a fresh start once the current step ends)
   after_fresh_start: 'continue', // after a clicked Fresh start: 'continue' (a new session starts at once) or 'wait' (Resume)
@@ -59,6 +68,14 @@ export const DEFAULTS = {
   batch_receive_s: 30, // a batch the mod hasn't reported getting by then is handed out again
   opusplan_switch_window_s: 15,
   test_timeout_min: 15, // auto mode's test of a finished ticket on main
+  heavy_at_once: 1, // builds and full test runs at the same time on this machine, engineers' and HQ's own together (Bug 76)
+}
+/** How long a build or test run waits for its turn before it goes ahead anyway (heavy.ts). An engineer's Bash hook may be held this long, so its time limit is a little more. */
+export const TURN_WAIT_S = Number(process.env.HQ_TURN_WAIT_S) || 1200
+/** How long Claude Code lets a Bash command run: its own `timeout` (ms) within Claude Code's limits, 2 minutes when it gives none. */
+export function bashLimitMs(timeout: unknown): number {
+  const def = Number(process.env.BASH_DEFAULT_TIMEOUT_MS) || 120_000, max = Number(process.env.BASH_MAX_TIMEOUT_MS) || 600_000
+  return Math.min(Math.max(Number(timeout) || def, 1000), max)
 }
 
 /** Settings the user picks from a short list (the UI offers only these, and the API takes nothing else). */
@@ -79,7 +96,7 @@ export function validSetting(key: string, value: unknown): string | null {
   const choices = CHOICES[key]; if (choices) return choices.includes(value as never) ? null : `${key} must be one of ${choices.join(', ')}`
   const def = DEFAULTS[key as keyof typeof DEFAULTS]
   if (typeof def === 'number') {
-    if (key === 'concurrency_cap' || key === 'revision_cap') return Number.isInteger(value) && (value as number) >= 1 ? null : `${key} must be a whole number of at least 1`
+    if (key === 'concurrency_cap' || key === 'revision_cap' || key === 'heavy_at_once') return Number.isInteger(value) && (value as number) >= 1 ? null : `${key} must be a whole number of at least 1`
     return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? null : `${key} must be a number of at least 0`
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return `${key} must be an object like ${JSON.stringify(def)}`

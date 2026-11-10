@@ -54,12 +54,15 @@ export async function repoRoot(p: string): Promise<string> {
   try { return await git(p, ['rev-parse', '--show-toplevel']) } catch { throw new Error(`${p} is not a git repository`) }
 }
 
+/** The top of the repo `p` is in (`p` itself if it's the top), or null. */
+export const repoAround = async (p: string): Promise<string | null> => (await tryGit(p, ['rev-parse', '--show-toplevel'])) || null
+
 export type RepoCandidate = { path: string; name: string; github: string | null }
 /** The repo(s) for a folder the user picked: the repo it is in (walking up), else the repos directly inside it (a plain
  *  wrapper folder around a clone; hidden folders and node_modules skipped). GitHub ones first. Read-only, no network. */
 export async function findRepos(p: string): Promise<RepoCandidate[]> {
   if (!fs.existsSync(p) || !fs.statSync(p).isDirectory()) throw new Error(`${p} does not exist or is not a folder`)
-  const up = await tryGit(p, ['rev-parse', '--show-toplevel'])
+  const up = await repoAround(p)
   const roots = up ? [up] : []
   if (!up) for (const d of fs.readdirSync(p, { withFileTypes: true })) {
     if (!d.isDirectory() || d.name.startsWith('.') || d.name === 'node_modules') continue

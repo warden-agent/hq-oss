@@ -59,14 +59,19 @@ export function whose(cwd: string | null, repos: { id: string; name: string; pat
   return { kind: 'project', name: rel ? `${r.name}/${rel}` : r.name }
 }
 
-/** Process ids whose working folder is `dir` or inside it, from lsof's `-d cwd -Fpn` listing. */
-export function pidsUnder(listing: string, dir: string): number[] {
-  const pids: number[] = []; let pid = 0
+/** Each process's working folder from lsof's `-d cwd -Fpn` listing. A folder since removed still names its old path (Linux adds
+ *  " (deleted)", which is dropped). */
+export function cwdsOf(listing: string): Map<number, string> {
+  const cwds = new Map<number, string>(); let pid = 0
   for (const l of listing.split('\n')) {
     if (l.startsWith('p')) pid = Number(l.slice(1))
-    else if (l.startsWith('n') && pid) { const cwd = l.slice(1); if (cwd === dir || cwd.startsWith(dir + path.sep)) pids.push(pid) }
+    else if (l.startsWith('n') && pid) cwds.set(pid, l.slice(1).replace(/ \(deleted\)$/, ''))
   }
-  return [...new Set(pids)]
+  return cwds
+}
+/** Process ids whose working folder is `dir` or inside it, from lsof's `-d cwd -Fpn` listing. */
+export function pidsUnder(listing: string, dir: string): number[] {
+  return [...cwdsOf(listing)].filter(([, cwd]) => cwd === dir || cwd.startsWith(dir + path.sep)).map(([pid]) => pid)
 }
 /** The processes still in process group `pgid` (pgrep -g leaves some out, so this reads ps). */
 export const groupPids = async (pgid: number): Promise<number[]> =>

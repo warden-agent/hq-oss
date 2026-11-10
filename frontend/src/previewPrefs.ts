@@ -14,6 +14,9 @@ const fresh = (): Prefs => ({ open: false, device: 'desktop', dock: 'bottom', h:
 const key = (repoId: string) => `hq.preview.${repoId}`
 const read = (repoId: string | null): Prefs => { if (!repoId) return fresh(); try { return { ...fresh(), ...JSON.parse(localStorage.getItem(key(repoId)) ?? '{}') } } catch { return fresh() } }
 
+/** A repo removed from HQ: its id never comes back, so what's remembered for it can go. */
+export const forgetPrefs = (repoId: string): void => { try { localStorage.removeItem(key(repoId)) } catch { /* private window: nothing was kept */ } }
+
 /** The preview's place on screen, remembered per repo (open, Desktop/Phone, dock, sizes). `save: false` while dragging. */
 export function usePreviewPrefs(repoId: string | null): [Prefs, (p: Partial<Prefs>, save?: boolean) => void] {
   const [state, setState] = useState(() => ({ repoId, prefs: read(repoId) }))

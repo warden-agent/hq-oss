@@ -2,13 +2,14 @@
 // Pure apart from measuring title widths. App builds it once per state change; the graph and the top bar both read it.
 import { createContext, useContext, useRef, useState } from 'react'
 import { MarkerType, type Edge, type Node } from '@xyflow/react'
-import { api, errText, jsonList, showError, unmergedDeps, waitingFor, type Agent, type State } from './api'
-import { goodNews, keysText, workingEngineers, yourTurn, type Ask, type Turn } from './needs.ts'
+import { api, errText, jsonList, keepNewest, showError, unmergedDeps, waitingFor, type Agent, type State } from './api'
+import { goodNews, keysText, yourTurn, type Ask, type Turn } from './needs.ts'
 
 export type Tone = 'plain' | 'muted' | 'amber' | 'rose' | 'sky' | 'emerald' | 'indigo'
 export type Line = { text: string; tone: Tone; rows?: 1 | 2 } // rows: set by the layout (a long line wraps to two)
 export type Act = { kind: 'launch'; waits: string[] } | { kind: 'read-plan' } | { kind: 'approve' } | { kind: 'merge'; into: string; github?: boolean; pr?: number } | { kind: 'make-pr' }
-  | { kind: 'link'; label: string; href: string; primary: boolean } | { kind: 'fix' } | { kind: 'resume'; parked: boolean }
+  | { kind: 'link'; label: string; href: string; primary: boolean } | { kind: 'resume'; parked: boolean }
+  | { kind: 'fix'; why?: 'tests' | 'change' } // why: its tests' fix stalled (Bug 84), or the change to its spec did; none: its conflicts
   | { kind: 'try'; on: boolean } // on: the preview is running this ticket now
   | { kind: 'do-rest' } | { kind: 'auto-retry' } // auto mode: from this stop on, and another go for a parked ticket
 /** A feature: one request of the project's TPM, a branch of the board (Bug 52: it has no TPM of its own). */
@@ -52,18 +53,7 @@ const agentColor: Record<string, string> = { working: '#10b981', idle: '#71717a'
 const ticketColor: Record<string, string> = { queued: '#3f3f46', planning: '#0ea5e9', plan_review: '#f59e0b', implementing: '#10b981', awaiting_answer: '#f59e0b', escalated: '#f43f5e', pr_ready: '#6366f1', pr_open: '#6366f1',
   resolving: '#f59e0b', merged: '#065f46' }
 
-/** Only the picked repo's work: its features, their tickets, agents, messages and reviews, and the notices about them or about the
- *  repo itself. Notices about nothing in particular stay. Each repo is a slate of its own; the others' work is still in HQ. */
-export function forRepo(s: State, repoId: string | null): State {
-  const fids = new Set(s.features.filter((f) => f.repo_id === repoId).map((f) => f.id))
-  const tickets = s.tickets.filter((t) => fids.has(t.feature_id)), tids = new Set(tickets.map((t) => t.id))
-  const agents = s.agents.filter((a) => a.repo_id ? a.repo_id === repoId : !a.feature_id || fids.has(a.feature_id)), aids = new Set(agents.map((a) => a.id))
-  const mine = (x: { agent_id?: string | null; ticket_id?: string | null }) => x.ticket_id ? tids.has(x.ticket_id) : x.agent_id ? aids.has(x.agent_id) : true
-  const about = (a: any) => { const m = /^repo_\w+:(.+)$/.exec(a.kind); return m ? m[1] === repoId : mine(a) } // repo_sync:<id>, repo_local:<id>
-  return { ...s, features: s.features.filter((f) => fids.has(f.id)), tickets, agents, reviews: s.reviews.filter(mine), attention: s.attention.filter(about),
-    asks: (s.asks ?? []).filter((a) => a.repo_id === repoId), working: workingEngineers(s),
-    messages: s.messages.filter((m) => m.repo_id ? m.repo_id === repoId : m.feature_id ? fids.has(m.feature_id) : [m.from_id, m.to_id].every((x) => !x || x === 'user' || x === 'hq' || aids.has(x))) }
-}
+export { forRepo } from './needs.ts'
 
 /** A GitHub repo HQ can't push to (an open-source one, say): its work stays local and finished tickets get Merge into main. */
 export const localOnly = (repo: any): boolean => repo?.kind === 'github' && repo.can_push === 0
@@ -140,6 +130,17 @@ export function cancelConfirm(title: string, body: string, go: string): Promise<
 /** Open tickets that wait on `t` (Bug 50): they can't start once it's removed, until the TPM rewires them. */
 export const waitingOn = (s: State, t: any): string[] => s.tickets.filter((x) => x.feature_id === t.feature_id && x.status !== 'merged' && x.status !== 'cancelled'
   && jsonList(x.deps).includes(t.key)).map((x) => x.key)
+/** HQ's confirm before Remove from HQ (Bug 66): what stops, what HQ forgets, and that the folder isn't touched. */
+export function removeConfirm(all: State, repo: any): Promise<boolean> {
+  const fids = new Set(all.features.filter((f) => f.repo_id === repo.id).map((f) => f.id))
+  const nf = fids.size, nt = all.tickets.filter((t) => fids.has(t.feature_id)).length, p = all.previews.find((x) => x.id === repo.id)
+  const agents = all.agents.filter((a) => live(a) && a.role !== 'launcher' && repoOfAgent(all, a) === repo.id)
+  return ask({ title: `Remove ${repo.name} from HQ?`, go: 'Remove from HQ', danger: true, leaving: null, staysHead: 'These stop straight away, with no handoff note:',
+    body: `HQ forgets ${repo.name}: ${nf} feature${nf === 1 ? '' : 's'}, ${nt} ticket${nt === 1 ? '' : 's'}, their messages and notices${repo.auto_mode ? ', and its auto mode' : ''}. `
+      + `Its folder isn't touched: worktrees, branches and uncommitted work stay where they are, but HQ won't know about them any more. GitHub is left alone. `
+      + `HQ's notes go to ~/.hq/archive/${repo.name}/. You can add the folder again later, as a new project.`,
+    apps: [...(isOn(p) ? [`${repo.name}'s app`] : []), ...(helperOn(p) ? ["the Launch helper"] : [])], parks: [], stays: agents.map((a) => about(all, a)) })
+}
 /** HQ's confirm before Clear project: what goes (the board, the app), who saves a handoff note first, and who stops at once. */
 export function clearConfirm(all: State, repo: any): Promise<boolean> {
   const fids = new Set(all.features.filter((f) => f.repo_id === repo.id).map((f) => f.id))
@@ -198,9 +199,10 @@ export function freshConfirm(s: State, who: string[]): Promise<boolean> {
 
 /** What the user can do with a finished ticket: HQ's Merge into main (local repos) or the PR on GitHub; Fix conflicts instead of
  *  Merge when it conflicts with main (on GitHub the PR link stays, second), or when its fix stalled (the engineer stopped, or went
- *  idle without finishing: pressing it again re-sends HQ's instructions). `eng`: the ticket's live engineer, if any. */
+ *  idle without finishing: pressing it again re-sends HQ's instructions; Fix tests when auto mode sent it back for its tests, Bug 84;
+ *  Build the change when the TPM changed its spec after it was finished). `eng`: the ticket's live engineer, if any. */
 export function mergeActs(t: any, base: string, eng: Agent | null): Act[] {
-  if (t.status === 'resolving') return !eng || eng.status === 'idle' ? [{ kind: 'fix' }] : []
+  if (t.status === 'resolving') return !eng || eng.status === 'idle' ? [{ kind: 'fix', why: t.fixing === 'changes' ? 'change' : t.fixing ? 'tests' : undefined }] : []
   const conflict = t.conflict_files != null && (t.status === 'pr_ready' || t.status === 'pr_open')
   if (t.status === 'pr_ready' && t.pr_state === 'local') return [conflict ? { kind: 'fix' } : { kind: 'merge', into: base }]
   const fix: Act[] = conflict ? [{ kind: 'fix' }] : []
@@ -222,11 +224,15 @@ export const agentWord = (a: Agent): string => ({ working: 'working', idle: 'idl
 export const DO_REST = 'Do the rest automatically'
 /** A notice's kind in words (the ⚠ menu and box lines); unknown kinds lose their underscores. */
 export const kindLabel = (k: string): string => k.startsWith('auto_stopped:') ? 'Auto mode stopped' : k.startsWith('auto_finished:') ? 'Auto mode finished' :
+  k.startsWith('test_cmd_proposed:') ? 'New test command, for your OK' :
   ({ auto_parked: 'Parked by auto mode', merged: 'Merged', stuck: 'Looks stuck', engineer_exited: 'Engineer stopped', agent_exited: 'Agent stopped',
-  message_for_user: 'Message for you', blocked: 'Blocked', dialog: 'Waiting on a dialog', usage_limit: 'Usage limit', merge_conflict: 'Merge conflict',
+  message_for_user: 'Message for you', blocked: 'Blocked', dialog: 'Waiting on a dialog', usage_limit: 'Usage limit', merge_conflict: 'Merge conflict', fix_stalled: 'Fix stalled',
+  change_stalled: 'Change stalled',
   conflicts_fixed: 'Conflicts fixed', delivery_failed: 'Message not delivered', dm_refused: 'Message not sent', context_high: 'Memory filling up', fresh_start_failed: "Fresh start didn't finish",
   tpm_rotate: 'TPM memory full', api_error: 'API error', rate_limit: 'Usage limit', backend_error: 'HQ error', user_override: 'Approved in the terminal',
-  cap_reached: 'Sent back too often', tpm_away: 'TPM not running', pr_failed: "Couldn't open the PR", mod_missing: 'Agent not connected' } as Record<string, string>)[k]
+  cap_reached: 'Sent back too often', tpm_away: 'TPM not running', pr_failed: "Couldn't open the PR", mod_missing: 'Agent not connected',
+  leftovers_stuck: "Leftover programs won't stop", leftovers_cant_check: "Can't check for leftovers", bg_stalled: 'Run frozen',
+  engineer_idle: 'Engineer idle' } as Record<string, string>)[k]
   ?? (k.startsWith('repo_') ? 'Repo' : k.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()))
 const steps = (a: Agent) => a.steps_total ? ` · step ${a.steps_done}/${a.steps_total}` : ''
 const firstLine = (text: string): string => String(text).split('\n').map((l) => l.replace(/^[#>*\-\s]+/, '').replace(/\*\*|`/g, '').trim()).find(Boolean) ?? ''
@@ -239,8 +245,10 @@ export const askLabels = (a: Ask): string[] => a.action ? a.choices : [...a.choi
 export const startText = (keys: string[], asking = false): string => `${keysText(keys)} ${keys.length > 1 ? 'are' : 'is'} ready to start.${asking ? ' Answer the TPM first: it may change them.' : ''}`
 export const startLabel = (keys: string[]): string => keys.length <= 3 ? `Start ${keys.join(', ')}` : `Start ${keys.length} ready`
 export const turnOn = (turn: Turn): boolean => turn.asks.length > 0 || turn.start.length > 0
-/** A ticket's status in words where the stored one would mislead (a local branch has no PR; a finished one may conflict). */
+/** A ticket's status in words where the stored one would mislead (a local branch has no PR; a finished one may conflict; one sent
+ *  back is fixing its conflicts or, on auto, its tests, or building a change to its spec). */
 export const ticketLabel = (t: any): string => (t.status === 'pr_ready' || t.status === 'pr_open') && t.conflict_files != null ? 'conflicts'
+  : t.status === 'resolving' && t.fixing === 'changes' ? 'changing it' : t.status === 'resolving' && t.fixing ? 'fixing tests'
   : t.status === 'pr_ready' ? 'ready to merge' : ({ queued: 'not started', planning: 'planning', plan_review: 'plan for you',
     implementing: 'building', awaiting_answer: 'has a question', escalated: 'needs you', pr_open: 'PR open', resolving: 'fixing conflicts', merged: 'merged',
     cancelled: 'cancelled' } as Record<string, string>)[t.status] ?? t.status
@@ -259,13 +267,14 @@ const unmerged = (t: any, all: any[]) => unmergedDeps(t, all)
 
 let ctx2d: CanvasRenderingContext2D | null = null
 const widths = new Map<string, number>() // measured once per text: the board is rebuilt on every patch
+const WIDTHS_MAX = 3000 // without a limit every line an agent ever showed stays for as long as the tab is open
 /** Width in px of `text` in the cards' 11px font (600 weight for titles and keys). */
 function textW(text: string, bold = false): number {
   const key = `${bold ? 'b' : 'n'}${text}`, known = widths.get(key); if (known !== undefined) return known
   if (!ctx2d) ctx2d = document.createElement('canvas').getContext('2d')
   if (!ctx2d) return text.length * 7
   ctx2d.font = `${bold ? '600 ' : ''}11px ${getComputedStyle(document.body).fontFamily}`
-  const w = ctx2d.measureText(text).width; widths.set(key, w); return w
+  return keepNewest(widths, key, ctx2d.measureText(text).width, WIDTHS_MAX)
 }
 /** Rows `text` needs in `inner` px when it wraps freely (word by word, as the browser does). */
 function wrapRows(text: string, inner: number): number {
@@ -293,7 +302,8 @@ const rowsIn = (text: string, inner: number, bold = false): 1 | 2 => textW(text,
 export function actLabel(a: Act): string {
   return a.kind === 'launch' ? 'Launch engineer' : a.kind === 'read-plan' ? 'Read plan' : a.kind === 'approve' ? 'Approve' : a.kind === 'merge' ? `Merge into ${a.into}`
     : a.kind === 'make-pr' ? 'Make PR' : a.kind === 'do-rest' ? DO_REST : a.kind === 'auto-retry' ? 'Try again'
-    : a.kind === 'link' ? a.label : a.kind === 'fix' ? 'Fix conflicts' : a.kind === 'try' ? (a.on ? 'Back to main' : 'Try it') : 'Resume'
+    : a.kind === 'link' ? a.label : a.kind === 'fix' ? (a.why === 'change' ? 'Build the change' : a.why === 'tests' ? 'Fix tests' : 'Fix conflicts')
+    : a.kind === 'try' ? (a.on ? 'Back to main' : 'Try it') : 'Resume'
 }
 const rowW = (labels: string[]) => labels.reduce((sum, l, i) => sum + textW(l) + BTN + (i ? GAP : 0), 0)
 /** Rows a wrapping row of buttons needs in `inner` px. */
@@ -384,8 +394,11 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
     const detail: Line | null = t.auto_parked_why ? { text: `parked: ${t.auto_parked_why}`, tone: 'rose' }
       : review ? { text: `Plan R-${review.round} waiting for you`, tone: 'amber' }
       : t.pr_state === 'closed' ? { text: `PR #${t.pr_number} was closed without merging`, tone: 'rose' }
-      : t.status === 'resolving' ? (!eng ? { text: 'fixing conflicts · its engineer stopped', tone: 'rose' }
-        : eng.status === 'idle' ? { text: 'its engineer went idle before finishing', tone: 'rose' } : { text: `its engineer is merging ${base} in`, tone: 'amber' })
+      : t.status === 'resolving' ? (!eng ? { text: `${ticketLabel(t)} · its engineer stopped`, tone: 'rose' }
+        : eng.status === 'idle' ? { text: 'its engineer went idle before finishing', tone: 'rose' }
+        : { text: t.fixing === 'changes' ? 'its spec changed · its engineer is building the change'
+          : t.fixing === 'tests_hung' ? `its tests never finished on ${base} · its engineer is finding why` : t.fixing ? `its tests failed on ${base} · its engineer is fixing them`
+          : `its engineer is merging ${base} in`, tone: 'amber' })
       : conflictText(t, base) && (t.status === 'pr_ready' || t.status === 'pr_open') ? { text: conflictText(t, base)!, tone: 'rose' }
       : auto && (t.status === 'pr_ready' || t.status === 'pr_open') ? { text: 'done · HQ tests it, then merges it', tone: 'indigo' }
       : t.status === 'pr_ready' && t.pr_state === 'local' ? { text: 'done · waiting for you to merge it', tone: 'indigo' }

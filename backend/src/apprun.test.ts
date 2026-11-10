@@ -4,8 +4,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { assignPorts, portRange, checkRecipe, commandRecipe, detectCommand, frameBlocked, installMark, installStep, lockfileProblem, needsInstall, printedPorts, runScript,
-  sameCommands, supervisorSpec, type Recipe } from './apprun.ts'
+import { assignPorts, portRange, checkRecipe, commandRecipe, detectCommand, frameBlocked, installMark, installStep, lockfileProblem, needsInstall, parseRunMark, printedPorts, runMark,
+  runScript, RUN_MARK, sameCommands, supervisorSpec, type Recipe } from './apprun.ts'
 
 const repo = (files: Record<string, string>): string => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-apprun-'))
@@ -36,6 +36,12 @@ test('install: only when npm\'s record is missing or older than the lockfile', (
 test('run script: the supervisor with its spec, from the checkout', () => {
   assert.equal(runScript({ cwd: "/tmp/it's here", node: '/n/node', supervisor: '/hq/supervise.mjs', spec: '/hq/p/spec.json' }),
     "#!/bin/bash\ncd '/tmp/it'\\''s here' || exit 1\nexec '/n/node' '/hq/supervise.mjs' '/hq/p/spec.json'\n")
+  // Bug 77: the run's mark is exported before the supervisor starts, so everything the app starts carries it
+  const mark = runMark('/Users/x/.hq', 'repo-1a2b3c4d', 1794265131000)
+  assert.match(mark, /^[0-9a-f]{8}\.repo-1a2b3c4d\.1794265131000$/); assert.notEqual(mark.split('.')[0], runMark('/tmp/other-hq', 'repo-1a2b3c4d', 1).split('.')[0])
+  assert.deepEqual(parseRunMark(mark), { hq: mark.split('.')[0], repoId: 'repo-1a2b3c4d', startedAt: 1794265131000 }); assert.equal(parseRunMark('nonsense'), null)
+  assert.equal(runScript({ cwd: '/r', node: '/n/node', supervisor: '/hq/supervise.mjs', spec: '/hq/p/spec.json', mark }),
+    `#!/bin/bash\ncd '/r' || exit 1\nexport ${RUN_MARK}='${mark}'\nexec '/n/node' '/hq/supervise.mjs' '/hq/p/spec.json'\n`)
 })
 
 test('printed ports: loopback URLs only, colours stripped, each once', () => {

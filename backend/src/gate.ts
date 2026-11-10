@@ -33,6 +33,13 @@ const denyAnswer = (message: string) => ({ hookSpecificOutput: { hookEventName: 
 export const pendingMessage = (round: number) => `Review R-${round} still pending — do not change the plan — call ExitPlanMode again.`
 
 export function openReviews(): ReviewRequest[] { return q<ReviewRequest>("SELECT * FROM review_requests WHERE status = 'open' ORDER BY opened_at") }
+/** The reviews the page gets, 50 at most. A plan's text goes only while its review is open (the page shows no other plan), and open
+ *  reviews come first, so the limit never drops one. */
+export function pageReviews(): Record<string, unknown>[] {
+  return q(`SELECT r.*, CASE WHEN r.status = 'open' THEN p.plan_text END AS plan_text, p.agent_id, p.verdict, p.verdict_message,
+      (SELECT COUNT(*) FROM plan_revisions x WHERE x.ticket_id = r.ticket_id AND x.verdict IN ('revise', 'user_architect')) AS revises_used
+    FROM review_requests r JOIN plan_revisions p ON p.id = r.plan_revision_id ORDER BY r.status = 'open' DESC, r.opened_at DESC LIMIT 50`)
+}
 export function getRevision(revId: string): PlanRevision | undefined { return one<PlanRevision>('SELECT * FROM plan_revisions WHERE id = ?', revId) }
 export function getReview(reviewId: string): ReviewRequest | undefined { return one<ReviewRequest>('SELECT * FROM review_requests WHERE id = ?', reviewId) }
 

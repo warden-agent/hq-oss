@@ -33,6 +33,7 @@ test('GitHub: tested on origin/main, merged through a PR; a refused merge stops 
     const t = (await hq.api('tickets', { featureId: f.id, title, size: 'S', spec: `${title}.` })).json
     await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'ok' })
     const e = await waitFor(`an engineer on ${t.key}`, async () => (await hq.state()).agents.find((a: any) => a.role === 'engineer' && a.ticket_id === t.id && a.status === 'working'))
+    await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'more to come' }) // the TPM is busy, so the merge doesn't end the run: both tickets are one run, whatever the timing
     await hq.hook(e.id, exitPlanMode('Plan'))
     const wt = path.join(dir, '.claude', 'worktrees', t.key); fs.writeFileSync(path.join(wt, `${title}.txt`), 'x\n'); sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', title)
     await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: 'done' })

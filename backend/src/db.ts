@@ -150,6 +150,12 @@ CREATE INDEX auto_runs_repo ON auto_runs(repo_id, started_at);`,
 `UPDATE repos SET next_ticket = MAX(next_ticket, 1 + COALESCE((SELECT MAX(CAST(substr(k.s, length(rtrim(k.s, '0123456789')) + 1) AS INTEGER))
   FROM (SELECT rtrim(lower(t.key), 'abcdefghijklmnopqrstuvwxyz-_') AS s, f.repo_id AS repo FROM tickets t JOIN features f ON f.id = t.feature_id) k
   WHERE k.repo = repos.id), 0));`,
+// Auto mode repairs a broken main itself: the main a repair ticket is fixing, the test command a run changed, and one waiting for the user's OK.
+`ALTER TABLE tickets ADD COLUMN repairs_main TEXT; ALTER TABLE auto_runs ADD COLUMN test_change TEXT; ALTER TABLE repos ADD COLUMN test_cmd_proposed TEXT;`,
+// Bug 70: the main a run tested when it started, so a restart doesn't test it again.
+`ALTER TABLE auto_runs ADD COLUMN main_checked TEXT;`,
+// Bug 84: what a ticket sent back to its engineer (`resolving`) is fixing. NULL: its conflicts with main; 'tests' or 'tests_hung': auto mode's test on main.
+`ALTER TABLE tickets ADD COLUMN fixing TEXT;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

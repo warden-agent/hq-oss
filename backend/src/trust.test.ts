@@ -52,6 +52,17 @@ test('a live lock is waited for (without blocking) and then refused; a stale one
   assert.equal(read().projects[path.join(root, 'blocked')].hasTrustDialogAccepted, true); assert.equal(fs.existsSync(LOCK), false)
 })
 
+test('Bug 59: a folder reached through a link is trusted by its real path, which is the one Claude Code asks about', async () => {
+  const real = dir('real-hq', 'workspaces'), link = path.join(root, 'hq-link'); fs.symlinkSync(path.join(root, 'real-hq'), link)
+  write({})
+  await ensureTrusted(path.join(link, 'workspaces'))
+  assert.equal(read().projects[real]?.hasTrustDialogAccepted, true)
+  assert.equal(read().projects[path.join(link, 'workspaces')], undefined)
+  dir('real-hq', 'workspaces', 'repo-1', 'tpm'); fs.utimesSync(CFG, 1000, 1000) // the TPM's folder, which exists by the time it launches: covered, nothing to write
+  await ensureTrusted(path.join(link, 'workspaces', 'repo-1', 'tpm'))
+  assert.equal(mtime(), 1000 * 1000)
+})
+
 test('an unreadable ~/.claude.json fails the launch rather than starting into the trust dialog', async () => {
   fs.writeFileSync(CFG, '{ not json')
   await assert.rejects(ensureTrusted(dir('broken')), /can't read ~\/.claude.json/)

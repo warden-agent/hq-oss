@@ -9,10 +9,10 @@ import { one, q, run, now } from './db.ts'
 import { bus, emit } from './events.ts'
 import { j } from './util.ts'
 import { conflictsWith, mergeIntoMain, names } from './localmerge.ts'
-import { clearConflict, mergeBase, setConflict, whoMergedFirst } from './conflicts.ts'
+import { clearConflict, clearStalled, fixWords, forTests, mergeBase, setConflict, stalledKind, whoMergedFirst } from './conflicts.ts'
 import { getAgent, stopAgent, type Agent } from './agents.ts'
 import { sendMessage } from './delivery.ts'
-import { autoOn, getFeature, getRepo, getTicket, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type Repo, type Ticket, liveTpm } from './records.ts'
+import { autoOn, getFeature, getRepo, getTicket, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type Repo, type Ticket, liveTpm, closedWhy } from './records.ts'
 import { ghOpts, git, syncRepo } from './repos.ts'
 import { releaseWorktree } from './slots.ts'
 import { writeFeatureMd } from './projectmd.ts'
@@ -39,15 +39,19 @@ export async function finishTicket(agent: Agent, title: string, body: string): P
       + " merge, never rebase), keep both sides' intent, run the tests, commit, then call open_pr again.")
   }
   const fixed = t.status === 'resolving' || (t.status === 'awaiting_answer' && t.prior_status === 'resolving')
+  const tests = fixed && forTests(t.fixing) // it went back for its tests, not conflicts (Bug 84)
+  const changed = fixed && t.fixing === 'changes' // or for a spec the TPM changed after it was finished
   const auto = autoOn(repo.id)
-  clearConflict(t.id)
+  clearConflict(t.id); clearStalled(t.id)
   run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
     `ticket:${t.id}`, 'pr', `# ${title}\n\n${body}`, now())
   if (!slug) {
-    setTicket(t.id, { status: 'pr_ready', pr_url: null, pr_state: 'local', prior_status: null })
+    setTicket(t.id, { status: 'pr_ready', pr_url: null, pr_state: 'local', prior_status: null, fixing: null })
     emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: false, fixed } })
-    if (fixed && !auto) attention('conflicts_fixed', `${t.key}: conflicts fixed (${repo.default_branch} merged in). Ready to merge again.`, { agentId: agent.id, ticketId: t.id })
+    if (fixed && !tests && !changed && !auto) attention('conflicts_fixed', `${t.key}: conflicts fixed (${repo.default_branch} merged in). Ready to merge again.`, { agentId: agent.id, ticketId: t.id })
     tellTpm(f, auto ? `HQ: ${t.key} is finished (${t.branch}). HQ tests it on ${repo.default_branch} and merges it; you'll be told when it merges.`
+      : tests ? `HQ: ${t.key}'s engineer fixed its tests on ${repo.default_branch}. The user merges it from HQ; you'll be told when it merges.`
+      : changed ? `HQ: ${t.key}'s engineer built the change to its spec (${t.branch}). The user merges it from HQ; you'll be told when it merges.`
       : fixed ? `HQ: ${t.key}'s conflicts with ${repo.default_branch} are fixed. The user merges it from HQ; you'll be told when it merges.`
       : `HQ: ${t.key} is finished (${t.branch}). The user merges it into ${repo.default_branch} from HQ; you'll be told when it merges.`)
     bus.emit('slot.freed') // its parallel slot is free now (listeners.ts)
@@ -59,10 +63,12 @@ export async function finishTicket(agent: Agent, title: string, body: string): P
     throw new Error(`HQ could not push ${t.branch}: ${(e as Error).message}. The user has been told; stop and wait for a message.`)
   }
   const hasPr = !!t.pr_number && t.pr_state === 'open' // fixed after a conflict: the push updated its open PR
-  setTicket(t.id, hasPr ? { status: 'pr_open', prior_status: null } : { status: 'pr_ready', pr_url: null, pr_state: 'waiting', prior_status: null })
+  setTicket(t.id, hasPr ? { status: 'pr_open', prior_status: null, fixing: null } : { status: 'pr_ready', pr_url: null, pr_state: 'waiting', prior_status: null, fixing: null })
   emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: true, waiting: !hasPr, fixed } })
-  if (fixed && !auto) attention('conflicts_fixed', `${t.key}: conflicts fixed (${base.name} merged in). Ready to merge again.`, { agentId: agent.id, ticketId: t.id })
+  if (fixed && !tests && !changed && !auto) attention('conflicts_fixed', `${t.key}: conflicts fixed (${base.name} merged in). Ready to merge again.`, { agentId: agent.id, ticketId: t.id })
   tellTpm(f, auto ? `HQ: ${t.key} is finished (${t.branch}, pushed). HQ tests it on ${base.name} and merges it; you'll be told when it merges.`
+    : tests ? `HQ: ${t.key}'s engineer fixed its tests on ${base.name}. The user merges it from HQ; you'll be told when it merges.`
+    : changed ? `HQ: ${t.key}'s engineer built the change to its spec (${t.branch}, pushed). The user merges it from HQ; you'll be told when it merges.`
     : fixed ? `HQ: ${t.key}'s conflicts with ${base.name} are fixed. The user merges it from HQ; you'll be told when it merges.`
     : `HQ: ${t.key} is finished (${t.branch}, pushed). The user tries it, then merges it or makes a PR from HQ; you'll be told when it merges.`)
   bus.emit('slot.freed') // its parallel slot is free now (listeners.ts)
@@ -129,6 +135,7 @@ async function checkOnce(): Promise<void> {
     const slug = usesGithub(repo) ? parseGithubRemote(repo.remote ?? '') : null
     if (!slug) { if (await branchMerged(repo.path, t.branch, `refs/heads/${repo.default_branch}`)) markMerged(t, null); else await checkConflict(t, repo); continue }
     const prs = await prsForBranch(slug, t.branch, ghOpts()).catch(() => null) // null: GitHub couldn't be asked
+    if (!getTicket(t.id)) continue // removed from HQ while GitHub was being asked
     const pr = decidingPr(prs ?? [])
     if (pr?.state === 'MERGED') { markMerged(t, pr); continue }
     if (pr?.state === 'OPEN') {
@@ -150,14 +157,17 @@ async function checkOnce(): Promise<void> {
 const fetchedFor = new Map<string, string>() // repo id → the origin main HQ fetched again because GitHub saw a conflict it didn't
 const toldStopped = new Set<string>() // engineers whose stalled fix the user has been told about (once per engineer per run)
 /** The early warning: a waiting ticket that would now conflict with main gets the notice and Fix conflicts; one that merges
- *  cleanly again loses them. A resolving ticket whose engineer has gone gets the notice again, so Fix conflicts can restart it. */
+ *  cleanly again loses them. A resolving ticket whose engineer has gone gets the notice again, so Fix conflicts can restart it; one
+ *  that went back for its tests gets its own notice and Fix tests (Bug 84), one that went back for a changed spec, Build the change. */
 async function checkConflict(t0: Ticket, repo: Repo, pr?: Pr): Promise<void> {
   const t = getTicket(t0.id); if (!t?.branch || !['pr_ready', 'pr_open', 'resolving'].includes(t.status)) return
   if (t.status === 'resolving') {
     const eng = t.assignee_agent_id ? getAgent(t.assignee_agent_id) : undefined
-    const why = `${t.key}: its engineer stopped before the conflicts with ${mergeBase(repo).name} were fixed. Press Fix conflicts to start another.`
+    const why = t.fixing ? `${t.key}: its engineer stopped while ${fixWords(t.fixing, mergeBase(repo).name).ing}.`
+      + ` Press ${t.fixing === 'changes' ? 'Build the change' : 'Fix tests'} to start another.`
+      : `${t.key}: its engineer stopped before the conflicts with ${mergeBase(repo).name} were fixed. Press Fix conflicts to start another.`
     if ((!eng || eng.status === 'exited') && !toldStopped.has(t.assignee_agent_id ?? t.id)) {
-      toldStopped.add(t.assignee_agent_id ?? t.id); attention('merge_conflict', why, { agentId: t.assignee_agent_id, ticketId: t.id })
+      toldStopped.add(t.assignee_agent_id ?? t.id); attention(stalledKind(t.fixing), why, { agentId: t.assignee_agent_id, ticketId: t.id })
     }
     return
   }
@@ -197,7 +207,7 @@ const merging = new Map<string, Promise<unknown>>() // one merge per repo at a t
 export function mergeTicket(ticketId: string): Promise<{ merged: true; sha: string; already: boolean }> {
   const t0 = getTicket(ticketId); const f = t0 && getFeature(t0.feature_id); const repo = f && getRepo(f.repo_id)
   if (!t0 || !repo) return Promise.reject(new Error('unknown ticket'))
-  if (repo.clearing_at) return Promise.reject(new Error(`${repo.name} is being cleared; wait until it's done.`))
+  const closed = closedWhy(repo.id); if (closed) return Promise.reject(new Error(closed))
   return inMergeQueue(repo.id, () => mergeNow(ticketId, repo))
 }
 /** Runs `fn` when the repo's earlier merges are done: nothing else merges there meanwhile. */
@@ -209,7 +219,7 @@ export async function mergeNow(ticketId: string, repo: Repo): Promise<{ merged: 
     const t = getTicket(ticketId)!
     if (t.status === 'merged') return { merged: true as const, sha: '', already: true }
     if (usesGithub(repo) && t.pr_state !== 'local') return mergeOnGithub(t, repo) // finished while local-only: still merged here
-    if (t.status === 'resolving') throw new Error(`${t.key}'s engineer is fixing its conflicts with ${repo.default_branch}; merge it once that's done.`)
+    if (t.status === 'resolving') throw new Error(`${t.key}'s engineer is ${fixWords(t.fixing, repo.default_branch).ing}; merge it once that's done.`)
     if (t.status !== 'pr_ready' || t.pr_state !== 'local' || !t.branch) throw new Error(`${t.key} isn't finished yet (${t.status}).`)
     const doc = one<{ text: string }>('SELECT text FROM docs WHERE scope = ? AND key = ?', `ticket:${t.id}`, 'pr')?.text ?? ''
     const body = doc.replace(/^# .*\n?/, '').trim() // the engineer's PR text, without its title line
@@ -233,7 +243,7 @@ export async function mergeNow(ticketId: string, repo: Repo): Promise<{ merged: 
  *  HQ notices, and local main fast-forwards. Nothing changes when GitHub refuses; the user reads why. */
 async function mergeOnGithub(t: Ticket, repo: Repo): Promise<{ merged: true; sha: string; already: boolean }> {
   const slug = parseGithubRemote(repo.remote ?? '')!, o = ghOpts()
-  if (t.status === 'resolving') throw new Error(`${t.key}'s engineer is fixing its conflicts with ${repo.default_branch}; merge it once that's done.`)
+  if (t.status === 'resolving') throw new Error(`${t.key}'s engineer is ${fixWords(t.fixing, repo.default_branch).ing}; merge it once that's done.`)
   if (!['pr_ready', 'pr_open'].includes(t.status) || !t.branch) throw new Error(`${t.key} isn't finished yet (${t.status}).`)
   if (t.conflict_files != null) throw new Error(`${t.key} conflicts with ${repo.default_branch}: press Fix conflicts first.`)
   await syncRepo(repo.id) // GitHub's main as it is now

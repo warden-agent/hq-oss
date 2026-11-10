@@ -16,7 +16,7 @@ export type Repo = {
   /** The project's TPM (Bug 52): its latest session, and when it was parked (switched away from). */
   tpm_agent_id: string | null; tpm_parked_at: number | null; next_ticket: number; next_feature: number
   /** Auto mode: on or off, why it stopped, why it's waiting, and the user's own test command. */
-  auto_mode: number; auto_stopped_why: string | null; auto_waiting: string | null; test_cmd: string | null
+  auto_mode: number; auto_stopped_why: string | null; auto_waiting: string | null; test_cmd: string | null; test_cmd_proposed: string | null
 }
 /** One request the project's TPM is working on: a branch of the board. `handle` (F-1…) is how the TPM names it. `tpm_agent_id`
  *  and `tpm_parked_at` are from when every feature had its own TPM (before Bug 52); nothing reads them any more. */
@@ -24,11 +24,16 @@ export type Feature = {
   id: string; repo_id: string; slug: string; title: string; request_text: string; status: string; tpm_agent_id: string | null
   merge_order: string; stacked_branches: number; created_at: number; updated_at: number; tpm_parked_at: number | null; handle: string | null
 }
+/** Why a finished ticket went back to its engineer: null, its conflicts with main; 'tests', auto mode's test of it on main failed; 'tests_hung',
+ *  that test never finished; 'changes', the TPM changed its spec after it was finished. */
+export type Fixing = 'tests' | 'tests_hung' | 'changes' | null
 export type Ticket = {
   id: string; feature_id: string; key: string; slug: string; title: string; size: string; status: TicketStatus; prior_status: TicketStatus | null
   assignee_agent_id: string | null; expected_files: string; deps: string; edit_overrides: string; branch: string | null; worktree_path: string | null
   pr_number: number | null; pr_url: string | null; pr_state: string | null; plan_round: number; handoff_updated_at: number | null
   last_handoff_hash: string | null; spec: string | null; go_ahead: number; conflict_files: string | null; conflict_with: string | null; auto_tries: number; auto_parked_why: string | null
+  repairs_main: string | null // the main a repair ticket of HQ's is fixing (auto mode)
+  fixing: Fixing // what it went back to its engineer for, while `resolving` (Bug 84)
   parked_at: number | null; created_at: number; updated_at: number
 }
 
@@ -44,10 +49,15 @@ export const syncBlocks = (repo: Repo): boolean => repo.kind === 'github' && !lo
 export const autoOn = (repoId: string | null | undefined): boolean => !!repoId && !!one<{ x: number }>('SELECT 1 AS x FROM repos WHERE id = ? AND auto_mode = 1', repoId)
 export const repos = (): Repo[] => q<Repo>('SELECT * FROM repos ORDER BY created_at')
 export const getRepo = (repoId: string): Repo | undefined => one<Repo>('SELECT * FROM repos WHERE id = ?', repoId)
-/** Refuses new work in a repo whose board is being cleared (clear.ts): no launches, tickets, merges or previews until it's done. */
-export function notClearing(repoId: string): void {
-  const r = getRepo(repoId); if (r?.clearing_at) throw new Error(`${r.name} is being cleared; wait until it's done.`)
+/** Repos on their way out of HQ (remove.ts). In memory, not clearing_at: the fresh-start sweep finishes any clear it finds, and that changes the folder. */
+export const removing = new Set<string>()
+/** Why nothing new may start in this repo, or null: its board is being cleared (clear.ts), or it's being removed. */
+export function closedWhy(repoId: string): string | null {
+  const r = getRepo(repoId)
+  return r?.clearing_at ? `${r.name} is being cleared; wait until it's done.` : removing.has(repoId) ? `${r?.name ?? 'That project'} is being removed from HQ.` : null
 }
+/** Refuses new work in a repo that's closed for now (closedWhy): no launches, tickets, merges or previews until it's done. */
+export function notClearing(repoId: string): void { const why = closedWhy(repoId); if (why) throw new Error(why) }
 export const features = (): Feature[] => q<Feature>('SELECT * FROM features ORDER BY created_at DESC')
 export const getFeature = (fid: string): Feature | undefined => one<Feature>('SELECT * FROM features WHERE id = ?', fid)
 export const tickets = (featureId?: string): Ticket[] =>

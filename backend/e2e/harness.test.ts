@@ -40,3 +40,20 @@ test('fake agents report in, hooks and MCP work as the agent, the plan gate hold
   assert.ok(trusted(path.join(hq.home, '.claude.json')).some((p) => p.startsWith(path.dirname(hq.home))))
   assert.ok(!trusted(path.join(os.homedir(), '.claude.json')).some((p) => p.startsWith(path.dirname(hq.home))))
 })
+
+test('stopping a test HQ twice never reaches a tmux server outside its own folder', async () => {
+  // A tmux that records every call and refuses kill-server unless it names a socket first, so even a regression here can't reach the user's server.
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-faketmux-')), calls = path.join(bin, 'calls')
+  const real = execFileSync('sh', ['-c', 'command -v tmux'], { encoding: 'utf8' }).trim()
+  const script = ['#!/bin/sh', `echo "$*" >> '${calls}'`, `case " $* " in *" kill-server "*) [ "$1" = -S ] || { echo 'refused: no -S' >&2; exit 1; } ;; esac`, `exec '${real}' "$@"`]
+  fs.writeFileSync(path.join(bin, 'tmux'), script.join('\n') + '\n', { mode: 0o755 })
+  const hq = await startHq({ env: { PATH: `${bin}:${process.env.PATH}` } })
+  hq.tmux('new-session', '-d', '-s', 'probe', 'sleep 60') // its own server, as an agent's would start it
+  await hq.stop(); await hq.stop() // the second used to run a bare kill-server after its folder had gone: the default server
+  const kills = fs.readFileSync(calls, 'utf8').split('\n').filter((l) => l.split(' ').includes('kill-server'))
+  assert.ok(kills.length >= 1, 'it stopped its own server')
+  const own = (process.env.HQ_SHORT_TMPDIR ?? '/tmp').replace(/[.*+?^${}()|[\]\\/]/g, '\\$&') // own-tmp.mjs gives the run a folder of its own there
+  for (const k of kills) assert.match(k, new RegExp(`^-S ${own}/hq-e2e-\\S+/tmux-\\d+/default kill-server$`), k)
+  fs.rmSync(bin, { recursive: true, force: true })
+})
+

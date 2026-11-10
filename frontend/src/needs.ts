@@ -5,6 +5,21 @@ import { FINISHED, readyTickets } from '../../backend/src/readiness.ts'
 
 type S = { repos: any[]; features: any[]; tickets: any[]; agents: any[]; reviews: any[]; attention: any[]; asks?: any[]; settings?: Record<string, any>; defaults?: Record<string, any>
   working?: number }
+/** The project a notice's kind names (repo_sync:<id>, auto_stopped:<id>, test_cmd_proposed:<id>): those notices have no ticket or agent to go by. */
+const kindRepo = (k: string): string | null => /^[a-z_]+:(.+)$/.exec(k)?.[1] ?? null
+/** Only the picked repo's work: its features, their tickets, agents, messages and reviews, and the notices about them or about the
+ *  repo itself. Notices about nothing in particular (the usage limit, an HQ error) stay. Each repo is a slate of its own; the others'
+ *  work is still in HQ, and the chip beside ⚠ says what it needs (Bug 63). */
+export function forRepo<T extends S & { messages: any[] }>(s: T, repoId: string | null): T {
+  const fids = new Set(s.features.filter((f) => f.repo_id === repoId).map((f) => f.id))
+  const tickets = s.tickets.filter((t) => fids.has(t.feature_id)), tids = new Set(tickets.map((t) => t.id))
+  const agents = s.agents.filter((a) => a.repo_id ? a.repo_id === repoId : !a.feature_id || fids.has(a.feature_id)), aids = new Set(agents.map((a) => a.id))
+  const mine = (x: { agent_id?: string | null; ticket_id?: string | null }) => x.ticket_id ? tids.has(x.ticket_id) : x.agent_id ? aids.has(x.agent_id) : true
+  const about = (a: any) => { const r = kindRepo(a.kind); return r ? r === repoId : mine(a) }
+  return { ...s, features: s.features.filter((f) => fids.has(f.id)), tickets, agents, reviews: s.reviews.filter(mine), attention: s.attention.filter(about),
+    asks: (s.asks ?? []).filter((a) => a.repo_id === repoId), working: workingEngineers(s),
+    messages: s.messages.filter((m) => m.repo_id ? m.repo_id === repoId : m.feature_id ? fids.has(m.feature_id) : [m.from_id, m.to_id].every((x) => !x || x === 'user' || x === 'hq' || aids.has(x))) }
+}
 /** Engineers using a parallel slot (finished ones don't). */
 export const workingEngineers = (s: { agents: any[]; tickets: any[] }): number =>
   s.agents.filter((a) => a.role === 'engineer' && a.status !== 'exited' && !FINISHED.includes(s.tickets.find((t) => t.id === a.ticket_id)?.status ?? '')).length
@@ -32,11 +47,12 @@ export type Need = { key: string; text: string; repoId: string | null; ref: { re
 /** Notices that alert: an agent is stuck, blocked, asking the user, sent back too often or stopped when it shouldn't have, or
  *  finished work can't go further. Information (merged, memory filling up, model notes) is left to the ⚠ menu. */
 export const ALERT_KINDS = new Set(['stuck', 'blocked', 'dialog', 'message_for_user', 'cap_reached', 'engineer_exited', 'agent_exited', 'launch_failed',
-  'fresh_start_failed', 'merge_conflict', 'delivery_failed', 'dm_refused', 'tpm_away', 'unexpected_prompt', 'usage_limit', 'rate_limit', 'api_error', 'pr_failed', 'push_failed', 'auto_parked'])
+  'fresh_start_failed', 'merge_conflict', 'fix_stalled', 'change_stalled', 'delivery_failed', 'dm_refused', 'tpm_away', 'unexpected_prompt', 'usage_limit', 'rate_limit', 'api_error',
+  'pr_failed', 'push_failed', 'auto_parked', 'leftovers_stuck', 'leftovers_cant_check', 'bg_stalled', 'engineer_idle'])
 /** Good news: green, not red, because nothing is wrong (Bug 61). */
-export const goodNews = (kind: string): boolean => kind === 'merged' || kind === 'conflicts_fixed' || kind.startsWith('auto_finished:')
-/** Auto mode's own notices name their project in the kind. */
-const autoKind = (k: string): string | null => /^auto_(stopped|finished):(.+)$/.exec(k)?.[2] ?? null
+export const goodNews = (kind: string): boolean => kind === 'merged' || kind === 'conflicts_fixed' || kind.startsWith('auto_finished:') || kind.startsWith('project_removed') // Bug 66's notice
+/** Auto mode's own notices that need the user: they name their project in the kind. */
+const autoNeeds = (k: string): boolean => /^(auto_stopped|auto_finished|test_cmd_proposed):/.test(k)
 
 /** Everything that needs the user right now, oldest kind first: the TPM's questions and tickets ready to start (Bug 43), plans
  *  waiting for review, finished tickets waiting for their merge (or for Fix conflicts), then alerting notices. `mergeAct` says what a finished ticket waits for (board.ts mergeActs). */
@@ -44,6 +60,7 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
   const feature = (id: unknown) => s.features.find((f) => f.id === id)
   const repoOf = (t: any): string | null => feature(t?.feature_id)?.repo_id ?? null
   const where = (repoId: string | null) => { const r = s.repos.find((x) => x.id === repoId); return r ? `${r.name}: ` : '' }
+  const named = (repoId: string | null, text: string) => text.startsWith(where(repoId)) ? text : `${where(repoId)}${text}` // auto notices already start with it
   const out: Need[] = []
   for (const r of s.repos) {
     const turn = yourTurn(s, r.id), ref = { tpm: r.id }
@@ -59,15 +76,21 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
     const f = feature(t.feature_id); if (!f || f.status === 'cancelled') continue
     const act = mergeAct(t); if (!act) continue
     out.push({ key: `${act}:${t.id}`, repoId: f.repo_id, ref: { ticket: t.id },
-      text: act === 'merge' ? `${where(f.repo_id)}${t.key} is finished and waiting for you to merge it` : `${where(f.repo_id)}${t.key} clashes with main: press Fix conflicts` })
+      text: act === 'merge' ? `${where(f.repo_id)}${t.key} is finished and waiting for you to merge it`
+        : t.status === 'resolving' && t.fixing === 'changes' ? `${where(f.repo_id)}${t.key}'s change isn't built yet and its engineer stopped: press Build the change`
+        : t.status === 'resolving' && t.fixing ? `${where(f.repo_id)}${t.key}'s tests aren't fixed yet and its engineer stopped: press Fix tests`
+        : `${where(f.repo_id)}${t.key} clashes with main: press Fix conflicts` })
   }
-  for (const a of s.attention.filter((x) => !x.resolved_at && (ALERT_KINDS.has(x.kind) || autoKind(x.kind)))) {
+  for (const a of s.attention.filter((x) => !x.resolved_at && (ALERT_KINDS.has(x.kind) || autoNeeds(x.kind)))) {
     const t = s.tickets.find((x) => x.id === a.ticket_id), ag = s.agents.find((x) => x.id === a.agent_id)
-    const repo = autoKind(a.kind) ?? (t ? repoOf(t) : ag?.repo_id ?? feature(ag?.feature_id)?.repo_id ?? null)
-    out.push({ key: `attention:${a.id}`, text: `${where(repo)}${String(a.detail ?? a.kind).slice(0, 160)}`, repoId: repo, ref: { attention: a.id } })
+    const repo = kindRepo(a.kind) ?? (t ? repoOf(t) : ag?.repo_id ?? feature(ag?.feature_id)?.repo_id ?? null)
+    out.push({ key: `attention:${a.id}`, text: named(repo, String(a.detail ?? a.kind).slice(0, 160)), repoId: repo, ref: { attention: a.id } })
   }
   return out
 }
+/** `here`: what this project's ⚠ counts, which includes what's about no project (the usage limit). `elsewhere`: the chip beside it. Together they're the tab title's count. */
+export const splitNeeds = (needs: Need[], repoId: string | null): { here: Need[]; elsewhere: Need[] } =>
+  ({ here: needs.filter((n) => !n.repoId || n.repoId === repoId), elsewhere: needs.filter((n) => n.repoId && n.repoId !== repoId) })
 
 /** The items in `now` that weren't there before (`seen`, null on the first look: then nothing is new, so loading or reloading the
  *  page never pops anything up). Returns them and the keys to remember next time. */

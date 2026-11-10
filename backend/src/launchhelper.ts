@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { emit } from './events.ts'
 import { attention, resolveKind } from './attention.ts'
-import { getFeature, getRepo, getTicket, type Repo, type Ticket } from './records.ts'
+import { getFeature, getRepo, getTicket, notClearing, type Repo, type Ticket } from './records.ts'
 import { tryable } from './trydata.ts'
 import { getAgent, launchAgent, liveAgents, stopAgent, type Agent } from './agents.ts'
 import { modelFor } from './roles.ts'
@@ -66,13 +66,19 @@ export function startHelper(repoId: string, why: 'first' | 'fix', ticket: string
 }
 async function startOne(repoId: string, why: 'first' | 'fix', ticket: string | null): Promise<ReturnType<typeof previewView>> {
   const repo0 = getRepo(repoId); if (!repo0) throw new Error('unknown repo')
-  if (repo0.clearing_at) throw new Error(`${repo0.name} is being cleared; wait until it's done.`)
+  notClearing(repoId)
   const cur = row(repoId)
   const tk = triedTicket(repoId, ticket ?? (why === 'fix' ? cur?.ticket_id ?? null : null))
   if (live(cur?.helper_agent_id ?? null)) { if (tk) save(repoId, { helper_ticket_id: tk.id }); return previewView(repo0) } // already on it
   const repo = await ensureFresh(repoId)
   const output = why === 'fix' ? await tmux.capturePane(previewSession(repoId), 80) : ''
   if (cur?.helper_worktree) await removeWorktree(repo.path, cur.helper_worktree) // a "Not now" or a lost helper's
+  if (repo.empty && !tk) { // Bug 67: a helper would spend tokens finding that out. A ticket to try has files of its own, even on an empty main (Bug 46)
+    resolveKind(notice(repoId), null)
+    save(repoId, { helper_agent_id: null, helper_worktree: null, helper_state: 'empty', helper_note: null, helper_saves: 0, draft_recipe: null, helper_ticket_id: null })
+    emit({ agentId: null, source: 'system', kind: 'launch.nothing_to_start', payload: { repo: repo.name } })
+    return previewView(repo)
+  }
   const name = `launch-${Date.now().toString(36)}`, wt = path.join(repo.path, '.claude', 'worktrees', name)
   await git(repo.path, ['worktree', 'add', '-q', '-b', `hq-launch/${name}`, wt, tk?.branch ?? mergeBase(repo).name])
   await excludeHqFolders(repo.path)
@@ -185,8 +191,8 @@ async function tryRun(repoId: string): Promise<void> {
     return tell(repoId, helper, `HQ couldn't start it: ${(e as Error).message}`)
   }
   const end = Date.now() + RUN_WAIT_MS
-  let cur = row(repoId)!
-  while (cur.status === 'starting' && cur.started_at === started.started_at && Date.now() < end) { await sleep(1000); cur = row(repoId)! }
+  let cur = row(repoId); if (!cur) return
+  while (cur.status === 'starting' && cur.started_at === started.started_at && Date.now() < end) { await sleep(1000); cur = row(repoId); if (!cur) return } // removed from HQ
   if (cur.started_at !== started.started_at) return // restarted or stopped by someone else meanwhile: that run's outcome is theirs
   const out = (await tmux.capturePane(previewSession(repoId), 60)).trimEnd().split('\n').slice(-40).join('\n')
   if (cur.status === 'running') {
@@ -198,6 +204,7 @@ async function tryRun(repoId: string): Promise<void> {
   tell(repoId, helper, `Real run on ${where}: ${what}. Last output:\n${out}\n\nFix the steps and call save_launch again.`)
 }
 function tell(repoId: string, helper: Agent | undefined, body: string): void {
+  if (!getRepo(repoId)) return
   if (!helper) return // OK'd from ⚙ after "Not now": the pane shows how it went
   save(repoId, { helper_state: 'working' })
   sendMessage({ channel: 'dm', from: 'hq', to: helper.id, reason: 'fyi', body })
@@ -240,7 +247,7 @@ export async function recoverHelpers(repos: Repo[]): Promise<void> {
 
 /** Helpers HQ lost track of (Bug 41): a live launcher for this repo that isn't the one in its preview row is stopped, and every
  *  launch-* worktree that isn't the row's is removed along with the test servers still running in it. */
-async function sweepStrays(repo: Repo): Promise<void> {
+export async function sweepStrays(repo: Repo): Promise<void> {
   const p = row(repo.id)
   for (const a of liveAgents().filter((x) => x.role === 'launcher' && x.cwd === repo.path && x.id !== p?.helper_agent_id)) {
     await stopAgent(a.id, 'stray launch helper').catch(() => {})

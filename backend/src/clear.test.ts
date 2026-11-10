@@ -146,3 +146,11 @@ test("a clear that can't finish stays locked and says why in a notice; once it c
   assert.equal(getRepo('r5')!.clearing_at, null); assert.equal(count('features', "id = 'f5'"), 0)
   assert.equal(count('needs_attention', "kind = 'repo_clear_failed:r5' AND resolved_at IS NULL"), 0)
 })
+
+test('Bug 63: a test command waiting for the user\'s OK goes with the board, as the run it came from does', async () => {
+  const { attention, openAttention } = await import('./attention.ts')
+  run("INSERT INTO repos(id, name, path, kind, created_at, test_cmd_proposed) VALUES ('r9', 'ninth', '/tmp/ninth', 'local', ?, '{\"now\":\"x\"}')", now)
+  attention('test_cmd_proposed:r9', 'ninth: a repair wants to change the test command.')
+  await clearRepo('r9')
+  assert.equal(openAttention().some((a) => a.kind === 'test_cmd_proposed:r9'), false); assert.equal(getRepo('r9')?.test_cmd_proposed, null)
+})

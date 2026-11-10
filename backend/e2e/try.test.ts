@@ -115,3 +115,21 @@ test('Bug 46: Try it on a new project with no start steps: Claude works them out
   }, 20_000)
   assert.equal(await page(p.url), 'hello page\n'); assert.equal(p.path, dir); assert.equal(p.recipe.parts[0].run, 'npm start')
 })
+
+test('Bug 67: Try it on a main with no files at all still gets a helper: the ticket has them', async () => {
+  const parent = path.join(hq.root, 'new-projects'); fs.mkdirSync(parent, { recursive: true })
+  const repo = (await hq.api('repos/new', { name: 'truly empty', parent, github: false })).json; assert.equal(repo.empty, 1)
+  const f = (await hq.api('features', { repoId: repo.id, title: 'hello', request: 'A hello page' })).json
+  await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Hello page', size: 'S', spec: 'A page.' })).json, eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  const wt = path.join(repo.path, '.claude', 'worktrees', t.key)
+  fs.writeFileSync(path.join(wt, 'package.json'), JSON.stringify({ name: 'empty', private: true, scripts: { start: 'node server.js' } }))
+  fs.writeFileSync(path.join(wt, 'server.js'), "require('http').createServer((q, s) => s.end('hello\\n')).listen(process.env.PORT)\n")
+  sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', 'hello page')
+  assert.equal((await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'hello' })).isError, false)
+  assert.equal((await hq.mcp(eng.id, 'open_pr', { title: 'hello', body: 'hello\n\n## Deviations from approved plan\nNone' })).isError, false)
+  const r = await hq.api(`previews/${repo.id}/start`, { ticket: t.id }); assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.match(r.json.helper_agent_id, /^launch-/); assert.equal(r.json.helper_ticket_id, t.id); assert.ok(fs.existsSync(path.join(r.json.helper_worktree, 'server.js')))
+  await hq.api(`previews/${repo.id}/dismiss`, {})
+})

@@ -11,8 +11,9 @@ import { one, q, run, now } from './db.ts'
 import { emit, patch, type HqEvent } from './events.ts'
 import { assignPorts, commandRecipe, detectCommand, frameBlocked, PREVIEW_PORTS, portBusy, printedPorts, runScript, supervisorSpec, type Recipe } from './apprun.ts'
 import { groupPids, pgidOf, portHolders, whoAnswers, whose, type Holder, type Whose } from './procs.ts'
+import { markFor, runOver, runStarting, sweepNow } from './leftovers.ts'
 import { git } from './reposync.ts'
-import { getFeature, getRepo, getTicket, repos, type Repo } from './records.ts'
+import { getFeature, getRepo, getTicket, repos, type Repo, notClearing } from './records.ts'
 import { syncRepo } from './repos.ts'
 import { shq, sleep } from './util.ts'
 import { copyMainData, tryable } from './trydata.ts'
@@ -59,6 +60,7 @@ export function previewView(repo: Repo): PreviewView {
 export const previews = () => repos().map(previewView)
 /** Saves and sends the UI the whole row (a patch for a row the UI hasn't seen would otherwise arrive half-filled). */
 export function save(repoId: string, fields: Partial<Preview>): void {
+  if (!getRepo(repoId)) return // removed from HQ while something was on its way: it would come back as a row with no project
   const next: Preview = { ...(row(repoId) ?? blank(repoId)), ...fields, updated_at: now() }
   run(`INSERT OR REPLACE INTO previews(${COLS.join(', ')}) VALUES (${COLS.map(() => '?').join(',')})`, ...COLS.map((k) => next[k]))
   const repo = getRepo(repoId); if (repo) patch('preview', repoId, previewView(repo))
@@ -97,11 +99,12 @@ function watch(repoId: string, since: number, done: string | null): void {
     if (cur.ticket_id && tried?.status !== 'merged' && !tryable(tried)) { // cancelled, sent to Fix conflicts…: back to main (a merge restarts it anyway)
       unwatch(repoId); void startPreview(repoId, `back on main: ${tried?.key ?? 'the ticket'} isn't waiting to be merged any more`, { ticket: null }).catch(() => {}); return
     }
-    if (!(await tmux.hasSession(session))) { save(repoId, { status: 'stopped', detail: 'its tmux session is gone', url: null }); return unwatch(repoId) }
+    if (!(await tmux.hasSession(session))) { save(repoId, { status: 'stopped', detail: 'its tmux session is gone', url: null }); void sweepNow(); return unwatch(repoId) }
     const code = await tmux.paneDeadStatus(session)
     if (code !== null) {
       save(repoId, { status: 'crashed', detail: `stopped with code ${code}` })
-      emit({ agentId: null, source: 'system', kind: 'preview.crashed', payload: { repo: repoId, code } }); return unwatch(repoId)
+      emit({ agentId: null, source: 'system', kind: 'preview.crashed', payload: { repo: repoId, code, ...stopReport(repoId, since) } })
+      void sweepNow(); return unwatch(repoId) // the run is over: what it left with no parent goes too (Bug 77)
     }
     if (cur.status === 'starting') {
       const r = cur.command ? null : parse(cur.recipe), tag = r && r.parts.length > 1 ? r.show : null // several parts: output lines are prefixed
@@ -136,17 +139,29 @@ function clash(repoId: string, since: number, port: number, others: Holder[]): P
   })
 }
 
-/** Stops the app: SIGTERM to the pane's whole process group (npm and the node it started), SIGKILL after 3s, then the session. */
+/** How long the app's supervisor gets to end the app: its own grace (5 s for what was asked to stop, then it kills), with room to spare. */
+const STOP_MS = Number(process.env.HQ_PREVIEW_STOP_MS) || 8000
+/** What the supervisor wrote as this run ended (supervise.mjs): how much of the app ran outside its own process group, and what had to be killed. */
+function stopReport(repoId: string, since: number): { outside?: number; killed?: number[] } {
+  try {
+    const r = JSON.parse(fs.readFileSync(path.join(PATHS.home, 'previews', repoId, 'stopped.json'), 'utf8')) as { at: number; outside: number; killed: number[] }
+    return r.at >= since ? { outside: r.outside, killed: r.killed } : {}
+  } catch { return {} }
+}
+/** Stops the app. Its supervisor is asked (SIGTERM) and ends everything the app started, whatever group or session that put itself in (supervise.mjs); if the
+ *  supervisor itself doesn't go, its whole process group is killed. Then the session, and what the run had left with no parent: leftovers.ts knows those
+ *  by the run's mark (Bug 77). A signal to the group alone left running whatever ignored it, was slow, or had left the group. */
 async function kill(repoId: string): Promise<void> {
-  const session = previewSession(repoId)
+  const session = previewSession(repoId), cur = row(repoId)
   if (await tmux.hasSession(session)) {
     const pid = (await tmux.paneDeadStatus(session)) === null ? await tmux.panePid(session) : null
     if (pid) {
-      try { process.kill(-pid, 'SIGTERM') } catch {}
-      if (!(await waitFor(async () => (await tmux.paneDeadStatus(session)) !== null, 3000))) { try { process.kill(-pid, 'SIGKILL') } catch {} }
+      try { process.kill(pid, 'SIGTERM') } catch {}
+      if (!(await waitFor(async () => (await tmux.paneDeadStatus(session)) !== null, STOP_MS))) { try { process.kill(-pid, 'SIGKILL') } catch {} }
     }
     await tmux.killSession(session)
   }
+  if (cur?.started_at && cur.status !== 'stopped') { runOver(markFor(repoId, cur.started_at)); await sweepNow() }
   const port = row(repoId)?.port; if (port) await waitFor(async () => !(await portBusy(port)), 3000)
 }
 
@@ -170,7 +185,7 @@ const SUPERVISOR = path.join(import.meta.dirname, 'supervise.mjs')
 export function startPreview(repoId: string, why: string | null = null, opts: { ticket?: string | null } = {}): Promise<ReturnType<typeof previewView>> {
   return serial(repoId, async () => {
     const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
-    if (repo.clearing_at) throw new Error(`${repo.name} is being cleared; wait until it's done.`)
+    notClearing(repoId)
     const cur = row(repoId)
     const asked = opts.ticket !== undefined, tid = asked ? opts.ticket ?? null : cur?.ticket_id ?? null
     let tk = tid ? getTicket(tid) : undefined
@@ -206,13 +221,15 @@ export function startPreview(repoId: string, why: string | null = null, opts: { 
         + ` · ${tk ? `${tk.key} · ` : ''}${branch ?? '?'}@${head ?? '?'}` })
     const install = spec.parts.filter((x) => x.install).map((x) => x.install).join(', ') || null
     fs.writeFileSync(path.join(dir, 'spec.json'), JSON.stringify(spec, null, 1))
-    const script = path.join(dir, 'run.sh')
-    fs.writeFileSync(script, runScript({ cwd, node: process.execPath, supervisor: SUPERVISOR, spec: path.join(dir, 'spec.json') }), { mode: 0o700 })
-    const t = now()
-    await tmux.newSession(previewSession(repoId), `bash ${shq(script)}`, { cwd })
-    await tmux.tmux('set-option', '-t', previewSession(repoId), 'status', 'off').catch(() => {}) // the Server tab is just the app's output
-    save(repoId, { status: 'starting', detail: install ? `installing packages (${install})…` : 'starting…', port, url: null, port_holders: null,
-      frameable: null, branch, head, started_at: t, ticket_id: tk?.id ?? null })
+    const script = path.join(dir, 'run.sh'), t = now(), mark = markFor(repoId, t)
+    fs.writeFileSync(script, runScript({ cwd, node: process.execPath, supervisor: SUPERVISOR, spec: path.join(dir, 'spec.json'), mark }), { mode: 0o700 })
+    runStarting(mark, true) // from the first moment its programs exist, they are a live run's
+    try {
+      await tmux.newSession(previewSession(repoId), `bash ${shq(script)}`, { cwd })
+      await tmux.tmux('set-option', '-t', previewSession(repoId), 'status', 'off').catch(() => {}) // the Server tab is just the app's output
+      save(repoId, { status: 'starting', detail: install ? `installing packages (${install})…` : 'starting…', port, url: null, port_holders: null,
+        frameable: null, branch, head, started_at: t, ticket_id: tk?.id ?? null })
+    } finally { runStarting(mark, false) }
     emit({ agentId: null, source: 'system', kind: 'preview.started', payload: { repo: repo.name, command, port, ports: got.ports, head, install, why, ticket: tk?.key ?? null, copied } })
     watch(repoId, t, why)
     return previewView(repo)
@@ -227,9 +244,10 @@ export function startPreview(repoId: string, why: string | null = null, opts: { 
 export function stopPreview(repoId: string): Promise<ReturnType<typeof previewView>> {
   return serial(repoId, async () => {
     const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
+    const since = row(repoId)?.started_at ?? 0
     unwatch(repoId); await kill(repoId)
     save(repoId, { status: 'stopped', detail: null, url: null, frameable: null, port_holders: null })
-    emit({ agentId: null, source: 'system', kind: 'preview.stopped', payload: { repo: repo.name } })
+    emit({ agentId: null, source: 'system', kind: 'preview.stopped', payload: { repo: repo.name, ...stopReport(repoId, since) } })
     return previewView(repo)
   })
 }

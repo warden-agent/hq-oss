@@ -8,6 +8,7 @@ import path from 'node:path'
 import { startHq, waitFor, sh, lockOf, type Hq } from './harness.ts'
 
 let hq: Hq
+const prompt = (id: string) => fs.readFileSync(path.join(hq.hqHome, 'agents', id, 'prompt.md'), 'utf8') // what the agent was started with
 before(async () => { hq = await startHq() })
 after(async () => { await hq?.stop() })
 
@@ -122,8 +123,8 @@ test('Bug 9: a stopped engineer is replaced (over the limit, no plan gate), surv
   const t = await tk(t2); assert.deepEqual([t.status, t.assignee_agent_id, t.worktree_path, t.branch], ['resolving', e2b.id, wtOf(dir, t2), 'hq/c2/T-02-invoices'])
   assert.equal(e2b.in_plan_mode, 0); assert.deepEqual([e2.model_alias, e2b.model_alias], ['opusplan', 'sonnet']) // a fix runs on the S model
   assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', e2b.id, 'launch.sh'), 'utf8'), /'--permission-mode' 'acceptEdits'/)
-  assert.match(e2b.launch_prompt, /^You are the engineer for ticket T-02 \(L\): Invoices\. Its work is already finished and committed on branch hq\/c2\/T-02-invoices/)
-  assert.match(e2b.launch_prompt, /HQ: main has moved on since you finished T-02\. T-01 merged first/)
+  assert.match(prompt(e2b.id), /^You are the engineer for ticket T-02 \(L\): Invoices\. Its work is already finished and committed on branch hq\/c2\/T-02-invoices/)
+  assert.match(prompt(e2b.id), /HQ: main has moved on since you finished T-02\. T-01 merged first/)
   assert.match(lockOf(dir, wtOf(dir, t2)) ?? '', /^claude session T-02 /) // the same worktree, now held by the new session
   assert.equal((await hq.state()).reviews.filter((x: any) => x.ticket_id === t2.id).length, 0) // no plan, no review
   // HQ restarts while the new engineer is gone: the ticket stays resolving, the notice comes back, Fix conflicts starts another.

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { onAsk, useBusy, type StopAsk } from './board'
-import { api, errText, onError } from './api'
+import { api, askUntilAnswered, errBody, errText, onError } from './api'
 import { projectSlug } from '../../backend/src/projectname.ts'
 
 const statusColor: Record<string, string> = { working: 'bg-emerald-500/20 text-emerald-300', idle: 'bg-zinc-700/50 text-zinc-300', plan_review: 'bg-amber-500/20 text-amber-300', blocked: 'bg-rose-500/20 text-rose-300', paused: 'bg-rose-500/20 text-rose-300', launching: 'bg-sky-500/20 text-sky-300', exited: 'bg-zinc-800 text-zinc-500',
@@ -40,12 +40,13 @@ export function Menu({ label, title, className = 'btn', align = 'right', childre
     {open && <div ref={pop} className={`absolute top-full z-50 mt-1 rounded-lg border border-zinc-700 bg-zinc-900 p-2 shadow-xl ${align === 'right' ? 'right-0' : 'left-0'}`}>{children(() => setOpen(false))}</div>}
   </div>
 }
-/** Errors from actions (showError), newest last, each with ×; at most three at a time. Replaces alert(). */
+/** Errors from actions (showError), newest first, so it's the oldest that scrolls out of view; each with ×, at most three at a time. Replaces alert(). In the page's
+ *  flow under the top bar, so it pushes the board down and never sits over a control, and menus open over it (Bug 56). No timer: a long refusal could go before it's read. */
 export function ErrorBar() {
   const [msgs, setMsgs] = useState<{ id: number; text: string }[]>([]); const n = useRef(0)
   useEffect(() => { onError((text) => setMsgs((m) => [...m.slice(-2), { id: ++n.current, text }])); return () => onError(null) }, [])
   if (!msgs.length) return null
-  return <div className="fixed left-1/2 top-10 z-[100] flex w-[640px] max-w-[90vw] -translate-x-1/2 flex-col gap-1" role="alert">{msgs.map((m) =>
+  return <div className="mx-auto my-1 flex max-h-[30vh] w-[640px] max-w-[90vw] flex-col gap-1 overflow-y-auto" role="alert">{[...msgs].reverse().map((m) =>
     <div key={m.id} className="flex items-start gap-2 rounded-md border border-rose-500/50 bg-rose-950 px-3 py-2 text-xs text-rose-200 shadow-xl">
       <span className="min-w-0 grow whitespace-pre-wrap break-words">{m.text}</span><button className="btn-sm shrink-0" title="Dismiss" onClick={() => setMsgs((x) => x.filter((y) => y.id !== m.id))}>×</button></div>)}</div>
 }
@@ -83,52 +84,54 @@ export function StopDialog() {
 export function NewProjectDialog({ onClose, onMade }: { onClose: () => void; onMade: (repoId: string) => void }) {
   const [setup, setSetup] = useState<{ parent: string; account: string; githubReady: boolean } | null>(null)
   const [name, setName] = useState(''), [parent, setParent] = useState(''), [github, setGithub] = useState(false)
-  const [busy, setBusy] = useState<null | 'pick' | 'make'>(null), [err, setErr] = useState('')
+  const [busy, setBusy] = useState<null | 'pick' | 'make' | 'add'>(null), [err, setErr] = useState('')
   const [away, setAway] = useState(false)
+  const [offer, setOffer] = useState<{ path: string; name: string; repoId: string | null; inside: boolean } | null>(null) // Bug 65: the repo already there
+  const working = busy === 'make' || busy === 'add'
   // Bug 51: HQ may be restarting as the box opens, so keep asking until it answers
+  useEffect(() => askUntilAnswered('repos/new-setup', { away: setAway, answer: (x) => { setSetup(x); setParent((p) => p || x.parent) }, refused: (e) => setErr(errText(e)) }), [])
   useEffect(() => {
-    let timer = 0, gone = false
-    const check = () => api('repos/new-setup', {}).then((x) => {
-      if (gone) return
-      setAway(false); setSetup(x); setParent((p) => p || x.parent)
-    }, (e) => {
-      if (gone) return
-      if (e instanceof TypeError) { setAway(true); timer = window.setTimeout(check, 1500) } // nothing answered
-      else { setAway(false); setErr(errText(e)) } // HQ refused: asking again won't help
-    })
-    void check()
-    return () => { gone = true; clearTimeout(timer) }
-  }, [])
-  useEffect(() => {
-    const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && busy !== 'make') onClose() }
+    const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !working) onClose() }
     document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
   })
   const slug = projectSlug(name), ok = !!slug && !!parent.trim() && !busy
+  /** A new name or place: what was offered for the old one no longer applies. */
+  const where = (set: (v: string) => void, v: string) => { set(v); if (offer) { setOffer(null); setErr('') } }
   const choose = () => {
     if (busy) return; setBusy('pick')
-    api('repos/pick-folder', { start: parent }).then((r) => { if (r.path) setParent(r.path) }).catch((e) => setErr(errText(e))).finally(() => setBusy(null))
+    api('repos/pick-folder', { start: parent }).then((r) => { if (r.path) where(setParent, r.path) }).catch((e) => setErr(errText(e))).finally(() => setBusy(null))
   }
-  const make = () => { if (!ok) return; setErr(''); setBusy('make'); api('repos/new', { name, parent, github }).then((r) => onMade(r.id), (e) => { setErr(errText(e)); setBusy(null) }) }
+  const make = (nested = false) => {
+    if (!ok) return; setErr(''); setOffer(null); setBusy('make')
+    api('repos/new', { name, parent, github, nested }).then((r) => onMade(r.id), (e) => { setOffer(errBody(e).existing ?? null); setErr(errText(e)); setBusy(null) })
+  }
+  const addIt = () => {
+    if (!offer || busy) return; setErr(''); setBusy('add')
+    api('repos', { path: offer.path }).then((r) => onMade(r.id), (e) => { setErr(errText(e)); setBusy(null) })
+  }
   const opt = (on: boolean, label: string, off = false) => <label className={`flex items-start gap-2 ${off ? 'text-zinc-600' : 'cursor-pointer text-zinc-200'}`}>
-    <input type="radio" name="np-where" className="mt-0.5" checked={github === on} disabled={off || busy === 'make'} onChange={() => setGithub(on)} />
+    <input type="radio" name="np-where" className="mt-0.5" checked={github === on} disabled={off || working} onChange={() => setGithub(on)} />
     <span className="min-w-0 break-words">{label}</span></label>
-  return <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 p-4" onPointerDown={(e) => { if (e.target === e.currentTarget && busy !== 'make') onClose() }}>
-    <form role="dialog" aria-modal="true" aria-label="New project" onSubmit={(e) => { e.preventDefault(); make() }}
+  return <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 p-4" onPointerDown={(e) => { if (e.target === e.currentTarget && !working) onClose() }}>
+    <form role="dialog" aria-modal="true" aria-label="New project" onSubmit={(e) => { e.preventDefault(); if (offer) addIt(); else make() }}
       className="flex max-h-[90vh] w-[480px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-400 shadow-xl">
       <div className="text-sm font-medium text-zinc-100">New project</div>
-      <label className="flex flex-col gap-1">Name<input className="input" autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Budget tracker" /></label>
+      <label className="flex flex-col gap-1">Name<input className="input" autoFocus value={name} onChange={(e) => where(setName, e.target.value)} placeholder="e.g. Budget tracker" /></label>
       <div className="flex flex-col gap-1">Where
-        <div className="flex gap-1.5"><input className="input min-w-0" value={parent} onChange={(e) => setParent(e.target.value)} placeholder="Folder the project goes in" />
+        <div className="flex gap-1.5"><input className="input min-w-0" value={parent} onChange={(e) => where(setParent, e.target.value)} placeholder="Folder the project goes in" />
           <button type="button" className="btn shrink-0" onClick={choose} disabled={!!busy}>{busy === 'pick' ? 'Choosing…' : 'Choose…'}</button></div>
-        {slug && parent.trim() && <div className="break-all text-zinc-500">Makes {parent.trim().replace(/\/+$/, '')}/{slug}</div>}</div>
+        {slug && parent.trim() && (!offer || offer.inside) && <div className="break-all text-zinc-500">Makes {parent.trim().replace(/\/+$/, '')}/{slug}</div>}</div>
       <div className="flex flex-col gap-1.5">Put it on GitHub?
         {opt(false, 'No, just this Mac')}
         {opt(true, `Yes, a private repo on ${setup?.account ?? 'GitHub'}`, !setup?.githubReady)}
         {setup && !setup.githubReady && <div className="text-amber-300/80">HQ isn't logged in to GitHub as {setup.account}, so it can only make local projects.</div>}</div>
       {away && <div role="status" className="text-amber-300/80">Can't reach HQ. It may be restarting. Trying again…</div>}
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
-      <div className="flex flex-wrap justify-end gap-1.5"><button type="button" className="btn" onClick={onClose} disabled={busy === 'make'}>Cancel</button>
-        <button type="submit" className="btn btn-primary" disabled={!ok}>{busy === 'make' ? (github ? 'Making it on GitHub…' : 'Making it…') : 'Create'}</button></div>
+      <div className="flex flex-wrap justify-end gap-1.5"><button type="button" className="btn" onClick={onClose} disabled={working}>Cancel</button>
+        {offer?.inside && <button type="button" className="btn" onClick={() => make(true)} disabled={!ok}>Create here anyway</button>}
+        {offer ? <button type="submit" className="btn btn-primary min-w-0 break-words" disabled={!!busy}>
+          {busy === 'add' ? 'Adding…' : offer.repoId ? `Open ${offer.name}` : `Add ${offer.name} to HQ`}</button>
+          : <button type="submit" className="btn btn-primary" disabled={!ok}>{busy === 'make' ? (github ? 'Making it on GitHub…' : 'Making it…') : 'Create'}</button>}</div>
     </form>
   </div>
 }

@@ -216,3 +216,39 @@ test('Bug 42: a busy port names whose program holds it, and Stop it and Launch f
   assert.equal((await hq.api(`previews/${repo.id}/free-port`, { pids: [stale.pid] })).status, 200)
   await waitFor('the app once more', async () => (await preview(repo.id)).status === 'running', 20_000)
 })
+
+test('Bug 67: Launch on a project with no files says so, with no helper and no tokens, and one inside another repo can offer that repo', async () => {
+  const outer = hq.repo('bigclone'), known = (await hq.api('repos', { path: outer })).json
+  const made = await hq.api('repos/new', { name: 'wrong place', parent: outer, github: false, nested: true }); assert.equal(made.status, 200, JSON.stringify(made.json))
+  const id = made.json.id, dir = made.json.path, repoNow = async () => (await hq.state()).repos.find((r: any) => r.id === id)
+  const helpers = async () => (await hq.state()).agents.filter((a: any) => a.role === 'launcher' && a.repo_id === id)
+  assert.equal(made.json.empty, 1)
+  fs.writeFileSync(path.join(dir, 'app.js'), 'x\n'); sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'one file')
+  const first = await hq.api(`previews/${id}/start`, {}); assert.match(first.json.helper_agent_id, /^launch-/) // a project with files: as before
+  await waitFor('the helper', async () => (await helpers()).find((a: any) => a.status !== 'launching'))
+  assert.equal((await hq.mcp(first.json.helper_agent_id, 'report_cant_start', { reason: 'Nothing to run.' })).isError, false)
+  await waitFor('its notice', async () => (await hq.state()).attention.find((a: any) => a.kind === `repo_launch:${id}` && !a.resolved_at))
+  await waitFor('the helper to go', async () => (await preview(id)).helper_agent_id === null)
+  sh(dir, 'rm', '-q', 'app.js'); sh(dir, 'commit', '-qm', 'and it goes')
+  const running = (await helpers()).filter((a: any) => a.status !== 'exited').length, total = (await helpers()).length
+
+  const r = await hq.api(`previews/${id}/start`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.equal(r.json.helper_state, 'empty'); assert.equal(r.json.helper_agent_id, null); assert.equal(r.json.helper_worktree, null)
+  for (const body of [{}, { why: 'fix' }]) { // Ask Claude, Try again and ⚙ get here without going through Launch
+    const s = await hq.api(`previews/${id}/setup`, body); assert.equal(s.status, 200); assert.equal(s.json.helper_state, 'empty')
+  }
+  assert.equal((await helpers()).length, total, 'no helper started'); assert.equal(running, 0)
+  assert.equal((await repoNow()).empty, 1)
+  assert.equal((await hq.state()).attention.some((a: any) => a.kind === `repo_launch:${id}` && !a.resolved_at), false) // the old "can't start" is out of date
+  assert.deepEqual((await hq.api(`repos/${id}/around`, {})).json.around, { path: fs.realpathSync(outer), name: 'bigclone', repoId: known.id })
+  assert.equal((await hq.api(`repos/${known.id}/around`, {})).json.around, null) // not inside anything
+
+  fs.writeFileSync(path.join(dir, 'app.js'), 'y\n'); sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'files again')
+  const back = await hq.api(`previews/${id}/start`, {}); assert.match(back.json.helper_agent_id, /^launch-/) // files again: Launch works as it did
+  await hq.api(`previews/${id}/dismiss`, {})
+})
+
+test('Bug 67: the repo around a project needn\'t be one HQ knows yet', async () => {
+  const outer = hq.repo('notadded'), made = (await hq.api('repos/new', { name: 'inside', parent: outer, github: false, nested: true })).json
+  assert.deepEqual((await hq.api(`repos/${made.id}/around`, {})).json.around, { path: fs.realpathSync(outer), name: 'notadded', repoId: null })
+})

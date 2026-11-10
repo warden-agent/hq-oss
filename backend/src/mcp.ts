@@ -1,4 +1,5 @@
-// HTTP MCP server "hq" with role-scoped tools (stateless transport per request, bearer token per agent).
+// HTTP MCP server "hq" with role-scoped tools (stateless transport per request, bearer token per agent). Agents reach it through
+// their own relay (mcprelay.mjs), which waits out a backend that is down.
 import http from 'node:http'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -9,8 +10,9 @@ import { emit, patch } from './events.ts'
 import { agentByToken, getAgent, type Agent } from './agents.ts'
 import { readInbox, sendMessage, resolveRecipient, dmAllowed, displayName } from './delivery.ts'
 import { attention } from './attention.ts'
-import { addFeature, createTicket, launchEngineer, setDependencies, waitingOn } from './tickets.ts'
+import { addFeature, changeFinished, createTicket, finishedAndStopped, launchEngineer, setDependencies, waitingOn } from './tickets.ts'
 import { writeFeatureMd, writeProjectMd } from './projectmd.ts'
+import { proposeTestCommand } from './auto.ts'
 import { autoOn, features, featureByHandle, tickets, getFeature, setTicket, ticketForAgent, ticketInRepo, type Feature } from './records.ts'
 import { finishTicket } from './mergewatch.ts'
 import { id, j, readJson, TooLarge } from './util.ts'
@@ -32,6 +34,12 @@ function registerTools(s: McpServer, agent: Agent): void {
     const away = a.to === 'tpm' && (!to || getAgent(to)?.status === 'exited') // Bug 52: the TPM starts on the user's message, not on an engineer's
     if (away && (a.reason === 'blocker' || a.reason === 'question')) attention('tpm_away', `${displayName(agent.id)}'s ${a.reason} is waiting for the TPM, which isn't`
       + ` running: send the TPM a message to start it. "${a.body.slice(0, 300)}"`, { agentId: agent.id, ticketId: agent.ticket_id })
+    const done = !to || to === a.to ? finishedAndStopped(a.to) : undefined // a finished ticket's engineer that HQ has stopped: say so, plainly
+    if (done && getFeature(done.feature_id)?.repo_id === agent.repo_id) {
+      const next = agent.role === 'tpm' ? `To change ${done.key}, call update_ticket_spec: HQ starts an engineer to build the change.`
+        : `Its work is on branch ${done.branch}; ask the TPM for anything else.`
+      return fail(`${done.key} is finished and its engineer (${a.to}) has stopped, so nobody would read this. Nothing was sent. ${next}`)
+    }
     if (!to) return fail(a.to === 'tpm' ? 'The project\'s TPM isn\'t running. HQ showed your message to the user instead; stop and wait for a message.' : `Unknown recipient '${a.to}'.`)
     if (to !== 'user' && to !== 'team') {
       const ok = dmAllowed(agent, to, a.reason)
@@ -92,15 +100,30 @@ function registerTools(s: McpServer, agent: Agent): void {
     })
     // A change of mind often changes what a ticket is (no "Reports tab" any more), so the title can change with the spec (Bug 33)
     s.registerTool('update_ticket_spec', {
-      description: 'Change a ticket\'s spec and/or title (keep the title matching what will be built). The assigned engineer is told. Not for merged or cancelled tickets.',
+      description: 'Change a ticket\'s spec and/or title (keep the title matching what will be built). The assigned engineer is told. A ticket that is already'
+        + ' finished goes back to an engineer to build the new spec, and can\'t be merged until that is done. Not for merged or cancelled tickets.',
       inputSchema: { key: z.string(), spec: z.string().optional(), title: z.string().optional() },
     }, async (a) => {
       logCall('update_ticket_spec', a); const t = byKey(a.key); if (!t) return fail('no such ticket')
       const title = a.title?.trim(); if (!a.spec && !title) return fail('give a new spec, a new title, or both')
       if (t.status === 'merged' || t.status === 'cancelled') return fail(`${t.key} is ${t.status}; create a new ticket instead`)
+      const done = t.status === 'pr_ready' || t.status === 'pr_open'
+      if (done && a.spec && a.spec !== t.spec) { // already built: an engineer builds the change before anything merges
+        try {
+          const r = await changeFinished(t.id, { spec: a.spec, ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
+          const who = r.via === 'launch' ? `HQ started an engineer (${r.engineer})` : `HQ told its engineer (${r.engineer})`
+          return text(`Updated. ${t.key} was already finished, so ${who} to build the change. It can't be merged until that's done; HQ tells you when it is.`)
+        } catch (e) {
+          return fail(`${t.key} is already finished, and HQ couldn't send it back to an engineer for this change: ${(e as Error).message.replace(/\.$/, '')}.`
+            + ' Nothing was changed. Try again in a minute, or create a new ticket for the change.')
+        }
+      }
       setTicket(t.id, { ...(a.spec ? { spec: a.spec } : {}), ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
       const what = [a.spec && 'spec', title && `title (now "${title}")`].filter(Boolean).join(' and ')
-      if (t.assignee_agent_id) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: agent.id, to: t.assignee_agent_id, reason: 'fyi', body: `Ticket ${t.key} ${what} updated. Call get_ticket to read it.` })
+      // a finished ticket's engineer has nothing to do with a new title (and has usually stopped)
+      if (t.assignee_agent_id && !done) {
+        sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: agent.id, to: t.assignee_agent_id, reason: 'fyi', body: `Ticket ${t.key} ${what} updated. Call get_ticket to read it.` })
+      }
       return text('Updated.')
     })
     s.registerTool('set_merge_order', {
@@ -189,6 +212,10 @@ function registerTools(s: McpServer, agent: Agent): void {
     s.registerTool('get_ticket', { description: 'Your ticket: spec, status, review state, handoff so far.', inputSchema: {} }, async () => { logCall('get_ticket', {}); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound'); const rv = one<{ id: string; round: number; status: string }>("SELECT id, round, status FROM review_requests WHERE ticket_id = ? AND status = 'open'", t.id); const hand = one<{ text: string }>('SELECT text FROM docs WHERE scope = ? AND key = ?', `ticket:${t.id}`, 'handoff'); return text(`# ${t.key} (${t.size}): ${t.title}\nStatus: ${t.status}${rv ? ` (review R-${rv.round} pending)` : ''}\nBranch: ${t.branch}\nExpected files: ${t.expected_files}\nDepends on: ${t.deps}\n\n## Spec\n${t.spec ?? ''}\n\n## Handoff so far\n${hand?.text ?? '(none)'}`) })
     s.registerTool('update_handoff', { description: 'Append to your handoff log. kind: after_plan | milestone | before_pr. Required before open_pr.', inputSchema: { text: z.string(), kind: z.enum(['after_plan', 'milestone', 'before_pr']) } }, async (a) => { logCall('update_handoff', { kind: a.kind, len: a.text.length }); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound'); const stamp = `### ${new Date().toISOString().slice(0, 16).replace('T', ' ')} — ${a.kind}\n${a.text}`; run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = text || char(10) || char(10) || excluded.text, updated_at = excluded.updated_at', `ticket:${t.id}`, 'handoff', stamp, now()); setTicket(t.id, { handoff_updated_at: now() }); return text('Handoff recorded.') })
     s.registerTool('report_blocked', { description: 'Tell HQ you are blocked and why (the user is notified).', inputSchema: { reason: z.string() } }, async (a) => { logCall('report_blocked', a); attention('blocked', `${agent.display_name ?? agent.id}: ${a.reason}`, { agentId: agent.id, ticketId: agent.ticket_id }); return text('Reported. Stop and wait for a message.') })
+    s.registerTool('propose_test_command', {
+      description: 'Repair tickets only: a test command that can work in HQ\'s sandbox, when the current one can\'t. HQ tries it itself on main plus your branch and messages you the result. '
+        + 'left_out: exactly which tests it no longer runs, and why.', inputSchema: { command: z.string().min(1).max(2000), left_out: z.string().min(1).max(1000) },
+    }, async (a) => { logCall('propose_test_command', a); try { return text(proposeTestCommand(agent, a.command, a.left_out)) } catch (e) { return fail((e as Error).message) } })
     s.registerTool('open_pr', {
       description: 'You are finished: HQ pushes your branch; the user tries it and merges it (or opens a PR) from HQ. Commit your work first. Requires a current before_pr handoff; the body needs a "## Deviations from approved plan" section.', inputSchema: { title: z.string(), body: z.string() } }, async (a) => { logCall('open_pr', { title: a.title }); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound'); if (!/## Deviations from approved plan/.test(a.body)) return fail('PR body must contain a "## Deviations from approved plan" section.'); if (!t.handoff_updated_at) return fail('Call update_handoff(kind: before_pr) first.')
       try { return text(await finishTicket(agent, a.title, a.body)) } catch (e) { return fail((e as Error).message) } })
@@ -210,6 +237,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (!agent) { res.writeHead(401, { 'content-type': 'application/json' }); res.end('{"error":"unauthorized"}'); return }
   if (!(req.url ?? '').startsWith('/mcp')) { res.writeHead(404); res.end(); return }
   const body = req.method === 'POST' ? await readJson(req) : undefined
+  const waited = Number(req.headers['x-hq-waited-ms']) // Bug 78: the agent's relay held this call while the backend was down
+  if (waited > 0) {
+    const b = body as { method?: string; params?: { name?: string } } | undefined
+    emit({ agentId: agent.id, source: 'mcp', kind: 'mcp.waited', payload: { ms: waited, call: b?.params?.name ?? b?.method } })
+  }
   const server = new McpServer({ name: 'hq', version: '0.1.0' }); registerTools(server, agent)
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
   res.on('close', () => { void transport.close(); void server.close() })

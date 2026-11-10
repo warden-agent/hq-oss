@@ -9,8 +9,8 @@
     "dev": "node --experimental-strip-types --watch src/index.ts",
     "start": "node --experimental-strip-types src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/**/*.test.ts",
-    "e2e": "node --experimental-strip-types --test --test-timeout=120000 e2e/*.test.ts"
+    "test": "node ../scripts/own-tmp.mjs node --experimental-strip-types --test src/**/*.test.ts",
+    "e2e": "node ../scripts/own-tmp.mjs node --experimental-strip-types --test --test-timeout=120000 e2e/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

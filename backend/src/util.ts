@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto'
+import fs from 'node:fs'
 export const id = (prefix: string): string => `${prefix}-${randomUUID().slice(0, 8)}`
 export const sha = (s: string): string => createHash('sha256').update(s).digest('hex')
 export const short = (s: string): string => sha(s).slice(0, 12)
 /** POSIX shell single-quote quoting (printf %q equivalent for our purposes). */
 export const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
+/** The path with its links resolved, or as given when it can't be (it doesn't exist yet). */
+export const real = (p: string): string => { try { return fs.realpathSync(p) } catch { return p } }
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 export function j<T>(s: string | null | undefined, fallback: T): T { try { return s ? (JSON.parse(s) as T) : fallback } catch { return fallback } }
 /** A request body over the limit (the servers answer 413). */

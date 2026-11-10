@@ -21,6 +21,7 @@ The schema and an Architect role prompt (`backend/roles/architect.prompt.md`) ar
   - `gate.ts` is the plan gate
   - `tickets.ts`, `records.ts`, `repos.ts`, `slots.ts`, `mergewatch.ts` and `handover.ts` handle features, tickets, repos, parallel slots, PRs and merges
   - `delivery.ts` carries messages between you, the TPM and engineers
+  - `mcp.ts` serves HQ's tools to agents. Each agent reaches it through its own `mcprelay.mjs`, which Claude Code starts and which waits out a backend that is down
   - `preview.ts` is the live preview: it runs a repo's launch recipe (`apprun.ts`) with `supervise.mjs` in a tmux pane
   - `launchhelper.ts` is the Launch helper: a one-off Claude session that works out a repo's recipe, which you OK once
   - `trust.ts` pre-accepts Claude Code's trust dialog
@@ -45,10 +46,10 @@ If bubblewrap can't run, auto mode won't turn on and says why. Some systems bloc
 ```bash
 npm install
 npm --workspace frontend run build      # the backend serves frontend/dist from disk
-tmux new-session -d -s hq-backend -c backend "npm run start 2>&1 | tee ~/.hq/logs/backend.log"
+tmux new-session -d -s hq-backend -c backend "node --experimental-strip-types src/index.ts 2>&1 | tee ~/.hq/logs/backend.log"
 ```
 
-Start it outside any sandbox. Agents run under that tmux server and inherit its environment. The backend prints `http://127.0.0.1:4780/?token=…`; open that once and the page keeps a cookie.
+Start it outside any sandbox. Agents run under that tmux server and inherit its environment. It is started with `node` itself: under `npm run start`, npm would stay in memory (about 50 MB) only to wait for it. The backend prints `http://127.0.0.1:4780/?token=…`; open that once and the page keeps a cookie.
 
 Ports, all bound to 127.0.0.1:
 - 4780: UI, API and WebSocket (the token and a matching Origin are required)
@@ -72,6 +73,11 @@ Ports, all bound to 127.0.0.1:
   - The run can't write outside its checkout and package caches, can't read `~/.ssh`, cloud or package-manager logins or HQ's own files, and can't reach other programs' sockets in the usual places.
   - The test step has no network beyond localhost. The install step has open network, because neither sandbox can filter by site, so a package's install script can reach the internet (with no credentials to send).
   - A test's Unix sockets must live in its own checkout.
+- **A project whose own tests fail repairs itself on auto.** HQ opens a repair ticket with the full output and what the sandbox can't do. Other engineers keep building, but nothing merges until the repair is in:
+  - If the repair can't be finished, or a run needs more than two, the project stops and asks you.
+  - If the test command itself can't work in the sandbox, the engineer proposes another. HQ tries it first, takes it, and lists it in the run's summary with what it leaves out. HQ can prove a command passes, not that it's a good test, so read that line. A second change in one run stops and asks.
+  - With auto mode off, HQ opens no repair of its own, and a proposed command waits for your OK.
+  - Each run tests main once as it starts, alongside the first tickets, so a broken main or a test command that can't work in the sandbox opens its repair straight away. A failure is run once more before a repair opens, so one flaky run can't spend one.
   - This protects your machine from accidents and careless code. It isn't a security boundary against a determined attacker.
 - **Messages** reach an agent through the `hq` mod when the session is idle. An agent can also pull them with `read_inbox`. Real typing in HQ's terminal holds delivery for a while.
 - **Plan gate:**
@@ -83,6 +89,7 @@ Ports, all bound to 127.0.0.1:
   - the hook answer that skips the plan menu
   - mod calls being async
   - the trust rule and the `~/.claude.json` lock HQ shares with live sessions
+  - the session file in `~/.claude/sessions/` that says `waiting` while a dialog is open, which is how a "waiting on a dialog" alert clears itself
 
   Re-check them before any version bump.
 

@@ -3,9 +3,10 @@ import fs from 'node:fs'
 import { q, run } from './db.ts'
 import { emit } from './events.ts'
 import { sleep } from './util.ts'
+import { sweepNow } from './leftovers.ts'
 import { claudeLockPid, listWorktrees, removeMerged, unlockStale } from './worktrees.ts'
 import { getAgent } from './agents.ts'
-import { getFeature, getRepo, getTicket, repos, type Ticket } from './records.ts'
+import { getFeature, getRepo, getTicket, repos, type Ticket, removing } from './records.ts'
 
 /** A worker slot's env: slot n owns ports 3100+10n … 3100+10n+9, and PORT is the first of them. */
 export const slotEnv = (idx: number): Record<string, string> => ({ HQ_WORKER: String(idx), PORT: String(3100 + idx * 10), HQ_PORT_BASE: String(3100 + idx * 10), DB_NAME: `hq_w${idx}` })
@@ -24,7 +25,7 @@ export function releaseSlot(agentId: string): void { run('UPDATE worker_slots SE
 /** Once an engineer is gone, its worktree's stale lock is cleared, and a merged ticket's worktree is removed if nothing in it
  *  would be lost (see worktrees.ts). A session HQ just stopped can take a moment to exit, so the lock is checked a few times. */
 export async function releaseWorktree(t: Ticket): Promise<void> {
-  const f = getFeature(t.feature_id), repo = f && getRepo(f.repo_id); if (!repo || !t.worktree_path) return
+  const f = getFeature(t.feature_id), repo = f && getRepo(f.repo_id); if (!repo || !t.worktree_path || removing.has(repo.id)) return // Remove from HQ leaves the folder, locks and all
   for (let i = 0; i < 10; i++) {
     for (const p of await unlockStale(repo.path)) emit({ agentId: null, source: 'system', kind: 'worktree.unlocked', payload: { path: p } })
     const w = (await listWorktrees(repo.path).catch(() => [])).find((x) => x.path === t.worktree_path)
@@ -32,6 +33,7 @@ export async function releaseWorktree(t: Ticket): Promise<void> {
     await sleep(500)
   }
   const cur = getTicket(t.id); if (cur?.status !== 'merged' || !cur.branch || !fs.existsSync(t.worktree_path)) return
+  await sweepNow() // what the engineer left running there goes first (Bug 75)
   const r = await removeMerged(repo.path, t.worktree_path, cur.branch, repo.default_branch).catch((e) => ({ removed: false, why: (e as Error).message }))
   emit({ agentId: null, source: 'system', kind: r.removed ? 'worktree.removed' : 'worktree.kept', payload: { ticket: t.key, path: t.worktree_path, why: r.why ?? null } })
 }

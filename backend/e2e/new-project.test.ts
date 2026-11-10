@@ -58,6 +58,25 @@ test('GitHub project: a private repo under the HQ account with main pushed, sync
   fs.writeFileSync(path.join(hq.home, '.gitconfig'), `[url "file://${bare}/"]\n\tinsteadOf = https://github.com/\n`)
 })
 
+test('Bug 65: a project aimed at a clone is offered the clone, on GitHub too; Add opens it; a known one is opened; anyway still works', async () => {
+  const site = path.join(parent, 'photo-site'); fs.mkdirSync(path.join(site, 'src'), { recursive: true }); sh(site, 'init', '-q', '-b', 'master')
+  fs.writeFileSync(path.join(site, 'src', 'app.js'), 'x'); sh(site, 'add', '.'); sh(site, 'commit', '-q', '-m', 'app')
+  const onGithub = () => fs.existsSync(path.join(bare, 'hq-bot')) ? fs.readdirSync(path.join(bare, 'hq-bot')) : []
+  const hub = onGithub(), repos = (await hq.state()).repos.length
+  const inside = await hq.api('repos/new', { name: 'photo site', parent: site, github: true })
+  assert.equal(inside.status, 409); assert.deepEqual(inside.json.existing, { path: site, name: 'photo-site', repoId: null, inside: true })
+  const next = await hq.api('repos/new', { name: 'photo-site', parent, github: true }) // the first step: the box's own Where, the clone's name
+  assert.equal(next.status, 409); assert.deepEqual(next.json.existing, { path: site, name: 'photo-site', repoId: null, inside: false })
+  assert.deepEqual(fs.readdirSync(site).sort(), ['.git', 'src']); assert.deepEqual(onGithub(), hub); assert.equal((await hq.state()).repos.length, repos)
+  const added = await hq.api('repos', { path: inside.json.existing.path }); assert.equal(added.status, 200, JSON.stringify(added.json))
+  assert.deepEqual([added.json.path, added.json.default_branch, added.json.empty], [site, 'master', 0])
+  const again = await hq.api('repos/new', { name: 'photo site', parent: site, github: false })
+  assert.equal(again.status, 409); assert.equal(again.json.existing.repoId, added.json.id)
+  const anyway = await hq.api('repos/new', { name: 'Part of it', parent: site, github: false, nested: true })
+  assert.equal(anyway.status, 200, JSON.stringify(anyway.json)); assert.equal(anyway.json.path, path.join(site, 'Part-of-it'))
+  assert.equal((await hq.api('repos/new-setup', {})).json.parent, parent) // the next one starts outside the clone
+})
+
 test('a taken name and a failed push leave nothing behind', async () => {
   const other = path.join(hq.root, 'other'); fs.mkdirSync(other)
   const taken = await hq.api('repos/new', { name: 'Shop', parent: other, github: true })

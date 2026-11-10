@@ -6,6 +6,7 @@
   "description": "HQ: local multi-agent Claude Code control room",
   "workspaces": ["backend", "frontend"],
   "scripts": {
+    "postinstall": "node scripts/fix-pty-helper.mjs",
     "backend": "npm --workspace backend run dev",
     "frontend": "npm --workspace frontend run dev"
   }

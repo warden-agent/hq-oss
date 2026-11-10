@@ -1,7 +1,7 @@
 // The UI's "needs you" list (Bug 24, frontend/src/needs.ts): what counts in the tab title and what pops up a notification.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { goodNews, keysText, needsYou, newNeeds, titleFor, yourTurn } from '../../frontend/src/needs.ts'
+import { forRepo, goodNews, keysText, needsYou, newNeeds, splitNeeds, titleFor, yourTurn } from '../../frontend/src/needs.ts'
 
 const state = () => ({
   repos: [{ id: 'r1', name: 'demo' }, { id: 'r2', name: 'api-server' }],
@@ -30,6 +30,32 @@ test('Bug 61: a run\'s finished and stopped notices count for their project, and
   assert.deepEqual(open(s), [['attention:9', 'r1'], ['attention:10', 'r2']]); assert.equal(titleFor(open(s).length), '(2) HQ')
   const read = { ...s, attention: s.attention.slice(1) } // what the UI holds once the patch with resolved_at has come in
   assert.deepEqual(open(read), [['attention:10', 'r2']]); assert.equal(titleFor(open(read).length), '(1) HQ')
+})
+
+test('Bug 63: a notice that names a project shows only there; one about nothing in particular shows everywhere', () => {
+  const s = { ...state(), messages: [], attention: [{ id: 1, kind: 'auto_finished:r1' }, { id: 2, kind: 'auto_stopped:r2' }, { id: 3, kind: 'test_cmd_proposed:r2' }, { id: 4, kind: 'repo_sync:r1' },
+    { id: 5, kind: 'backend_error' }, { id: 6, kind: 'rate_limit' }, { id: 7, kind: 'merged', ticket_id: 't2' }, { id: 8, kind: 'stuck', agent_id: 'tpm-2' }] }
+  assert.deepEqual(forRepo(s, 'r1').attention.map((a) => a.id), [1, 4, 5, 6, 7])
+  assert.deepEqual(forRepo(s, 'r2').attention.map((a) => a.id), [2, 3, 5, 6, 8])
+})
+
+test('Bug 63: ⚠ and the chip beside it add up to the tab title; what\'s about no project counts once, on ⚠', () => {
+  const s = { ...state(), attention: [...state().attention, { id: 4, kind: 'auto_stopped:r2', detail: 'api-server: auto mode stopped.' }, { id: 5, kind: 'rate_limit', detail: 'Usage at 90%' }] }
+  const needs = needsYou(s, (t) => acts[t.id] ?? null), { here, elsewhere } = splitNeeds(needs, 'r1')
+  assert.deepEqual(here.map((n) => n.key), ['review:R-1', 'merge:t2', 'attention:5'])
+  assert.deepEqual(elsewhere.map((n) => n.key), ['fix:t3', 'attention:1', 'attention:4'])
+  assert.equal(here.length + elsewhere.length, needs.length)
+})
+
+test('Bug 63: a pop-up says the project\'s name once, whether or not the notice already does', () => {
+  const s = { ...state(), reviews: [], attention: [{ id: 9, kind: 'auto_finished:r1', detail: 'demo: auto mode finished (T1).' },
+    { id: 10, kind: 'stuck', agent_id: 'tpm-2', detail: 'TPM search went quiet' }] }
+  assert.deepEqual(needsYou(s, () => null).map((n) => n.text), ['demo: auto mode finished (T1).', 'api-server: TPM search went quiet'])
+})
+
+test('Bug 63: a test command waiting for the user\'s OK counts for its project', () => {
+  const s = { ...state(), reviews: [], attention: [{ id: 11, kind: 'test_cmd_proposed:r2', detail: 'api-server: a repair proposes a new test command.' }] }
+  assert.deepEqual(needsYou(s, () => null).map((n) => [n.key, n.repoId]), [['attention:11', 'r2']])
 })
 
 test('goodNews (Bug 61): finished and merged are green; anything that may need the user is not', () => {

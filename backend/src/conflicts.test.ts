@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-conflicts-'))
 const { migrate, run } = await import('./db.ts')
 migrate()
-const { fixConflictsText, mergeBase, whoMergedFirst } = await import('./conflicts.ts')
+const { changeText, fixConflictsText, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, stalledKind, testsFailed, whoMergedFirst } = await import('./conflicts.ts')
 const { getRepo, getTicket, localOnly, syncBlocks, usesGithub } = await import('./records.ts')
 
 const sh = (cwd: string, ...args: string[]): string =>
@@ -91,4 +91,38 @@ If you can't keep both, call report_blocked and say why.`)
   assert.match(clean, /it already merges cleanly with main now/); assert.doesNotMatch(clean, /conflicted file/); assert.match(clean, /\n5\. Call open_pr again/)
   const many = fixConflictsText({ t, base: 'main', files: Array.from({ length: 25 }, (_, i) => `f${i}`), merged: [], inProgress: false })
   assert.match(many, /f19 and 5 more\./)
+})
+
+test('fixTestsText (Bug 82): what failed early is kept with the end of the output, and a run that never finished says so', () => {
+  const t = getTicket('shop')!, passing = Array.from({ length: 300 }, (_, i) => `  ✔ case ${i} passes (1ms)`).join('\n')
+  const failed = { kind: 'fail' as const, test: 'npm test', output: `${passing}\nℹ fail 1`, earlier: "Error: Cannot find module 'jsdom'" }
+  const text = fixTestsText({ t, base: 'main', failed })
+  assert.match(text, /fails its tests, so HQ didn't merge it/); assert.match(text, /Error: Cannot find module 'jsdom'/); assert.match(text, /ℹ fail 1\n\nFix it now/)
+  assert.match(text, /Run `npm test` and fix what fails/); assert.ok(text.length < 5500, String(text.length))
+  const hung = fixTestsText({ t, base: 'main', failed: { ...failed, earlier: '', hung: true } })
+  assert.match(hung, /never finished its tests: HQ stopped `npm test` after 15 minutes/); assert.doesNotMatch(hung, /fails its tests/)
+  assert.match(hung, /find what never finishes and fix it/); assert.match(hung, /ℹ fail 1\n\nFix it now/)
+})
+
+test('Bug 84: what the tests printed is kept for an engineer that takes over, and a note stands in when it\'s gone', () => {
+  const t = getTicket('shop')!, failed = { kind: 'fail' as const, test: 'npm test', output: 'ℹ fail 1', earlier: "Error: Cannot find module 'jsdom'", hung: true }
+  assert.match(testsFailed({ ...t, fixing: 'tests_hung' }, 'npm run check').output, /doesn't have what they printed/)
+  assert.equal(testsFailed({ ...t, fixing: 'tests_hung' }, 'npm run check').test, 'npm run check'); assert.equal(testsFailed({ ...t, fixing: 'tests_hung' }, null).hung, true)
+  keepTestsFailed(t, failed); assert.deepEqual(testsFailed(t, 'other'), failed)
+  keepTestsFailed(t, { ...failed, output: 'second', hung: false }); assert.equal(testsFailed(t, null).output, 'second') // the latest failure, not the first
+  assert.deepEqual(fixWords(null, 'main'), { to: 'merge main in and fix its conflicts', ing: 'fixing its conflicts with main' })
+  assert.equal(fixWords('tests', 'origin/main').ing, 'fixing its tests on origin/main')
+})
+
+test('a finished ticket whose spec changed: its own words, notice and instructions, apart from tests and conflicts', () => {
+  assert.deepEqual(fixWords('changes', 'main'), { to: 'build the change to its spec', ing: 'building the change to its spec' })
+  assert.deepEqual(['changes', 'tests', 'tests_hung', null].map((f) => forTests(f as never)), [false, true, true, false])
+  assert.deepEqual(['changes', 'tests', 'tests_hung', null].map((f) => stalledKind(f as never)), ['change_stalled', 'fix_stalled', 'fix_stalled', 'merge_conflict'])
+  const t = getTicket('shop')!, live = changeText({ t }), fresh = changeText({ t, launch: { worktree: '/wt/shop' } })
+  assert.match(live, /^HQ: the TPM changed the spec of invoices after it was finished\. It isn't merged yet/)
+  const steps = ['1. Call get_ticket and read the spec as it is now.', 'Run the tests.', 'update_handoff(kind: before_pr)', 'Call open_pr again', 'report_blocked']
+  for (const s of steps) assert.ok(live.includes(s), s)
+  assert.doesNotMatch(live, /conflict|git merge|fails its tests/)
+  assert.match(fresh, /^You are the engineer for ticket invoices \(S\): invoices title\. .*committed on branch b\/INV in your worktree \/wt\/shop; get_ticket has/)
+  assert.ok(fresh.endsWith(`the handoff so far.\n\n${live}`))
 })

@@ -147,9 +147,17 @@ export function supervisorSpec(o: { recipe: Recipe; root: string; ports: Record<
     }),
   }
 }
-/** The script the preview's tmux session runs: the supervisor, with the spec file HQ wrote next to it. */
-export function runScript(o: { cwd: string; node: string; supervisor: string; spec: string }): string {
-  return ['#!/bin/bash', `cd ${shq(o.cwd)} || exit 1`, `exec ${shq(o.node)} ${shq(o.supervisor)} ${shq(o.spec)}`].join('\n') + '\n'
+/** Bug 77: every program a preview run starts carries this variable (they inherit it from the run's script), so HQ can tell what a run left behind from the
+ *  user's own programs in the same folder. Its value names the HQ (two can run on one machine), the repo and the start. */
+export const RUN_MARK = 'HQ_PREVIEW_RUN'
+export const runMark = (hqHome: string, repoId: string, startedAt: number): string => `${createHash('sha256').update(hqHome).digest('hex').slice(0, 8)}.${repoId}.${startedAt}`
+export function parseRunMark(mark: string): { hq: string; repoId: string; startedAt: number } | null {
+  const m = /^([0-9a-f]{8})\.(.+)\.(\d+)$/.exec(mark); return m ? { hq: m[1]!, repoId: m[2]!, startedAt: Number(m[3]) } : null
+}
+/** The script the preview's tmux session runs: the supervisor, with the spec file HQ wrote next to it and the run's mark. */
+export function runScript(o: { cwd: string; node: string; supervisor: string; spec: string; mark?: string }): string {
+  return ['#!/bin/bash', `cd ${shq(o.cwd)} || exit 1`, ...(o.mark ? [`export ${RUN_MARK}=${shq(o.mark)}`] : []),
+    `exec ${shq(o.node)} ${shq(o.supervisor)} ${shq(o.spec)}`].join('\n') + '\n'
 }
 
 /** Loopback ports the app printed (`http://localhost:5173/`), for apps such as Vite that pick their own port. */

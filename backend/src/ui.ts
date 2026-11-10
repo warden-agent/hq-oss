@@ -1,4 +1,5 @@
 // UI server: static frontend, REST API, WebSocket (patches, events, terminals). 127.0.0.1 only, token + Origin checked.
+import { stopFrozen } from './bgruns.ts'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -6,26 +7,29 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { BIND, PORTS, DEFAULTS, CHOICES, ENGINEER_LIMIT, NOTE_CAP, GITHUB_ACCOUNT, uiToken, validSetting } from './config.ts'
 import { q, getSetting, setSetting, now, one } from './db.ts'
 import { bus, emit, patch, type Patch, type HqEvent } from './events.ts'
-import { allAgents, getAgent, stopAgent, update, type Agent } from './agents.ts'
-import { openTerminal, openPreviewTerminal, type Term } from './terminal.ts'
+import { allAgents, getAgent, pageAgent, stopAgent, update, type Agent } from './agents.ts'
+import type { Term } from './terminal.ts'
+import { termMessage } from './termws.ts'
 import { createFeature, createTicket, launchEngineer, resumeEngineer, startReady, startReadyRepo, fillSlots, cancelTicket, cancelFeature, fixConflicts } from './tickets.ts'
 import { messageTpm, restartTpm } from './tpm.ts'
 import { freshStart, freshStartAll, parkRepo, resumeRepo } from './freshstart.ts'
 import { clearRepo } from './clear.ts'
+import { removeRepo } from './remove.ts'
 import { repos, features, tickets, getTicket } from './records.ts'
-import { addRepo, defaultParent, pickParent, pickRepo, syncRepo } from './repos.ts'
-import { createProject, githubReady } from './newproject.ts'
+import { pump } from './heavy.ts'
+import { addRepo, defaultParent, pickParent, pickRepo, repoAroundProject, syncRepo } from './repos.ts'
+import { createProject, githubReady, RepoHere } from './newproject.ts'
 import { makePr, mergeTicket } from './mergewatch.ts'
-import { answerReview, openReviews, getReview, getRevision, heldCount, isVerdict, VERDICTS } from './gate.ts'
+import { answerReview, openReviews, pageReviews, getReview, getRevision, heldCount, isVerdict, VERDICTS } from './gate.ts'
 import { interruptAndType, sendMessage, messagesForFeature } from './delivery.ts'
 import { openAttention, resolveAttention } from './attention.ts'
 import { resumeRole } from './modelguard.ts'
 import * as tmux from './tmux.ts'
 import { answerAsk, answerOpenAsks, openAsks } from './asks.ts'
-import { freePort, NeedsSetup, previews, previewSession, setPreviewCommand, startPreview, stopPreview } from './preview.ts'
+import { freePort, NeedsSetup, previews, setPreviewCommand, startPreview, stopPreview } from './preview.ts'
 import { approve, dismiss, launchWithoutRecipe, startHelper } from './launchhelper.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
-import { autoCheck, autoResume, autoRetry, autoRuns, setAuto, setTestCmd, undoRun } from './auto.ts'
+import { answerTestCommand, autoCheck, autoResume, autoRetry, autoRuns, setAuto, setTestCmd, undoRun } from './auto.ts'
 
 const TOKEN = uiToken()
 const extras = new Map<string, Record<string, unknown>>() // non-column agent fields from patches (activity, steps, context)
@@ -39,7 +43,7 @@ function seedExtras(): void {
 bus.on('patch', (p: Patch) => { if (p.entity === 'agent' && p.patch) { const cur = extras.get(p.id) ?? {}; for (const [k, v] of Object.entries(p.patch)) if (['activity', 'last_message', 'steps_done', 'steps_total', 'context_tokens', 'five_hour_pct', 'seven_day_pct'].includes(k)) cur[k] = v; extras.set(p.id, cur) } })
 /** What follows a clicked Fresh start: the body's choice, else the user's setting ('wait' parks the work for Resume). */
 const afterFresh = (v: unknown): 'continue' | 'park' => v === 'continue' || v === 'park' ? v : getSetting('after_fresh_start', DEFAULTS.after_fresh_start) === 'wait' ? 'park' : 'continue'
-const agentView = (a: Agent) => ({ ...a, ...(extras.get(a.id) ?? {}), token_hash: undefined })
+const agentView = (a: Agent) => ({ ...pageAgent(a), ...(extras.get(a.id) ?? {}) })
 
 /** Bug 48: the frontend build HQ serves (its hashed script, e.g. index-pXb_ChmJ.js), or null when there's no build. A tab still
  *  running another build reloads itself (App.tsx). */
@@ -56,11 +60,8 @@ function build(): string | null {
 }
 
 function snapshot() {
-  const reviews = q(`SELECT r.*, p.plan_text, p.edited_plan_text, p.agent_id, p.verdict, p.verdict_message,
-      (SELECT COUNT(*) FROM plan_revisions x WHERE x.ticket_id = r.ticket_id AND x.verdict IN ('revise', 'user_architect')) AS revises_used
-    FROM review_requests r JOIN plan_revisions p ON p.id = r.plan_revision_id ORDER BY r.opened_at DESC LIMIT 50`)
   const agents = allAgents(); for (const id of extras.keys()) if (!agents.some((a) => a.id === id)) extras.delete(id) // agents too old to show
-  return { autoRuns: autoRuns(), repos: repos(), features: features(), tickets: tickets(), agents: agents.map(agentView), messages: messagesForFeature(null, 300), reviews,
+  return { autoRuns: autoRuns(), repos: repos(), features: features(), tickets: tickets(), agents: agents.map(agentView), messages: messagesForFeature(null, 300), reviews: pageReviews(),
     attention: openAttention(), asks: openAsks(), settings: Object.fromEntries(q<{ key: string; value: string }>('SELECT key, value FROM settings').map((r) => [r.key,
       JSON.parse(r.value)])), defaults: { ...DEFAULTS, github_account: GITHUB_ACCOUNT, choices: CHOICES, engineer_limit: ENGINEER_LIMIT, note_cap: NOTE_CAP }, held: heldCount(),
         ports: PORTS, previews: previews(), build: build() }
@@ -85,12 +86,14 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'state') return json(res, 200, snapshot())
     if (r0 === 'repos' && r1 && r2 === 'sync' && req.method === 'POST') return json(res, 200, await syncRepo(r1))
     if (r0 === 'repos' && r1 === 'pick' && req.method === 'POST') { try { return json(res, 200, await pickRepo()) } catch (e) { return json(res, 400, { error: (e as Error).message }) } }
-    if (r0 === 'repos' && r1 === 'new-setup' && req.method === 'POST') return json(res, 200, { parent: defaultParent(), account: GITHUB_ACCOUNT, githubReady: await githubReady() })
+    if (r0 === 'repos' && r1 === 'new-setup' && req.method === 'POST') return json(res, 200, { parent: await defaultParent(), account: GITHUB_ACCOUNT, githubReady: await githubReady() })
     if (r0 === 'repos' && r1 === 'pick-folder' && req.method === 'POST') {
       try { return json(res, 200, await pickParent(String(body.start ?? ''))) } catch (e) { return json(res, 400, { error: (e as Error).message }) }
     }
     if (r0 === 'repos' && r1 === 'new' && req.method === 'POST') {
-      try { return json(res, 200, await createProject(String(body.name ?? ''), String(body.parent ?? ''), body.github === true)) } catch (e) { return json(res, 400, { error: (e as Error).message }) }
+      try { return json(res, 200, await createProject(String(body.name ?? ''), String(body.parent ?? ''), body.github === true, undefined, body.nested === true)) } catch (e) {
+        return e instanceof RepoHere ? json(res, 409, { error: e.message, existing: e.existing }) : json(res, 400, { error: (e as Error).message })
+      }
     }
     if (r0 === 'repos' && !r1 && req.method === 'POST') { try { return json(res, 200, await addRepo(String(body.path ?? ''), body.name ? String(body.name) : undefined)) } catch (e) { return json(res, 400, { error: (e as Error).message }) } }
     if (r0 === 'features' && r1 && r2 === 'start-ready' && req.method === 'POST') { try { return json(res, 200, await startReady(r1)) } catch (e) { return json(res, 400, { error: (e as Error).message }) } }
@@ -101,10 +104,15 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'repos' && r1 && r2 === 'restart-tpm' && req.method === 'POST') { try { return json(res, 200, agentView(await restartTpm(r1, { why: 'ui' }))) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 && r2 === 'auto' && req.method === 'POST') { try { return json(res, 200, await setAuto(r1, !!body.on)) } catch (e) { return json(res, 409,
       { error: (e as Error).message }) } }
+    if (r0 === 'repos' && r1 && r2 === 'around' && req.method === 'POST') { try { return json(res, 200, { around: await repoAroundProject(r1) }) }
+      catch (e) { return json(res, 400, { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 && r2 === 'auto-check' && req.method === 'POST') { try { return json(res, 200, await autoCheck(r1)) }
       catch (e) { return json(res, 400, { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 && r2 === 'auto-resume' && req.method === 'POST') { try { return json(res, 200, await autoResume(r1)) }
       catch (e) { return json(res, 409, { error: (e as Error).message }) } }
+    if (r0 === 'repos' && r1 && r2 === 'test-cmd-answer' && req.method === 'POST') {
+      try { return json(res, 200, await answerTestCommand(r1, !!body.use)) } catch (e) { return json(res, 409, { error: (e as Error).message }) }
+    }
     if (r0 === 'repos' && r1 && r2 === 'test-cmd' && req.method === 'POST') { try { return json(res, 200, setTestCmd(r1, String(body.cmd ?? ''))) } catch (e) { return json(res,
       400, { error: (e as Error).message }) } }
     if (r0 === 'auto-runs' && r1 && r2 === 'undo' && req.method === 'POST') { try { return json(res, 200, await undoRun(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
@@ -135,7 +143,11 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'repos' && r1 && r2 === 'park') return json(res, 200, await parkRepo(r1))
     if (r0 === 'repos' && r1 && r2 === 'resume') return json(res, 200, await resumeRepo(r1))
     if (r0 === 'repos' && r1 && r2 === 'clear') { try { return json(res, 200, await clearRepo(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
+    if (r0 === 'repos' && r1 && r2 === 'remove' && req.method === 'POST') { try { return json(res, 200, await removeRepo(r1, typeof body.landing === 'string' ? body.landing : null)) }
+      catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'resume') { try { return json(res, 200, agentView(await resumeEngineer(r1))) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
+    if (r0 === 'agents' && r1 && r2 === 'stop-frozen-runs' && req.method === 'POST') {
+      try { return json(res, 200, await stopFrozen(r1, 'user')) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'agents' && r1 && r2 === 'stop') { await stopAgent(r1, 'user'); return json(res, 200, { ok: true }) }
     if (r0 === 'agents' && r1 && r2 === 'takeover') { update(r1, { takeover_locked_until: body.locked ? now() + 365 * 86_400_000 : 0 }); return json(res, 200, { ok: true }) }
     if (r0 === 'agents' && r1 && r2 === 'type') { const a = getAgent(r1); if (!a) return json(res, 404, {}); update(r1, { takeover_locked_until: now() + getSetting('takeover_lock_s', DEFAULTS.takeover_lock_s) * 1000 }); await tmux.sendKeys(a.tmux_session, String(body.text ?? ''), body.enter !== false); return json(res, 200, { ok: true }) }
@@ -158,6 +170,7 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
       const bad = validSetting(String(body.key), body.value); if (bad) return json(res, 400, { error: bad })
       setSetting(String(body.key), body.value); patch('setting', String(body.key), { value: body.value }); emit({ agentId: null, source: 'ui', kind: 'settings.changed', payload: { key: body.key } })
       if (body.key === 'concurrency_cap') void fillSlots().catch(() => {})
+      if (body.key === 'heavy_at_once') pump() // raised: whoever waits for a turn may go
       return json(res, 200, { ok: true })
     }
     if (r0 === 'roles' && r1 && r2 === 'resume') { resumeRole(r1); return json(res, 200, { ok: true }) }
@@ -206,19 +219,10 @@ function onClient(ws: WebSocket): void {
   bus.on('patch', onPatch); bus.on('event', onEvent); bus.on('resnapshot', onSnapshot)
   ws.on('message', (raw) => {
     let m: Record<string, unknown>; try { m = JSON.parse(String(raw)) } catch { return }
-    const agentId = String(m.agentId ?? '')
-    if (m.type === 'term.open') {
-      terms.get(agentId)?.kill()
-      const cols = Number(m.cols ?? 120), rows = Number(m.rows ?? 36), onData = (d: string) => send({ type: 'term', agentId, data: d })
-      const onExit = () => { send({ type: 'term.exit', agentId }); if (terms.get(agentId) === t) terms.delete(agentId) } // a replaced view's late exit leaves its successor alone
-      // `preview:<repoId>` is the live preview's server output; anything else is an agent id
-      const t = agentId.startsWith('preview:') ? openPreviewTerminal(previewSession(agentId.slice('preview:'.length)), cols, rows, onData, onExit) : openTerminal(agentId, cols, rows, onData, onExit)
-      if (t) terms.set(agentId, t)
+    if (m.type !== 'snapshot') return termMessage(m, terms, send)
+    try { send({ type: 'snapshot', data: snapshot() }) } catch (e) { // a throw here would stall this socket (termws.ts)
+      emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { server: 'ws', message: 'snapshot', error: String(e) } })
     }
-    else if (m.type === 'term.input') terms.get(agentId)?.write(String(m.data ?? ''), m.typed === true)
-    else if (m.type === 'term.resize') terms.get(agentId)?.resize(Number(m.cols), Number(m.rows))
-    else if (m.type === 'term.close') { terms.get(agentId)?.kill(); terms.delete(agentId) }
-    else if (m.type === 'snapshot') send({ type: 'snapshot', data: snapshot() })
   })
   ws.on('close', () => { bus.off('patch', onPatch); bus.off('event', onEvent); bus.off('resnapshot', onSnapshot); for (const t of terms.values()) t.kill() })
 }

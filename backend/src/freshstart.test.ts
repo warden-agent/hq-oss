@@ -11,7 +11,7 @@ const { migrate, setSetting } = await import('./db.ts')
 migrate()
 const { limitFor } = await import('./freshstart.ts')
 const { noteProblem } = await import('./notes.ts')
-const { engineerResumePrompt } = await import('./handover.ts')
+const { engineerResumePrompt, tpmPrompt } = await import('./handover.ts')
 const { validSetting } = await import('./config.ts')
 
 test('the TPM limit is the pick; engineers get about two-thirds of it; only the presets are taken', () => {
@@ -41,4 +41,19 @@ test("the engineer taking over gets the goal, the note, git and the plan, and no
   const none = { status: '', log: '', diffStat: '' }
   const planning = engineerResumePrompt({ ...(t as object), status: 'planning' } as never, { feature: 'phone', worktree: '/wt', base: 'main', note: null, git: none, plan: null, fix: null })
   assert.match(planning, /call ExitPlanMode/); assert.match(planning, /\(none\)/); assert.doesNotMatch(planning, /Approved plan/)
+})
+
+test('Bug 84: an engineer taking over a ticket sent back says what it was fixing, conflicts or tests, and so does the TPM\'s board', () => {
+  const none = { status: '', log: '', diffStat: '' }
+  const t = (fixing: string | null) => ({ key: 'UI-3', size: 'S', title: 'Totals', branch: 'hq/ui/UI-3', spec: 'Add totals.', status: 'resolving', fixing }) as never
+  const brief = (fixing: string | null) => engineerResumePrompt(t(fixing), { feature: 'phone', worktree: '/wt', base: 'main', note: null, git: none, plan: null, fix: 'HQ SAYS' })
+  assert.match(brief(null), /It was fixing its conflicts with main; HQ's instructions for that are below\.[\s\S]*## HQ's instructions\nHQ SAYS/)
+  assert.match(brief('tests'), /It was fixing its tests on main;/); assert.doesNotMatch(brief('tests'), /conflict/)
+  assert.match(brief('tests_hung'), /It was finding what never finishes in its tests on main;/)
+  assert.match(brief('changes'), /It was building the change to its spec; HQ's instructions for that are below\./); assert.doesNotMatch(brief('changes'), /conflict|its tests/)
+  const board = (fixing: string | null) => tpmPrompt({ name: 'phone', path: '/p', auto_mode: 1 } as never, { ws: '/ws', previous: null, messages: [],
+    board: [{ f: { title: 'Totals', handle: 'F-1' } as never, tickets: [t(fixing)] }] })
+  assert.match(board(null), /UI-3 \(S\) Totals: its engineer is fixing its conflicts with main/)
+  assert.match(board('tests'), /UI-3 \(S\) Totals: its engineer is fixing its tests on main/)
+  assert.match(board('changes'), /UI-3 \(S\) Totals: its engineer is building the change to its spec/)
 })
