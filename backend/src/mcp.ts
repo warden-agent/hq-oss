@@ -47,7 +47,9 @@ function registerTools(s: McpServer, agent: Agent): void {
         attention('dm_refused', `${displayName(agent.id)}'s ${a.reason} to ${displayName(to)} was refused (${ok.why}): ${a.body.slice(0, 400)}`, { agentId: agent.id, ticketId: agent.ticket_id })
         return fail(`${ok.why}. HQ showed this ${a.reason} to the user instead; stop and wait for a message.`)
       }
-      if (!ok.ok) return fail(ok.why!)
+      // Bug 86: nothing wakes the agent once the limit clears, so a promise to resend it later is never kept
+      if (!ok.ok) return fail(`${ok.why}. Nothing was sent, and nothing will remind you to send it later: don't promise to resend it. `
+        + `If it still matters, put it in your next message to ${displayName(to)}.`)
     }
     const m = sendMessage({ repoId: agent.repo_id, featureId: agent.feature_id, channel: to === 'team' ? 'team' : 'dm', from: agent.id, to: to === 'team' ? null : to, reason: a.reason, body: a.body, inReplyTo: a.in_reply_to ?? null })
     if (agent.role === 'engineer' && a.reason === 'question' && agent.ticket_id) { const t = ticketForAgent(agent)!; setTicket(t.id, { prior_status: t.status, status: 'awaiting_answer' }); run('INSERT INTO questions(id, ticket_id, from_agent_id, to_target, message_id, asked_at) VALUES (?,?,?,?,?,?)', id('q'), t.id, agent.id, to, m.id, now()) }
@@ -120,9 +122,10 @@ function registerTools(s: McpServer, agent: Agent): void {
       }
       setTicket(t.id, { ...(a.spec ? { spec: a.spec } : {}), ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
       const what = [a.spec && 'spec', title && `title (now "${title}")`].filter(Boolean).join(' and ')
-      // a finished ticket's engineer has nothing to do with a new title (and has usually stopped)
+      // a finished ticket's engineer has nothing to do with a new title (and has usually stopped). HQ's notice, not the TPM's
+      // message: it doesn't count against the TPM's DM limits (Bug 86)
       if (t.assignee_agent_id && !done) {
-        sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: agent.id, to: t.assignee_agent_id, reason: 'fyi', body: `Ticket ${t.key} ${what} updated. Call get_ticket to read it.` })
+        sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to: t.assignee_agent_id, reason: 'fyi', body: `HQ: the TPM updated ${t.key}'s ${what}. Call get_ticket to read it.` })
       }
       return text('Updated.')
     })
@@ -213,7 +216,8 @@ function registerTools(s: McpServer, agent: Agent): void {
     s.registerTool('update_handoff', { description: 'Append to your handoff log. kind: after_plan | milestone | before_pr. Required before open_pr.', inputSchema: { text: z.string(), kind: z.enum(['after_plan', 'milestone', 'before_pr']) } }, async (a) => { logCall('update_handoff', { kind: a.kind, len: a.text.length }); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound'); const stamp = `### ${new Date().toISOString().slice(0, 16).replace('T', ' ')} — ${a.kind}\n${a.text}`; run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = text || char(10) || char(10) || excluded.text, updated_at = excluded.updated_at', `ticket:${t.id}`, 'handoff', stamp, now()); setTicket(t.id, { handoff_updated_at: now() }); return text('Handoff recorded.') })
     s.registerTool('report_blocked', { description: 'Tell HQ you are blocked and why (the user is notified).', inputSchema: { reason: z.string() } }, async (a) => { logCall('report_blocked', a); attention('blocked', `${agent.display_name ?? agent.id}: ${a.reason}`, { agentId: agent.id, ticketId: agent.ticket_id }); return text('Reported. Stop and wait for a message.') })
     s.registerTool('propose_test_command', {
-      description: 'Repair tickets only: a test command that can work in HQ\'s sandbox, when the current one can\'t. HQ tries it itself on main plus your branch and messages you the result. '
+      description: 'Repair tickets only: a test command that can work in HQ\'s sandbox, when the current one can\'t. Run it with the Bash tool first, exactly as you propose it: '
+        + 'HQ only takes a command it has seen run in your session. HQ then tries it itself on main plus your branch and messages you the result. '
         + 'left_out: exactly which tests it no longer runs, and why.', inputSchema: { command: z.string().min(1).max(2000), left_out: z.string().min(1).max(1000) },
     }, async (a) => { logCall('propose_test_command', a); try { return text(proposeTestCommand(agent, a.command, a.left_out)) } catch (e) { return fail((e as Error).message) } })
     s.registerTool('open_pr', {

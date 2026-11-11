@@ -2,13 +2,20 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { PATHS, PORTS, DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR, TURN_WAIT_S } from './config.ts'
+import { PATHS, PORTS, DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR, TURN_WAIT_S, HQ_AWAY_WAIT_S } from './config.ts'
 import { getSetting } from './db.ts'
-import { real } from './util.ts'
+import { real, shq } from './util.ts'
 
 export type Role = 'tpm' | 'architect' | 'engineer' | 'launcher'
 const HOME = os.homedir()
-const HOOK = (token: string) => `http://127.0.0.1:${PORTS.hooks}/hooks/${token}`
+/** Bug 87: an agent's token goes in a header, never in the hook's URL. With HQ down, Claude Code prints a failed http hook's URL on the
+ *  agent's screen ("HTTP 502 from <url>"), where the model reads it; it never prints the headers. */
+const HOOK_URL = () => `http://127.0.0.1:${PORTS.hooks}/hooks`
+export const TOKEN_HEADER = 'X-HQ-Token'
+/** The SessionStart hook is a command (curl): the header comes from this file in the agent's folder, so the command holds no token either. */
+export const HOOK_HEADER_FILE = 'hook-header'
+export const hookHeaderLine = (token: string) => `${TOKEN_HEADER}: ${token}\n`
+const hook = (token: string, timeout: number, extra: Record<string, unknown> = {}) => ({ type: 'http', url: HOOK_URL(), headers: { [TOKEN_HEADER]: token }, timeout, ...extra })
 
 export const ENGINEER_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'LSP', 'ToolSearch', 'EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'Agent']
 export const ENGINEER_DISALLOWED = ['EnterWorktree', 'ExitWorktree', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'AskUserQuestion', 'Monitor', 'Skill']
@@ -27,23 +34,33 @@ export function modelFor(role: Role, size?: string): string {
   return size === 'S' ? m.engineer_s : m.engineer_ml
 }
 
-function hookGroup(token: string, extra: Record<string, unknown> = {}) { return [{ hooks: [{ type: 'http', url: HOOK(token), timeout: 10, ...extra }] }] }
+const NODE = (): string => fs.existsSync(process.execPath) ? process.execPath : 'node'
+const HOOKWAIT = path.join(import.meta.dirname, 'hookwait.mjs')
+/** Bug 85: a PermissionRequest goes through hookwait.mjs, which waits for a backend that's down (a restart) instead of refusing. HQ's
+ *  own answer may take up to `answerS` (the plan gate holds); the wait for HQ comes on top, and Claude Code's limit a little after that. */
+function permissionHook(agentDir: string, answerS: number) {
+  const limit = answerS + HQ_AWAY_WAIT_S
+  const command = [NODE(), HOOKWAIT, `http://127.0.0.1:${PORTS.hooks}/hooks`, path.join(agentDir, 'token'), String(limit)].map(shq).join(' ')
+  return { type: 'command', command, timeout: limit + 15 }
+}
+
+function hookGroup(token: string) { return [{ hooks: [hook(token, 10)] }] }
 
 export function buildSettings(role: Role, token: string, opts: { agentDir: string; repoAllowlist?: string[]; editOverrides?: string[] }): Record<string, unknown> {
   const gateTimeout = getSetting('gate_timeout_s', DEFAULTS.gate_timeout_s)
-  const sessionStartCmd = `curl -s -m 5 -X POST -H 'Content-Type: application/json' --data-binary @- ${HOOK(token)}`
+  const sessionStartCmd = `curl -s -m 5 -X POST -H 'Content-Type: application/json' -H @${shq(path.join(opts.agentDir, HOOK_HEADER_FILE))} --data-binary @- ${HOOK_URL()}`
   const hooks: Record<string, unknown> = {
     SessionStart: [{ hooks: [{ type: 'command', command: sessionStartCmd, timeout: 10 }] }],
     UserPromptSubmit: hookGroup(token),
     PermissionRequest: [
-      { matcher: 'ExitPlanMode', hooks: [{ type: 'http', url: HOOK(token), timeout: gateTimeout, onFailure: 'block' }] },
-      { matcher: '^(?!ExitPlanMode$).*', hooks: [{ type: 'http', url: HOOK(token), timeout: 30, onFailure: 'block' }] },
+      { matcher: 'ExitPlanMode', hooks: [permissionHook(opts.agentDir, gateTimeout)] },
+      { matcher: '^(?!ExitPlanMode$).*', hooks: [permissionHook(opts.agentDir, 30)] },
     ],
     PreToolUse: hookGroup(token), PostToolUse: hookGroup(token), PostToolUseFailure: hookGroup(token),
     Stop: hookGroup(token), StopFailure: hookGroup(token), Notification: hookGroup(token),
     PreModelSwitch: hookGroup(token), PostModelSwitch: hookGroup(token), PreCompact: hookGroup(token), PostCompact: hookGroup(token),
     ConfigChange: hookGroup(token), SubagentStart: hookGroup(token), SubagentStop: hookGroup(token), TaskCreated: hookGroup(token), TaskCompleted: hookGroup(token),
-    SessionEnd: [{ hooks: [{ type: 'http', url: HOOK(token), timeout: 5 }] }],
+    SessionEnd: [{ hooks: [hook(token, 5)] }],
   }
   const base: Record<string, unknown> = {
     permissions: { disableAutoMode: 'disable', disableBypassPermissionsMode: 'disable', deny: ['Cd'] },
@@ -54,7 +71,7 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
   if (role !== 'engineer' && role !== 'launcher') return base // the Launch helper gets the engineer's sandbox, and runs no git writes
   // A build or test run can be held at this hook until its turn comes (heavy.ts), so a Bash command's hook gets longer than that wait. Past it, Claude Code runs
   // the command anyway (spike 2026-11-09: a hook that times out counts as no answer).
-  hooks.PreToolUse = [{ matcher: 'Bash', hooks: [{ type: 'http', url: HOOK(token), timeout: TURN_WAIT_S + 60 }] }, { matcher: '^(?!Bash$).*', hooks: hookGroup(token)[0]!.hooks }]
+  hooks.PreToolUse = [{ matcher: 'Bash', hooks: [hook(token, TURN_WAIT_S + 60)] }, { matcher: '^(?!Bash$).*', hooks: hookGroup(token)[0]!.hooks }]
   const overrides = new Set(opts.editOverrides ?? [])
   const deny = [
     'Read(~/.claude/**)', 'Read(~/.claude.json)', `Read(//${HOME}/.hq/**)`, 'Read(.env)', 'Read(.env.*)', 'Read(**/secrets/**)', 'Read(~/.ssh/**)', 'Read(~/.aws/**)',
@@ -102,8 +119,7 @@ const RELAY = path.join(import.meta.dirname, 'mcprelay.mjs')
  *  Bug 78: connected to the backend directly, an agent lost HQ's tools for good once the backend had been down for 15 s. The relay
  *  reads the agent's token from its file; the backend's own node runs it, or the one on PATH when that binary has since been replaced. */
 export function buildMcp(tokenFile: string): Record<string, unknown> {
-  const node = fs.existsSync(process.execPath) ? process.execPath : 'node'
-  return { mcpServers: { hq: { type: 'stdio', command: node, args: [RELAY], env: { HQ_MCP_URL: `http://127.0.0.1:${PORTS.mcp}/mcp`, HQ_TOKEN_FILE: tokenFile } } } }
+  return { mcpServers: { hq: { type: 'stdio', command: NODE(), args: [RELAY], env: { HQ_MCP_URL: `http://127.0.0.1:${PORTS.mcp}/mcp`, HQ_TOKEN_FILE: tokenFile } } } }
 }
 
 /** CLI flags per role (excluding the common ones the launcher adds). Engineers start in plan mode; one fixing a merge conflict on

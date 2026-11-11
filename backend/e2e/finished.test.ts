@@ -73,7 +73,7 @@ test('a spec changed after the ticket is finished goes back to its engineer, and
   assert.match((await fix(t)).json.error, /is already building the change to its spec$/) // the button isn't there while it works; the API says why
   // A second change while the first is being built: the engineer is told the usual way; it's still the same job.
   r = await spec(tpm, t, { spec: 'Orders, newest first, ten a page.' }); assert.equal(r.text, 'Updated.')
-  assert.match((await sent(tpm, e.id))[0].body, /^Ticket T-01 spec updated\. Call get_ticket to read it\.$/)
+  assert.equal((await sent('hq', e.id)).filter((m: any) => /^HQ: the TPM updated T-01's spec\. Call get_ticket to read it\.$/.test(m.body)).length, 1)
   assert.match((await hq.mcp(e.id, 'get_ticket')).text, /Orders, newest first, ten a page\./)
   // The engineer builds it and finishes again: ready to merge, with the TPM told what happened (and no "conflicts fixed").
   const done = await finish(e, wtOf(dir, t), 'v1\norders, newest first\n'); assert.match(done.text, /^Done\. The user merges/)

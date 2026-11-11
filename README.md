@@ -29,11 +29,11 @@ The schema and an Architect role prompt (`backend/roles/architect.prompt.md`) ar
 - `frontend/`: Vite + React + Tailwind. A React Flow graph with the project's TPM on top and a box per feature and ticket, xterm.js terminals, and the live preview pane.
 - `plugin/`: the `hq` Claude Code mod loaded into every agent (`--plugin-dir`). It handles message delivery (`$.prompt.submit` when the session is idle), telemetry and the model guard.
 - `backend/roles/`: the role prompts appended to each agent's system prompt. They are copied to `~/.hq/roles/` on every start.
-- State lives in `~/.hq/`: the SQLite DB, per-agent files, TPM workspaces, logs, and the pinned binary `~/.hq/bin/claude-2.1.300`.
+- State lives in `~/.hq/`: the SQLite DB, per-agent files, TPM workspaces, logs, and HQ's own copy of Claude Code, `~/.hq/bin/claude-2.1.322`.
 
 ## Run
 
-Prerequisites: Node 25, tmux, `lsof`, `gh`, and the pinned Claude Code binary at `~/.hq/bin/claude-2.1.300`.
+Prerequisites: Node 25, tmux, `lsof`, `gh`, and Claude Code 2.1.322 on this computer. HQ takes its own copy of it on first start (see [Key decisions](#key-decisions)).
 
 HQ runs on macOS and Linux:
 - **macOS** needs nothing else, and is where HQ gets its everyday use.
@@ -76,6 +76,7 @@ Ports, all bound to 127.0.0.1:
 - **A project whose own tests fail repairs itself on auto.** HQ opens a repair ticket with the full output and what the sandbox can't do. Other engineers keep building, but nothing merges until the repair is in:
   - If the repair can't be finished, or a run needs more than two, the project stops and asks you.
   - If the test command itself can't work in the sandbox, the engineer proposes another. HQ tries it first, takes it, and lists it in the run's summary with what it leaves out. HQ can prove a command passes, not that it's a good test, so read that line. A second change in one run stops and asks.
+  - HQ only takes a command the engineer has run in its own session first. Every engineer has to run it there, and Claude Code refuses some commands that HQ's sandbox would run, such as `node --test $(ls test/*.js)`.
   - With auto mode off, HQ opens no repair of its own, and a proposed command waits for your OK.
   - Each run tests main once as it starts, alongside the first tickets, so a broken main or a test command that can't work in the sandbox opens its repair straight away. A failure is run once more before a repair opens, so one flaky run can't spend one.
   - This protects your machine from accidents and careless code. It isn't a security boundary against a determined attacker.
@@ -85,13 +86,23 @@ Ports, all bound to 127.0.0.1:
   - a re-sent plan re-attaches to its review by hash, and a changed plan replaces the open review
   - every round, verdict and send-back is recorded
 - **Model guard:** when a session drifts off its model, HQ alerts you and pauses that role, and never aborts by default. When a TPM's context grows past 300k tokens, HQ tells you to start a fresh TPM briefed from its records.
-- **Claude Code is pinned to 2.1.300.** Several things HQ relies on were checked on that exact version:
-  - the hook answer that skips the plan menu
-  - mod calls being async
+- **HQ runs its own copy of Claude Code 2.1.322, the version it was checked on.** HQ leans on things Claude Code doesn't promise (listed below), and an update can change any of them without a word. So an update never reaches HQ's agents by itself:
+  - On first start HQ copies that version to `~/.hq/bin/claude-2.1.322` from this computer's install: `~/.local/share/claude/versions/2.1.322`, or the `claude` on your PATH if it is that version. If neither is there, HQ doesn't start and says so.
+  - Updating your own Claude Code later changes nothing for HQ's agents. The ⚠ menu notes, as information, that a newer one is installed.
+  - `HQ_CLAUDE_BIN=<a claude binary>` runs another one (`HQ_CLAUDE_VERSION=<version>` picks another copy in `~/.hq/bin/`). HQ then raises **Claude Code not checked**, once per version; it looks again at every launch and every few minutes, so an update of that binary can't slip past.
+  - The Agents menu always says which version the agents run. Agents already running keep the version they started with.
+
+  **Moving HQ to a new Claude Code:** run these on the new binary, fix what differs, then raise `CHECKED_VERSION` in `backend/src/claudeversion.ts`. Checked on 2.1.322:
+  - the hook answer that skips the plan menu, and the plan menu's own approval being noticed
+  - a command held at its `PreToolUse` hook starts when the hook answers, and runs anyway when the hook times out
+  - a Bash `timeout` moves the command to the background instead of stopping it: what the hook then carries (`backgroundTaskId`, `timedOutAfterMs`), where its output goes, its process group, and the `<task-notification>` that wakes the agent
+  - helpers: their hooks carry `agent_id`, the Agent tool's result carries `isAsync` and `agentId`, and Claude Code's own helper fires `SubagentStop` after the turn has ended
+  - the mod: its calls are async, and `$.prompt.submit` delivers a message once the session is idle (not after an Escape, until a normal turn ends)
   - the trust rule and the `~/.claude.json` lock HQ shares with live sessions
   - the session file in `~/.claude/sessions/` that says `waiting` while a dialog is open, which is how a "waiting on a dialog" alert clears itself
-
-  Re-check them before any version bump.
+  - the screen: the idle prompt's footer and the menus (`backend/src/screen.ts` is tested on real captures)
+  - `CLAUDE_CODE_TMPDIR` is ignored when longer than about 30 bytes
+  - a whole run with real agents: a request, plans approved and sent back, tickets built in the sandbox and merged, an urgent message, a fresh start, auto mode
 
 What's built and what's next: [`docs/PROGRESS.md`](docs/PROGRESS.md). The original design notes are kept outside this repo.
 

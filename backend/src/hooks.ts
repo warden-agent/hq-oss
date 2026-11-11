@@ -6,7 +6,7 @@ import { run, now, getSetting, one } from './db.ts'
 import { emit, patch } from './events.ts'
 import { agentByToken, getAgent, update, tmuxToken, revokeToken, type Agent } from './agents.ts'
 import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
-import { ackBatchFromPrompt, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor } from './delivery.ts'
+import { ackBatchFromPrompt, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway } from './delivery.ts'
 import { onPostModelSwitch, onTurnStep } from './modelguard.ts'
 import { attention, resolveKind } from './attention.ts'
 import { getRepo, getTicket, repoOfAgent } from './records.ts'
@@ -15,6 +15,7 @@ import { addRun, endRuns, waitingText, watchedTask } from './bgruns.ts'
 import { isBridgePid } from './terminal.ts'
 import * as tmux from './tmux.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
+import { TOKEN_HEADER } from './roles.ts'
 
 const TAKEOVER_ATTACHED_MS = 365 * 86_400_000 // "until they detach"
 /** Notification types that mean a dialog is open and waiting for a person (checked on 2.1.300). */
@@ -24,6 +25,13 @@ const json = (res: http.ServerResponse, code: number, obj: unknown) => { res.wri
 const deny = (message: string) => ({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message } } })
 const allow = () => ({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } })
 const trim = (v: unknown, n = 400): string => { const s = typeof v === 'string' ? v : JSON.stringify(v ?? ''); return s.length > n ? s.slice(0, n) + '…' : s }
+/** Bug 83: a Bash command Claude Code let a repair engineer run, kept whole on its event. HQ takes a new test command only when the engineer
+ *  ran it this way first (auto.ts ranByEngineer): its own sandbox runs commands that Claude Code refuses in an engineer's session. A refused
+ *  command fires PostToolUseFailure with Claude Code's reason; one that ran and failed says "Exit code N" (both seen on 2.1.300). */
+const ranBash = (agent: Agent, tool: string, input: Record<string, unknown>, error?: unknown): string | undefined => {
+  if (tool !== 'Bash' || (error !== undefined && !/^Exit code \d/.test(String(error))) || !getTicket(agent.ticket_id ?? '')?.repairs_main) return undefined
+  return String(input.command ?? '').slice(0, 8000)
+}
 
 function describeTool(tool: string, input: Record<string, unknown>): string {
   if (tool === 'Bash') return `Running: ${trim(input.command, 80)}`
@@ -61,6 +69,7 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (sub) payload.sub = true
   const turn = turns.get(agent.id) ?? { prompt: 0, stop: 0 }; turns.set(agent.id, turn)
   const bg = helpers.get(agent.id) ?? new Map<string, string>(); helpers.set(agent.id, bg); const helperId = String(body.agent_id ?? '')
+  if (ev !== 'SessionEnd') tellIfHqWasAway(agent) // Bug 85: it was told to wait for HQ, and HQ is answering again
   switch (ev) {
     case 'SessionStart': bg.clear(); endRuns(agent.id, 'all', 'session'); Object.assign(payload, { source: body.source, model: body.model, cwd: body.cwd }); Object.assign(fields, { claude_session_id: String(body.session_id ?? '') || null, transcript_path: (body.transcript_path as string | undefined) ?? null, status: 'working' }); run('UPDATE sessions SET claude_session_id = ?, transcript_path = ? WHERE agent_id = ? AND ended_at IS NULL', body.session_id as string, body.transcript_path as string, agent.id); break
     case 'UserPromptSubmit': { turn.prompt = ++turnSeq; payload.prompt = trim(body.prompt, 200); fields.status = 'working'; live.activity = 'Thinking'
@@ -81,8 +90,10 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
         if (r.isAsync && typeof r.agentId === 'string') { bg.set(r.agentId, trim(r.description ?? input.description, 60)); payload.helper = r.agentId } }
       if (tool === 'Bash' && !sub) { // Bug 95: still running in the background, and the agent waits on it
         const task = watchedTask(input, body.tool_response, getRepo(repoOfAgent(agent) ?? '')?.test_cmd ?? null)
-        if (task) { addRun(agent.id, { task, use: String(body.tool_use_id ?? ''), command: String(input.command ?? '') }); payload.bg = task } } break
-    case 'PostToolUseFailure': Object.assign(payload, { input: trim(input, 200), use: body.tool_use_id, error: trim(body.error, 300), is_interrupt: body.is_interrupt }); break
+        if (task) { addRun(agent.id, { task, use: String(body.tool_use_id ?? ''), command: String(input.command ?? '') }); payload.bg = task } }
+      payload.ran = ranBash(agent, tool, input); break
+    case 'PostToolUseFailure': Object.assign(payload, { input: trim(input, 200), use: body.tool_use_id, error: trim(body.error, 300), is_interrupt: body.is_interrupt })
+      payload.ran = ranBash(agent, tool, input, body.error ?? ''); break
     case 'Stop': { turn.stop = ++turnSeq; payload.last = trim(body.last_assistant_message, 600); const on = stillOn(agent.id, bg); fields.status = on ? 'working' : 'idle'
       Object.assign(live, { activity: on, last_message: trim(body.last_assistant_message, 2000) })
       if (agent.role === 'tpm') recordReply(agent, String(body.last_assistant_message ?? '')); break }
@@ -215,7 +226,13 @@ export function startHooksServer(): http.Server {
 async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://x'); const parts = url.pathname.split('/').filter(Boolean)
   const body = req.method === 'POST' ? asObject(await readJson(req, 8 * 1024 * 1024)) : {} // hooks carry whole tool outputs
-  if (parts[0] === 'hooks' && parts[1]) { const a = agentByToken(parts[1]); if (!a) return json(res, 403, { error: 'bad token' }); if (!body.hook_event_name) return json(res, 200, {}); try { return handleHook(a, body, res) } catch (e) { emit({ agentId: a.id, source: 'system', kind: 'hook.error', payload: { error: String(e) } }); return json(res, 200, {}) } }
+  // Bug 87: the token comes in a header. `/hooks/<token>` is still taken from agents started before that change, until they restart.
+  const hookToken = parts[0] === 'hooks' ? (parts.length === 1 ? req.headers[TOKEN_HEADER.toLowerCase()] : parts.length === 2 ? parts[1] : undefined) : undefined
+  if (typeof hookToken === 'string' && hookToken) {
+    const a = agentByToken(hookToken); if (!a) return json(res, 403, { error: 'bad token' })
+    if (!body.hook_event_name) return json(res, 200, {})
+    try { return handleHook(a, body, res) } catch (e) { emit({ agentId: a.id, source: 'system', kind: 'hook.error', payload: { error: String(e) } }); return json(res, 200, {}) }
+  }
   if (parts[0] === 'mod' && parts[1] && parts[2]) { const a = agentByToken(parts[1]); if (!a) return json(res, 403, { error: 'bad token' }); return handleMod(a, parts[2], url, body, res) }
   if (parts[0] === 'tmux' && parts[1] && parts[2] && parts[3]) {
     const a = getAgent(parts[1]); if (!a || tmuxToken(parts[1]) !== parts[2]) return json(res, 403, {})

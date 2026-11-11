@@ -8,7 +8,7 @@ import { api } from './api'
 import { askLabels, askText, cancelConfirm, mergeConfirm, startLabel, startText, turnOn, waitingOn } from './board'
 import { actLabel, answerReview, kindLabel, freshBlocker, freshConfirm, freshOffered, localOnly, OPEN_PREVIEW, stopOthers, ticketLabel, useBoard, useBusy, useRevisionCap,
   type Act, type FeatureView, type Line, type TicketView, type TpmView, type Tone } from './board'
-import { goodNews, type Turn } from './needs.ts'
+import { goodNews, plainNews, type Turn } from './needs.ts'
 import { DoRestBtn } from './Auto'
 import type { Agent } from './api'
 import { ActBtn, Linked, Md, Pill } from './ui'
@@ -96,7 +96,7 @@ const answerOnly = (kind: string): boolean => /^(auto_stopped|test_cmd_proposed)
 const FIX_KINDS = new Set(['merge_conflict', 'fix_stalled', 'change_stalled']) // notices with the ticket's fix button
 export function AttentionList({ items, show }: { items: any[]; show?: (a: any) => (() => void) | null }) {
   return <div className="flex flex-col gap-1">{items.map((a) => { const go = show?.(a); return <div key={a.id} className="rounded-md border border-zinc-800 bg-zinc-950/60 p-2 text-xs">
-    <div className="flex items-start justify-between gap-2"><span className={`min-w-0 break-words font-medium ${goodNews(a.kind) ? 'text-emerald-300' : 'text-rose-300'}`}>{kindLabel(a.kind)}</span><span className="flex shrink-0 gap-1">
+    <div className="flex items-start justify-between gap-2"><span className={`min-w-0 break-words font-medium ${goodNews(a.kind) ? 'text-emerald-300' : plainNews(a.kind) ? 'text-sky-300' : 'text-rose-300'}`}>{kindLabel(a.kind)}</span><span className="flex shrink-0 gap-1">
       {FIX_KINDS.has(a.kind) && a.ticket_id && <FixAct t={{ id: a.ticket_id }} why={a.kind === 'fix_stalled' ? 'tests' : a.kind === 'change_stalled' ? 'change' : undefined} />}{a.kind === 'bg_stalled' && a.agent_id && <StopRunAct agentId={a.agent_id} />}{go && <button className="btn-sm" onClick={go}>Show</button>}{!answerOnly(a.kind) && <ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} />}</span></div>
     <div className="mt-1 break-words text-zinc-400"><Linked text={a.detail} /></div></div> })}</div>
 }

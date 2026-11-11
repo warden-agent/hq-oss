@@ -10,7 +10,7 @@ import { LaunchBtn, PreviewPane } from './Preview'
 import { clampH, clampW, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
 import { useAlerts } from './alerts'
 import { AlertsLine } from './AlertsLine'
-import { goodNews, keysText, splitNeeds, yourTurn, type Need } from './needs.ts'
+import { claudeLine, goodNews, keysText, splitNeeds, yourTurn, type Need } from './needs.ts'
 import { AutoBanner, AutoDialog, AutoSwitch, DoRestBtn, LastRunBtn } from './Auto'
 
 type Tab = 'agent' | 'ticket' | 'messages' | 'events'
@@ -300,6 +300,7 @@ function TestLimit({ state }: { state: State }) {
 function AgentsMenu({ state, selected, onPick }: { state: State; selected: string | null; onPick: (a: Agent) => void }) {
   const running = state.agents.filter((a) => a.status !== 'exited').length
   return <Menu label={`Agents · ${running} running`} title="Every agent, including stopped ones and ones with no box on the graph">{(close) => <div className="flex max-h-[75vh] w-80 flex-col gap-1 overflow-y-auto">
+    {state.claude && (() => { const c = claudeLine(state.claude); return <div className={`break-words px-1 text-[11px] ${c.warn ? 'text-amber-300' : 'text-zinc-500'}`}>{c.text}</div> })()}
     {!state.agents.length && <div className="p-1 text-xs text-zinc-500">No agents yet.</div>}
     {state.agents.map((a) => { const w = waitingFor(a, state); return <button key={a.id} onClick={() => { onPick(a); close() }} className={`card w-full p-2! text-left text-xs ${selected === a.id ? 'border-indigo-500/60!' : ''}`}>
       <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate font-medium" title={a.display_name ?? a.id}>{a.display_name ?? a.id}</span><Pill s={a.status} /></div>

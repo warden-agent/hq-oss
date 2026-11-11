@@ -9,6 +9,7 @@ import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { pidsUnder } from '../src/procs.ts'
+import { CHECKED_VERSION } from '../src/claudeversion.ts'
 
 const BACKEND = path.resolve(import.meta.dirname, '..')
 const FAKE = path.join(import.meta.dirname, 'fake-claude.mjs')
@@ -68,6 +69,7 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv } = {}) {
   const screens = path.join(root, 'screens'); fs.mkdirSync(screens)
   const env: NodeJS.ProcessEnv = { ...process.env, HQ_FAKE_SCREEN_DIR: screens, HOME: home, HQ_HOME: hqHome, HQ_UI_PORT: String(ports.ui), HQ_HOOKS_PORT: String(ports.hooks), HQ_MCP_PORT: String(ports.mcp), HQ_PREVIEW_PORTS: await previewRange(), HQ_CLAUDE_BIN: FAKE, TMUX_TMPDIR: tmuxDir,
     HQ_AGENT_TMP: path.join(tmuxDir, 'a-'), // agents' own temp folders go with the run (Bug 81)
+    HQ_FAKE_VERSION: CHECKED_VERSION, HQ_INSTALLED_CLAUDE: '', // the fake is the version HQ was checked on, and this machine's own Claude Code isn't looked at (Bug 97)
     GIT_AUTHOR_NAME: 'HQ e2e', GIT_AUTHOR_EMAIL: 'e2e@hq.test', GIT_COMMITTER_NAME: 'HQ e2e', GIT_COMMITTER_EMAIL: 'e2e@hq.test', GIT_CONFIG_NOSYSTEM: '1', ...o.env }
   delete env.TMUX; delete env.TMUX_PANE // inside tmux these would point every tmux call at the live server
   // This run's own tmux server, named in every call the harness makes. With its folder gone, a bare `tmux` falls back to the default server, which is
@@ -146,7 +148,8 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv } = {}) {
     },
     /** Posts one hook event as the agent (what Claude Code's http hooks send). `signal` lets a test drop a held call. */
     async hook(agentId: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
-      const r = await fetch(`http://127.0.0.1:${ports.hooks}/hooks/${agentToken(agentId)}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ session_id: 'fake', ...body }), signal })
+      const headers = { 'content-type': 'application/json', 'x-hq-token': agentToken(agentId) } // where Claude Code's http hooks send it (Bug 87)
+      const r = await fetch(`http://127.0.0.1:${ports.hooks}/hooks`, { method: 'POST', headers, body: JSON.stringify({ session_id: 'fake', ...body }), signal })
       return r.json()
     },
     /** The mod's long-poll for the next message batch (what register.js asks every 1.5 s). `{}` means nothing to deliver. */

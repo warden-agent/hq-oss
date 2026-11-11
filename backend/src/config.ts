@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
+import { CHECKED_VERSION } from './claudeversion.ts'
 
 export const HQ_HOME = process.env.HQ_HOME ?? path.join(os.homedir(), '.hq')
 export const PATHS = {
@@ -29,7 +30,7 @@ export const ENGINEER_CACHE = (() => {
 /** Each agent's own temp folder is this followed by its id: Claude Code's scratch files and every command's TMPDIR go there
  *  (`CLAUDE_CODE_TMPDIR`), so what a killed test run leaves goes when the agent does instead of piling up in the shared
  *  /tmp/claude-<uid> (Bug 81). Claude Code ignores one longer than about 30 bytes for its commands (it keeps sockets inside), and
- *  says so only in its debug log: /tmp/hq123456-launch-abcdefghij, 31 bytes, still worked on 2.1.300 (2026-11-09). So flat in /tmp,
+ *  says so only in its debug log: /tmp/hq123456-launch-abcdefghij, 31 bytes, still worked on 2.1.300 and 2.1.322. So flat in /tmp,
  *  with a prefix per HQ (an isolated HQ shares /tmp): /tmp/hq6ae1a5-launch-1234abcd is 29. Tests give their own with HQ_AGENT_TMP. */
 export const AGENT_TMP = process.env.HQ_AGENT_TMP || `/tmp/hq${createHash('sha256').update(path.resolve(HQ_HOME)).digest('hex').slice(0, 6)}-`
 export const agentTmpDir = (agentId: string): string => AGENT_TMP + agentId
@@ -43,8 +44,11 @@ export const BIND = '127.0.0.1'
 // GitHub identity the backend uses for clone/fetch (gh's credential helper reads this account's config dir).
 export const GITHUB_ACCOUNT = process.env.HQ_GITHUB_ACCOUNT ?? 'warden-agent'
 export const GH_CONFIG_DIR = process.env.HQ_GH_CONFIG_DIR ?? path.join(os.homedir(), '.config', 'gh-warden-bot')
-export const PINNED_VERSION = process.env.HQ_CLAUDE_VERSION ?? '2.1.300'
-export const CLAUDE_BIN = process.env.HQ_CLAUDE_BIN ?? path.join(PATHS.bin, `claude-${PINNED_VERSION}`)
+/** The Claude Code HQ's agents run: HQ's own copy of the version it was checked on (claudeversion.ts, Bug 97), in ~/.hq/bin. HQ_CLAUDE_VERSION picks another
+ *  version's copy and HQ_CLAUDE_BIN any binary; HQ then says its agents run a version it wasn't checked on (claudecheck.ts). */
+export const PINNED_VERSION = process.env.HQ_CLAUDE_VERSION ?? CHECKED_VERSION
+export const CLAUDE_BIN_GIVEN = !!process.env.HQ_CLAUDE_BIN
+export const CLAUDE_BIN = process.env.HQ_CLAUDE_BIN || path.join(PATHS.bin, `claude-${PINNED_VERSION}`)
 
 // Default tunables; persisted/overridable through the `settings` table.
 export const DEFAULTS = {
@@ -72,6 +76,8 @@ export const DEFAULTS = {
 }
 /** How long a build or test run waits for its turn before it goes ahead anyway (heavy.ts). An engineer's Bash hook may be held this long, so its time limit is a little more. */
 export const TURN_WAIT_S = Number(process.env.HQ_TURN_WAIT_S) || 1200
+/** Bug 85: how long an agent's request for HQ's OK waits for a backend that's down (hookwait.mjs) before the agent is told to stop and wait. */
+export const HQ_AWAY_WAIT_S = Number(process.env.HQ_AWAY_WAIT_S) || 600
 /** How long Claude Code lets a Bash command run: its own `timeout` (ms) within Claude Code's limits, 2 minutes when it gives none. */
 export function bashLimitMs(timeout: unknown): number {
   const def = Number(process.env.BASH_DEFAULT_TIMEOUT_MS) || 120_000, max = Number(process.env.BASH_MAX_TIMEOUT_MS) || 600_000

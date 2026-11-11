@@ -1,6 +1,6 @@
 // What Claude Code says about its own session (Bug 62): it keeps ~/.claude/sessions/<pid>.json with `status` (busy, idle, or waiting while a dialog is open) and when that last
 // changed. HQ hears when a dialog opens (the Notification hook) but nothing when it closes, and a denied or Escaped dialog fires no hook at all, so this file is how HQ tells a
-// dialog is really gone. It's Claude Code's file, not an API: rerun hq-notes/test-tools/dialogspike.mjs at every version bump (spike S1 checked 2.1.300).
+// dialog is really gone. It's Claude Code's file, not an API: rerun hq-notes/test-tools/dialogspike.mjs at every version bump (spike S1 checked 2.1.300 and 2.1.322).
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'

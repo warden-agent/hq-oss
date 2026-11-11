@@ -30,6 +30,7 @@ import { freePort, NeedsSetup, previews, setPreviewCommand, startPreview, stopPr
 import { approve, dismiss, launchWithoutRecipe, startHelper } from './launchhelper.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
 import { answerTestCommand, autoCheck, autoResume, autoRetry, autoRuns, setAuto, setTestCmd, undoRun } from './auto.ts'
+import { claudeInfo } from './claudecheck.ts'
 
 const TOKEN = uiToken()
 const extras = new Map<string, Record<string, unknown>>() // non-column agent fields from patches (activity, steps, context)
@@ -64,7 +65,7 @@ function snapshot() {
   return { autoRuns: autoRuns(), repos: repos(), features: features(), tickets: tickets(), agents: agents.map(agentView), messages: messagesForFeature(null, 300), reviews: pageReviews(),
     attention: openAttention(), asks: openAsks(), settings: Object.fromEntries(q<{ key: string; value: string }>('SELECT key, value FROM settings').map((r) => [r.key,
       JSON.parse(r.value)])), defaults: { ...DEFAULTS, github_account: GITHUB_ACCOUNT, choices: CHOICES, engineer_limit: ENGINEER_LIMIT, note_cap: NOTE_CAP }, held: heldCount(),
-        ports: PORTS, previews: previews(), build: build() }
+        ports: PORTS, previews: previews(), build: build(), claude: claudeInfo() }
 }
 const json = (res: http.ServerResponse, code: number, obj: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)) }
 const cookieToken = (req: http.IncomingMessage): string | null => { const m = /(?:^|;\s*)hq=([^;]+)/.exec(req.headers.cookie ?? ''); return m ? decodeURIComponent(m[1]!) : null }

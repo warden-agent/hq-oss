@@ -67,11 +67,19 @@ test('bad verdicts, bad settings and oversized bodies are refused (1 MB; 8 MB fo
   const big = JSON.stringify({ body: 'x'.repeat(2 * 1024 * 1024) })
   const ui = await fetch(`http://127.0.0.1:${hq.ports.ui}/api/agents/${tpm.id}/message`, { method: 'POST', headers: { authorization: `Bearer ${fs.readFileSync(path.join(hq.hqHome, 'ui-token'), 'utf8').trim()}`, 'content-type': 'application/json' }, body: big })
   assert.equal(ui.status, 413)
-  const hookUrl = `http://127.0.0.1:${hq.ports.hooks}/hooks/${hq.agentToken(eng.id)}` // hooks carry whole tool outputs: 8 MB there
-  const hook2 = await fetch(hookUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: {}, tool_response: 'x'.repeat(2 * 1024 * 1024) }) })
+  const hookUrl = `http://127.0.0.1:${hq.ports.hooks}/hooks` // hooks carry whole tool outputs: 8 MB there
+  const headers = { 'content-type': 'application/json', 'x-hq-token': hq.agentToken(eng.id) }
+  const read = { hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: {}, tool_response: 'x'.repeat(2 * 1024 * 1024) }
+  const hook2 = await fetch(hookUrl, { method: 'POST', headers, body: JSON.stringify(read) })
   assert.equal(hook2.status, 200)
-  const hook = await fetch(hookUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ body: 'x'.repeat(9 * 1024 * 1024) }) })
+  const hook = await fetch(hookUrl, { method: 'POST', headers, body: JSON.stringify({ body: 'x'.repeat(9 * 1024 * 1024) }) })
   assert.equal(hook.status, 413)
+  // Bug 87: the token comes in a header; the old `/hooks/<token>` still works for agents started before; anything else is refused
+  const ev = JSON.stringify({ hook_event_name: 'Notification', message: 'x' }), ct = { 'content-type': 'application/json' }
+  assert.equal((await fetch(hookUrl, { method: 'POST', headers: { ...ct, 'x-hq-token': 'not-a-token' }, body: ev })).status, 403)
+  assert.equal((await fetch(hookUrl, { method: 'POST', headers: ct, body: ev })).status, 404)
+  assert.equal((await fetch(`${hookUrl}/${hq.agentToken(eng.id)}`, { method: 'POST', headers: ct, body: ev })).status, 200)
+  assert.equal((await fetch(`${hookUrl}/${hq.agentToken(eng.id)}/x`, { method: 'POST', headers: ct, body: ev })).status, 404)
   const mcp = await fetch(`http://127.0.0.1:${hq.ports.mcp}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${hq.agentToken(eng.id)}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: big })
   assert.equal(mcp.status, 413)
   assert.equal((await hq.api('state')).status, 200) // and HQ is still fine

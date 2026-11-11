@@ -1,7 +1,7 @@
 // The UI's "needs you" list (Bug 24, frontend/src/needs.ts): what counts in the tab title and what pops up a notification.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { forRepo, goodNews, keysText, needsYou, newNeeds, splitNeeds, titleFor, yourTurn } from '../../frontend/src/needs.ts'
+import { claudeLine, forRepo, goodNews, keysText, needsYou, newNeeds, plainNews, splitNeeds, titleFor, yourTurn } from '../../frontend/src/needs.ts'
 
 const state = () => ({
   repos: [{ id: 'r1', name: 'demo' }, { id: 'r2', name: 'api-server' }],
@@ -110,4 +110,23 @@ test('yourTurn (Bug 50): a ticket the TPM asked to remove is not offered to star
     asks: [{ id: 'ask-1', repo_id: 'r1', feature_id: 'f1', question: 'Remove T1?', choices: '["Remove it","Keep it"]', action: '{"kind":"cancel_ticket","ticket":"a"}', answered_at: null }] }
   const turn = yourTurn(s as any, 'r1')
   assert.deepEqual(turn.start, ['T2']); assert.equal(turn.asks[0]!.action, true)
+})
+
+test("Bug 97: agents on a Claude Code HQ wasn't checked on alert in every project; a newer one merely installed is information", () => {
+  const s = { ...state(), reviews: [], attention: [{ id: 20, kind: 'claude_unchecked', detail: "HQ's agents now run Claude Code 2.1.340, but HQ has only been checked on 2.1.322." },
+    { id: 21, kind: 'claude_newer', detail: 'Claude Code 2.1.340 is installed on this computer.' }] }
+  const needs = needsYou(s, () => null)
+  assert.deepEqual(needs.map((n) => [n.key, n.repoId]), [['attention:20', null]]) // about no project, so each project's ⚠ counts it
+  for (const repo of ['r1', 'r2']) assert.deepEqual(splitNeeds(needs, repo), { here: needs, elsewhere: [] })
+  assert.equal(forRepo({ ...s, messages: [] }, 'r1').attention.length, 2) // both are listed in the ⚠ menu, whichever project is open
+  assert.equal(goodNews('claude_newer'), false); assert.equal(plainNews('claude_newer'), true) // neither green nor red
+  assert.equal(plainNews('claude_unchecked'), false)
+})
+test('Bug 97: the Agents menu says which Claude Code runs, and warns only when it is not the checked one', () => {
+  assert.deepEqual(claudeLine({ checked: '2.1.322', runs: '2.1.322', installed: null }), { warn: false, text: 'Agents run Claude Code 2.1.322, the version HQ was checked on.' })
+  assert.deepEqual(claudeLine({ checked: '2.1.322', runs: '2.1.322', installed: '2.1.322' }), { warn: false, text: 'Agents run Claude Code 2.1.322, the version HQ was checked on.' })
+  assert.deepEqual(claudeLine({ checked: '2.1.322', runs: '2.1.322', installed: '2.1.340' }),
+    { warn: false, text: "Agents run Claude Code 2.1.322, the version HQ was checked on. This computer's own is 2.1.340." })
+  assert.deepEqual(claudeLine({ checked: '2.1.322', runs: '2.1.340', installed: '2.1.340' }), { warn: true, text: 'Agents run Claude Code 2.1.340. HQ was checked on 2.1.322.' })
+  assert.deepEqual(claudeLine({ checked: '2.1.322', runs: null, installed: null }), { warn: true, text: "HQ can't tell which Claude Code agents run. It was checked on 2.1.322." })
 })

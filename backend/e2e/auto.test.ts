@@ -166,6 +166,11 @@ const breakMain = (p: P, name = 'main'): void => {
 const repairs = async (p: P): Promise<any[]> => { const fs0 = (await hq.state()).features.filter((f: any) => f.repo_id === p.repo.id).map((f: any) => f.id)
   return (await hq.state()).tickets.filter((t: any) => t.repairs_main && fs0.includes(t.feature_id)).sort((x: any, y: any) => x.created_at - y.created_at) }
 const repair = (p: P, n = 1) => waitFor(`repair ${n}`, async () => (await repairs(p))[n - 1])
+/** What Claude Code's hook says of a Bash command once it's over. With no `error` it ran; "Exit code N" ran and failed; any other error is a refusal. */
+const bash = (e: any, command: string, error?: string) => hq.hook(e.id, { hook_event_name: error ? 'PostToolUseFailure' : 'PostToolUse', tool_name: 'Bash',
+  tool_input: { command }, ...(error ? { error } : { tool_response: { stdout: '', stderr: '' } }) })
+/** A repair engineer runs its new test command, as it must (Bug 83), then proposes it. */
+const propose = async (e: any, command: string, left_out: string) => { await bash(e, command); return hq.mcp(e.id, 'propose_test_command', { command, left_out }) }
 
 test('a broken main repairs itself: HQ opens the ticket, others keep building, nothing else merges until it is in, then everything lands', async () => {
   const p = await project('broken')
@@ -297,13 +302,32 @@ test('a test command is the whole repair: HQ tries it, takes it on auto, closes 
   const e1 = await engineer(t1); breakMain(p); await work(p, t1, e1, { 'one.txt': '1\n' })
   const r = await repair(p), er = await engineer(r)
   assert.equal((await hq.mcp(e1.id, 'propose_test_command', { command: 'true', left_out: 'all' })).isError, true, 'repair tickets only')
-  assert.equal((await hq.mcp(er.id, 'propose_test_command', { command: 'node -e "process.exit(1)"', left_out: 'x' })).isError, false)
+  assert.equal((await propose(er, 'node -e "process.exit(1)"', 'x')).isError, false)
   await waitFor('the refusal', async () => (await hq.state()).messages.find((m: any) => m.to_id === er.id && /didn't pass/.test(m.body)))
   assert.equal((await repoNow(p)).test_cmd, null, 'a failing command changes nothing')
-  assert.equal((await hq.mcp(er.id, 'propose_test_command', { command: 'node --test test/ok.test.js', left_out: 'test/main.test.js' })).isError, false)
+  assert.equal((await propose(er, 'node --test test/ok.test.js', 'test/main.test.js')).isError, false)
   await waitFor('the new command', async () => (await repoNow(p)).test_cmd); await until(r, 'cancelled'); await until(t1, 'merged'); await turnEnds(p)
   const run = await waitFor('the run to finish', async () => (await runs(p)).find((x: any) => x.status === 'finished'))
   assert.match(run.summary, /## Test command changed/); assert.match(run.summary, /node --test test\/ok\.test\.js/); assert.match(run.summary, /Left out: test\/main\.test\.js/)
+})
+
+test('Bug 83: a test command is taken only once Claude Code has let the repair engineer run it', async () => {
+  const p = await project('ranfirst')
+  const t1 = await ticket(p, 'One'); await turnEnds(p)
+  const e1 = await engineer(t1); breakMain(p); await work(p, t1, e1, { 'one.txt': '1\n' })
+  const r = await repair(p), er = await engineer(r)
+  const cmd = 'node --test $(ls test/ok.test.js)', ok = 'node --test test/ok.test.js' // both pass in HQ's /bin/sh; Claude Code refuses the first in an engineer's session
+  const ask = (command: string) => hq.mcp(er.id, 'propose_test_command', { command, left_out: 'test/main.test.js' })
+  const never = await ask(cmd); assert.equal(never.isError, true); assert.match(never.text, /hasn't seen that command run in your session/)
+  await bash(er, cmd, `This session is isolated in the worktree ${wt(p, r)}, but this command runs node with a value computed at runtime (command output)`)
+  assert.equal((await ask(cmd)).isError, true, 'Claude Code refused it: not a run')
+  await bash(e1, cmd); assert.equal((await ask(cmd)).isError, true, "another ticket's engineer ran it, not this one")
+  await bash(er, ok.replace('ok', 'other')); assert.equal((await ask(ok)).isError, true, 'it ran something else'); assert.equal((await ask('  ')).isError, true)
+  assert.equal((await repoNow(p)).test_cmd, null)
+  // What the check must let through: a run inside a longer line, one that ended in an error, and one from before a restart
+  await bash(er, `npm run build;  ${ok} 2>&1 | tail -5`, 'Exit code 1\nnpm error Missing script: "build"'); await hq.restart()
+  assert.equal((await ask(ok)).isError, false); await waitFor('the new command', async () => (await repoNow(p)).test_cmd === ok)
+  await until(r, 'cancelled'); await until(t1, 'merged')
 })
 
 test('a repair needing a code fix and a new command lands; a second change in one run stops and asks', async () => {
@@ -313,12 +337,12 @@ test('a repair needing a code fix and a new command lands; a second change in on
   const r = await repair(p), er = await engineer(r); assert.equal((await hq.hook(er.id, exitPlanMode('Plan'))).hookSpecificOutput.decision.behavior, 'allow')
   fs.mkdirSync(path.join(wt(p, r), 'fixed')); fs.writeFileSync(path.join(wt(p, r), 'fixed', 'a.test.js'), PASS)
   sh(wt(p, r), 'add', '.'); sh(wt(p, r), 'commit', '-qm', 'new tests')
-  assert.equal((await hq.mcp(er.id, 'propose_test_command', { command: 'node --test fixed/a.test.js', left_out: 'test/' })).isError, false) // that file is only on the branch
+  assert.equal((await propose(er, 'node --test fixed/a.test.js', 'test/')).isError, false) // that file is only on the branch
   await waitFor('the save', async () => (await repoNow(p)).test_cmd); await openPr(er); await until(r, 'merged'); await until(t1, 'merged')
   fs.writeFileSync(path.join(p.dir, 'fixed', 'a.test.js'), BROKEN); sh(p.dir, 'add', '.'); sh(p.dir, 'commit', '-qm', 'break')
   await work(p, t2, e2, { 'two.txt': '2\n' })
   const r2 = await repair(p, 2), er2 = await engineer(r2), before = (await repoNow(p)).test_cmd
-  assert.equal((await hq.mcp(er2.id, 'propose_test_command', { command: 'true', left_out: 'everything' })).isError, false)
+  assert.equal((await propose(er2, 'true', 'everything')).isError, false)
   const why = await waitFor('the stop', async () => (await repoNow(p)).auto_stopped_why)
   assert.match(why, /second change to the test command/); assert.equal((await repoNow(p)).test_cmd, before, 'the tests stay as they were')
 })
@@ -329,13 +353,13 @@ test('off auto HQ asks: no repair ticket by itself, and a test command waits for
   const e1 = await engineer(t1); breakMain(p); await work(p, t1, e1, { 'one.txt': '1\n' })
   const r = await repair(p), er = await engineer(r)
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200)
-  assert.equal((await hq.mcp(er.id, 'propose_test_command', { command: 'node --test test/ok.test.js', left_out: 'test/main.test.js' })).isError, false)
+  assert.equal((await propose(er, 'node --test test/ok.test.js', 'test/main.test.js')).isError, false)
   await waitFor('the question', async () => (await repoNow(p)).test_cmd_proposed); assert.equal((await repoNow(p)).test_cmd, null, 'nothing changes until the user says')
   assert.ok((await hq.state()).attention.some((a: any) => a.kind === `test_cmd_proposed:${p.repo.id}`))
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd-answer`, { use: false })).status, 200)
   assert.equal((await repoNow(p)).test_cmd, null); assert.equal((await repoNow(p)).test_cmd_proposed, null)
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd-answer`, { use: true })).status, 409, 'nothing is waiting')
-  assert.equal((await hq.mcp(er.id, 'propose_test_command', { command: 'node --test test/ok.test.js', left_out: 'test/main.test.js' })).isError, false)
+  assert.equal((await propose(er, 'node --test test/ok.test.js', 'test/main.test.js')).isError, false)
   await waitFor('the question again', async () => (await repoNow(p)).test_cmd_proposed)
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd-answer`, { use: true })).status, 200)
   assert.equal((await repoNow(p)).test_cmd, 'node --test test/ok.test.js')

@@ -7,16 +7,19 @@ import path from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 
 const args = process.argv.slice(2)
+// `--version`, as HQ asks it at start and before each launch (Bug 97): the harness says which one, and by default it's the one HQ was checked on
+if (args.includes('--version')) { console.log(`${process.env.HQ_FAKE_VERSION ?? '0.0.0'} (Claude Code)`); process.exit(0) }
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined }
 const settings = JSON.parse(fs.readFileSync(flag('--settings'), 'utf8'))
-const hookUrl = settings.hooks.UserPromptSubmit[0].hooks[0].url
 const worktree = flag('--worktree')
 if (worktree) {
   const wt = path.join(process.cwd(), '.claude', 'worktrees', worktree)
   try { execFileSync('git', ['-C', process.cwd(), 'worktree', 'lock', '--reason', `claude session ${worktree} (pid ${process.pid} start ${new Date().toUTCString()})`, wt], { stdio: 'pipe' }) }
   catch (e) { console.error(`fake-claude: could not lock ${wt}: ${String(e.stderr ?? e).trim()}`) }
 }
-await fetch(hookUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hook_event_name: 'SessionStart', session_id: flag('--session-id'), transcript_path: null, cwd: process.cwd(), source: 'startup', model: 'fake' }) })
+// Runs HQ's own SessionStart command, as Claude Code does: the token comes from the agent's header file (Bug 87)
+const start = { hook_event_name: 'SessionStart', session_id: flag('--session-id'), transcript_path: null, cwd: process.cwd(), source: 'startup', model: 'fake' }
+execFileSync('/bin/sh', ['-c', settings.hooks.SessionStart[0].hooks[0].command], { input: JSON.stringify(start), stdio: ['pipe', 'ignore', 'inherit'] })
 console.log(`fake-claude ${flag('--name') ?? ''} up (pid ${process.pid})`)
 // Claude Code 2.1.300's screen when it waits at its prompt (Bug 25 tests): the input box and a footer with no "esc to interrupt"
 if (process.env.HQ_FAKE_IDLE_SCREEN) console.log(`\n✻ Baked for 2s · done\n\n${'─'.repeat(60)}\n❯ \n${'─'.repeat(60)}\n  ⏸ manual mode on · ? for shortcuts · ← for agents`)

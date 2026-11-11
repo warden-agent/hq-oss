@@ -12,7 +12,7 @@ process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_ENGINEER_CACHE = path
 const { migrate } = await import('./db.ts')
 migrate()
 const { buildSettings } = await import('./roles.ts')
-const { ENGINEER_CACHE } = await import('./config.ts')
+const config = await import('./config.ts'); const { ENGINEER_CACHE } = config
 
 test('engineers\' package caches (npm, Go, Python) sit outside home; PyPI is reachable, github.com stays blocked', () => {
   const s = buildSettings('engineer', 'tok', { agentDir: tmp }) as any
@@ -66,7 +66,7 @@ test('Bug 76: a Bash command\'s hook can be held until its turn, so it outlasts 
   for (const role of ['engineer', 'launcher'] as const) {
     const pre = (buildSettings(role, 'tok', { agentDir: tmp }) as any).hooks.PreToolUse
     assert.deepEqual(pre.map((g: any) => [g.matcher, g.hooks[0].timeout]), [['Bash', TURN_WAIT_S + 60], ['^(?!Bash$).*', 10]], role)
-    assert.ok(new RegExp(pre[1].matcher).test('Read') && !new RegExp(pre[1].matcher).test('Bash')); assert.match(pre[0].hooks[0].url, /\/hooks\/tok$/)
+    assert.ok(new RegExp(pre[1].matcher).test('Read') && !new RegExp(pre[1].matcher).test('Bash')); assert.match(pre[0].hooks[0].url, /\/hooks$/)
   }
   const tpm = (buildSettings('tpm', 'tok', { agentDir: tmp }) as any).hooks.PreToolUse
   assert.equal(tpm.length, 1); assert.equal(tpm[0].matcher, undefined); assert.equal(tpm[0].hooks[0].timeout, 10)
@@ -80,4 +80,34 @@ test("Bug 96: the engineer prompt says what a Bash timeout really does, and neve
   assert.match(text, /never end your turn to wait on a run that is still going/)
   const { testCmdNote } = await import('./tickets.ts')
   assert.match(testCmdNote('npm test'), /^While you work, run only the tests for what you changed\. .*run it once, just before open_pr: .*: npm test$/)
+})
+
+test('Bug 87: no hook URL or command holds the agent\'s token; http hooks send it in a header, and SessionStart reads it from a file', async () => {
+  const token = 'tok-Bug87_secret'
+  for (const role of ['tpm', 'architect', 'engineer', 'launcher'] as const) {
+    const hooks = (buildSettings(role, token, { agentDir: path.join(tmp, "it's here") }) as any).hooks as Record<string, { hooks: any[] }[]>
+    const all = Object.values(hooks).flat().flatMap((g) => g.hooks)
+    for (const h of all.filter((x) => x.type === 'http')) {
+      assert.match(h.url, /^http:\/\/127\.0\.0\.1:\d+\/hooks$/, role); assert.deepEqual(h.headers, { 'X-HQ-Token': token }, role)
+    }
+    const start = hooks.SessionStart![0]!.hooks[0]
+    assert.equal(start.type, 'command'); assert.ok(!start.command.includes(token), role)
+    assert.ok(start.command.includes(`-H @'${path.join(tmp, "it'\\''s here", 'hook-header')}'`), start.command)
+    // the token shows up nowhere but in those headers
+    const rest = JSON.stringify({ ...(buildSettings(role, token, { agentDir: tmp }) as any), hooks: undefined }) + JSON.stringify(all.map(({ headers: _, ...h }) => h))
+    assert.ok(!rest.includes(token), role)
+  }
+})
+
+test('Bug 85: every role asks HQ\'s OK through hookwait.mjs, which waits for a backend that\'s down; Claude Code\'s limit is past the wait', () => {
+  const { DEFAULTS, HQ_AWAY_WAIT_S } = config
+  for (const role of ['tpm', 'engineer', 'architect', 'launcher'] as const) {
+    const [gate, other] = (buildSettings(role, 'tok-secret', { agentDir: tmp }) as any).hooks.PermissionRequest.map((g: any) => g.hooks[0])
+    for (const h of [gate, other]) {
+      assert.equal(h.type, 'command'); assert.match(h.command, /hookwait\.mjs' 'http:\/\/127\.0\.0\.1:\d+\/hooks' /)
+      assert.ok(h.command.includes(`'${path.join(tmp, 'token')}'`)); assert.ok(!h.command.includes('tok-secret'), 'the token stays in its file')
+    }
+    assert.equal(gate.timeout, DEFAULTS.gate_timeout_s + HQ_AWAY_WAIT_S + 15); assert.ok(gate.command.endsWith(`'${DEFAULTS.gate_timeout_s + HQ_AWAY_WAIT_S}'`))
+    assert.equal(other.timeout, 30 + HQ_AWAY_WAIT_S + 15)
+  }
 })

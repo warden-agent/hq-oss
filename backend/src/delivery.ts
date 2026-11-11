@@ -1,9 +1,11 @@
 // Messages, batches and the delivery policy. Batches are composed lazily when the mod asks for work.
+import fs from 'node:fs'
+import path from 'node:path'
 import { one, q, run, now, getSetting, tx } from './db.ts'
 import { DEFAULTS } from './config.ts'
 import { emit, patch } from './events.ts'
 import { id } from './util.ts'
-import { getAgent, liveAgents, type Agent } from './agents.ts'
+import { agentDir, getAgent, liveAgents, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
 import * as tmux from './tmux.ts'
 
@@ -65,7 +67,7 @@ export function nextBatchFor(agent: Agent): Handed | null {
   if (agent.status === 'paused' || pausedRoles().includes(agent.role)) return null
   const lost = t - getSetting('batch_receive_s', DEFAULTS.batch_receive_s) * 1000 // handed out, but the mod never said it got it
   for (const b of q<Batch>("SELECT * FROM batches WHERE agent_id = ? AND acked_at IS NULL AND dropped_at IS NULL AND received_at IS NULL AND handed_at IS NOT NULL AND handed_at < ?", agent.id, lost)) requeue(b.id, 'not_received')
-  // Submitted but the prompt never started: Claude Code drops a mod's prompt after an Escape interrupt (2.1.300). Send it again.
+  // Submitted but the prompt never started: Claude Code drops a mod's prompt after an Escape interrupt (2.1.300, 2.1.322). Send it again.
   const unacked = q<Batch>('SELECT * FROM batches WHERE agent_id = ? AND acked_at IS NULL AND dropped_at IS NULL AND submitted_at IS NOT NULL AND submitted_at < ?', agent.id, t - NOT_ACKED_MS)
   for (const b of unacked) requeue(b.id, 'not_acked')
   const open = one<Batch>('SELECT * FROM batches WHERE agent_id = ? AND acked_at IS NULL AND dropped_at IS NULL AND handed_at IS NOT NULL AND handed_at > ? ORDER BY handed_at DESC', agent.id, t - 180_000)
@@ -85,7 +87,7 @@ export function nextBatchFor(agent: Agent): Handed | null {
   return { ...b, raw: allUser, asUser: allUser }
 }
 /** Urgent delivery: Escape stops the agent's current turn and `m` is typed into its terminal. After an interrupt Claude Code
- *  drops prompts a mod submits until a normal turn has ended (seen on 2.1.300), so the mod can't carry it. `m` is marked
+ *  drops prompts a mod submits until a normal turn has ended (seen on 2.1.300 and 2.1.322), so the mod can't carry it. `m` is marked
  *  delivered before the first await, so the mod's long-poll never hands it out as well. */
 export async function interruptAndType(agent: Agent, m: Message): Promise<void> {
   const t0 = now(); run("UPDATE messages SET delivered_at = ?, delivery_method = 'tmux' WHERE id = ?", t0, m.id); patch('message', m.id, { delivered_at: t0, delivery_method: 'tmux' })
@@ -136,6 +138,18 @@ export function ackBatchFromPrompt(agent: Agent, prompt: string): string | null 
   emit({ agentId: agent.id, source: 'system', kind: 'batch.acked', payload: { id: batchId } })
   return batchId
 }
+/** Bug 85: hookwait.mjs leaves this in an agent's folder when HQ stayed away so long that it told the agent to stop and wait for a
+ *  message. Once HQ hears from the agent again, or starts with the agent still running, that message goes out, once. */
+export const HQ_AWAY_MARK = 'hq-unreachable'
+export function tellIfHqWasAway(agent: Agent): void {
+  const mark = path.join(agentDir(agent.id), HQ_AWAY_MARK)
+  if (agent.status === 'exited' || !fs.existsSync(mark)) return
+  try { fs.rmSync(mark) } catch { return } // another hook got there first
+  const body = 'HQ is back. It was down for a while (most likely a restart), so a step of yours that needed its OK was turned away and you '
+    + 'were told to wait. Carry on from where you stopped, and run that step again.'
+  sendMessage({ repoId: agent.repo_id, featureId: agent.feature_id, channel: 'dm', from: 'hq', to: agent.id, reason: 'fyi', body })
+  emit({ agentId: agent.id, source: 'system', kind: 'agent.hq_back', payload: {} })
+}
 /** read_inbox fallback: returns and marks delivered. */
 export function readInbox(agent: Agent): Message[] {
   const msgs = pendingFor(agent); const t = now()
@@ -159,16 +173,35 @@ export function resolveRecipient(agent: Agent, to: string): string | null {
   }
   return null
 }
-/** The per-recipient window throttles chatter (fyi, answer); a blocker or question always gets through it, because refusing one
- *  leaves the sender waiting on a message nobody got (seen 2026-10-29). The per-hour cap still applies to every reason. */
+/** How long a message of the user's to an agent still counts as what the agent's next message to someone passes on (Bug 86). */
+const RELAY_MS = 3_600_000
+/** Bug 86: a DM `m` (one row of messages, as alias m) that passes on what the user said: the user wrote to its sender after the
+ *  sender's previous DM to the same recipient, and not long before `m`. Each message of the user's frees one DM per recipient.
+ *  Ordered by rowid, not created_at: a reply and the message before it can share a millisecond. */
+const RELAYED = `EXISTS (SELECT 1 FROM messages u WHERE u.from_id = 'user' AND u.to_id = m.from_id AND u.rowid < m.rowid AND u.created_at > m.created_at - ${RELAY_MS}
+  AND u.rowid > COALESCE((SELECT MAX(p.rowid) FROM messages p WHERE p.from_id = m.from_id AND p.to_id = m.to_id AND p.channel = 'dm' AND p.rowid < m.rowid), 0))`
+/** The DMs from one agent to other agents since `since` that the limits count (Bug 86): not its replies and messages to the user,
+ *  not what it passed on from the user. */
+function countedDms(from: string, since: number, to?: string): number {
+  return one<{ c: number }>(`SELECT COUNT(*) c FROM messages m WHERE m.from_id = ? AND m.channel = 'dm' AND m.to_id NOT IN ('user', 'hq')
+    AND (? IS NULL OR m.to_id = ?) AND m.created_at > ? AND NOT ${RELAYED}`, from, to ?? null, to ?? null, since)!.c
+}
+/** The user wrote to `from` since its last DM to `to`: what it sends `to` now passes that on (Bug 86). */
+function passesOnUser(from: string, to: string): boolean {
+  const last = one<{ r: number | null }>("SELECT MAX(rowid) r FROM messages WHERE from_id = ? AND to_id = ? AND channel = 'dm'", from, to)!.r ?? 0
+  return !!one("SELECT 1 AS x FROM messages WHERE from_id = 'user' AND to_id = ? AND rowid > ? AND created_at > ?", from, last, now() - RELAY_MS)
+}
+/** The limits throttle chatter between agents. They count only agent-to-agent DMs: a TPM's replies to the user and messages to
+ *  the user are another kind of thing (Bug 86). A message that passes on what the user just told the agent is never held back.
+ *  The per-recipient window lets a blocker or question through, because refusing one leaves the sender waiting on a message
+ *  nobody got (seen 2026-10-29); the per-hour cap applies to every reason. */
 export function dmAllowed(agent: Agent, to: string, reason: string): { ok: boolean; why?: string } {
+  if (passesOnUser(agent.id, to)) return { ok: true }
   const perHour = getSetting('dm_per_hour', DEFAULTS.dm_per_hour); const perPeerMin = getSetting('dm_per_peer_min', DEFAULTS.dm_per_peer_min)
   const t = now()
-  const hour = one<{ c: number }>("SELECT COUNT(*) c FROM messages WHERE from_id = ? AND channel = 'dm' AND created_at > ?", agent.id, t - 3_600_000)!.c
-  if (hour >= perHour) return { ok: false, why: `DM limit: ${perHour} per hour` }
+  if (countedDms(agent.id, t - 3_600_000) >= perHour) return { ok: false, why: `DM limit: ${perHour} per hour` }
   if (reason === 'blocker' || reason === 'question') return { ok: true }
-  const peer = one<{ c: number }>("SELECT COUNT(*) c FROM messages WHERE from_id = ? AND to_id = ? AND channel = 'dm' AND created_at > ?", agent.id, to, t - perPeerMin * 60_000)!.c
-  if (peer >= 1) return { ok: false, why: `DM limit: one per ${perPeerMin} min to the same recipient` }
+  if (countedDms(agent.id, t - perPeerMin * 60_000, to) >= 1) return { ok: false, why: `DM limit: one per ${perPeerMin} min to the same recipient` }
   return { ok: true }
 }
 

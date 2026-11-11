@@ -1,4 +1,4 @@
-// Bugs 95/96: Bash commands an agent waits on in the background. In Claude Code 2.1.300 a command that hits its `timeout` isn't stopped: it moves to the
+// Bugs 95/96: Bash commands an agent waits on in the background. In Claude Code (2.1.300 and 2.1.322) a command that hits its `timeout` isn't stopped: it moves to the
 // background, and the agent is woken only by a <task-notification> once it exits (spike 2026-11-10, bgspike.sh). On 2026-11-09 a test run froze that way
 // (a real one, 0% CPU for 20 minutes): its engineer would have waited forever, and HQ showed it idle. Now HQ keeps the runs each agent waits on. The agent is
 // working while one runs, and a run that uses no CPU and writes nothing for `bg_stall_min` minutes is frozen: a notice with Stop it and tell the engineer,

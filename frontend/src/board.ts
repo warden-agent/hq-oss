@@ -232,7 +232,7 @@ export const kindLabel = (k: string): string => k.startsWith('auto_stopped:') ? 
   tpm_rotate: 'TPM memory full', api_error: 'API error', rate_limit: 'Usage limit', backend_error: 'HQ error', user_override: 'Approved in the terminal',
   cap_reached: 'Sent back too often', tpm_away: 'TPM not running', pr_failed: "Couldn't open the PR", mod_missing: 'Agent not connected',
   leftovers_stuck: "Leftover programs won't stop", leftovers_cant_check: "Can't check for leftovers", bg_stalled: 'Run frozen',
-  engineer_idle: 'Engineer idle' } as Record<string, string>)[k]
+  engineer_idle: 'Engineer idle', claude_unchecked: 'Claude Code not checked', claude_newer: 'Newer Claude Code installed' } as Record<string, string>)[k]
   ?? (k.startsWith('repo_') ? 'Repo' : k.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()))
 const steps = (a: Agent) => a.steps_total ? ` · step ${a.steps_done}/${a.steps_total}` : ''
 const firstLine = (text: string): string => String(text).split('\n').map((l) => l.replace(/^[#>*\-\s]+/, '').replace(/\*\*|`/g, '').trim()).find(Boolean) ?? ''

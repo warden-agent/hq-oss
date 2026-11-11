@@ -203,7 +203,12 @@ ${failReport(r, 8000)}
 ## Steps
 1. Find out why, from the output above. Run the tests with a time limit, so a frozen run can't hold you up: the Bash tool's own \`timeout\` setting, not a \`timeout\` command (a Mac has none).
 2. If a test or the code is wrong, fix that, then call open_pr. HQ tests it and merges it first.
-3. If the command itself can't work in the sandbox, find one that does and call propose_test_command, saying exactly what it leaves out. HQ tries it first.
+3. If the command itself can't work in the sandbox, find one that does:
+   - Run it with the Bash tool, exactly as you'll propose it. HQ only takes a command it has seen run in your session, because every engineer has to run it there,
+     and Claude Code refuses some commands that HQ's sandbox would run: \`node --test $(ls test/*.js)\`, for one, where the list of files is worked out as it runs.
+   - If yours is refused, move the part it refuses into a script in the repo (an npm script, for one) and commit it. Don't swap it for a fixed list of files:
+     tests added later would never run.
+   - Then call propose_test_command, saying exactly what it leaves out. HQ tries it too, on ${base} plus your branch.
 
 ## Rules
 - Fix the cause. Don't delete or weaken a test that can run in the sandbox, and leave out only what can't.
@@ -460,13 +465,27 @@ function tellEngineers(repoId: string, cmd: string | null): void {
   }
 }
 const proposing = new Set<string>() // repair tickets whose test command HQ is trying now
-/** A repair's proposal: a test command that can work in HQ's sandbox. HQ tries it on main plus the repair's branch, so a repair that needs
- *  a fix and a new command can land. A pass on auto is taken at once and goes in the summary (the user's call: HQ can prove a command
- *  passes, not that it's a good test, and the summary is the check); off auto the user OKs it. A second change in a run stops and asks,
- *  so the tests can't be whittled down until they pass. */
+const squash = (s: string): string => s.replace(/\s+/g, ' ').trim()
+/** Bug 83: has Claude Code let an engineer on this ticket run `command`, by itself or inside a longer line (`… 2>&1 | tail`)? HQ's own try can't
+ *  tell: it runs /bin/sh, and one project's saved command (`node --test … $(grep -rL …)`) was refused in every engineer's session. Read from the
+ *  events (hooks.ts ranBash), so a restart, or a fresh engineer on the ticket, doesn't lose it. */
+export function ranByEngineer(ticketId: string, command: string): boolean {
+  const want = squash(command); if (!want) return false
+  return q<{ payload: string }>(`SELECT e.payload FROM events e JOIN agents a ON a.id = e.agent_id
+    WHERE a.ticket_id = ? AND e.kind IN ('hook.PostToolUse:Bash', 'hook.PostToolUseFailure:Bash') AND e.payload LIKE '%"ran":%'`, ticketId)
+    .some((e) => squash(j<{ ran?: string }>(e.payload, {}).ran ?? '').includes(want))
+}
+const NOT_RUN = "HQ hasn't seen that command run in your session, so nothing changed. Run it with the Bash tool exactly as you propose it, then call this again. "
+  + "Every engineer has to run it in a session like yours, and Claude Code refuses some commands that HQ's sandbox would run. "
+  + "If it's refused, move the part it refuses into a script in the repo (an npm script, for one), commit it, and run that."
+/** A repair's proposal: a test command that can work in HQ's sandbox. The engineer has to have run it itself first (Bug 83). HQ tries it on
+ *  main plus the repair's branch, so a repair that needs a fix and a new command can land. A pass on auto is taken at once and goes in the
+ *  summary (the user's call: HQ can prove a command passes, not that it's a good test, and the summary is the check); off auto the user OKs
+ *  it. A second change in a run stops and asks, so the tests can't be whittled down until they pass. */
 export function proposeTestCommand(agent: Agent, command: string, leftOut: string): string {
   const t = ticketForAgent(agent), repo = t ? getRepo(getFeature(t.feature_id)?.repo_id ?? '') : undefined
   if (!t?.repairs_main || !t.branch || !repo) throw new Error('Only a repair ticket can change the test command.')
+  if (!ranByEngineer(t.id, command)) throw new Error(NOT_RUN)
   if (proposing.has(t.id)) throw new Error('HQ is still trying your last one. End your turn; its message will come.')
   proposing.add(t.id)
   const tell = (body: string) => sendMessage({ repoId: repo.id, channel: 'dm', from: 'hq', to: agent.id, reason: 'fyi', body })

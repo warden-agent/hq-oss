@@ -126,6 +126,24 @@ test('a blocker always reaches the TPM; one the hourly cap refuses goes to the u
   await hq.api('settings', { key: 'dm_per_hour', value: 6 }); await hq.api(`agents/${eng.id}/stop`, {}) // frees its slot
 })
 
+test('Bug 86: the TPM\'s chat with the user doesn\'t use up its DM limits, and it can always pass on what the user said', async () => {
+  const { f, tpm } = await setup('relay-user')
+  await takeLaunch(tpm.id)
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Shelf', size: 'S', spec: 'A shelf.' })).json
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  for (let i = 0; i < 6; i++) await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: `Here is answer ${i}.` }) // six replies
+  const tell = (body: string) => hq.mcp(tpm.id, 'send_message', { to: eng.id, reason: 'fyi', body })
+  try {
+    assert.equal((await tell('The user wants a shelf.')).isError, false, 'passes on the request (the user\'s first message), not counted')
+    assert.equal((await tell('Use oak.')).isError, false, 'six chat replies are not six DMs')
+    const chatter = await tell('Also, sand it.')
+    assert.equal(chatter.isError, true); assert.match(chatter.text, /one per 5 min/); assert.match(chatter.text, /nothing will remind you/)
+    await say(tpm.id, 'HQ is back, please carry on.')
+    assert.equal((await tell('The user says: carry on.')).isError, false, 'what the user just said gets through the window')
+  } finally { await hq.api(`agents/${eng.id}/stop`, {}) } // frees its slot
+})
+
 test('engineers have no respond_to_issues tool', async () => {
   const { f } = await setup('no-respond')
   const t = (await hq.api('tickets', { featureId: f.id, title: 'Jar', size: 'S', spec: 'A jar.' })).json
@@ -152,10 +170,12 @@ test('a stopped agent\'s token stops working; /clear keeps a session alive; a lo
   hq.tmux('kill-session', '-t', `hq-${e1.id}`) // the engineer's process dies without a SessionEnd
   await hq.restart() // recoverAgents finds it gone
   assert.equal((await hq.state()).agents.find((a: any) => a.id === e1.id).status, 'exited')
-  const hook = await fetch(`http://127.0.0.1:${hq.ports.hooks}/hooks/${tok}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: {} }) })
+  const hook = await fetch(`http://127.0.0.1:${hq.ports.hooks}/hooks`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-hq-token': tok },
+    body: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: {} }) })
   assert.equal(hook.status, 403)
   assert.equal((await hq.state()).agents.find((a: any) => a.id === e1.id).status, 'exited') // the late hook didn't bring it back
   assert.equal(fs.existsSync(path.join(hq.hqHome, 'agents', e1.id, 'token')), false)
+  assert.equal(fs.existsSync(path.join(hq.hqHome, 'agents', e1.id, 'hook-header')), false) // Bug 87: the SessionStart hook's copy goes too
 
   const t2 = (await hq.api('tickets', { featureId: f.id, title: 'Cap', size: 'S', spec: 'A cap.' })).json
   const e2 = (await hq.api(`tickets/${t2.id}/launch`, {})).json
@@ -179,5 +199,5 @@ test('Bug 33: the TPM can retitle a ticket after a change of mind; the engineer 
   const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
   await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
   await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Totals line' })
-  await waitFor('the engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /title \(now "Totals line"\) updated/.test(m.body)))
+  await waitFor('the engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /^HQ: the TPM updated .*title \(now "Totals line"\)\./.test(m.body)))
 })

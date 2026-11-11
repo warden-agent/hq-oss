@@ -7,9 +7,10 @@ import { db, one, q, run, now } from './db.ts'
 import { emit, patch } from './events.ts'
 import { id, sha, shq } from './util.ts'
 import * as tmux from './tmux.ts'
-import { buildMcp, buildSettings, roleFlags, rolePromptPath, type Role } from './roles.ts'
+import { buildMcp, buildSettings, roleFlags, rolePromptPath, HOOK_HEADER_FILE, hookHeaderLine, type Role } from './roles.ts'
 import { ensureTrusted } from './trust.ts'
 import { resolveKind } from './attention.ts'
+import { checkClaude } from './claudecheck.ts'
 
 export type Agent = {
   id: string; role: Role; repo_id: string | null; feature_id: string | null; ticket_id: string | null; review_request_id: string | null; model_alias: string; model_live: string | null
@@ -55,6 +56,7 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   const dir = agentDir(agentId)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   fs.writeFileSync(path.join(dir, 'token'), token, { mode: 0o600 })
+  fs.writeFileSync(path.join(dir, HOOK_HEADER_FILE), hookHeaderLine(token), { mode: 0o600 }) // what the SessionStart hook sends (Bug 87)
   fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(buildSettings(spec.role, token, { agentDir: dir, repoAllowlist: spec.repoAllowlist, editOverrides: spec.editOverrides }), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(buildMcp(path.join(dir, 'token')), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'prompt.md'), spec.launchPrompt)
@@ -72,6 +74,8 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
        spec.role === 'engineer' && spec.permissionMode !== 'acceptEdits' ? 1 : 0, t, spec.launchPrompt, spec.displayName)
   run('INSERT INTO sessions(id, agent_id, claude_session_id, started_at) VALUES (?,?,?,?)', id('ses'), agentId, sessionId, t)
   run('INSERT INTO batches(id, agent_id, text, created_at, method) VALUES (?,?,?,?,?)', id('B'), agentId, spec.launchPrompt, t, 'launch')
+  // Bug 97: the binary may have changed since the last look (an update, when HQ_CLAUDE_BIN names the user's own). Never what stops a launch
+  const claude = (await checkClaude().catch(() => null))?.runs ?? null
   try {
     await ensureTrusted(spec.cwd)
     await tmux.newSession(tmuxName(agentId), `bash ${shq(scriptPath)}; echo HQ-AGENT-EXITED; sleep 86400`, { cwd: spec.cwd })
@@ -81,7 +85,7 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   const tk = newToken(); fs.writeFileSync(path.join(dir, 'tmux-token'), tk, { mode: 0o600 })
   await tmux.setHook(tmuxName(agentId), 'client-attached', `curl -s -m 2 -X POST http://127.0.0.1:${PORTS.hooks}/tmux/${agentId}/${tk}/attached`)
   await tmux.setHook(tmuxName(agentId), 'client-detached', `curl -s -m 2 -X POST http://127.0.0.1:${PORTS.hooks}/tmux/${agentId}/${tk}/detached`)
-  emit({ agentId, source: 'system', kind: 'agent.launched', payload: { role: spec.role, model: spec.model, cwd: spec.cwd, sessionId } })
+  emit({ agentId, source: 'system', kind: 'agent.launched', payload: { role: spec.role, model: spec.model, cwd: spec.cwd, sessionId, claude } })
   const a = getAgent(agentId)!; patch('agent', agentId, pageAgent(a)); return a
 }
 
@@ -96,7 +100,10 @@ export async function stopAgent(agentId: string, reason = 'stopped'): Promise<vo
 export function lost(agentId: string, payload: Record<string, unknown> = {}): void {
   update(agentId, { status: 'exited', ended_at: now() }); revokeToken(agentId); resolveKind('dialog', agentId); emit({ agentId, source: 'system', kind: 'agent.lost', payload })
 }
-export function revokeToken(agentId: string): void { update(agentId, { token_revoked_at: now() }); try { fs.rmSync(path.join(agentDir(agentId), 'token')) } catch {} }
+export function revokeToken(agentId: string): void {
+  update(agentId, { token_revoked_at: now() })
+  for (const f of ['token', HOOK_HEADER_FILE]) { try { fs.rmSync(path.join(agentDir(agentId), f)) } catch {} }
+}
 export function tmuxToken(agentId: string): string | null { try { return fs.readFileSync(path.join(agentDir(agentId), 'tmux-token'), 'utf8').trim() } catch { return null } }
 
 /** On startup: reconcile DB agents with live tmux sessions. */

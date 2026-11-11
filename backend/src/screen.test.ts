@@ -1,4 +1,4 @@
-// paneLooksIdle against screens captured from real Claude Code 2.1.300 sessions in HQ (spike, 2026-10-28; Bug 25).
+// paneLooksIdle against screens captured from real Claude Code sessions: 2.1.300 in HQ (spike, 2026-10-28; Bug 25) and 2.1.322 (2026-11-10; Bug 97).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { paneLooksIdle } from './screen.ts'
@@ -23,4 +23,42 @@ test('paneLooksIdle: thinking, running a command, a plan menu or a permission pr
 test('paneLooksIdle: a blank or half-drawn screen is not idle', () => {
   assert.equal(paneLooksIdle(''), false)
   assert.equal(paneLooksIdle('❯ \n  ? for shortcuts\n'), false) // no input box rule above the prompt
+})
+
+// ---- Claude Code 2.1.322 (Bug 97): no "← for agents" any more, and the footer's other hints come and go ----
+const DONE = '✻ Sautéed for 10s · done 5:37 PM'
+const IDLE_322 = [
+  box('❯ ', '  ⏵⏵ accept edits on (shift+tab to cycle)', DONE),
+  box('❯ ', '  ⏸ plan mode on (shift+tab to cycle)', DONE),
+  box('❯ start both tickets now', '  ⏸ manual mode on · ? for shortcuts', '✻ Churned for 26s · done 5:41 PM'), // a TPM
+  // a command still runs in the background (a dev server, or a test run that hit its time limit)
+  box('❯ check progress of the tock task', '  ⏵⏵ accept edits on · 1 shell · ↓ to manage', '✻ Cooked for 2s · done 5:36 PM · 1 shell still running'),
+  box('❯ ', '  ⏸ plan mode on · 1 shell · ↓ to manage', `${DONE} · 1 shell still running`),
+  box('❯ ', '  ⏸ manual mode on · 1 shell · ↓ to manage', `${DONE} · 1 shell still running`),
+  // once a helper has run
+  box('❯ ', '  ⏸ manual mode on · /tasks to see subagents', '⏺ Agent "Create five.txt file" finished · 10s\n✻ Worked for 12s · done 5:42 PM'),
+  box('❯ ', '  ⏵⏵ accept edits on (shift+tab to cycle) · /tasks to see subagents', '✻ Churned for 43s · done 5:48 PM'),
+  // a helper still runs: the turn has ended, and its row sits under the footer
+  box('❯ ', '  ⏵⏵ accept edits on (shift+tab to cycle) · ↓ to manage\n  ⏺ main\n  ◯ general-purpose  Run sleep helper command        23s · ↓ 14.1k tokens',
+    '✻ Waiting for 1 background agent to finish'),
+  // a draft somebody typed and didn't send
+  box('❯ a draft typed by a person', '  ⏸ manual mode on', '✻ Baked for 9s · done 5:45 PM'),
+]
+const BUSY_322 = [
+  box('❯ ', '  ⏵⏵ accept edits on · 1 shell · esc to interrupt · ↓ to manage', '✳ Considering… (6s · ↓ 205 tokens)\n  ⎿  Tip: Use /theme to change the color theme'),
+  box('❯ ', '  ⏸ manual mode on · esc to interrupt', '✶ Thinking… (3s)'),
+]
+const PLAN_MENU_322 = [RULE, '   Claude has written up a plan and is ready to execute. Would you like to proceed?', '', '   ❯ 1. Yes, auto-accept edits',
+  '     2. Yes, manually approve edits', '     3. Tell Claude what to change', '        shift+tab to approve with this feedback', '',
+  '   ctrl+g to edit in VS Code · .hq-plans/abundant-cuddling-shamir.md', RULE, ''].join('\n')
+
+test('paneLooksIdle: 2.1.322 waits at its prompt with or without the hints 2.1.300 always showed', () => {
+  for (const s of IDLE_322) assert.equal(paneLooksIdle(s), true, s)
+})
+test('paneLooksIdle: 2.1.322 at work, or showing its plan menu, is not idle', () => {
+  for (const s of [...BUSY_322, PLAN_MENU_322]) assert.equal(paneLooksIdle(s), false, s)
+})
+test("paneLooksIdle: the words of a footer anywhere else don't make a screen idle", () => {
+  assert.equal(paneLooksIdle(`⏺ The footer says "plan mode on" while I plan.\n${RULE}\n❯ \n${RULE}\n`), false) // above the box, and no footer under it
+  assert.equal(paneLooksIdle(`${RULE}\n❯ ls\nREADME.md  manual mode on.txt\n❯ \n`), false) // a shell's prompt (Claude Code has ended): no box around it
 })

@@ -2,7 +2,7 @@
 // load 26 on 14 cores. Now at most `heavy_at_once` of them run at a time on this machine (1 unless the user raises it), first come first served, and HQ's own test
 // runs wait in the same line as engineers' commands.
 // An engineer's command is held at its PreToolUse hook: Claude Code starts a command when that hook answers, the command's own time limit only starts then, and a wait
-// costs no tokens (spike 2026-11-09 on 2.1.300: held 40 s, the command began the second the hook answered, and a 5 s limit still let it run). The engineer just
+// costs no tokens (spike 2026-11-09 on 2.1.300, again on 2.1.322: held 40 s, the command began the second the hook answered, and a 5 s limit still let it run). The engineer just
 // sees the command take longer.
 // Nothing waits for good. A turn comes back when its command ends, when its agent moves on to its next tool, when its agent's turn ends, when its agent goes, or
 // when the command's own time limit has passed; and whoever has waited TURN_WAIT_S goes ahead anyway. HQ down or restarted: held hooks fail, and Claude Code runs

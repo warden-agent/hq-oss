@@ -1,8 +1,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { PATHS, PORTS, CLAUDE_BIN, uiToken } from './config.ts'
+import { PATHS, PORTS, uiToken } from './config.ts'
 import { migrate } from './db.ts'
-import { recoverAgents } from './agents.ts'
+import { recoverAgents, liveAgents } from './agents.ts'
+import { tellIfHqWasAway } from './delivery.ts'
 import { startHooksServer } from './hooks.ts'
 import { startMcpServer } from './mcp.ts'
 import { startUiServer } from './ui.ts'
@@ -22,6 +23,7 @@ import { ensureTrusted } from './trust.ts'
 import { startAutoLoop } from './auto.ts'
 import { killTestRuns, sweepRunTmp, sweepTestWorktrees } from './testrun.ts'
 import { startLeftoverSweeps, sweepAgentTmp, sweepNow } from './leftovers.ts'
+import { checkClaude, claudeInfo, ensureClaude, startClaudeCheck } from './claudecheck.ts'
 
 /** The repo's role prompts and mod are what agents get: copied into HQ's home on every start when they differ (new agents
  *  pick them up; running ones keep what they started with). Extra files already in the plugin folder are left alone. */
@@ -39,13 +41,16 @@ function ensureAssets(): void {
   }
   for (const f of ['tpm', 'engineer', 'architect', 'launcher']) { const src = path.join(repoRoles, `${f}.prompt.md`); if (fs.existsSync(src)) sync(src, path.join(PATHS.roles, `${f}.prompt.md`)) }
   if (changed.length) emit({ agentId: null, source: 'system', kind: 'assets.updated', payload: { files: changed } })
-  if (!fs.existsSync(CLAUDE_BIN)) { console.error(`Pinned Claude Code binary missing: ${CLAUDE_BIN}`); process.exit(1) }
 }
 async function main(): Promise<void> {
   migrate(); ensureAssets()
+  try { await ensureClaude() } catch (e) { console.error((e as Error).message); process.exit(1) } // no agent could start
+  // Bug 97: which Claude Code the agents run, and whether HQ was checked on it, before the page or a launch can ask. A look that fails stops nothing
+  await checkClaude().catch((e) => emit({ agentId: null, source: 'system', kind: 'claude.check_error', payload: { error: String(e) } }))
   // Every TPM workspace is a plain folder under this one, so trusting it once means TPM launches never write ~/.claude.json.
   try { await ensureTrusted(PATHS.workspaces) } catch (e) { emit({ agentId: null, source: 'system', kind: 'trust.error', payload: { error: String(e) } }) }
   await recoverAgents()
+  for (const a of liveAgents()) tellIfHqWasAway(a) // Bug 85: told to wait for HQ while it was down; an idle agent sends no hook to remind HQ
   await sweepWorktrees().catch((e) => emit({ agentId: null, source: 'system', kind: 'worktree.sweep.error', payload: { error: String(e) } }))
   for (const r of repos()) await sweepTestWorktrees(r.path).catch(() => {}) // a test run the last backend didn't finish
   try { // and its temp files (Bug 81)
@@ -59,7 +64,8 @@ async function main(): Promise<void> {
   startListeners()
   startHooksServer(); startMcpServer(); startUiServer(); startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
   startLeftoverSweeps()
-  emit({ agentId: null, source: 'system', kind: 'backend.started', payload: { ports: PORTS } })
+  startClaudeCheck()
+  emit({ agentId: null, source: 'system', kind: 'backend.started', payload: { ports: PORTS, claude: claudeInfo() } })
   console.log(`HQ backend up. UI: http://127.0.0.1:${PORTS.ui}/?token=${uiToken()}  hooks :${PORTS.hooks}  mcp :${PORTS.mcp}  state ${PATHS.home}`)
 }
 // HQ keeps running (nothing would restart it), but the user sees that something went wrong: one ⚠ item until they tick it off.

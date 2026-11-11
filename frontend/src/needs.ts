@@ -48,9 +48,12 @@ export type Need = { key: string; text: string; repoId: string | null; ref: { re
  *  finished work can't go further. Information (merged, memory filling up, model notes) is left to the ⚠ menu. */
 export const ALERT_KINDS = new Set(['stuck', 'blocked', 'dialog', 'message_for_user', 'cap_reached', 'engineer_exited', 'agent_exited', 'launch_failed',
   'fresh_start_failed', 'merge_conflict', 'fix_stalled', 'change_stalled', 'delivery_failed', 'dm_refused', 'tpm_away', 'unexpected_prompt', 'usage_limit', 'rate_limit', 'api_error',
-  'pr_failed', 'push_failed', 'auto_parked', 'leftovers_stuck', 'leftovers_cant_check', 'bg_stalled', 'engineer_idle'])
+  'pr_failed', 'push_failed', 'auto_parked', 'leftovers_stuck', 'leftovers_cant_check', 'bg_stalled', 'engineer_idle',
+  'claude_unchecked']) // Bug 97: agents on a Claude Code HQ wasn't checked on. A newer one merely installed (claude_newer) is information
 /** Good news: green, not red, because nothing is wrong (Bug 61). */
 export const goodNews = (kind: string): boolean => kind === 'merged' || kind === 'conflicts_fixed' || kind.startsWith('auto_finished:') || kind.startsWith('project_removed') // Bug 66's notice
+/** Plain information: nothing is wrong and nothing is asked, so neither red nor green (Bug 97: a newer Claude Code is installed, and HQ's agents stay put). */
+export const plainNews = (kind: string): boolean => kind === 'claude_newer'
 /** Auto mode's own notices that need the user: they name their project in the kind. */
 const autoNeeds = (k: string): boolean => /^(auto_stopped|auto_finished|test_cmd_proposed):/.test(k)
 
@@ -99,5 +102,12 @@ export function newNeeds(seen: Set<string> | null, now: Need[]): { fresh: Need[]
   return { fresh: seen ? now.filter((n) => !seen.has(n.key)) : [], seen: keys }
 }
 
+/** Which Claude Code the agents run, in a line for the Agents menu (Bug 97). `warn`: it isn't the version HQ was checked on. */
+export function claudeLine(c: { checked: string; runs: string | null; installed: string | null }): { text: string; warn: boolean } {
+  if (c.runs !== c.checked) return { warn: true, text: c.runs ? `Agents run Claude Code ${c.runs}. HQ was checked on ${c.checked}.`
+    : `HQ can't tell which Claude Code agents run. It was checked on ${c.checked}.` }
+  const here = c.installed && c.installed !== c.runs ? ` This computer's own is ${c.installed}.` : ''
+  return { warn: false, text: `Agents run Claude Code ${c.runs}, the version HQ was checked on.${here}` }
+}
 /** The tab title: "(2) HQ" while two things need the user. */
 export const titleFor = (n: number): string => n ? `(${n}) HQ` : 'HQ'

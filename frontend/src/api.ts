@@ -3,6 +3,8 @@ export type State = { autoRuns?: any[]; repos: any[]; features: any[]; tickets: 
   settings: Record<string, any>; defaults: Record<string, any>; held: number; ports: Record<string, number>; previews: any[]
   /** The frontend build HQ serves now (Bug 48): a tab running another one is out of date. */
   build?: string | null
+  /** Bug 97: the Claude Code version HQ was checked on, the one its agents run, and the one installed on this computer (null: unknown, or none). */
+  claude?: { checked: string; runs: string | null; installed: string | null }
   /** Engineers working in every repo (forRepo sets it: the parallel limit counts them all). */
   working?: number }
 export async function api<T = any>(path: string, body?: unknown): Promise<T> {
