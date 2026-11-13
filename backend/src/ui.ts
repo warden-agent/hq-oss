@@ -22,6 +22,7 @@ import { createProject, githubReady, RepoHere } from './newproject.ts'
 import { makePr, mergeTicket } from './mergewatch.ts'
 import { answerReview, openReviews, pageReviews, getReview, getRevision, heldCount, isVerdict, VERDICTS } from './gate.ts'
 import { interruptAndType, sendMessage, messagesForFeature } from './delivery.ts'
+import { wakeAll } from './wake.ts'
 import { openAttention, resolveAttention } from './attention.ts'
 import { resumeRole } from './modelguard.ts'
 import * as tmux from './tmux.ts'
@@ -31,6 +32,7 @@ import { approve, dismiss, launchWithoutRecipe, startHelper } from './launchhelp
 import { readJson, asObject, TooLarge } from './util.ts'
 import { answerTestCommand, autoCheck, autoResume, autoRetry, autoRuns, setAuto, setTestCmd, undoRun } from './auto.ts'
 import { claudeInfo } from './claudecheck.ts'
+import { pageFeed } from './pagefeed.ts'
 
 const TOKEN = uiToken()
 const extras = new Map<string, Record<string, unknown>>() // non-column agent fields from patches (activity, steps, context)
@@ -172,6 +174,7 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
       setSetting(String(body.key), body.value); patch('setting', String(body.key), { value: body.value }); emit({ agentId: null, source: 'ui', kind: 'settings.changed', payload: { key: body.key } })
       if (body.key === 'concurrency_cap') void fillSlots().catch(() => {})
       if (body.key === 'heavy_at_once') pump() // raised: whoever waits for a turn may go
+      if (body.key === 'paused_roles' || body.key === 'batch_receive_s') wakeAll() // Bug 99: who may get a batch, or when one falls due
       return json(res, 200, { ok: true })
     }
     if (r0 === 'roles' && r1 && r2 === 'resume') { resumeRole(r1); return json(res, 200, { ok: true }) }
@@ -213,15 +216,17 @@ export function startUiServer(): http.Server {
 function onClient(ws: WebSocket): void {
   const terms = new Map<string, Term>()
   const send = (obj: unknown) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)) }
-  send({ type: 'snapshot', data: snapshot() })
-  const onPatch = (p: Patch) => send({ type: 'patch', ...p })
+  const feed = pageFeed() // Bug 98: agent patches that would change nothing on this tab aren't sent
+  const sendSnapshot = () => { const data = snapshot(); feed.snapshot(data.agents); send({ type: 'snapshot', data }) }
+  sendSnapshot()
+  const onPatch = (p: Patch) => { const q = feed.patch(p); if (q) send({ type: 'patch', ...q }) }
   const onEvent = (e: HqEvent) => send({ type: 'event', event: { ...e, payload: e.payload } })
-  const onSnapshot = () => send({ type: 'snapshot', data: snapshot() }) // after a clear: whole rows are gone
+  const onSnapshot = () => sendSnapshot() // after a clear: whole rows are gone
   bus.on('patch', onPatch); bus.on('event', onEvent); bus.on('resnapshot', onSnapshot)
   ws.on('message', (raw) => {
     let m: Record<string, unknown>; try { m = JSON.parse(String(raw)) } catch { return }
     if (m.type !== 'snapshot') return termMessage(m, terms, send)
-    try { send({ type: 'snapshot', data: snapshot() }) } catch (e) { // a throw here would stall this socket (termws.ts)
+    try { sendSnapshot() } catch (e) { // a throw here would stall this socket (termws.ts)
       emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { server: 'ws', message: 'snapshot', error: String(e) } })
     }
   })

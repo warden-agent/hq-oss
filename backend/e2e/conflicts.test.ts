@@ -80,7 +80,9 @@ test('Bug 9: the early warning, a refusal that names who merged first, and Fix c
   assert.equal((await notices(t2, 'merge_conflict')).length, 0) // being handled; a later conflict gets a fresh notice
   assert.match((await fix(t2)).json.error, new RegExp(`already fixing its conflicts`))
   // Its engineer goes idle before the instructions reach it: nothing is sent twice. Once they did and it stopped anyway, pressing
-  // Fix conflicts again re-sends them.
+  // Fix conflicts again re-sends them. Its mod is alive and has its launch prompt in hand, so the instructions wait behind it, and the
+  // Stop hook doesn't carry them either (Bug 103: it would, to an agent whose mod is quiet).
+  assert.ok((await hq.modNext(e2.id)).batch)
   await hq.hook(e2.id, { hook_event_name: 'Stop', last_assistant_message: 'done' })
   assert.match((await fix(t2)).json.error, /HQ's instructions to .* haven't been delivered yet/)
   assert.match((await hq.mcp(e2.id, 'read_inbox')).text, /main has moved on/) // now it has them

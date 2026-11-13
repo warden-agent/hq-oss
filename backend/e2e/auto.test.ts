@@ -63,14 +63,41 @@ test('Bug 69: a test HQ stopped in the middle of a test run leaves nothing runni
   await testRunning('stopped'); await hq.stop()
   await waitFor('the test run to end', () => !stuckRun(), 3000)
 })
+/** The pids of the runs under way now: the next start tests the ticket again with the same command, so the old run is told apart by its pids. */
+const stuckPids = () => execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).split('\n').map((l) => l.trim()).filter((l) => l.split(/\s+/).slice(1).join(' ')
+  .startsWith(MARK)).map((l) => Number(l.split(/\s+/)[0]))
+const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
 test('Bug 69: a backend killed outright can\'t stop its test run, so the next start does', async () => {
-  const p = await testRunning('killed')
-  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200) // or the next start tests the ticket again
+  const p = await testRunning('killed'), old = stuckPids(); assert.ok(old.length)
   const pid = execFileSync('lsof', ['-ti', `tcp:${hq.ports.ui}`, '-sTCP:LISTEN'], { encoding: 'utf8' }).trim().split('\n')[0]!
   process.kill(Number(pid), 'SIGKILL'); await wait(300)
-  if (process.platform === 'darwin') assert.ok(stuckRun(), 'it outlives the backend, or this proves nothing') // Linux's sandbox dies with its parent
+  if (process.platform === 'darwin') assert.ok(old.some(alive), 'it outlives the backend, or this proves nothing') // Linux's sandbox dies with its parent
   await hq.restart()
-  await waitFor('the test run to end', () => !stuckRun(), 5000)
+  await waitFor('the old test run to end', () => !old.some(alive), 5000)
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200) // and the new one with it (Bug 89)
+  await waitFor('the new one to end', () => !stuckRun(), 5000)
+})
+const tested = async () => ((await hq.api('events?limit=500')).json as any[]).filter((e) => e.kind === 'auto.tested' || e.kind === 'auto.main_checked')
+test('Bug 89: auto off during the check of main ends that run at once, with no result; on again checks main afresh', async () => {
+  const p = await project('offmain'); await ticket(p, 'One')
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: MARK })).status, 200); await turnEnds(p)
+  await waitFor('the check of main', () => stuckRun(), 15_000)
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200)
+  await waitFor('the run to end', () => !stuckRun(), 5000); await wait(500)
+  assert.deepEqual(await tested(), [], 'no result: not a failure, not a repair'); assert.equal((await runs(p))[0].status, 'off'); assert.deepEqual(await repairs(p), [])
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: '' })).status, 200); assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
+  const c = await waitFor('a new check', async () => (await checks())[0], 15_000); assert.equal(c.result, 'pass')
+})
+test('Bug 89: auto off while a finished ticket is tested ends the run; the ticket isn\'t sent back, and on again tests it afresh', async () => {
+  const p = await project('offticket'), t = await ticket(p, 'Thing')
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: `if [ -f thing.js ]; then ${MARK}; fi` })).status, 200); await turnEnds(p)
+  await waitFor('main checked', async () => (await checks())[0]); await work(p, t, await engineer(t), { 'thing.js': '1\n' })
+  await waitFor('the ticket\'s test', () => stuckRun(), 15_000); const old = stuckPids()
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200); assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
+  await waitFor('the old run to end', () => !old.some(alive), 5000)
+  await waitFor('a fresh test of it', () => stuckPids().some((x) => !old.includes(x)), 15_000)
+  assert.equal((await tested()).filter((e) => e.kind === 'auto.tested').length, 0, 'the stopped run said nothing')
+  const now = await tk(t); assert.equal(now.status, 'pr_ready'); assert.equal(now.auto_tries, 0, 'not sent back to its engineer')
 })
 
 test('a machine that can\'t sandbox the tests says so before anything starts: no switch, no run, no tokens', async () => {
@@ -247,14 +274,23 @@ test('Bug 62: a TPM that has gone can\'t stop the project again on Resume with i
 })
 
 test('Bug 62: a dialog answered before HQ looks again doesn\'t park the engineer or stop the project; one still open does', async () => {
-  const p = await project('answered'), t1 = await ticket(p, 'One'); await turnEnds(p); const e1 = await engineer(t1)
-  await hq.session(e1.id, 'waiting'); await hq.hook(e1.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' })
-  await hq.session(e1.id, 'busy') // answered at once: no hook says so
-  await hq.session(p.tpm.id, 'waiting'); await hq.hook(p.tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this too?' })
-  await hq.session(p.tpm.id, 'idle'); await wait(1500)
+  await hq.api('settings', { key: 'concurrency_cap', value: 3 })
+  const p = await project('answered'), t1 = await ticket(p, 'One'), t2 = await ticket(p, 'Two'), t3 = await ticket(p, 'Three'); await turnEnds(p)
+  const e1 = await engineer(t1), e2 = await engineer(t2), e3 = await engineer(t3)
+  const ask = (a: any, message: string) => hq.hook(a.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message })
+  const parks = async (t: any, why: RegExp) => assert.match(await waitFor(`${t.key} to park`, async () => (await tk(t)).auto_parked_why), why)
+  // Answered at once, and no hook says so. Bug 93: the answer goes in the session file before the alert, timed after it (as if
+  // answered just after), because a look of HQ's between the alert and a rewrite of the file rightly sees the dialog still open.
+  const later = Date.now() + 60_000
+  await hq.session(e1.id, 'busy', later); await ask(e1, 'Allow this?')
+  await hq.session(p.tpm.id, 'idle', later); await ask(p.tpm, 'Allow this too?')
+  // A dialog still open parks its ticket as before, and is the proof that HQ looked, in place of a fixed wait. The look that parks t2
+  // has the two answered notices too, and the one that parks t3 starts only once that look is over.
+  await hq.session(e2.id, 'waiting'); await ask(e2, 'Allow that?'); await parks(t2, /Allow that\?/)
+  await hq.session(e3.id, 'waiting'); await ask(e3, 'And that?'); await parks(t3, /And that\?/)
   assert.equal((await tk(t1)).auto_parked_why, null); assert.equal((await repoNow(p)).auto_stopped_why, null)
-  await hq.session(e1.id, 'waiting'); await hq.hook(e1.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'And this?' })
-  await waitFor('the park', async () => (await tk(t1)).auto_parked_why) // still open: auto mode does as before
+  // Nothing more on e1 here: the look that parked t3 may still hold e1's answered notice, and a new dialog of e1's now would make it
+  // park t1 with that notice's words (Bug 117).
 })
 
 test('a repair that keeps failing stops the project with the reason, and Resume looks again', async () => {

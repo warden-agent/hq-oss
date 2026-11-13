@@ -13,6 +13,7 @@ const repo = (files: Record<string, string>): string => {
   return dir
 }
 const pkg = (scripts: Record<string, string>) => JSON.stringify({ name: 'x', scripts })
+const deps = JSON.stringify({ name: 'x', scripts: { start: 'x' }, dependencies: { ms: '2.1.3' } }) // something for npm to install
 const age = (dir: string, f: string, secondsAgo: number) => { const t = new Date(Date.now() - secondsAgo * 1000); fs.utimesSync(path.join(dir, f), t, t) }
 
 test('command: dev beats start; neither or no package.json means HQ cannot tell', () => {
@@ -24,13 +25,28 @@ test('command: dev beats start; neither or no package.json means HQ cannot tell'
 })
 
 test('install: only when npm\'s record is missing or older than the lockfile', () => {
-  const fresh = repo({ 'package.json': pkg({ start: 'x' }), 'package-lock.json': '{}', 'node_modules/.package-lock.json': '{}' })
+  const fresh = repo({ 'package.json': deps, 'package-lock.json': '{}', 'node_modules/.package-lock.json': '{}' })
   age(fresh, 'package-lock.json', 60); assert.equal(installStep(fresh), null)
   age(fresh, 'node_modules/.package-lock.json', 120); assert.equal(installStep(fresh), 'npm ci') // a merge changed dependencies
-  assert.equal(installStep(repo({ 'package.json': pkg({ start: 'x' }), 'package-lock.json': '{}' })), 'npm ci') // never installed
-  assert.equal(installStep(repo({ 'package.json': pkg({ start: 'x' }) })), 'npm install') // no lockfile, nothing installed
-  assert.equal(installStep(repo({ 'package.json': pkg({ start: 'x' }), 'node_modules/a/index.js': '' })), null)
+  assert.equal(installStep(repo({ 'package.json': deps, 'package-lock.json': '{}' })), 'npm ci') // never installed
+  assert.equal(installStep(repo({ 'package.json': deps })), 'npm install') // no lockfile, nothing installed
+  assert.equal(installStep(repo({ 'package.json': deps, 'node_modules/a/index.js': '' })), null)
   assert.equal(installStep(repo({ 'README.md': 'hi' })), null)
+})
+
+test('install: never for a package.json that lists no packages (Bug 90: npm would write a package-lock.json)', () => {
+  const with_ = (extra: object) => JSON.stringify({ name: 'x', scripts: { start: 'x' }, ...extra })
+  assert.equal(installStep(repo({ 'package.json': pkg({ start: 'x' }) })), null)
+  assert.equal(installStep(repo({ 'package.json': with_({ dependencies: {}, devDependencies: {} }) })), null)
+  // a project already hit by Bug 90: npm ci never makes node_modules for it, so it would run on every start
+  assert.equal(installStep(repo({ 'package.json': pkg({ start: 'x' }), 'package-lock.json': '{}' })), null)
+  assert.equal(commandRecipe('npm start', repo({ 'package.json': pkg({ start: 'x' }) })).parts[0].install, undefined)
+  // what it must not catch: any kind of dependency, a workspace root, a package.json npm itself would choke on
+  for (const k of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'])
+    assert.equal(installStep(repo({ 'package.json': with_({ [k]: { ms: '2.1.3' } }) })), 'npm install', k)
+  assert.equal(installStep(repo({ 'package.json': with_({ workspaces: ['pkgs/*'] }) })), 'npm install')
+  assert.equal(installStep(repo({ 'package.json': '{ not json' })), 'npm install')
+  assert.equal(installStep(repo({ 'package.json': 'null' })), 'npm install')
 })
 
 test('run script: the supervisor with its spec, from the checkout', () => {
@@ -101,7 +117,7 @@ test('recipe: the OK covers commands and files, not the notes', () => {
 })
 
 test('recipe: the user\'s own command is one part on an auto port', () => {
-  const r = commandRecipe('PORT=4000 node server.js', repo({ 'package.json': pkg({ start: 'x' }), 'package-lock.json': '{}' }))
+  const r = commandRecipe('PORT=4000 node server.js', repo({ 'package.json': deps, 'package-lock.json': '{}' }))
   assert.deepEqual(r, { parts: [{ name: 'app', dir: '.', run: 'PORT=4000 node server.js', port: 'auto', install: 'npm ci' }], show: 'app', worktree_files: [], notes: '' })
 })
 
@@ -129,7 +145,7 @@ test('installs: once per checkout, again when the install_when file changes', ()
 })
 
 test('the user\'s own command installs again after a merge changes dependencies, even after an earlier install', () => {
-  const dir = repo({ 'package.json': pkg({ start: 'x' }), 'package-lock.json': '{}', 'node_modules/.package-lock.json': '{}' })
+  const dir = repo({ 'package.json': deps, 'package-lock.json': '{}', 'node_modules/.package-lock.json': '{}' })
   age(dir, 'node_modules/.package-lock.json', 120); age(dir, 'package-lock.json', 60) // a merge brought a newer lockfile
   const r = commandRecipe('npm start', dir)
   const spec = supervisorSpec({ recipe: r, root: dir, ports: { app: 3090 }, marks: { [dir]: 'installed' }, marksFile: '/m.json', header: 'h' })

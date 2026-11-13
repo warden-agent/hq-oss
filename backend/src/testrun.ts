@@ -164,8 +164,9 @@ export function sweepRunTmp(): string[] {
 }
 /** Runs `cmd` in `cwd` in the sandbox with a clean environment: no tokens, no agent ids, nothing of the backend's but PATH and HOME.
  *  With no sandbox nothing runs: HQ never runs this code bare. */
-export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number }): Promise<RunResult> {
+export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal }): Promise<RunResult> {
   return new Promise((resolve) => {
+    if (o.signal?.aborted) return resolve({ code: null, output: '', earlier: '', timedOut: false, sandboxFailed: false }) // stopped before it began: nothing runs
     const tmp = process.platform === 'darwin' ? runTmp() : null
     const env = { HOME: os.homedir(), PATH: process.env.PATH ?? '/usr/bin:/bin', TMPDIR: tmp ?? '/tmp', LANG: process.env.LANG ?? 'en_US.UTF-8',
       CI: '1', ...cacheEnv(), ...(process.env.RUSTUP_HOME ? { RUSTUP_HOME: process.env.RUSTUP_HOME } : {}) } // rustup's toolchains, if they aren't in ~/.rustup
@@ -176,8 +177,9 @@ export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; ti
     p.stdout.setEncoding('utf8').on('data', take); p.stderr.setEncoding('utf8').on('data', take)
     const signal = (s: NodeJS.Signals) => { try { process.kill(-p.pid!, s) } catch { /* gone */ } }, kill = () => signal('SIGKILL')
     const timer = setTimeout(() => { timedOut = true; signal('SIGINT'); hard = setTimeout(kill, GRACE_MS) }, o.timeoutMs)
+    o.signal?.addEventListener('abort', kill) // nobody will read what it says, so no grace for its last words (Bug 89)
     let result: RunResult | null = null // the first word wins: a program that won't start sends 'error' and then 'close'
-    const done = (r: RunResult) => { clearTimeout(timer); clearTimeout(hard); if (result) return; result = r
+    const done = (r: RunResult) => { clearTimeout(timer); clearTimeout(hard); o.signal?.removeEventListener('abort', kill); if (result) return; result = r
       void (tmp ? fs.promises.rm(tmp, { recursive: true, force: true }) : Promise.resolve()).catch(() => {}).then(() => resolve(r)) }
     p.on('error', (e) => done({ code: null, output: `${bin} wouldn't start, and HQ won't run the tests without it: ${(e as Error).message}`, earlier: '', timedOut,
       sandboxFailed: true }))
@@ -198,9 +200,25 @@ export async function sweepTestWorktrees(repoPath: string): Promise<void> {
   for (const d of fs.existsSync(dir) ? fs.readdirSync(dir) : []) if (d.startsWith('hq-test-')) await dropWorktree(repoPath, path.join(dir, d))
 }
 
-/** `hung`: it never finished, and HQ stopped it at the time limit. `output` and `earlier` are a run's (RunResult). */
+/** `hung`: it never finished, and HQ stopped it at the time limit. `output` and `earlier` are a run's (RunResult). `stopped`: auto mode went off
+ *  during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bug 89). */
 export type TestResult = { kind: 'pass'; test: string } | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean } | { kind: 'no_tests' }
-  | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string }
+  | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' }
+/** Auto mode's own runs under way, by project folder (Bug 89). A repair's try of a test command isn't one: with auto off its result goes to the user. */
+const autoRuns = new Map<string, Set<AbortController>>(), stops = new Map<string, number>()
+/** How many times auto mode's runs were stopped in this project. Auto reads it before it looks at anything, and a run started with an older
+ *  count is stopped as it starts: auto may go off while HQ is still at the git steps before the run, with nothing yet to stop. */
+export const autoGen = (repoPath: string): number => stops.get(repoPath) ?? 0
+/** Auto mode went off: its runs in this project end now, a run still waiting for its turn never starts, and each one says `stopped`. */
+export function stopAutoTests(repoPath: string): number {
+  stops.set(repoPath, autoGen(repoPath) + 1); const s = autoRuns.get(repoPath); for (const c of s ?? []) c.abort(); return s?.size ?? 0
+}
+const ownedBy = (repoPath: string, gen: number | null): { signal: AbortSignal; done: () => void } => {
+  const c = new AbortController(); if (gen === null) return { signal: c.signal, done: () => {} }
+  if (gen !== autoGen(repoPath)) c.abort()
+  const s = autoRuns.get(repoPath) ?? new Set(); autoRuns.set(repoPath, s.add(c))
+  return { signal: c.signal, done: () => { s.delete(c); if (!s.size && autoRuns.get(repoPath) === s) autoRuns.delete(repoPath) } }
+}
 export type Failed = Extract<TestResult, { kind: 'fail' }>
 // At most `max` characters of the start or the end, cut between lines
 const firstChars = (s: string, max: number): string => { if (s.length <= max) return s; const i = s.lastIndexOf('\n', max); return `${s.slice(0, i > 0 ? i : max)}\n…` }
@@ -212,10 +230,13 @@ export function failReport(r: Pick<Failed, 'output' | 'earlier'>, max: number): 
   const head = `Lines that named a failure or an error, from earlier in the output:\n${firstChars(r.earlier, Math.max(max / 2, max - r.output.length - 100))}`
   return `${head}\n\nThe end of the output:\n${lastChars(r.output, Math.max(500, max - head.length))}`
 }
-/** The tests on commit `sha`. `custom`: the user's own command (it replaces the test step; the install step still comes from the files). */
-async function runAt(repoPath: string, sha: string, key: string, custom: string | null): Promise<TestResult> {
-  const wt = testWorktree(repoPath, key); await dropWorktree(repoPath, wt)
+/** The tests on commit `sha`. `custom`: the user's own command (it replaces the test step; the install step still comes from the files).
+ *  `auto`: auto mode's own run, which turning it off stops: autoGen's count as auto read it. */
+async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: number | null): Promise<TestResult> {
+  const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto), stopped = { kind: 'stopped' } as const
   try {
+    if (signal.aborted) return stopped
+    await dropWorktree(repoPath, wt)
     fs.mkdirSync(path.dirname(wt), { recursive: true })
     await git(repoPath, ['worktree', 'add', '--detach', '--quiet', wt, sha])
     await seedPackages(repoPath, wt)
@@ -223,25 +244,29 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
     if (!plan) return { kind: 'no_tests' }
     const timeoutMs = getSetting('test_timeout_min', DEFAULTS.test_timeout_min) * 60_000
     return await withTurn(`HQ's test of ${key}`, 'tests', async (): Promise<TestResult> => { // in line with engineers' own builds and test runs (Bug 76); the time limit starts with the run
+      if (signal.aborted) return stopped // it waited for its turn and auto went off meanwhile
       if (plan.install) {
-        const i = await runSandboxed(wt, plan.install, { network: true, timeoutMs })
+        const i = await runSandboxed(wt, plan.install, { network: true, timeoutMs, signal })
+        if (signal.aborted) return stopped
         if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
         if (i.code !== 0) return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier }
       }
-      const r = await runSandboxed(wt, plan.test, { network: false, timeoutMs })
+      const r = await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal })
+      if (signal.aborted) return stopped
       if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
       if (r.code === 0) return { kind: 'pass', test: plan.test }
       return { kind: 'fail', test: plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so
     })
   } catch (e) { return { kind: 'error', why: (e as Error).message.split('\n')[0] ?? 'unknown error' } }
-  finally { await dropWorktree(repoPath, wt) }
+  finally { done(); await dropWorktree(repoPath, wt) }
 }
 /** The tests on `branch` merged into `base` (a ref): main isn't touched, and the commit tested goes away unused. */
-export async function testCombined(repoPath: string, base: string, branch: string, key: string, custom: string | null): Promise<TestResult> {
+export async function testCombined(repoPath: string, base: string, branch: string, key: string, custom: string | null, auto: number | null = null): Promise<TestResult> {
   const c = await combinedCommit(repoPath, base, branch)
   if ('conflicts' in c) return { kind: 'conflicts', files: c.conflicts }
   if ('error' in c) return { kind: 'error', why: c.error }
-  return runAt(repoPath, c.sha, key, custom)
+  return runAt(repoPath, c.sha, key, custom, auto)
 }
 /** The tests on `base` alone: when a ticket fails, is it the ticket, or was main already broken? */
-export const testBase = (repoPath: string, base: string, key: string, custom: string | null): Promise<TestResult> => runAt(repoPath, base, `${key}-main`, custom)
+export const testBase = (repoPath: string, base: string, key: string, custom: string | null, auto: number | null = null): Promise<TestResult> =>
+  runAt(repoPath, base, `${key}-main`, custom, auto)

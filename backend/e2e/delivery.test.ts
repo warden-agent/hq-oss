@@ -4,6 +4,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, type Hq } from './harness.ts'
 
 let hq: Hq
@@ -80,6 +81,46 @@ test('a hold set while the mod is polling holds the batch', async () => {
   assert.deepEqual(await poll, {})
   await hq.api(`agents/${tpm.id}/takeover`, { locked: false })
   assert.match((await hq.modNext(tpm.id)).batch.text, /Held note/)
+})
+
+/** Writes to the test HQ's database, for state only time would bring (a mod gone quiet, a batch handed out long ago). */
+function sql(query: string, ...args: (string | number)[]): void {
+  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite')); try { db.prepare(query).run(...args) } finally { db.close() }
+}
+/** Moves a batch's times 10 minutes back: past the "submitted but never started" wait (90 s) and the one-in-flight window (3 min). */
+const ageBatch = (id: string) => sql(`UPDATE batches SET handed_at = handed_at - 600000, received_at = received_at - 600000,
+  submitted_at = submitted_at - 600000 WHERE id = ?`, id)
+const kinds = async (agentId: string, kind: string) => (await hq.api(`events?agent=${agentId}`)).json.filter((e: any) => e.kind === kind)
+
+test('Bug 103: a message the Stop hook hands over counts as delivered and is not handed out again', async () => {
+  const { tpm } = await setup('stop-hook')
+  await takeLaunch(tpm.id)
+  sql('UPDATE agents SET mod_seen_at = ? WHERE id = ?', Date.now() - 300_000, tpm.id) // its mod hasn't asked for work in 5 minutes
+  await say(tpm.id, 'Stop-hook note.')
+  const r = await hq.hookOnce(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' }) // not the Stop that follows
+  assert.equal(r.decision, 'block'); assert.match(r.reason, /^HQ message batch (B-[0-9a-f]+):\n.*Stop-hook note\./s)
+  const id = /B-[0-9a-f]+/.exec(r.reason)![0]
+  // Claude Code goes on with the message as feedback on its turn, and no UserPromptSubmit follows (2.1.322), so the hook's answer is the delivery.
+  const m = (await hq.state()).messages.find((x: any) => x.body === 'Stop-hook note.'); assert.equal(m.batch_id, id); assert.ok(m.ack_at, 'acknowledged')
+  assert.equal((await kinds(tpm.id, 'batch.acked')).filter((e: any) => JSON.parse(e.payload).id === id).length, 1)
+  assert.equal((await hq.state()).agents.find((a: any) => a.id === tpm.id).status, 'working') // it is working on the message, not idle
+  ageBatch(id) // long after: its mod is back, and the Stop that ends the turn the message started
+  assert.deepEqual(await hq.modNext(tpm.id), {}, 'not handed out a second time')
+  assert.deepEqual(await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Noted.' }), {})
+  assert.equal((await kinds(tpm.id, 'batch.requeued')).length, 0)
+  assert.equal((await hq.state()).attention.filter((a: any) => a.kind === 'delivery_failed' && a.agent_id === tpm.id).length, 0)
+})
+
+test('Bug 103: a batch the mod submitted whose prompt never started is still handed out again', async () => {
+  const { tpm } = await setup('never-started')
+  await takeLaunch(tpm.id)
+  await say(tpm.id, 'Lost after Escape.')
+  const b = (await hq.modNext(tpm.id)).batch; assert.match(b.text, /Lost after Escape/)
+  await hq.modEvent(tpm.id, { kind: 'batch_received', id: b.id }); await hq.modEvent(tpm.id, { kind: 'batch_submitted', id: b.id }) // and no UserPromptSubmit
+  ageBatch(b.id)
+  const again = (await hq.modNext(tpm.id)).batch
+  assert.ok(again, 'handed out again'); assert.notEqual(again.id, b.id); assert.equal(again.text, b.text)
+  assert.deepEqual((await kinds(tpm.id, 'batch.requeued')).map((e: any) => JSON.parse(e.payload)), [{ id: b.id, why: 'not_acked', launch: false }])
 })
 
 test('only an answer answers an engineer\'s question; HQ\'s notices come from HQ', async () => {
@@ -200,4 +241,51 @@ test('Bug 33: the TPM can retitle a ticket after a change of mind; the engineer 
   await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
   await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Totals line' })
   await waitFor('the engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /^HQ: the TPM updated .*title \(now "Totals line"\)\./.test(m.body)))
+})
+
+test('Bug 102: a spec change while a ticket has no engineer waits for the next one, and the TPM hears so', async () => {
+  const { f, tpm } = await setup('spec-gone')
+  const spec = (t: any, a: Record<string, string>) => hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, ...a })
+  const msgs = async (to: string) => (await hq.state()).messages.filter((m: any) => m.to_id === to && m.from_id === 'hq' && /^HQ: the TPM updated/.test(m.body))
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Shelf', size: 'S', spec: 'A shelf.' })).json
+  assert.equal((await spec(t, { spec: 'A pine shelf.' })).text, `Updated. Nobody has started on ${t.key} yet; its engineer gets the new spec when it starts.`)
+  assert.equal((await hq.state()).messages.filter((m: any) => m.feature_id === f.id && m.from_id === 'hq' && /^HQ: the TPM updated/.test(m.body)).length, 0)
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', eng.id, 'prompt.md'), 'utf8'), /## Spec\nA pine shelf\./)
+  assert.equal((await spec(t, { spec: 'An oak shelf.' })).text, 'Updated.') // the engineer on it now is told, as before
+  const oak = await msgs(eng.id); assert.equal(oak.length, 1)
+  await hq.mcp(eng.id, 'read_inbox') // it has read that one
+  await hq.api(`agents/${eng.id}/stop`, {})
+  await waitFor('the engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id).status === 'exited')
+  const gone = `Updated. ${t.key}'s engineer (${eng.id}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.`
+  assert.equal((await spec(t, { spec: 'A walnut shelf.' })).text, gone)
+  assert.equal((await spec(t, { title: 'Walnut shelf' })).text, gone)
+  const waiting = (await msgs(eng.id)).filter((m: any) => !m.delivered_at); assert.equal(waiting.length, 2)
+  // Resume: the engineer that takes over starts from the spec as it is now and gets both notices.
+  const r = await hq.api(`tickets/${t.id}/resume`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', r.json.id, 'prompt.md'), 'utf8'), /A walnut shelf\./)
+  assert.deepEqual((await msgs(r.json.id)).map((m: any) => m.id).sort(), waiting.map((m: any) => m.id).sort())
+  assert.equal((await msgs(eng.id)).filter((m: any) => !m.delivered_at).length, 0, 'nothing left for the engineer that has gone')
+  assert.equal((await spec(t, { spec: 'A cherry shelf.' })).text, 'Updated.') // the one on it now is told at once
+  assert.equal((await msgs(r.json.id)).length, 3)
+})
+
+test('Bug 102: a relaunch over an engineer that left a question open gets its unread messages, and an answer leaves the new plan alone', async () => {
+  const { f, tpm } = await setup('relaunch-question')
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Rack', size: 'S', spec: 'A rack.' })).json
+  const e1 = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === e1.id && a.status === 'working'))
+  assert.equal((await hq.mcp(e1.id, 'send_message', { to: 'tpm', reason: 'question', body: 'Steel or wood?' })).isError, false)
+  assert.equal((await ticketOf(t)).status, 'awaiting_answer')
+  await hq.api(`agents/${e1.id}/stop`, {})
+  await waitFor('the engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === e1.id).status === 'exited')
+  await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, spec: 'A steel rack.' })
+  const e2 = (await hq.api(`tickets/${t.id}/launch`, {})).json; assert.ok(e2.id, JSON.stringify(e2))
+  await waitFor('the new engineer', async () => (await hq.state()).agents.find((a: any) => a.id === e2.id && a.status === 'working'))
+  assert.equal((await ticketOf(t)).status, 'planning')
+  const left = (await hq.state()).messages.filter((m: any) => m.to_id === e1.id && !m.delivered_at); assert.equal(left.length, 0)
+  assert.ok((await hq.state()).messages.some((m: any) => m.to_id === e2.id && m.from_id === 'hq' && /^HQ: the TPM updated/.test(m.body)))
+  assert.equal((await hq.mcp(tpm.id, 'send_message', { to: e1.id, reason: 'answer', body: 'Steel.' })).isError, false)
+  assert.equal((await ticketOf(t)).status, 'planning') // the old question's answer doesn't move the new engineer's ticket
 })

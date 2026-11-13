@@ -8,6 +8,7 @@ import { id } from './util.ts'
 import { agentDir, getAgent, liveAgents, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
 import * as tmux from './tmux.ts'
+import { wake, wakeAll } from './wake.ts'
 
 export type Message = { id: string; repo_id: string | null; feature_id: string | null; channel: string; from_id: string; to_id: string | null; reason: string; in_reply_to: string | null; body: string; created_at: number; batch_id: string | null; delivered_at: number | null; delivery_method: string | null; ack_at: number | null }
 export type Batch = { id: string; agent_id: string; text: string; created_at: number; handed_at: number | null; submitted_at: number | null; acked_at: number | null; method: string | null; received_at: number | null; dropped_at: number | null }
@@ -25,6 +26,7 @@ export function sendMessage(m: { repoId?: string | null; featureId?: string | nu
   const row: Message = { id: id('msg'), repo_id: m.repoId ?? repoFor(m.featureId, m.from, m.to), feature_id: m.featureId ?? null, channel: m.channel, from_id: m.from, to_id: m.to ?? null, reason: m.reason, in_reply_to: m.inReplyTo ?? null, body: m.body, created_at: now(), batch_id: null, delivered_at: null, delivery_method: null, ack_at: null }
   run('INSERT INTO messages(id, repo_id, feature_id, channel, from_id, to_id, reason, in_reply_to, body, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)', row.id, row.repo_id, row.feature_id, row.channel, row.from_id, row.to_id, row.reason, row.in_reply_to, row.body, row.created_at)
   patch('message', row.id, row as unknown as Record<string, unknown>)
+  if (row.channel === 'team') wakeAll(); else wake(row.to_id) // Bug 99: its waiting `next` hands it out at once
   emit({ agentId: m.from === 'user' || m.from === 'hq' ? null : m.from, source: 'system', kind: 'message.sent', payload: { id: row.id, to: row.to_id, reason: m.reason, channel: m.channel } })
   // What answers an engineer's question: anything the user sends it (their message box says 'fyi'), or the TPM's reply marked as one.
   const answers = m.from === 'user' || (getAgent(m.from)?.role === 'tpm' && (!!m.inReplyTo || m.reason === 'answer'))
@@ -86,6 +88,16 @@ export function nextBatchFor(agent: Agent): Handed | null {
   emit({ agentId: agent.id, source: 'system', kind: 'batch.handed', payload: { id: b.id, messages: msgs.map((m) => m.id) } })
   return { ...b, raw: allUser, asUser: allUser }
 }
+/** Bug 99: when nextBatchFor could next find something with nothing else changing (no message, no ack, no setting): a hold ends,
+ *  a batch handed out or submitted is due to be handed out again, or the one in flight stops holding the rest back. Null: none. */
+export function nextDeadline(agent: Agent): number | null {
+  const t = now(), receive = getSetting('batch_receive_s', DEFAULTS.batch_receive_s) * 1000, times: number[] = []
+  if (agent.takeover_locked_until && agent.takeover_locked_until > t) times.push(agent.takeover_locked_until)
+  for (const b of q<Batch>('SELECT * FROM batches WHERE agent_id = ? AND acked_at IS NULL AND dropped_at IS NULL AND handed_at IS NOT NULL', agent.id)) {
+    times.push(b.handed_at! + 180_000); if (b.received_at === null) times.push(b.handed_at! + receive); if (b.submitted_at !== null) times.push(b.submitted_at + NOT_ACKED_MS)
+  }
+  const later = times.filter((x) => x >= t); return later.length ? Math.min(...later) + 1 : null // the checks compare with < and >
+}
 /** Urgent delivery: Escape stops the agent's current turn and `m` is typed into its terminal. After an interrupt Claude Code
  *  drops prompts a mod submits until a normal turn has ended (seen on 2.1.300 and 2.1.322), so the mod can't carry it. `m` is marked
  *  delivered before the first await, so the mod's long-poll never hands it out as well. */
@@ -114,12 +126,14 @@ export function requeue(batchId: string, why: string): void {
     tx(() => { run('UPDATE batches SET dropped_at = ? WHERE id = ?', now(), b.id); run('UPDATE messages SET batch_id = NULL, delivered_at = NULL, delivery_method = NULL WHERE batch_id = ?', b.id) })
     for (const m of ms) patch('message', m.id, { batch_id: null, delivered_at: null, delivery_method: null })
   }
+  wake(b.agent_id) // back in the queue (and no longer the one in flight)
   emit({ agentId: b.agent_id, source: 'system', kind: 'batch.requeued', payload: { id: b.id, why, launch: b.method === 'launch' } })
 }
 function giveUp(b: Batch, why: string, tries: number): void {
   const ms = q<{ id: string }>('SELECT id FROM messages WHERE batch_id = ?', b.id)
   tx(() => { run('UPDATE batches SET dropped_at = ? WHERE id = ?', now(), b.id); run("UPDATE messages SET delivery_method = 'failed' WHERE batch_id = ?", b.id) })
   for (const m of ms) patch('message', m.id, { delivery_method: 'failed' })
+  wake(b.agent_id) // no longer the one in flight: what came after it can go
   emit({ agentId: b.agent_id, source: 'system', kind: 'batch.given_up', payload: { id: b.id, why, tries, launch: b.method === 'launch' } })
   attention('delivery_failed', `${displayName(b.agent_id)}: HQ couldn't deliver ${b.method === 'launch' ? 'its launch prompt' : 'a message batch'} ${tries} times (${why === 'submit_failed' ? 'the mod could not submit it' : 'the mod never got it'}), so it stopped trying. Check its terminal, then send the message again.`, { agentId: b.agent_id })
 }
@@ -132,11 +146,22 @@ export function ackBatchFromPrompt(agent: Agent, prompt: string): string | null 
     batchId = open.find((b) => head && b.text.trim().slice(0, 60) === head)?.id ?? null
   }
   if (!batchId) return null
+  ackBatch(agent, batchId); return batchId
+}
+function ackBatch(agent: Agent, batchId: string): void {
   const t = now(); run('UPDATE batches SET acked_at = ? WHERE id = ? AND agent_id = ?', t, batchId, agent.id)
   run('UPDATE messages SET ack_at = ? WHERE batch_id = ?', t, batchId)
-  for (const row of q<Message>('SELECT * FROM messages WHERE batch_id = ?', batchId)) patch('message', row.id, { ack_at: t, delivered_at: row.delivered_at })
+  for (const row of q<Message>('SELECT * FROM messages WHERE batch_id = ?', batchId)) patch('message', row.id, { ack_at: t, delivered_at: row.delivered_at, delivery_method: row.delivery_method })
   emit({ agentId: agent.id, source: 'system', kind: 'batch.acked', payload: { id: batchId } })
-  return batchId
+  wake(agent.id) // the one in flight arrived: the next can go
+}
+/** Bug 103: a batch handed over in the Stop hook's answer, when the agent's mod has gone quiet. Claude Code goes on with it as feedback
+ *  on the turn that was ending, and no UserPromptSubmit follows (checked on 2.1.322), so nothing would ever ack it, and the "submitted
+ *  but the prompt never started" rule in nextBatchFor would hand its messages out again. The hook's answer is the delivery: acked now. */
+export function deliveredByStopHook(agent: Agent, batchId: string): void {
+  const t = now()
+  tx(() => { run("UPDATE batches SET method = 'stop_hook', submitted_at = ?, received_at = ? WHERE id = ?", t, t, batchId); run("UPDATE messages SET delivery_method = 'stop_hook' WHERE batch_id = ?", batchId) })
+  ackBatch(agent, batchId)
 }
 /** Bug 85: hookwait.mjs leaves this in an agent's folder when HQ stayed away so long that it told the agent to stop and wait for a
  *  message. Once HQ hears from the agent again, or starts with the agent still running, that message goes out, once. */

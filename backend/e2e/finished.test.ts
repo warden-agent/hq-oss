@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, sh, exitPlanMode, type Hq } from './harness.ts'
 
 let hq: Hq
@@ -110,8 +111,14 @@ test("a change HQ can't send back changes nothing; with no engineer left a fresh
   assert.equal(n.detail, 'T-01: its engineer stopped while building the change to its spec. Press Build the change to start another.')
   assert.equal((await notices(t, 'fix_stalled')).length + (await notices(t, 'merge_conflict')).length, 0)
   assert.equal((await merge(t)).status, 409)
+  // Bug 102: another change meanwhile waits for the next engineer (the TPM hears so), and Build the change hands it to that one.
+  r = await spec(tpm, t, { spec: 'Invoices with totals and tax.' })
+  assert.equal(r.text, `Updated. T-01's engineer (${e2.id}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on T-01.`)
+  const waiting = (await sent('hq', e2.id)).filter((m: any) => !m.delivered_at); assert.equal(waiting.length, 1)
   const again = await fix(t); assert.equal(again.status, 200, JSON.stringify(again.json)); assert.equal(again.json.via, 'launch')
   const e3 = await liveEngineer(t, e2.id); assert.equal(e3.id, again.json.engineer)
+  assert.deepEqual((await sent('hq', e3.id)).map((m: any) => m.id), [waiting[0].id])
+  assert.equal((await sent('hq', e2.id)).filter((m: any) => !m.delivered_at).length, 0)
   assert.match(prompt(e3.id), /HQ: the TPM changed the spec of T-01 after it was finished\./); assert.doesNotMatch(prompt(e3.id), /conflict|git merge/)
   assert.equal((await notices(t, 'change_stalled')).length, 0)
   now = await tk(t); assert.deepEqual([now.status, now.fixing, now.assignee_agent_id], ['resolving', 'changes', e3.id])
@@ -173,6 +180,20 @@ test('a finished engineer with something left to do is kept: a helper of its own
   await hq.api(`agents/${e.id}/takeover`, { locked: true }); await turnEnds(e.id); await kept(e, 'idle')
   await hq.api(`agents/${e.id}/takeover`, { locked: false }); await stopped(e); assert.equal(await why(e), 'finished')
   const now = await tk(t); assert.deepEqual([now.status, now.assignee_agent_id], ['pr_ready', e.id])
+})
+
+test('Bug 103: a finished engineer the Stop hook hands a message to is kept while it works on it', async () => {
+  const { dir, f } = await setup('s4b')
+  const t = await ticket(f, 'Orders'); await launch(t); const e = await liveEngineer(t)
+  const first = (await hq.modNext(e.id)).batch; await hq.modEvent(e.id, { kind: 'batch_received', id: first.id })
+  await hq.hook(e.id, { hook_event_name: 'UserPromptSubmit', prompt: first.text })
+  await finish(e, wtOf(dir, t), 'v1\norders\n')
+  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite')) // its mod has gone quiet, so the Stop hook carries the message
+  try { db.prepare('UPDATE agents SET mod_seen_at = ? WHERE id = ?').run(Date.now() - 300_000, e.id) } finally { db.close() }
+  assert.equal((await hq.api(`agents/${e.id}/message`, { body: 'Is the list sorted?', reason: 'fyi' })).status, 200)
+  const r = await hq.hookOnce(e.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' }); assert.equal(r.decision, 'block'); assert.match(r.reason, /Is the list sorted\?/)
+  await kept(e, 'working') // the turn goes on with the message
+  await turnEnds(e.id); await stopped(e); assert.equal(await why(e), 'finished') // and it goes once that turn ends
 })
 
 /** Runs `fn` against a second HQ started with `env`; the tests' own HQ is back afterwards. */

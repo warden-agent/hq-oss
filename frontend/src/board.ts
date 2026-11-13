@@ -332,6 +332,19 @@ function depths(deps: Map<string, string[]>): { depth: Map<string, number>; loop
 
 /** The project's TPM on top, always (Bug 52); one box per feature (oldest on the left) with its tickets below in dependency
  *  columns, left to right. `repo`: the picked repo (its TPM box shows even with nothing on the board). */
+/** Bug 98: the boxes and lines that came out of buildBoard the same as last time (same JSON) are last time's objects, and when all of them
+ *  did, so are the lists. ReactFlow then redraws only what changed: a hook that moves one engineer's activity line redraws its box alone. */
+const shapes = new WeakMap<object, string>()
+const shape = (x: object): string => { let k = shapes.get(x); if (k === undefined) { k = JSON.stringify(x); shapes.set(x, k) } return k }
+function keep<T extends { id: string }>(prev: T[], next: T[]): T[] {
+  const old = new Map(prev.map((x) => [x.id, x]))
+  const out = next.map((x) => { const o = old.get(x.id); return o && shape(o) === shape(x) ? o : x })
+  return out.length === prev.length && out.every((x, i) => x === prev[i]) ? prev : out
+}
+export function boardKeeper(): (next: Board) => Board {
+  let prev: Board | null = null
+  return (next) => prev = prev ? { ...next, nodes: keep(prev.nodes, next.nodes), edges: keep(prev.edges, next.edges) } : next
+}
 export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ?? null): Board {
   const agentById = new Map(s.agents.map((a) => [a.id, a])), ticketById = new Map(s.tickets.map((t) => [t.id, t]))
   // 1. Which boxes exist. Cancelled features stay only while one of their agents runs; a feature whose tickets all merged collapses.

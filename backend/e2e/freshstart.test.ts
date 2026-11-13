@@ -96,11 +96,16 @@ test('no fresh start, and no typed Urgent, while the agent waits on a dialog', a
 test('no note in time: HQ writes one, and a parked ticket waits for Resume', async () => {
   const { f } = await setup('fresh-fallback')
   const t = await ticket(f, 'Quiet'); const eng = await building(t)
+  const pre = (tool: string, tool_input: object, extra: object = {}) => hq.hook(eng.id, { hook_event_name: 'PreToolUse', tool_name: tool, tool_input, ...extra })
+  await pre('Edit', { file_path: 'hello.txt', old_string: 'a', new_string: 'b' }); await pre('Read', { file_path: 'hello.txt' })
+  await pre('Grep', { pattern: 'helper-search' }, { agent_id: 'helper-1' }) // a helper's call: not the engineer's own step
   assert.equal((await hq.api(`agents/${eng.id}/fresh-start`, { then: 'park' })).status, 200)
   await waitFor('the fallback', async () => (await tk(t)).parked_at, 20_000)
   assert.equal((await agent(eng.id)).status, 'exited'); assert.equal(await live(t), undefined)
   const note = (await hq.api(`docs?scope=${encodeURIComponent(`resume:ticket:${t.id}`)}`)).json[0].text
   assert.match(note, /Written by HQ/)
+  assert.match(note, /oldest first:\n(- .*\n)*- Edit \{"file_path":"hello.txt",[^\n]*\n- Read \{"file_path":"hello.txt"\}\n## Watch out/) // Bug 101
+  assert.doesNotMatch(note, /none recorded|helper-search/)
   const r = await hq.api(`tickets/${t.id}/resume`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.match(await prompt(r.json.id), /Written by HQ/); assert.equal((await tk(t)).parked_at, null)
 })

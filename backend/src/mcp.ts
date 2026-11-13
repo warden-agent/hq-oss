@@ -10,7 +10,7 @@ import { emit, patch } from './events.ts'
 import { agentByToken, getAgent, type Agent } from './agents.ts'
 import { readInbox, sendMessage, resolveRecipient, dmAllowed, displayName } from './delivery.ts'
 import { attention } from './attention.ts'
-import { addFeature, changeFinished, createTicket, finishedAndStopped, launchEngineer, setDependencies, waitingOn } from './tickets.ts'
+import { addFeature, changeFinished, createTicket, finishedAndStopped, launchEngineer, liveEngineerOf, setDependencies, waitingOn } from './tickets.ts'
 import { writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { proposeTestCommand } from './auto.ts'
 import { autoOn, features, featureByHandle, tickets, getFeature, setTicket, ticketForAgent, ticketInRepo, type Feature } from './records.ts'
@@ -102,8 +102,8 @@ function registerTools(s: McpServer, agent: Agent): void {
     })
     // A change of mind often changes what a ticket is (no "Reports tab" any more), so the title can change with the spec (Bug 33)
     s.registerTool('update_ticket_spec', {
-      description: 'Change a ticket\'s spec and/or title (keep the title matching what will be built). The assigned engineer is told. A ticket that is already'
-        + ' finished goes back to an engineer to build the new spec, and can\'t be merged until that is done. Not for merged or cancelled tickets.',
+      description: 'Change a ticket\'s spec and/or title (keep the title matching what will be built). Its engineer is told (with none on it now, the next one'
+        + ' that starts on it). A ticket that is already finished goes back to an engineer to build the new spec, and can\'t be merged until that is done. Not for merged or cancelled tickets.',
       inputSchema: { key: z.string(), spec: z.string().optional(), title: z.string().optional() },
     }, async (a) => {
       logCall('update_ticket_spec', a); const t = byKey(a.key); if (!t) return fail('no such ticket')
@@ -122,12 +122,14 @@ function registerTools(s: McpServer, agent: Agent): void {
       }
       setTicket(t.id, { ...(a.spec ? { spec: a.spec } : {}), ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
       const what = [a.spec && 'spec', title && `title (now "${title}")`].filter(Boolean).join(' and ')
-      // a finished ticket's engineer has nothing to do with a new title (and has usually stopped). HQ's notice, not the TPM's
-      // message: it doesn't count against the TPM's DM limits (Bug 86)
-      if (t.assignee_agent_id && !done) {
-        sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to: t.assignee_agent_id, reason: 'fyi', body: `HQ: the TPM updated ${t.key}'s ${what}. Call get_ticket to read it.` })
-      }
-      return text('Updated.')
+      if (done) return text('Updated.') // a finished ticket's engineer has nothing to do with a new title (and has usually stopped)
+      // Bug 102: the engineer on the ticket now hears it. One that has gone never would: its notice waits, and the next engineer on the
+      // ticket gets it when it starts (startEngineer hands over). HQ's notice, not the TPM's message: no DM limits (Bug 86)
+      const eng = liveEngineerOf(t), to = eng ?? t.assignee_agent_id, news = [a.spec && 'spec', title && 'title'].filter(Boolean).join(' and ')
+      if (to) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to, reason: 'fyi', body: `HQ: the TPM updated ${t.key}'s ${what}. Call get_ticket to read it.` })
+      if (eng) return text('Updated.')
+      return text(to ? `Updated. ${t.key}'s engineer (${to}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.`
+        : `Updated. Nobody has started on ${t.key} yet; its engineer gets the new ${news} when it starts.`)
     })
     s.registerTool('set_merge_order', {
       description: 'Set the intended merge order of one feature\'s tickets (their keys).', inputSchema: { feature: z.string().optional(), keys: z.array(z.string()) },

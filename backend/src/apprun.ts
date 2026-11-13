@@ -25,11 +25,23 @@ export function detectCommand(repoPath: string): string | null {
   } catch { return null }
 }
 
+/** Does this package.json give npm anything to install? A package with none still gets a package-lock.json written by
+ *  `npm install` and no node_modules, so every later start would run `npm ci` again (Bug 90). Unreadable: assume it does. */
+export function listsPackages(pkgPath: string): boolean {
+  let pkg: Record<string, unknown>
+  try { pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) } catch { return true }
+  if (!pkg || typeof pkg !== 'object' || pkg.workspaces) return true // a workspace root: its packages list their own
+  return ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'].some((k) => {
+    const v = pkg[k]; return !!v && typeof v === 'object' && Object.keys(v).length > 0
+  })
+}
+
 /** Install first when npm's own record of what's installed (node_modules/.package-lock.json) is missing or older than the
- *  lockfile, e.g. after a merge changed dependencies. Without a lockfile: only when nothing is installed yet. */
+ *  lockfile, e.g. after a merge changed dependencies. Without a lockfile: only when nothing is installed yet. Never for a
+ *  package.json that lists no packages, so Launch adds no file to the user's project (Bug 90). */
 export function installStep(repoPath: string): 'npm ci' | 'npm install' | null {
   const at = (f: string) => { try { return fs.statSync(path.join(repoPath, f)).mtimeMs } catch { return null } }
-  if (at('package.json') === null) return null
+  if (at('package.json') === null || !listsPackages(path.join(repoPath, 'package.json'))) return null
   const lock = at('package-lock.json'), record = at('node_modules/.package-lock.json')
   if (lock === null) return at('node_modules') === null ? 'npm install' : null
   return record === null || record < lock ? 'npm ci' : null

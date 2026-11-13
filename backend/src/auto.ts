@@ -25,7 +25,7 @@ import { features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTick
 import { readyTickets } from './readiness.ts'
 import { ensureFresh, ghOpts, git, syncRepo } from './repos.ts'
 import { canLaunch } from './scheduler.ts'
-import { detectTests, failReport, sandboxProblem, testBase, testCombined, type Failed } from './testrun.ts'
+import { autoGen, detectTests, failReport, sandboxProblem, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
 import { addFeature, cancelTicket, createTicket, fillSlots, fixConflicts, fixTests, resumeEngineer, testCmdNote } from './tickets.ts'
 import { restartTpm, tpmStarting } from './tpm.ts'
 import { dialogGone } from './presence.ts'
@@ -232,15 +232,16 @@ async function repairMain(repo: Repo, tip: string, b: Failed): Promise<void> {
 async function checkMain(repo0: Repo, r: AutoRun): Promise<void> {
   const still = () => { const cur = getRepo(repo0.id); return cur?.auto_mode && !cur.auto_stopped_why && !cur.clearing_at && openRun(cur.id)?.id === r.id ? cur : null }
   await inMergeQueue(repo0.id, async () => {
-    if (!still()) return
+    const gen = autoGen(repo0.path); if (!still()) return // read first: auto going off from here on stops the run (Bug 89)
     const repo = await ensureFresh(repo0.id).catch(() => null); if (!repo || !still()) return
     const base = mergeBase(repo), tip = await ref(repo)
     const checked = () => { run('UPDATE auto_runs SET main_checked = ? WHERE id = ?', tip || 'nothing to test', r.id); patch('auto_run', r.id, { main_checked: tip || 'nothing to test' }) }
     // A finished ticket already waiting goes first: its own test checks main, and tests main alone if it fails (PR #59). A new test command that only that ticket satisfies
     // would otherwise look like a broken main and open a repair that holds it up.
     if (!tip || repo.empty || openRepair(repo.id) || nextToMerge(repo, tip)) return checked()
-    const test = () => testBase(repo.path, base.ref, `run-${r.id}`, repo.test_cmd)
+    const test = () => testBase(repo.path, base.ref, `run-${r.id}`, repo.test_cmd, gen)
     let b = await test(); if (b.kind === 'fail' && !b.hung && still()) b = await test()
+    if (b.kind === 'stopped') return // auto went off: no result, and a later run checks again (Bug 89)
     emit({ agentId: null, source: 'system', kind: 'auto.main_checked', payload: { repo: repo.id, run: r.id, result: b.kind, test: 'test' in b ? b.test : null } })
     const cur = still(); if (!cur) return
     checked()
@@ -252,10 +253,11 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
   const still = () => { const r = getRepo(repo0.id), t = getTicket(t0.id); return r?.auto_mode && !r.auto_stopped_why && !r.clearing_at && t && FINISHED_NOT_MERGED.includes(t.status) &&
     !t.auto_parked_why ? { repo: r, t } : null }
   await inMergeQueue(repo0.id, async () => {
-    if (!still()) return
+    const gen = autoGen(repo0.path); if (!still()) return // read first: auto going off from here on stops the run (Bug 89)
     const repo = await ensureFresh(repo0.id).catch((e) => { stopProject(repo0, `HQ couldn't bring it up to date: ${(e as Error).message}`); return null }); if (!repo || !still()) return
     const t = getTicket(t0.id)!, base = mergeBase(repo), tip = await ref(repo), branch = `refs/heads/${t.branch}`
-    const r = await testCombined(repo.path, base.ref, branch, t.key, repo.test_cmd)
+    const r = await testCombined(repo.path, base.ref, branch, t.key, repo.test_cmd, gen)
+    if (r.kind === 'stopped') return // auto went off: nothing follows, not even with it back on by now (Bug 89)
     emit({ agentId: null, source: 'system', kind: 'auto.tested', payload: { ticket: t.id, key: t.key, result: r.kind, test: 'test' in r ? r.test : null } })
     if (!still()) return // turned off or removed during the test: a run that was killed reads as a failure, and nothing should follow from it
     if (r.kind === 'no_tests') { noTestsAt.set(t.id, testState(t, tip)); setRepo(repo, { auto_waiting: NO_TESTS }); return }
@@ -268,7 +270,7 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
     if (r.kind === 'fail') {
       const fix = () => retry(t, `Its tests still fail on ${base.name} after ${MAX_TRIES} fixes. ${whyFailed(r)}`, () => fixTests(t.id, r))
       if (t.repairs_main) return fix() // main is broken: that's why this ticket exists, so testing main alone says nothing
-      const b = await testBase(repo.path, base.ref, t.key, repo.test_cmd)
+      const b = await testBase(repo.path, base.ref, t.key, repo.test_cmd, gen); if (b.kind === 'stopped') return
       if (b.kind === 'fail') { if (still()) await repairMain(getRepo(repo.id)!, tip, b); return } // turned off during the test: nothing to repair for
       return fix()
     }
@@ -442,6 +444,7 @@ export async function setAuto(repoId: string, on: boolean): Promise<{ on: boolea
     tellTpm(repoId, rules)
   } else {
     const r = openRun(repoId); setRepo(repo, { auto_mode: 0, auto_stopped_why: null, auto_waiting: null }); clearGoAhead(repoId)
+    stopAutoTests(repo.path) // its test run ends now, not at its time limit, with no result (Bug 89)
     resolveKind(`auto_stopped:${repoId}`, null) // the banner goes with auto_stopped_why; so does its ⚠ line
     if (r) await closeRun(getRepo(repoId)!, r, 'off')
     tellTpm(repoId, 'HQ: the user turned auto mode off. They start, approve and merge from HQ again, and your normal rules apply. Running engineers finish their tickets.')

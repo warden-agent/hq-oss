@@ -4,6 +4,7 @@ import { DEFAULTS } from './config.ts'
 import { emit } from './events.ts'
 import { attention } from './attention.ts'
 import { update, type Agent } from './agents.ts'
+import { wakeAll } from './wake.ts'
 
 export function familyOf(model: string | null | undefined): string {
   const m = (model ?? '').toLowerCase()
@@ -20,7 +21,7 @@ export function pauseRole(role: string, reason: string): void {
   const paused = getSetting<string[]>('paused_roles', []); if (!paused.includes(role)) setSetting('paused_roles', [...paused, role])
   emit({ agentId: null, source: 'system', kind: 'role.paused', payload: { role, reason } })
 }
-export function resumeRole(role: string): void { setSetting('paused_roles', getSetting<string[]>('paused_roles', []).filter((r) => r !== role)); emit({ agentId: null, source: 'system', kind: 'role.resumed', payload: { role } }) }
+export function resumeRole(role: string): void { setSetting('paused_roles', getSetting<string[]>('paused_roles', []).filter((r) => r !== role)); emit({ agentId: null, source: 'system', kind: 'role.resumed', payload: { role } }); wakeAll() }
 
 export function onPostModelSwitch(agent: Agent, body: Record<string, unknown>): void {
   const from = String(body.from_model ?? ''), to = String(body.to_model ?? ''), source = String(body.source ?? ''), requested = body.requested_model == null ? null : String(body.requested_model)

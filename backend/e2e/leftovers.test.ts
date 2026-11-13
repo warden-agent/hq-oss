@@ -33,7 +33,8 @@ async function engineer(name: string) {
   const wt = (await hq.state()).tickets.find((x: any) => x.id === t.id).worktree_path as string
   return { repo, eng, wt }
 }
-const bash = (agentId: string, ev: 'PreToolUse' | 'PostToolUse', command = 'npm test') => hq.hook(agentId, { hook_event_name: ev, tool_name: 'Bash', tool_input: { command } })
+const bash = (agentId: string, ev: 'PreToolUse' | 'PostToolUse', command = 'npm test', use?: string) =>
+  hq.hook(agentId, { hook_event_name: ev, tool_name: 'Bash', tool_input: { command }, ...(use ? { tool_use_id: use } : {}) })
 const gone = (pid: number, ms = 12_000) => waitFor(`pid ${pid} to be stopped`, () => !alive(pid), ms)
 
 test('a command\'s leftover goes once the command ends; nothing in use, and nothing of the user\'s, is touched', async () => {
@@ -52,12 +53,21 @@ test('a command\'s leftover goes once the command ends; nothing in use, and noth
 
 test('commands one after another: an earlier one\'s leftover goes while the next runs; the next one\'s own waits for it to end', async () => {
   const { eng, wt } = await engineer('left-next')
-  await bash(eng.id, 'PreToolUse'); const first = await orphan(wt)
+  await bash(eng.id, 'PreToolUse', 'npm test', 'u1'); const first = await orphan(wt)
   await new Promise((r) => setTimeout(r, 3500)) // ps gives start times in whole seconds: clearly older than the next command
-  await bash(eng.id, 'PostToolUse'); await bash(eng.id, 'PreToolUse', 'npm run lint') // no gap, as when Claude Code runs a list of commands
+  await bash(eng.id, 'PostToolUse', 'npm test', 'u1'); await bash(eng.id, 'PreToolUse', 'npm run lint', 'u2') // no gap, as when Claude Code runs a list of commands
   const own = await orphan(wt); await gone(first)
   await new Promise((r) => setTimeout(r, 3000)); assert.ok(alive(own), 'what the running command started is kept')
-  await bash(eng.id, 'PostToolUse', 'npm run lint'); await gone(own)
+  await bash(eng.id, 'PostToolUse', 'npm run lint', 'u2'); await gone(own)
+})
+
+test('Bug 100: commands that overlap end by their ids; the look after each finds what that one left, not the one still running', async () => {
+  const { eng, wt } = await engineer('left-ids')
+  await bash(eng.id, 'PreToolUse', 'npm run dev', 'a1'); const daemon = await orphan(wt) // a long command (a subagent's, say) and its daemon
+  await new Promise((r) => setTimeout(r, 3500)) // ps gives start times in whole seconds: clearly older than a2
+  await bash(eng.id, 'PreToolUse', 'npm test', 'a2'); await bash(eng.id, 'PostToolUse', 'npm test', 'a2') // a2 ends first: by its id, a1 still runs
+  await new Promise((r) => setTimeout(r, 4000)); assert.ok(alive(daemon), 'a1 still runs: what it started is its own')
+  await bash(eng.id, 'PostToolUse', 'npm run dev', 'a1'); await gone(daemon) // the look after a1 asks about everything since a1 began
 })
 
 test('a command HQ never hears the end of (refused, or its hook lost) puts the clean-up off only until the turn ends', async () => {
@@ -85,7 +95,7 @@ test("Try it on a ticket: what the app put in the background stays; what the eng
   await gone(left); assert.ok(alive(apps), "the app's own"); assert.equal((await fetch(p.url)).status, 200)
   assert.equal((await preview()).ticket_id, ticket)
   assert.equal((await hq.api(`previews/${repo.id}/start`, { ticket: null })).status, 200) // Back to main: nothing is using that folder now
-  await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' }); await gone(apps)
+  await gone(apps) // the run on the ticket is over: what it put in the background goes with it (Bug 100: not left to the next look)
 })
 
 test('stopping an engineer, or switching away from its project, stops what it left (even mid-command)', async () => {

@@ -17,8 +17,8 @@ const SECRETS = ['.ssh/id_rsa', '.netrc', '.npmrc', '.git-credentials', '.config
 for (const f of SECRETS) { fs.mkdirSync(path.dirname(path.join(home, f)), { recursive: true }); fs.writeFileSync(path.join(home, f), 'secret') }
 process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup') // the toolchain stays where it's installed, whatever HOME says
 process.env.HOME = home; process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_ENGINEER_CACHE = path.join(tmp, 'cache')
-const { bwrapArgs, detectTests, failReport, failureLines, sandboxProblem, runSandboxed, sweepRunTmp, testBase, testCombined, sweepTestWorktrees, testWorktree } =
-  await import('./testrun.ts')
+const { bwrapArgs, detectTests, failReport, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase, testCombined, sweepTestWorktrees,
+  testWorktree } = await import('./testrun.ts')
 const { db, migrate } = await import('./db.ts'); migrate(); void db
 
 const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd,
@@ -226,4 +226,40 @@ test('Bug 82: a run past its time limit gets Ctrl+C first, so node names the tes
 test('Bug 82: a run that ignores Ctrl+C is still stopped, a little later', boxed, async () => {
   const t0 = Date.now(), r = await runSandboxed(dir({}), "trap '' INT; echo waiting; sleep 60", { network: false, timeoutMs: 500 })
   assert.equal(r.timedOut, true); assert.equal(r.output, 'waiting'); assert.ok(Date.now() - t0 < 20_000, String(Date.now() - t0))
+})
+
+// Bug 89: turning auto off stops auto mode's own test run in that project at once, whatever step it's at, and nothing else.
+const cache = path.join(tmp, 'cache'), seen = (f: string) => fs.existsSync(path.join(cache, f)) // the one folder outside the checkout a run can write to
+const until = async (what: string, ok: () => boolean, ms = 15_000) => { const t0 = Date.now(); while (!ok()) { assert.ok(Date.now() - t0 < ms, `waited for ${what}`)
+  await new Promise((r) => setTimeout(r, 50)) } }
+const SLEEP = `sleep 57.${process.pid}`, sleeping = () => execFileSync('ps', ['-axo', 'command='], { encoding: 'utf8' }).split('\n').some((l) => l.startsWith(SLEEP))
+test('Bug 89: auto off ends its test run at once and says stopped, not failed; the checkout and the run go', boxed, async () => {
+  const d = oneFile(), t0 = Date.now(), r = testBase(d, 'main', 'S1', `touch "${cache}/s1" && ${SLEEP}`, autoGen(d))
+  await until('the run', () => seen('s1') && sleeping()); assert.equal(stopAutoTests(d), 1)
+  assert.deepEqual(await r, { kind: 'stopped' }); assert.ok(Date.now() - t0 < 15_000, String(Date.now() - t0))
+  assert.equal(sleeping(), false); assert.equal(fs.existsSync(testWorktree(d, 'S1-main')), false); assert.equal(stopAutoTests(d), 0, 'nothing left to stop')
+})
+test('Bug 89: auto off while packages install: the tests never run', boxed, async () => {
+  const d = fs.mkdtempSync(path.join(tmp, 'r-')); sh(d, 'init', '-q', '-b', 'main')
+  write(d, { 'package.json': JSON.stringify({ name: 'p', private: true, dependencies: {}, scripts: { test: 'node --test', preinstall: `touch "${cache}/s2" && ${SLEEP}` } }) })
+  sh(d, 'add', '.'); sh(d, 'commit', '-qm', 'base')
+  const r = testBase(d, 'main', 'S2', `touch "${cache}/s2-tested"`, autoGen(d))
+  await until('the install', () => seen('s2') && sleeping()); stopAutoTests(d)
+  assert.deepEqual(await r, { kind: 'stopped' }); assert.equal(seen('s2-tested'), false); assert.equal(sleeping(), false)
+})
+test('Bug 89: a run waiting for its turn never starts; a run that isn\'t auto mode\'s, or another project\'s, carries on', boxed, async () => {
+  const d = oneFile(), e = oneFile()
+  const first = testBase(e, 'main', 'S3', `touch "${cache}/s3" && sleep 1 && grep -q 1 a.txt`, null) // a repair's try of a command, say: it has the one turn
+  await until('the first run', () => seen('s3'))
+  const queued = testBase(d, 'main', 'S4', `touch "${cache}/s4"`, autoGen(d))
+  assert.equal(stopAutoTests(e), 0, 'not auto mode\'s'); stopAutoTests(d)
+  assert.equal((await first).kind, 'pass'); assert.deepEqual(await queued, { kind: 'stopped' }); assert.equal(seen('s4'), false)
+  assert.equal((await testBase(d, 'main', 'S5', 'grep -q 1 a.txt', autoGen(d))).kind, 'pass', 'a new run after a stop runs as usual')
+})
+test('Bug 89: auto off before the run has started (HQ still at its git steps) stops it too', boxed, async () => {
+  const d = oneFile(), gen = autoGen(d), r = testCombined(d, 'main', 'b', 'S6', `touch "${cache}/s6"`, gen); stopAutoTests(d)
+  assert.deepEqual(await r, { kind: 'stopped' }); assert.equal(seen('s6'), false)
+  const late = testBase(d, 'main', 'S7', `touch "${cache}/s7"`, gen) // HQ read the count before auto went off, and is only now starting the run
+  assert.deepEqual(await late, { kind: 'stopped' }); assert.equal(seen('s7'), false)
+  assert.equal((await testBase(d, 'main', 'S8', 'grep -q 1 a.txt', autoGen(d))).kind, 'pass', 'a run that starts after the stop runs')
 })

@@ -89,12 +89,17 @@ export function createTicket(featureId: string, t: { key?: string; title: string
   return row
 }
 
+/** The engineer on a ticket now: its assignee, or another engineer started on it, that hasn't exited. Null when it has none. */
+export function liveEngineerOf(t: Ticket): string | null {
+  return one<{ id: string }>("SELECT id FROM agents WHERE role = 'engineer' AND status != 'exited' AND (id = ? OR ticket_id = ?)", t.assignee_agent_id ?? '', t.id)?.id ?? null
+}
+
 /** Start an engineer on a ticket. Every caller (TPM, Launch engineer, Start ready) gets the same rules: one engineer per ticket,
  *  dependencies merged first, the parallel limit. They're all checked before the first await, so a second launch of the same
  *  ticket is refused while the first is still under way. */
 export async function launchEngineer(ticketId: string, opts: { synced?: boolean } = {}): Promise<Agent> {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
-  const live = one<{ id: string }>("SELECT id FROM agents WHERE role = 'engineer' AND status != 'exited' AND (id = ? OR ticket_id = ?)", t.assignee_agent_id ?? '', t.id)?.id ?? null
+  const live = liveEngineerOf(t)
   const blocked = launchBlocker(t, { starting: starting.has(t.id), liveEngineer: live }); if (blocked) throw new Error(blocked)
   const waits = unmergedDeps(t, tickets(t.feature_id)); if (waits.length) throw new Error(`${t.key} waits on ${waits.join(', ')} (not merged yet)`)
   const cap = canLaunch({ ignoreCap: !!t.repairs_main }); if (!cap.ok) throw new Error(cap.why) // nothing merges until a repair is in: it can't wait a whole ticket for a slot
@@ -127,7 +132,7 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; fix?: (worktre
   // Installed packages come from the main checkout, so the engineer can run the tests straight away (never blocks the launch)
   await seedPackages(repo.path, wtPath).then((dirs) => { if (dirs.length) emit({ agentId: null, source: 'system', kind: 'worktree.packages', payload: { path: wtPath, dirs } }) },
     (e) => emit({ agentId: null, source: 'system', kind: 'worktree.packages_failed', payload: { path: wtPath, error: String(e) } }))
-  const spec = t.spec ?? ''
+  const spec = getTicket(t.id)?.spec ?? t.spec ?? '' // the TPM may have changed it while this one was starting
   const prompt = opts.fix ? opts.fix(wtPath) : opts.resume ? await opts.resume.prompt(wtPath)
     : `Ticket ${t.key} (${t.size}): ${t.title}\nFeature: ${f.title}\nBranch: ${branch} (your worktree: ${wtPath})\nExpected files: ${t.expected_files}\nDepends on: ${t.deps}\n\n## Spec\n${spec}\n\nStart by calling get_ticket, explore the code, write your plan, and call ExitPlanMode.`
   const slot = nextWorkerSlot(`pending-${t.id}`) // a fix runs on the S model below: no plan, so no opusplan plan→exec switch
@@ -139,6 +144,10 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; fix?: (worktre
   }).catch((e) => { releaseSlot(`pending-${t.id}`); throw e })
   run('UPDATE worker_slots SET agent_id = ? WHERE idx = ?', a.id, slot.idx)
   setTicket(t.id, { status: opts.fix ? 'resolving' : opts.resume?.status ?? 'planning', prior_status: opts.resume ? t.prior_status : null, assignee_agent_id: a.id, branch, worktree_path: wtPath, parked_at: null })
+  // Bug 102: what was left for the ticket's engineer that has gone (a spec change, the TPM's messages) is for this one now. Every way an
+  // engineer starts on a ticket comes here: launch, relaunch, Resume, and a send-back's Fix conflicts / Fix tests / Build the change.
+  const prev = t.assignee_agent_id && t.assignee_agent_id !== a.id ? getAgent(t.assignee_agent_id) : undefined
+  if (prev?.status === 'exited') handOver(prev.id, a.id)
   emit({ agentId: a.id, source: 'system', kind: 'ticket.launched', payload: { ticket: t.id, branch, worktree: wtPath, slot: slot.idx, fix: !!opts.fix } })
   const why = opts.fix ? ` to ${fixWords(opts.fixing ?? null, mergeBase(repo).name).to}` : opts.resume ? ' to take over after a fresh start (the last engineer left a handoff note)' : ''
   tellTpm(f, `HQ: engineer ${a.id} started on ${t.key}${why} (branch ${branch}). Address messages for this ticket to id ${a.id}.`)
@@ -173,7 +182,7 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
       }
       return engineerResumePrompt(t, { feature: f.title, worktree: wt, base: base.name, note, git: await gitFacts(wt, base.ref), plan, fix })
     } } })
-    if (old) { handOver(old.id, a.id); for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
+    if (old) { for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
     clearStalled(t.id) // someone is fixing its tests (or building its change) again
     emit({ agentId: a.id, source: 'system', kind: 'ticket.resumed', payload: { ticket: t.id, key: t.key, previous: old?.id ?? null, note: !!note } })
     return a

@@ -6,7 +6,8 @@ import { run, now, getSetting, one } from './db.ts'
 import { emit, patch } from './events.ts'
 import { agentByToken, getAgent, update, tmuxToken, revokeToken, type Agent } from './agents.ts'
 import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
-import { ackBatchFromPrompt, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway } from './delivery.ts'
+import { ackBatchFromPrompt, deliveredByStopHook, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway, nextDeadline } from './delivery.ts'
+import { listen, type Waiter } from './wake.ts'
 import { onPostModelSwitch, onTurnStep } from './modelguard.ts'
 import { attention, resolveKind } from './attention.ts'
 import { getRepo, getTicket, repoOfAgent } from './records.ts'
@@ -18,6 +19,8 @@ import { readJson, asObject, TooLarge } from './util.ts'
 import { TOKEN_HEADER } from './roles.ts'
 
 const TAKEOVER_ATTACHED_MS = 365 * 86_400_000 // "until they detach"
+/** Bug 99: the longest a waiting `next` goes without looking, for a change that woke nothing (a write that wake.ts doesn't hear of). */
+const NEXT_BACKSTOP_MS = Number(process.env.HQ_NEXT_BACKSTOP_MS ?? 5000)
 /** Notification types that mean a dialog is open and waiting for a person (checked on 2.1.300). */
 const DIALOGS = new Set(['permission_prompt', 'elicitation_dialog', 'elicitation_url_dialog', 'agent_needs_input', 'worker_permission_prompt'])
 
@@ -111,7 +114,7 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     fields.paused_reason = null; resolveKind('usage_limit', agent.id)
   }
   if (agent.status === 'exited') delete fields.status // a late hook from a session HQ already counts as gone doesn't bring it back
-  update(agent.id, fields); if (agent.status !== 'exited' && Object.keys(live).length) patch('agent', agent.id, live)
+  update(agent.id, fields, agent.status !== 'exited' ? live : {}) // one patch (Bug 98)
   emit({ agentId: agent.id, sessionId: String(body.session_id ?? ''), source: 'hook', kind: `hook.${ev}${tool ? ':' + tool : ''}`, payload })
 
   // ---- decisions ----
@@ -141,7 +144,11 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     const unread = unreadCount(agent); if (unread) ctx.push(`HQ: ${unread} unread message(s) are queued and will arrive as a new turn when you are idle.`)
     if (agent.ticket_id) { const rv = openReviews().find((r) => r.ticket_id === agent.ticket_id); if (rv) ctx.push(`HQ: plan review R-${rv.round} is pending; if your ExitPlanMode call was denied without an HQ message, call ExitPlanMode again without changing the plan.`) }
     if (ev === 'Stop') { const modAlive = agent.mod_seen_at && t - agent.mod_seen_at < 120_000; const pend = pendingFor(agent)
-      if (!modAlive && pend.length && !(agent.takeover_locked_until && agent.takeover_locked_until > t)) { const b = nextBatchFor(agent); if (b) { run('UPDATE batches SET method = ?, submitted_at = ?, received_at = ? WHERE id = ?', 'stop_hook', t, t, b.id); return json(res, 200, { decision: 'block', reason: `HQ message batch ${b.id}:\n${b.text}` }) } } }
+      // The mod has gone quiet: the batch goes in this answer, and the turn goes on with it (Bug 103). So the agent is working again, as
+      // after a prompt: a finished engineer isn't stopped while it reads the message, and a helper ending now doesn't make it idle.
+      if (!modAlive && pend.length && !(agent.takeover_locked_until && agent.takeover_locked_until > t)) { const b = nextBatchFor(agent); if (b) {
+        deliveredByStopHook(agent, b.id); turn.prompt = ++turnSeq; update(agent.id, { status: 'working' }, { activity: 'Thinking' }) // one patch (Bug 98)
+        return json(res, 200, { decision: 'block', reason: `HQ message batch ${b.id}:\n${b.text}` }) } } }
     return json(res, 200, ctx.length ? { hookSpecificOutput: { hookEventName: ev, additionalContext: ctx.join('\n') } } : {})
   }
   if (ev === 'Notification') { // Bug 62: exact names. elicitation_response and _complete mean a dialog ended, and quota_auto_resume_fired that Claude Code carries on
@@ -178,19 +185,29 @@ function recordTask(agent: Agent, tool: string, input: Record<string, unknown>, 
 function handleMod(agent: Agent, action: string, url: URL, body: Record<string, unknown>, res: http.ServerResponse): void {
   const t = now()
   if (action === 'next') {
-    const wait = Math.min(Number(url.searchParams.get('wait') ?? 15000), 25000); const started = t
-    let gone = false; res.on('close', () => { gone = true })
-    // The agent row is read again every pass: a hold or pause set while the mod waits counts at once. Nothing is handed to a
+    const end = t + Math.min(Number(url.searchParams.get('wait') ?? 15000), 25000)
+    // Bug 99: it looks once now, then again when something that could give it a batch changes (wake.ts), when a hold ends or a batch
+    // falls due (nextDeadline), or every NEXT_BACKSTOP_MS at most. A wake looks on the next turn of the event loop, after the code that
+    // woke it has finished: an urgent message is marked delivered right after it is stored, and must not be handed out as well.
+    // The agent row is read again every look: a hold or pause set while the mod waits counts at once. Nothing is handed to a
     // connection that's already closed (a batch handed out but never received is handed out again; see nextBatchFor).
-    const tick = (): void => {
-      if (gone || res.destroyed || res.writableEnded) return
-      try { // later passes run from a timer, outside the server's own catch
-        const a = getAgent(agent.id); if (!a || a.status === 'exited') return json(res, 200, {})
-        const b = nextBatchFor(a); if (b) return json(res, 200, { batch: { id: b.id, text: b.text, asUser: b.asUser, raw: b.raw } })
-      } catch (e) { emit({ agentId: agent.id, source: 'system', kind: 'backend.error', payload: { server: 'mod', error: String(e) } }); return json(res, 500, { error: 'HQ error' }) }
-      if (now() - started >= wait) return json(res, 200, {}); setTimeout(tick, 500)
+    let timer: NodeJS.Timeout | undefined, soon = false, done = false
+    const w: Waiter = { status: agent.status, wake: () => { if (done || soon) return; soon = true; setImmediate(look) } }
+    const stop = listen(agent.id, w)
+    const finish = (code: number, out: object): void => { done = true; clearTimeout(timer); stop(); json(res, code, out) }
+    res.on('close', () => { done = true; clearTimeout(timer); stop() })
+    const look = (): void => {
+      soon = false; clearTimeout(timer)
+      if (done || res.destroyed || res.writableEnded) return
+      try { // later looks run from a timer, outside the server's own catch
+        const a = getAgent(agent.id); if (!a || a.status === 'exited') return finish(200, {})
+        w.status = a.status
+        const b = nextBatchFor(a); if (b) return finish(200, { batch: { id: b.id, text: b.text, asUser: b.asUser, raw: b.raw } })
+        const left = end - now(); if (left <= 0) return finish(200, {})
+        const due = nextDeadline(a); if (!soon) timer = setTimeout(look, Math.max(5, Math.min(left, NEXT_BACKSTOP_MS, due === null ? Infinity : due - now())))
+      } catch (e) { emit({ agentId: agent.id, source: 'system', kind: 'backend.error', payload: { server: 'mod', error: String(e) } }); return finish(500, { error: 'HQ error' }) }
     }
-    update(agent.id, { mod_seen_at: t }); return tick()
+    update(agent.id, { mod_seen_at: t }); return look()
   }
   if (action === 'event') {
     const kind = String(body.kind ?? ''); update(agent.id, { mod_seen_at: t })

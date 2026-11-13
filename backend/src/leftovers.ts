@@ -3,7 +3,8 @@
 // stops it: tmux kill-session doesn't reach it and removing the worktree doesn't either. They piled up while engineers worked
 // (12 servers of one app, 4 GB, swap full on 2026-11-08). HQ finds them by working folder, never by name (the user's own app
 // can have the same one), and stops only what nobody is using: see leftoverGroups. Servers an agent needs across commands
-// use run_in_background, which keeps them its own (spike 2026-11-08). One look is a ps and an lsof: about 70 ms on a busy Mac.
+// use run_in_background, which keeps them its own (spike 2026-11-08). A full look is a ps and an lsof of every orphan: about
+// 70 ms on a busy Mac. Bug 100: after a command ends, the look is narrowed to what can be that command's (see rootsToAsk).
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
@@ -39,12 +40,13 @@ const zombie = (p: Proc): boolean => p.stat.startsWith('Z')
  *  owner is using it right now (`skip`). Any other name there is the user's own (`claude --worktree` puts its folders there too).
  *  `busy`: folders whose agent has a Bash command running, and when the oldest of those began.
  *  `app`: the folder the live preview runs in (Try it on a ticket), with when it began starting and when it answered. */
-export type HqDirs = { root: string; names: Set<string>; skip: Set<string>; busy?: Map<string, number>; app?: Map<string, [number, number]> }[]
+/*  `only`: just `names` count (a narrowed look, agentDirs), not every Launch helper's or test run's folder too. */
+export type HqDirs = { root: string; names: Set<string>; skip: Set<string>; busy?: Map<string, number>; app?: Map<string, [number, number]>; only?: boolean }[]
 export function inHq(dirs: HqDirs, cwd: string): { name: string; busy: number; app: [number, number] | null } | null {
   for (const d of dirs) {
     if (!cwd.startsWith(d.root + path.sep)) continue
     const name = cwd.slice(d.root.length + 1).split(path.sep)[0]!
-    if (d.skip.has(name) || !(d.names.has(name) || /^(launch|hq-test)-/.test(name))) continue
+    if (d.skip.has(name) || !(d.names.has(name) || (!d.only && /^(launch|hq-test)-/.test(name)))) continue
     return { name, busy: d.busy?.get(name) ?? 0, app: d.app?.get(name) ?? null }
   }
   return null
@@ -82,16 +84,23 @@ export function leftoverGroups(procs: Proc[], cwds: Map<number, string>, dirs: H
 type Ran = { ok: boolean; out: string; missing: boolean }
 const exec = (cmd: string, args: string[]): Promise<Ran> => new Promise((resolve) => execFile(cmd, args, { maxBuffer: 16 * 1024 * 1024 }, (err, stdout) =>
   resolve({ ok: !err, out: String(stdout ?? ''), missing: (err as NodeJS.ErrnoException | null)?.code === 'ENOENT' }))) // lsof exits 1 when a pid is gone
+/** The orphans whose working folder a look asks lsof for: no terminal, parent gone. `since` (a narrowed look, Bug 100): only
+ *  those that began after a command did (less ps's slack), the only ones that command can have left. Most of the time none. */
+export function rootsToAsk(procs: Proc[], since?: number): number[] {
+  return procs.filter((p) => p.ppid === 1 && noTty(p) && !zombie(p) && (since === undefined || p.start >= since - SLACK_MS)).map((p) => p.pid)
+}
 /** This user's processes, and the working folders of those that could be leftovers. Null: HQ can't look. HQ's own folder is
- *  asked for too: an lsof that doesn't give it isn't working, and every look would quietly find nothing. */
-async function look(): Promise<{ procs: Proc[]; cwds: Map<number, string> } | null> {
+ *  asked for too: an lsof that doesn't give it isn't working, and every look would quietly find nothing. A narrowed look
+ *  (`since`) with no orphan to ask about doesn't run lsof at all, and leaves raising the alert to the full look. */
+async function look(since?: number): Promise<{ procs: Proc[]; cwds: Map<number, string> } | null> {
+  const narrow = since !== undefined, cant = (why: string) => { if (!narrow) cantCheck(why); return null }
   const ps = await exec('ps', ['-axo', PS])
   const uid = process.getuid?.() ?? -1, procs = parsePs(ps.out).filter((p) => p.uid === uid)
-  if (!procs.length) { cantCheck(ps.missing ? "`ps` isn't installed" : '`ps` listed no programs'); return null }
-  const roots = procs.filter((p) => p.ppid === 1 && noTty(p) && !zombie(p)).map((p) => p.pid)
+  if (!procs.length) return cant(ps.missing ? "`ps` isn't installed" : '`ps` listed no programs')
+  const roots = rootsToAsk(procs, since); if (narrow && !roots.length) return { procs, cwds: new Map() }
   const lsof = await exec('lsof', ['-a', '-d', 'cwd', '-p', [...roots, process.pid].join(','), '-Fpn'])
   const cwds = cwdsOf(lsof.out)
-  if (!cwds.has(process.pid)) { cantCheck(lsof.missing ? "`lsof` isn't installed (on Linux: `sudo apt install lsof`)" : "`lsof` didn't answer"); return null }
+  if (!cwds.has(process.pid)) return cant(lsof.missing ? "`lsof` isn't installed (on Linux: `sudo apt install lsof`)" : "`lsof` didn't answer")
   return { procs, cwds }
 }
 const CANT = 'leftovers_cant_check', STUCK = 'leftovers_stuck'
@@ -172,13 +181,15 @@ export function bashBegan(agentId: string, p: { use?: unknown; timeout?: unknown
   const use = String(p.use ?? '') // told twice about one command (it waited its turn, heavy.ts): it began the second time
   inFlight.set(agentId, [...running(agentId, t).filter((c) => !use || c.use !== use), { use, at: t, until: t + bashLimitMs(p.timeout) + 15_000, sub: !!p.sub }])
 }
-/** `use`: the command that ended (with no id, the oldest). `turn`: the agent's own turn ended, so its own commands all have. */
-export function bashEnded(agentId: string, o: { use?: unknown; turn?: boolean }, t = Date.now()): void {
-  const cmds = running(agentId, t), use = String(o.use ?? '')
-  if (o.turn) { inFlight.set(agentId, cmds.filter((c) => c.sub)); return }
+/** `use`: the command that ended (with no id, the oldest). `turn`: the agent's own turn ended, so its own commands all have.
+ *  Returns when the earliest command that ended began (null: none HQ knew of was running). */
+export function bashEnded(agentId: string, o: { use?: unknown; turn?: boolean }, t = Date.now()): number | null {
+  const cmds = running(agentId, t), use = String(o.use ?? ''), first = (xs: Cmd[]) => xs.length ? Math.min(...xs.map((c) => c.at)) : null
+  if (o.turn) { inFlight.set(agentId, cmds.filter((c) => c.sub)); return first(cmds.filter((c) => !c.sub)) }
   const i = cmds.findIndex((c) => c.use === use)
-  if (i >= 0 || !use) cmds.splice(Math.max(i, 0), 1)
+  const done = i >= 0 || (!use && cmds.length) ? cmds.splice(Math.max(i, 0), 1) : []
   inFlight.set(agentId, cmds)
+  return first(done)
 }
 /** When the oldest command `agentId` still has running began; 0 when it has none. A run it waits on in the background counts (Bug 96, bgruns.ts): its turn
  *  has ended, but what it starts is its own until it ends too. */
@@ -205,11 +216,22 @@ export function hqDirs(only?: string): HqDirs {
     const p = q<Pv>(`SELECT t.worktree_path AS wt, p.helper_worktree AS helper, p.status, p.started_at, p.updated_at FROM previews p
       LEFT JOIN tickets t ON t.id = p.ticket_id AND p.status IN ('starting', 'running') WHERE p.id = ?`, r.id)[0]
     if (p?.helper) skip.add(path.basename(p.helper))
-    // a running preview's row was last written when the app answered (or later: that only spares more)
-    if (p?.wt) app.set(path.basename(p.wt), [p.started_at ?? 0, p.status === 'starting' ? Infinity : p.updated_at])
+    // a running preview's row was last written when the app answered (or later: that only spares more). A run being stopped
+    // spares nothing: what it started is a leftover now (its row still says running until the stop is through, Bug 100)
+    if (p?.wt && !(p.started_at && over.has(markFor(r.id, p.started_at)))) app.set(path.basename(p.wt), [p.started_at ?? 0, p.status === 'starting' ? Infinity : p.updated_at])
     const root = path.join(real(r.path), '.claude', 'worktrees') // lsof gives folders with their links resolved (/tmp is /private/tmp on a Mac)
     return [{ root, names, skip, busy, app }, ...(root === raw ? [] : [{ root: raw, names, skip, busy, app }])]
   }).flat()
+}
+/** Bug 100: the folders a narrowed look covers, the worktrees of these agents' tickets (none for a TPM: it has no worktree). */
+export function agentDirs(agentIds: string[]): HqDirs {
+  if (!agentIds.length) return []
+  const rows = q<{ repo_id: string; wt: string }>(`SELECT f.repo_id, t.worktree_path AS wt FROM agents a JOIN tickets t ON t.id = a.ticket_id
+    JOIN features f ON f.id = t.feature_id WHERE a.id IN (${agentIds.map(() => '?').join(',')}) AND t.worktree_path IS NOT NULL`, ...agentIds)
+  return [...new Set(rows.map((r) => r.repo_id))].flatMap((repoId) => {
+    const mine = new Set(rows.filter((r) => r.repo_id === repoId).map((r) => path.basename(r.wt)))
+    return hqDirs(repoId).map((d) => ({ ...d, names: new Set([...d.names].filter((n) => mine.has(n))), only: true })).filter((d) => d.names.size)
+  })
 }
 /** Remove from HQ calls this just before HQ forgets the repo. */
 export function rememberGone(repoId: string, ms = 120_000): void { // its agents are all stopped: nothing there is in use
@@ -217,22 +239,28 @@ export function rememberGone(repoId: string, ms = 120_000): void { // its agents
 }
 
 /** One look and clean-up: SIGTERM each leftover group, a fresh look after 2 s, SIGKILL what's still a leftover (a fresh look
- *  means a reused pid is never hit), and an alert if anything outlives that. `dirs` for tests. */
-export async function stopLeftovers(dirs?: HqDirs): Promise<{ stopped: Leftover[]; stuck: Leftover[] }> {
+ *  means a reused pid is never hit), and an alert if anything outlives that. `dirs` for tests. `narrow` (Bug 100): the look after
+ *  a command, only at orphans that began since `since` in these agents' worktrees and not at preview runs' leftovers. It sees too
+ *  little to raise or clear the alerts: the full look (every minute, and wherever HQ stops or removes something) does that. */
+export async function stopLeftovers(dirs?: HqDirs, narrow?: { since: number; agents: string[] }): Promise<{ stopped: Leftover[]; stuck: Leftover[] }> {
+  const where = narrow ? agentDirs(narrow.agents) : dirs; if (narrow && !where?.length) return { stopped: [], stuck: [] }
   const scan = async (only?: Leftover[]) => {
     for (let i = gone.length - 1; i >= 0; i--) if (gone[i]!.until < Date.now()) gone.splice(i, 1)
-    const l = await look(); if (!l) return null
-    const found = leftoverGroups(l.procs, l.cwds, dirs ?? [...hqDirs(), ...gone.flatMap((g) => g.dirs)], process.pid, await runLeftovers(l))
+    const l = await look(narrow?.since); if (!l) return null
+    if (narrow && !l.cwds.size) return []
+    const runs = narrow ? new Map<number, string>() : await runLeftovers(l)
+    const found = leftoverGroups(l.procs, l.cwds, where ?? [...hqDirs(), ...gone.flatMap((g) => g.dirs)], process.pid, runs)
     return only ? found.filter((x) => only.some((o) => o.pgid === x.pgid)) : found
   }
   const first = await scan(); if (!first) return { stopped: [], stuck: [] }
-  resolveKind(CANT, null)
-  if (!first.length) { resolveKind(STUCK, null); return { stopped: [], stuck: [] } }
+  if (!narrow) resolveKind(CANT, null)
+  if (!first.length) { if (!narrow) resolveKind(STUCK, null); return { stopped: [], stuck: [] } }
   const signal = (xs: Leftover[], sig: NodeJS.Signals) => { for (const x of xs) if (x.pgid > 1) try { process.kill(-x.pgid, sig) } catch { /* gone */ } } // never kill(-1)
   signal(first, 'SIGTERM'); await sleep(2000)
   const still = await scan(first) ?? []
   signal(still, 'SIGKILL'); const stuck = still.length ? (await sleep(1000), await scan(still) ?? []) : []
   emit({ agentId: null, source: 'system', kind: 'procs.leftovers_stopped', payload: { stopped: first, killed: still.map((x) => x.pgid), stuck: stuck.map((x) => x.pgid) } })
+  if (narrow) return { stopped: first, stuck }
   if (stuck.length) {
     const pids = stuck.flatMap((x) => x.pids), folders = [...new Set(stuck.map((x) => x.folder))].join(', ')
     attention(STUCK, `HQ couldn't stop ${pids.length} program${pids.length === 1 ? '' : 's'} left running in ${folders} (pid ${pids.slice(0, 6).join(', ')}). `
@@ -242,13 +270,15 @@ export async function stopLeftovers(dirs?: HqDirs): Promise<{ stopped: Leftover[
 }
 
 let going: Promise<unknown> | null = null
-/** A fresh look now. Callers about to remove a worktree await it; one already under way may have looked before their agents
- *  stopped, so this waits for it and then looks again. */
-export async function sweepNow(): Promise<void> {
+/** One look at a time: two would signal the same groups. */
+async function serial(job: () => Promise<unknown>): Promise<void> {
   while (going) await going.catch(() => {})
-  going = stopLeftovers().catch((e) => emit({ agentId: null, source: 'system', kind: 'procs.leftovers_error', payload: { error: String(e) } }))
+  going = job().catch((e) => emit({ agentId: null, source: 'system', kind: 'procs.leftovers_error', payload: { error: String(e) } }))
   try { await going } finally { going = null }
 }
+/** A fresh look now. Callers about to remove a worktree await it; one already under way may have looked before their agents
+ *  stopped, so this waits for it and then looks again. */
+export const sweepNow = (): Promise<void> => serial(() => stopLeftovers())
 /** Bug 81: an agent's own temp folder goes once the agent has, and with it whatever its killed test runs left there. Which folders
  *  are whose is read in one go, so an agent launching meanwhile (its folder and its row come together) is never taken for gone. A
  *  /clear's SessionEnd doesn't make an agent exited (hooks.ts), so a live one's folder is never taken either. */
@@ -262,26 +292,45 @@ export async function sweepAgentTmp(): Promise<string[]> {
   if (gone.length) emit({ agentId: null, source: 'system', kind: 'agent.tmp_removed', payload: { agents: gone.map((d) => d.slice(pre.length)) } })
   return gone.map((d) => d.slice(pre.length))
 }
-let soon: NodeJS.Timeout | null = null, soonBy = 0
-/** After a burst of commands: one look 2 s after the last, and no later than 6 s after the first (several agents' commands can
- *  end one after another without a 2 s gap for as long as they work). */
-export function sweepSoon(ms = 2000): void {
-  const t = Date.now(); if (soon) clearTimeout(soon); else soonBy = t + 3 * ms
-  soon = setTimeout(() => { soon = null; void sweepNow() }, Math.max(0, Math.min(ms, soonBy - t))); soon.unref()
+/** One look 2 s after the last call, and no later than 6 s after the first (several agents' commands can end one after another
+ *  without a 2 s gap for as long as they work). */
+function debounced(fire: () => void, ms = 2000): () => void {
+  let soon: NodeJS.Timeout | null = null, by = 0
+  return () => {
+    const t = Date.now(); if (soon) clearTimeout(soon); else by = t + 3 * ms
+    soon = setTimeout(() => { soon = null; fire() }, Math.max(0, Math.min(ms, by - t))); soon.unref()
+  }
+}
+/** A full look, soon. */
+export const sweepSoon = debounced(() => void sweepNow())
+/** Bug 100: after a command ends, a look at what it can have left: orphans that began since it did (`since`; 0 when HQ didn't
+ *  hear it begin), in its agent's worktree. Several agents' calls in one burst share one look, from the earliest `since`. */
+const after = new Map<string, number>()
+const narrowSoon = debounced(() => {
+  const agents = [...after.keys()], since = Math.min(...after.values()); after.clear()
+  void serial(() => stopLeftovers(undefined, { since, agents }))
+})
+export function sweepAfter(agentId: string, since: number): void {
+  if (!agentId) return
+  after.set(agentId, Math.min(since, after.get(agentId) ?? since)); narrowSoon()
 }
 
 let started = false
-/** Every Bash command's end and every turn's end, an agent gone (5 s later: Claude Code may still be exiting, and until it has,
- *  what it started still has a live parent), and once a minute in case anything was missed. */
+/** A narrowed look at every Bash command's end and every turn's end that ends commands (Bug 100); a full one when an agent has
+ *  gone (5 s later: Claude Code may still be exiting, and until it has, what it started still has a live parent), when a run in
+ *  the background ends, and once a minute in case anything was missed (a command whose end never came, say). */
 export function startLeftoverSweeps(): void {
   if (started) return
   started = true
   const at = (e: HqEvent) => e.agentId ?? ''
   bus.on('event:hook.PreToolUse:Bash', (e: HqEvent) => bashBegan(at(e), e.payload))
   bus.on('event:turns.started', (e: HqEvent) => { if (e.agentId) bashBegan(e.agentId, e.payload) }) // held until its turn came: it begins now
-  const ended = (e: HqEvent) => { bashEnded(at(e), { use: e.payload.use }); sweepSoon() }
+  const ended = (e: HqEvent) => sweepAfter(at(e), bashEnded(at(e), { use: e.payload.use }) ?? 0)
   bus.on('event:hook.PostToolUse:Bash', ended); bus.on('event:hook.PostToolUseFailure:Bash', ended)
-  bus.on('event:hook.Stop', (e: HqEvent) => { if (!e.payload.sub) bashEnded(at(e), { turn: true }); sweepSoon() })
+  bus.on('event:hook.Stop', (e: HqEvent) => { // a turn that ends with no command running ended none: nothing new can be left
+    if (e.payload.sub) return
+    const since = bashEnded(at(e), { turn: true }); if (since !== null) sweepAfter(at(e), since)
+  })
   bus.on('event:bg.ended', () => sweepSoon()) // a run in the background ended (Bug 96): what it started is no one's now
   const exited = (e: HqEvent) => { if (e.payload.reason === 'clear') return; inFlight.delete(at(e)); setTimeout(() => sweepSoon(), 5000).unref() }
   for (const k of ['agent.stopped', 'agent.lost', 'hook.SessionEnd']) bus.on(`event:${k}`, exited)

@@ -104,10 +104,12 @@ export function fallbackNote(a: Agent, why: string): string {
   const head = `(Written by HQ: the ${a.role === 'tpm' ? 'TPM' : 'engineer'} didn't leave a note${why ? `: ${why}` : ''}.)`
   if (a.role === 'tpm') return `${head}\nRely on PROJECT.md, the ticket list and the recent messages with the user.`
   const t = a.ticket_id ? getTicket(a.ticket_id) : undefined
-  const steps = q<{ payload: string }>("SELECT payload FROM events WHERE agent_id = ? AND kind = 'hook.PreToolUse' ORDER BY id DESC LIMIT 6", a.id).reverse()
-    .map((e) => {
-      try { const p = JSON.parse(e.payload) as { tool?: string; input?: unknown }; return `- ${p.tool ?? '?'} ${JSON.stringify(p.input ?? '').slice(0, 140)}` } catch { return '' }
-    }).filter(Boolean)
+  // Bug 101: the kind carries the tool ('hook.PreToolUse:Bash'). Helpers' calls (sub) are left out, or a helper's searches push
+  // out the engineer's own last edits. hooks.ts stores the input already as a (cut) JSON string: print it as it is.
+  const steps = q<{ payload: string }>("SELECT payload FROM events WHERE agent_id = ? AND kind LIKE 'hook.PreToolUse:%' ORDER BY id DESC LIMIT 40", a.id)
+    .map((e) => { try { return JSON.parse(e.payload) as { tool?: string; input?: unknown; sub?: boolean } } catch { return null } })
+    .filter((p) => p && !p.sub).slice(0, 6).reverse()
+    .map((p) => `- ${p!.tool ?? '?'} ${(typeof p!.input === 'string' ? p!.input : JSON.stringify(p!.input ?? '')).slice(0, 140)}`)
   return `${head}\n## Where it stopped\n${t ? `${t.key} was ${t.status}.` : ''} Its last actions, oldest first:\n${steps.join('\n') || '- (none recorded)'}\n`
     + '## Watch out\nIt may have stopped mid-edit: check the uncommitted changes and run the tests before carrying on.'
 }

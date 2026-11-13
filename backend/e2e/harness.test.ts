@@ -4,6 +4,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
+import net from 'node:net'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { startHq, waitFor, exitPlanMode, pendingAfter, lockOf, type Hq } from './harness.ts'
@@ -41,6 +42,17 @@ test('fake agents report in, hooks and MCP work as the agent, the plan gate hold
   assert.ok(!trusted(path.join(os.homedir(), '.claude.json')).some((p) => p.startsWith(path.dirname(hq.home))))
 })
 
+test('a Stop HQ answers with a message goes on like Claude Code: the turn ends again, and the agent is idle', async () => {
+  const dir = hq.repo('stop-again'); const repo = (await hq.api('repos', { path: dir })).json
+  const f = (await hq.api('features', { repoId: repo.id, title: 'Stop again', request: 'Make a thing' })).json
+  const tpm = await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
+  const status = async () => (await hq.state()).agents.find((a: any) => a.id === tpm.id).status
+  await hq.api(`agents/${tpm.id}/message`, { body: 'One more thing.', reason: 'fyi' }) // the fake has no mod: the Stop hook carries it
+  const r = await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' })
+  assert.equal(r.decision, 'block'); assert.equal(await status(), 'idle') // the first answer, and the Stop that ended the turn it started
+  assert.deepEqual(await hq.hookOnce(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' }), {}) // nothing left to hand over
+})
+
 test('stopping a test HQ twice never reaches a tmux server outside its own folder', async () => {
   // A tmux that records every call and refuses kill-server unless it names a socket first, so even a regression here can't reach the user's server.
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-faketmux-')), calls = path.join(bin, 'calls')
@@ -57,3 +69,33 @@ test('stopping a test HQ twice never reaches a tmux server outside its own folde
   fs.rmSync(bin, { recursive: true, force: true })
 })
 
+
+/** Something else listening on `port`, as another test HQ's hooks server would. */
+const squat = (port: number): Promise<net.Server> => new Promise((resolve, reject) => {
+  const s = net.createServer((c) => c.end('HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\n\r\n{}')); s.on('error', reject); s.listen(port, '127.0.0.1', () => resolve(s))
+})
+const closed = (s: net.Server) => new Promise((r) => s.close(r))
+const freeNow = async (): Promise<number> => { const s = await squat(0), p = (s.address() as net.AddressInfo).port; await closed(s); return p }
+
+test('Bug 92: a port taken before the backend listens gets new ports, so MCP calls reach HQ\'s MCP server', async () => {
+  const taken = await freeNow(), other = await squat(taken)
+  const hq = await startHq({ ports: { mcp: taken } })
+  try {
+    assert.notEqual(hq.ports.mcp, taken, 'it moved off the taken port')
+    assert.equal(new Set(Object.values(hq.ports)).size, 3, 'three different ports')
+    assert.match(hq.log(), /EADDRINUSE/, 'the first try did hit it')
+    const repo = (await hq.api('repos', { path: hq.repo('ports') })).json
+    const f = (await hq.api('features', { repoId: repo.id, title: 'Ports', request: 'Make a thing' })).json
+    await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
+    const r = await hq.mcp(f.tpm_agent_id, 'list_tickets'); assert.equal(r.isError, false, r.text)
+  } finally { await hq.stop(); await closed(other) }
+})
+
+test('Bug 92: a restart whose port was taken meanwhile says so, rather than running without that server', async () => {
+  const hq = await startHq()
+  try {
+    await hq.down(); const other = await squat(hq.ports.mcp)
+    try { await assert.rejects(hq.up(), /was taken while it was down/) } finally { await closed(other) }
+    await hq.up(); assert.equal((await hq.api('state')).status, 200, 'and it starts once the port is free')
+  } finally { await hq.stop() }
+})

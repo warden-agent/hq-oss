@@ -8,7 +8,7 @@ import { execFileSync, spawn } from 'node:child_process'
 
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-leftovers-')))
 process.env.HQ_HOME = path.join(tmp, 'hq')
-const { bashBegan, bashEnded, busySince, inHq, leftoverGroups, parsePs, stopLeftovers, sweepAgentTmp } = await import('./leftovers.ts')
+const { bashBegan, bashEnded, busySince, inHq, leftoverGroups, parsePs, rootsToAsk, stopLeftovers, sweepAgentTmp } = await import('./leftovers.ts')
 const { AGENT_TMP, agentTmpDir } = await import('./config.ts')
 const { cwdsOf } = await import('./procs.ts')
 const { migrate, run } = await import('./db.ts'); migrate()
@@ -70,6 +70,9 @@ test("where the live preview runs: an orphan from the app's start-up is kept; wh
   // still starting (installing packages, say): anything since it began may be the app's
   const both = [{ pid: 714, ppid: 1, pgid: 714, cwd: wt('SHOP-13'), age: 5 }, { pid: 715, ppid: 1, pgid: 715, cwd: wt('SHOP-13'), age: 900 }]
   assert.deepEqual(pids(both, span(Infinity)), [715])
+  // a narrowed look covers its agent's worktree only, not every Launch helper's and test run's folder
+  const only = [{ root: W, names: new Set(['SHOP-13']), skip: new Set<string>(), only: true }]
+  assert.deepEqual(['SHOP-13', 'SHOP-1', 'launch-mh2x', 'hq-test-SHOP-9'].map((n) => !!inHq(only, wt(n))), [true, false, false, false])
 })
 
 test('which commands are running: each ends by its id, at the end of the turn, or when its own time limit has passed', () => {
@@ -93,6 +96,27 @@ test('which commands are running: each ends by its id, at the end of the turn, o
   bashBegan(a, {}, T); bashBegan(a, {}, T + 1000); bashEnded(a, {}, T + 2000); assert.equal(busySince(a, T + 2000), T + 1000)
   bashEnded(a, {}, T + 3000); bashEnded(a, {}, T + 4000); assert.equal(busySince(a, T + 4000), 0)
   bashBegan(a, { timeout: 99_999_999 }, T); assert.equal(busySince(a, T + 614_000), T); assert.equal(busySince(a, T + 616_000), 0) // never past Claude Code's 10 min
+})
+
+test('Bug 100: a command\'s end says when it began, so the look after it asks only about what began since', () => {
+  const T = NOW, a = 'eng-test-100'
+  bashBegan(a, { use: 'u1' }, T); bashBegan(a, { use: 'u2' }, T + 5000)
+  assert.equal(bashEnded(a, { use: 'u2' }, T + 6000), T + 5000) // by its id, not the oldest
+  assert.equal(bashEnded(a, { use: 'other' }, T + 7000), null) // HQ never heard it begin: the look can't be narrowed
+  assert.equal(bashEnded(a, { use: 'u1' }, T + 8000), T); assert.equal(bashEnded(a, {}, T + 9000), null) // nothing running
+  bashBegan(a, { use: 'u3' }, T + 10_000); bashBegan(a, { use: 'u4' }, T + 11_000); bashBegan(a, { use: 's1', sub: true }, T + 9500)
+  assert.equal(bashEnded(a, { turn: true }, T + 12_000), T + 10_000) // the turn's own commands, not the subagent's
+  assert.equal(bashEnded(a, { turn: true }, T + 13_000), null) // a turn that ended no command: no look
+  assert.equal(bashEnded(a, { use: 's1' }, T + 14_000), T + 9500)
+
+  const at = (pid: number, age: number, o: Partial<{ ppid: number; tty: string; stat: string }> = {}) =>
+    ({ pid, ppid: o.ppid ?? 1, pgid: pid, uid: 501, tty: o.tty ?? '??', stat: o.stat ?? 'S', start: NOW - age * 1000 })
+  const procs = [at(1, 99_999, { ppid: 0 }), at(10, 3), at(11, 9), at(12, 30), at(13, 3, { tty: 'ttys001' }), at(14, 3, { ppid: 13 }), at(15, 3, { stat: 'Z' })]
+  assert.deepEqual(rootsToAsk(procs), [10, 11, 12]) // a full look: every orphan with no terminal
+  // the command began 10 s ago: what it can have left began after that, or up to 2 s before (ps rounds to the second); an older
+  // orphan (another command's, a daemon of the user's) isn't asked about, nor one with a terminal, a live parent, or a zombie
+  assert.deepEqual(rootsToAsk(procs, NOW - 10_000), [10, 11]); assert.deepEqual(rootsToAsk(procs, NOW - 12_500), [10, 11])
+  assert.deepEqual(rootsToAsk(procs, NOW), []) // nothing new: no lsof at all
 })
 
 test('never: a terminal anywhere in the tree (tmux, the user\'s shells), HQ itself, zombies, a live parent', () => {

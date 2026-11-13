@@ -11,6 +11,7 @@ import { buildMcp, buildSettings, roleFlags, rolePromptPath, HOOK_HEADER_FILE, h
 import { ensureTrusted } from './trust.ts'
 import { resolveKind } from './attention.ts'
 import { checkClaude } from './claudecheck.ts'
+import { agentChanged } from './wake.ts'
 
 export type Agent = {
   id: string; role: Role; repo_id: string | null; feature_id: string | null; ticket_id: string | null; review_request_id: string | null; model_alias: string; model_live: string | null
@@ -30,11 +31,13 @@ export function agentBySession(sessionId: string): Agent | undefined { return on
  *  agent's prompt.md). */
 export const pageAgent = (a: Agent) => ({ ...a, token_hash: undefined, launch_prompt: undefined })
 export function liveAgents(): Agent[] { return q<Agent>("SELECT * FROM agents WHERE status != 'exited' ORDER BY started_at") }
-/** Writes agent columns (a key that isn't one is a type error, not a failed UPDATE at runtime). */
-export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>): void {
-  const keys = Object.keys(fields) as (keyof typeof fields)[]; if (!keys.length) return
-  run(`UPDATE agents SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => fields[k] as never), agentId)
-  patch('agent', agentId, fields)
+/** Writes agent columns (a key that isn't one is a type error, not a failed UPDATE at runtime). `shown`: fields the page shows that
+ *  aren't columns (a hook's activity line), sent in the same patch (Bug 98). */
+export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>, shown: Record<string, unknown> = {}): void {
+  const keys = Object.keys(fields) as (keyof typeof fields)[]
+  if (keys.length) run(`UPDATE agents SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => fields[k] as never), agentId)
+  if (keys.length || Object.keys(shown).length) patch('agent', agentId, { ...fields, ...shown })
+  if (keys.length) agentChanged(agentId, fields) // Bug 99: a waiting `next` looks again if delivery reads what changed
 }
 
 export type LaunchSpec = {

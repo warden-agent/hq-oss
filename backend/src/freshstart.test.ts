@@ -9,7 +9,8 @@ import path from 'node:path'
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-fresh-'))
 const { migrate, setSetting } = await import('./db.ts')
 migrate()
-const { limitFor } = await import('./freshstart.ts')
+const { limitFor, fallbackNote } = await import('./freshstart.ts')
+const { emit } = await import('./events.ts')
 const { noteProblem } = await import('./notes.ts')
 const { engineerResumePrompt, tpmPrompt } = await import('./handover.ts')
 const { validSetting } = await import('./config.ts')
@@ -56,4 +57,19 @@ test('Bug 84: an engineer taking over a ticket sent back says what it was fixing
   assert.match(board(null), /UI-3 \(S\) Totals: its engineer is fixing its conflicts with main/)
   assert.match(board('tests'), /UI-3 \(S\) Totals: its engineer is fixing its tests on main/)
   assert.match(board('changes'), /UI-3 \(S\) Totals: its engineer is building the change to its spec/)
+})
+
+test("Bug 101: HQ's note lists the engineer's own last six tool calls, oldest first, readable", () => {
+  const call = (agentId: string, tool: string, input: object, extra: object = {}, ev = 'PreToolUse') => emit({ agentId, source: 'hook',
+    kind: `hook.${ev}:${tool}`, payload: { event: ev, tool, mode: 'acceptEdits', input: JSON.stringify(input), ...extra } }) // as hooks.ts stores it
+  call('eng-a', 'Read', { file_path: 'old.ts' }) // the seventh from the end: cut
+  for (let i = 1; i <= 5; i++) call('eng-a', 'Edit', { file_path: `f${i}.ts` })
+  call('eng-a', 'Bash', { command: 'npm test' }); call('eng-a', 'Bash', { command: 'npm test' }, { ran: true }, 'PostToolUse')
+  call('eng-a', 'Grep', { pattern: 'helper' }, { sub: true }) // a helper's call, after the engineer's last one
+  call('eng-b', 'Write', { file_path: 'other.ts' }) // another agent
+  const note = fallbackNote({ id: 'eng-a', role: 'engineer', ticket_id: null } as never, 'its session ended first')
+  const lines = note.split('\n').filter((l) => l.startsWith('- '))
+  assert.deepEqual(lines, [1, 2, 3, 4, 5].map((i) => `- Edit {"file_path":"f${i}.ts"}`).concat('- Bash {"command":"npm test"}'))
+  assert.doesNotMatch(note, /none recorded|old\.ts|helper|other\.ts/)
+  assert.match(fallbackNote({ id: 'eng-c', role: 'engineer', ticket_id: null } as never, ''), /- \(none recorded\)/)
 })

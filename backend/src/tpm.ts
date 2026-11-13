@@ -11,6 +11,7 @@ import { modelFor } from './roles.ts'
 import { features, getRepo, liveTpm, localOnly, notClearing, tickets, type Repo } from './records.ts'
 import { ensureFresh } from './repos.ts'
 import { sendMessage, type Message } from './delivery.ts'
+import { wake } from './wake.ts'
 import { resolveKind } from './attention.ts'
 import { tpmPrompt } from './handover.ts'
 import { readNote } from './notes.ts'
@@ -103,5 +104,6 @@ export function handOver(oldId: string, newId: string): void {
     run("UPDATE needs_attention SET agent_id = ? WHERE agent_id = ? AND kind = 'message_for_user' AND resolved_at IS NULL", newId, oldId)
   })
   for (const m of moved) patch('message', m.id, { to_id: newId })
+  if (moved.length) wake(newId) // Bug 99: its waiting `next` hands them out
   for (const a of told) patch('attention', a.id, { agent_id: newId })
 }

@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { api, connectWs, errText, jsonList, showError, waitingFor, FINISHED, type Agent, type State, type WsMsg } from './api'
 import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
 import { AttentionList, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
 import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, hasParked, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel,
-  removeConfirm, openSummary, useBoard, type Board, type Pop, type PopKind } from './board'
+  removeConfirm, openSummary, boardKeeper, useBoard, type Board, type Pop, type PopKind } from './board'
 import { ActBtn, ErrorBar, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
 import { LaunchBtn, PreviewPane } from './Preview'
 import { clampH, clampW, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
@@ -44,7 +44,7 @@ function UpdatedBar() {
 export default function App() {
   const [all, setState] = useState<State | null>(null) // everything HQ sends; `state` below is the picked repo's share
   const [ws, setWs] = useState<WebSocket | null>(null)
-  const [events, setEvents] = useState<any[]>([])
+  const [events] = useState(eventLog) // Bug 98: outside App's state, so an event line redraws only the Events list
   const [sel, setSel] = useState<Sel>({ node: null, agentId: null, ticketId: null })
   const [repoId, setRepoId] = useState<string | null>(() => { try { return localStorage.getItem(REPO_KEY) } catch { return null } })
   const [pop, setPop] = useState<Pop>(null)
@@ -67,7 +67,7 @@ export default function App() {
       flushAt = 0; const batch = queue.splice(0)
       const patches = batch.filter((m) => m.type === 'patch'), evs = batch.flatMap((m) => m.type === 'event' ? [m.event] : [])
       if (patches.length) setState((s) => s ? patches.reduce(applyPatch, s) : s)
-      if (evs.length) setEvents((e) => [...evs.reverse(), ...e].slice(0, 300))
+      if (evs.length) events.add(evs)
     }
     const open = () => {
       let opened = false
@@ -87,11 +87,12 @@ export default function App() {
       }
     }
     open(); return () => { stopped = true; clearTimeout(retry); clearTimeout(flushAt); sock?.close() }
-  }, [])
+  }, [events]) // the log never changes: once
   const feed = useCallback((agentId: string, cb: (d: string) => void) => { feeds.current.set(agentId, cb); return () => { feeds.current.delete(agentId) } }, [])
   const repoNow = all ? all.repos.find((r) => r.id === repoId) ?? all.repos[all.repos.length - 1] ?? null : null
   const state = useMemo(() => all && forRepo(all, repoNow?.id ?? null), [all, repoNow?.id]) // each repo is its own slate
-  const board = useMemo(() => state ? buildBoard(state, now, state.repos.find((r) => r.id === repoNow?.id) ?? null) : null, [state, now, repoNow?.id])
+  const [steady] = useState(boardKeeper) // Bug 98: boxes that came out the same are last time's, so only a changed box is redrawn
+  const board = useMemo(() => state ? steady(buildBoard(state, now, state.repos.find((r) => r.id === repoNow?.id) ?? null)) : null, [state, now, repoNow?.id, steady])
   const showNeed = useRef<(n: Need) => void>(() => {}) // set below, once the board is known
   const needs = useAlerts(all, (n) => showNeed.current(n))
   // A clicked notification opens its box when it's in the repo on screen; another repo's is only named (switching parks agents).
@@ -113,8 +114,10 @@ export default function App() {
   const pv = repoNow ? (state?.previews ?? []).find((x) => x.id === repoNow.id) ?? null : null
   const pvMissing = !!repoNow && !pv // a repo added since the snapshot: fetch its preview row
   useEffect(() => { if (pvMissing && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'snapshot' })) }, [pvMissing, ws])
+  const focus = useCallback((node: string, kind?: PopKind) => { setFocusReq({ node, n: Date.now() }); setPop(kind ? { node, kind } : null) }, [])
+  const ctx = useMemo(() => state && { state, repo: repoNow, pop, setPop, focus, selected: sel.node }, [state, repoNow, pop, focus, sel.node])
   const connText = conn === 'token' ? "HQ didn't accept this page's token. Open the URL the backend printed (it carries the token)." : conn === 'down' ? "Can't reach the HQ backend. Retrying…" : conn === 'connecting' && state ? 'Reconnecting to HQ…' : ''
-  if (!state || !board) return <div className={`p-8 ${conn === 'token' || conn === 'down' ? 'text-rose-300' : 'text-zinc-400'}`}>{connText || 'Connecting to HQ…'}</div>
+  if (!state || !board || !ctx) return <div className={`p-8 ${conn === 'token' || conn === 'down' ? 'text-rose-300' : 'text-zinc-400'}`}>{connText || 'Connecting to HQ…'}</div>
   const repo = repoNow, { here, elsewhere } = splitNeeds(needs, repo?.id ?? null)
   /** Picking another repo stops the other repos' apps (after HQ's stop dialog, which can stop the old repo's agents too) and is
    *  remembered across reloads. */
@@ -132,7 +135,6 @@ export default function App() {
   }
   const selAgent = state.agents.find((a) => a.id === sel.agentId) ?? null, selTicket = state.tickets.find((t) => t.id === sel.ticketId) ?? null
   const showPanel = (open: boolean, tab?: Tab) => { setPanel((p) => ({ open, tab: tab ?? p.tab })); saveOpen(open) }
-  const focus = (node: string, kind?: PopKind) => { setFocusReq({ node, n: Date.now() }); setPop(kind ? { node, kind } : null) }
   /** A feature box opens its TPM; a ticket box opens its running engineer, or the ticket itself when nobody is on it. */
   const selectNode = (id: string) => {
     if (id === 'tpm') { const t = repo?.tpm_agent_id ? state.agents.find((a) => a.id === repo.tpm_agent_id) : undefined // its terminal, else the conversation
@@ -143,7 +145,7 @@ export default function App() {
   const pickAgent = (a: Agent) => { setSel({ node: board.agentNode(a.id), agentId: a.id, ticketId: a.ticket_id ?? null }); showPanel(true, 'agent') }
   const pvOpen = !!repo && !!pv && prefs.open, pvBelow = prefs.dock === 'bottom'
   const tabLabel: Record<Tab, string> = { agent: `Agent${selAgent ? `: ${selAgent.display_name ?? selAgent.id}` : ''}`, ticket: `Ticket${selTicket ? `: ${selTicket.key}` : ''}`, messages: 'Messages', events: 'Events' }
-  return <BoardCtx.Provider value={{ state, repo, pop, setPop, focus, selected: sel.node }}>
+  return <BoardCtx.Provider value={ctx}>
     {updated && <UpdatedBar />}
     <StopDialog />
     <AutoDialog all={all!} />
@@ -183,14 +185,27 @@ export default function App() {
             <div className="min-h-0 grow">{panel.tab === 'agent' ? (selAgent ? <AgentPane a={selAgent} ws={ws} feed={feed} /> : <div className="p-4 text-sm text-zinc-500">Click a box on the graph to see its agent here.</div>)
               : panel.tab === 'ticket' ? <TicketInfo t={selTicket} state={state} />
               : panel.tab === 'messages' ? <Messages state={state} featureId={sel.node?.startsWith('f:') ? sel.node.slice(2) : selTicket?.feature_id ?? null} />
-              : <div className="h-full overflow-y-auto text-[11px] text-zinc-500">{events.map((e, i) => <div key={i} className="truncate"><span className="text-zinc-600">{new Date(e.at).toLocaleTimeString()}</span> <span className="text-zinc-400">{e.agentId ?? '·'}</span> {e.kind}</div>)}</div>}</div>
+              : <Events log={events} />}</div>
           </aside></>}
       </div>
     </div>
   </BoardCtx.Provider>
 }
+/** The newest 300 events, for the Events tab. */
+function eventLog() {
+  let list: any[] = []; const subs = new Set<() => void>()
+  return { add(evs: any[]) { list = [...[...evs].reverse(), ...list].slice(0, 300); for (const f of subs) f() }, get: () => list,
+    subscribe: (f: () => void) => { subs.add(f); return () => { subs.delete(f) } } }
+}
+function Events({ log }: { log: ReturnType<typeof eventLog> }) {
+  const events = useSyncExternalStore(log.subscribe, log.get)
+  return <div className="h-full overflow-y-auto text-[11px] text-zinc-500">{events.map((e, i) => <div key={i} className="truncate"><span className="text-zinc-600">
+    {new Date(e.at).toLocaleTimeString()}</span> <span className="text-zinc-400">{e.agentId ?? '·'}</span> {e.kind}</div>)}</div>
+}
+const same = (a: unknown, b: unknown): boolean => a === b || (typeof a === 'object' && typeof b === 'object' && a !== null && b !== null && JSON.stringify(a) === JSON.stringify(b))
+/** One patch on the state. Bug 98: one that changes nothing gives back the same state, so nothing is worked out or drawn again. */
 function applyPatch(s: State, m: { entity: string; id: string; patch: Record<string, any> | null }): State {
-  if (m.entity === 'setting') return { ...s, settings: { ...s.settings, [m.id]: m.patch?.value } }
+  if (m.entity === 'setting') return same(s.settings[m.id], m.patch?.value) ? s : { ...s, settings: { ...s.settings, [m.id]: m.patch?.value } }
   const key = ({ agent: 'agents', ticket: 'tickets', feature: 'features', message: 'messages', review: 'reviews', attention: 'attention', repo: 'repos', preview: 'previews',
     ask: 'asks', auto_run: 'autoRuns' } as Record<string, keyof State>)[m.entity]
   if (!key) return s
@@ -198,7 +213,7 @@ function applyPatch(s: State, m: { entity: string; id: string; patch: Record<str
   if (m.entity === 'repo' && i < 0 && !m.patch?.name) return s // a late change to a project just removed from HQ
   let next: any[]
   if (m.patch === null) next = list.filter((x) => x.id !== m.id)
-  else if (i >= 0) next = list.map((x) => x.id === m.id ? { ...x, ...m.patch } : x)
+  else if (i >= 0) { if (Object.entries(m.patch).every(([k, v]) => k in list[i] && same(list[i][k], v))) return s; next = list.map((x) => x.id === m.id ? { ...x, ...m.patch } : x) }
   else next = [{ id: m.id, ...m.patch }, ...list]
   if (key === 'attention') next = next.filter((x) => !x.resolved_at)
   if (key === 'asks') next = next.filter((x) => !x.answered_at)
