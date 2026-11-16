@@ -18,6 +18,7 @@ export const PATHS = {
   bin: path.join(HQ_HOME, 'bin'),
   plugin: path.join(HQ_HOME, 'plugin'),          // the hq mod (copied from the repo at setup)
   uiToken: path.join(HQ_HOME, 'ui-token'),
+  testCmds: path.join(HQ_HOME, 'test-cmds.json'), // each project's test command, for the Bash hook to read while HQ is down (Bug 112, heavy.ts saveTestCmds)
 }
 for (const p of [PATHS.home, PATHS.agents, PATHS.workspaces, PATHS.roles, PATHS.logs, PATHS.bin]) fs.mkdirSync(p, { recursive: true })
 /** Engineers' shared package caches (uv, pip). Not under $HOME: Claude Code ignores a --settings sandbox allowWrite under a denied
@@ -76,7 +77,8 @@ export const DEFAULTS = {
 }
 /** How long a build or test run waits for its turn before it goes ahead anyway (heavy.ts). An engineer's Bash hook may be held this long, so its time limit is a little more. */
 export const TURN_WAIT_S = Number(process.env.HQ_TURN_WAIT_S) || 1200
-/** Bug 85: how long an agent's request for HQ's OK waits for a backend that's down (hookwait.mjs) before the agent is told to stop and wait. */
+/** Bug 85: how long an agent's request for HQ's OK waits for a backend that's down (hookwait.mjs) before the agent is told to stop and wait.
+ *  Bug 112: and how long an engineer's build or test run waits for one (turnwait.mjs) before it goes ahead without a turn. */
 export const HQ_AWAY_WAIT_S = Number(process.env.HQ_AWAY_WAIT_S) || 600
 /** How long Claude Code lets a Bash command run: its own `timeout` (ms) within Claude Code's limits, 2 minutes when it gives none. */
 export function bashLimitMs(timeout: unknown): number {

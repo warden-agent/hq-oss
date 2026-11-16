@@ -156,6 +156,12 @@ CREATE INDEX auto_runs_repo ON auto_runs(repo_id, started_at);`,
 `ALTER TABLE auto_runs ADD COLUMN main_checked TEXT;`,
 // Bug 84: what a ticket sent back to its engineer (`resolving`) is fixing. NULL: its conflicts with main; 'tests' or 'tests_hung': auto mode's test on main.
 `ALTER TABLE tickets ADD COLUMN fixing TEXT;`,
+// Bug 107: the saved test command Claude Code refused in an engineer's session (JSON: the command, Claude Code's words, whose engineer ran it, the
+// repair ticket HQ opened for it), and on that repair ticket the command it is fixing. A repair of the command has repairs_main too: nothing merges until it's in.
+`ALTER TABLE repos ADD COLUMN test_cmd_refused TEXT; ALTER TABLE tickets ADD COLUMN repairs_cmd TEXT;`,
+// Bug 110: when the agent's own turn was last interrupted (Escape in its terminal) with no turn ended normally since. Until one does, Claude Code
+// drops every prompt a mod submits, so HQ types the agent's messages into its terminal instead (delivery.ts).
+`ALTER TABLE agents ADD COLUMN interrupted_at INTEGER;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

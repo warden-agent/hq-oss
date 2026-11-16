@@ -6,8 +6,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import net from 'node:net'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { DatabaseSync } from 'node:sqlite'
+import { pathToFileURL } from 'node:url'
 import { startHq, waitFor, exitPlanMode, pendingAfter, lockOf, type Hq } from './harness.ts'
+import { PORT_TAKEN_EXIT } from '../src/ports.ts'
 
 let hq: Hq
 before(async () => { hq = await startHq() })
@@ -70,6 +73,29 @@ test('stopping a test HQ twice never reaches a tmux server outside its own folde
 })
 
 
+// Bug 113: a test file whose teardown never ended held CI for 16 minutes. stubborn.mjs makes the backend misbehave.
+const STUBBORN = pathToFileURL(path.join(import.meta.dirname, 'stubborn.mjs')).href
+const stubborn = (how: string, more: NodeJS.ProcessEnv = {}) => startHq({ env: { NODE_OPTIONS: `--import=${STUBBORN}`, HQ_STUBBORN: how, ...more } })
+const pipes = () => process.getActiveResourcesInfo().filter((r) => r === 'PipeWrap').length
+test('Bug 113: a backend that won\'t stop on SIGTERM is killed after 10 s, and the test is told', async () => {
+  const hq = await stubborn('term'), t0 = Date.now()
+  await assert.rejects(hq.stop(), /didn't stop within 10 s of SIGTERM, so it was killed/)
+  assert.ok(Date.now() - t0 < 20_000, `stopped in ${Date.now() - t0} ms`)
+})
+test('Bug 113: a process that keeps the backend\'s output can\'t keep the test file running: its pipes close, and the test is told', async () => {
+  const pidFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-stubborn-')), 'pid'), before = pipes()
+  const hq = await stubborn('pipe', { HQ_STUBBORN_PID: pidFile }), pid = Number(fs.readFileSync(pidFile, 'utf8'))
+  try {
+    assert.equal(pipes(), before + 2, "the backend's output and errors")
+    await assert.rejects(hq.stop(), /still held its output 3 s after it stopped/)
+    process.kill(pid, 0) // still running: only the harness's end of its pipes went
+    await waitFor('nothing of it to keep this process alive', () => pipes() === before, 2000)
+  } finally { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } fs.rmSync(path.dirname(pidFile), { recursive: true, force: true }) }
+})
+test('Bug 113: backends that stop cleanly, a restarted one\'s first run too, stop with nothing said', async () => {
+  const hq = await startHq(); await hq.restart(); await hq.stop()
+})
+
 /** Something else listening on `port`, as another test HQ's hooks server would. */
 const squat = (port: number): Promise<net.Server> => new Promise((resolve, reject) => {
   const s = net.createServer((c) => c.end('HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\n\r\n{}')); s.on('error', reject); s.listen(port, '127.0.0.1', () => resolve(s))
@@ -83,7 +109,8 @@ test('Bug 92: a port taken before the backend listens gets new ports, so MCP cal
   try {
     assert.notEqual(hq.ports.mcp, taken, 'it moved off the taken port')
     assert.equal(new Set(Object.values(hq.ports)).size, 3, 'three different ports')
-    assert.match(hq.log(), /EADDRINUSE/, 'the first try did hit it')
+    const said = `HQ can't start: one of its ports is not free.\n  port ${taken} (agents' tools (MCP), HQ_MCP_PORT) is in use by `
+    assert.ok(hq.log().includes(said), 'the first try did hit it, and stopped')
     const repo = (await hq.api('repos', { path: hq.repo('ports') })).json
     const f = (await hq.api('features', { repoId: repo.id, title: 'Ports', request: 'Make a thing' })).json
     await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
@@ -95,7 +122,29 @@ test('Bug 92: a restart whose port was taken meanwhile says so, rather than runn
   const hq = await startHq()
   try {
     await hq.down(); const other = await squat(hq.ports.mcp)
-    try { await assert.rejects(hq.up(), /was taken while it was down/) } finally { await closed(other) }
+    try { await assert.rejects(hq.up(), new RegExp(`was taken while it was down:[^]*port ${hq.ports.mcp} \\(agents' tools`)) } finally { await closed(other) }
     await hq.up(); assert.equal((await hq.api('state')).status, 200, 'and it starts once the port is free')
+  } finally { await hq.stop() }
+})
+
+test('Bug 118: a second backend on a running HQ\'s ports stops before it touches anything, naming each port and its holder', async () => {
+  const hq = await startHq()
+  try {
+    const started = () => { // a backend that got past its port check would go on to say so
+      const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { readOnly: true })
+      try { return db.prepare("SELECT count(*) AS n FROM events WHERE kind = 'backend.started'").get()!.n } finally { db.close() }
+    }
+    const before = started()
+    const r = spawnSync(process.execPath, ['--experimental-strip-types', 'src/index.ts'], { cwd: path.resolve(import.meta.dirname, '..'), env: hq.env, encoding: 'utf8', timeout: 30_000 })
+    assert.equal(r.status, PORT_TAKEN_EXIT, r.stderr)
+    assert.match(r.stderr, /^HQ can't start: its ports are not free\.$/m)
+    const roles = { ui: 'the page and its API, HQ_UI_PORT', hooks: "agents' hooks, HQ_HOOKS_PORT", mcp: "agents' tools (MCP), HQ_MCP_PORT" }
+    for (const [name, role] of Object.entries(roles)) {
+      const line = `  port ${hq.ports[name as keyof typeof roles]} (${role}) is in use by node (pid `
+      assert.ok(r.stderr.split('\n').some((l) => l.startsWith(line) && /\(pid \d+\)$/.test(l)), `${line}…\n${r.stderr}`)
+    }
+    assert.doesNotMatch(r.stdout, /HQ backend up/)
+    assert.equal(started(), before, 'it stopped before writing anything')
+    assert.equal((await hq.api('state')).status, 200, 'the running HQ carries on')
   } finally { await hq.stop() }
 })

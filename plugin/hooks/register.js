@@ -5,15 +5,21 @@ let agentId = ''
 let token = ''
 let pending = null
 let polling = false
+let followUp = false // Bug 135: an empty answer may be followed by one ask at once; each tick of the clock allows one more
 
 function post($, path, obj) {
   if (!backend || !token) return Promise.resolve(null)
   return $.http.fetch(backend + '/mod/' + token + '/' + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(obj) }).catch(() => null)
 }
 
+// Asks HQ for the next batch. HQ holds the request open until it has one, 15 s at most. Bug 135: the mod asks again as soon as a
+// request is dealt with (a wait that ended with nothing, a batch that has gone in), so one is open nearly all the time and a message
+// never waits for the clock. The clock is the backstop for the rest: HQ away or refusing, a batch that could not be submitted.
+// An empty answer is followed up once per tick only, so answers that come back at once can never turn into a loop.
 async function poll($) {
   if (polling || pending) return
   polling = true
+  let again = false
   try {
     const r = await $.http.fetch(backend + '/mod/' + token + '/next?wait=15000', { method: 'GET' })
     if (r && r.ok && r.text) {
@@ -23,13 +29,14 @@ async function poll($) {
         post($, 'event', { kind: 'batch_received', id: data.batch.id })
         $.ui.log('HQ: delivering ' + data.batch.id + ' (waits for idle)')
         $.prompt.submit({ text: data.batch.raw ? data.batch.text : 'HQ message batch ' + data.batch.id + ':\n' + data.batch.text, asUser: data.batch.asUser ? true : undefined })
-          .then(() => { post($, 'event', { kind: 'batch_submitted', id: data.batch.id }); pending = null })
+          .then(() => { post($, 'event', { kind: 'batch_submitted', id: data.batch.id }); pending = null; poll($) })
           .catch((err) => { post($, 'event', { kind: 'batch_submit_failed', id: data.batch.id, error: String(err) }); pending = null })
-      }
+      } else if (followUp) { followUp = false; again = true }
     }
   } catch (err) {
     post($, 'event', { kind: 'poll_error', error: String(err) })
   } finally { polling = false }
+  if (again) poll($)
 }
 
 export function register(on) {
@@ -42,7 +49,7 @@ export function register(on) {
     let usage = null
     try { usage = await $.session.usage() } catch (err) { usage = { error: String(err) } }
     await post($, 'event', { kind: 'session.start', sessionId: await $.session.id(), model: await $.session.model(), cwd: await $.session.cwd(), usage, hasToken: !!token })
-    $.clock.every(1500, () => poll($))
+    $.clock.every(1500, () => { followUp = true; poll($) })
     return next(e)
   })
   on('plugin.register', async ($, e, next) => {
@@ -54,7 +61,9 @@ export function register(on) {
   on('turn.start', async ($, e, next) => { post($, 'event', { kind: 'turn.start', turnId: e.turnId, agentId: e.agentId || null }); return next(e) })
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
+    // tools: what this request asked to run. HQ's model check needs it: the request that calls ExitPlanMode can be reported after the approval (Bug 105)
     post($, 'event', { kind: 'turn.step', model: e.model, agentId: e.agentId || null, usageModel: result && result.usage ? result.usage.model : null,
+      tools: result && result.toolUses ? result.toolUses.map((u) => u.name) : [],
       usage: result && result.usage ? { input: result.usage.input_tokens, output: result.usage.output_tokens, cacheRead: result.usage.cache_read_input_tokens, cacheWrite: result.usage.cache_creation_input_tokens } : null })
     return result
   })

@@ -67,7 +67,8 @@ export const launching = (id: string): boolean => starting.has(id) || fixing.has
 /** The project's test command, for an engineer: the usual one may not work in its sandbox, and this is the one its ticket is judged by. */
 export const testCmdNote = (cmd: string): string => 'While you work, run only the tests for what you changed. ' // a full run while working can freeze (Bug 96)
   + `HQ tests this project with this command, so run it once, just before open_pr: use it for your full test run instead of the project's usual one: ${cmd}`
-export function createTicket(featureId: string, t: { key?: string; title: string; size: string; spec: string; expected_files?: string[]; depends_on?: string[]; repairs_main?: string }): Ticket {
+export function createTicket(featureId: string, t: { key?: string; title: string; size: string; spec: string; expected_files?: string[]; depends_on?: string[]; repairs_main?: string
+  repairs_cmd?: string }): Ticket {
   const f = getFeature(featureId); if (!f) throw new Error('unknown feature')
   if (f.status === 'cancelled') throw new Error(`${f.handle ?? f.title} is cancelled; start a new feature for this`)
   notClearing(f.repo_id)
@@ -81,12 +82,25 @@ export function createTicket(featureId: string, t: { key?: string; title: string
     prior_status: null, assignee_agent_id: null, expected_files: JSON.stringify(t.expected_files ?? []), deps: JSON.stringify(t.depends_on ?? []),
     edit_overrides: '[]', branch: null, worktree_path: null, pr_number: null, pr_url: null, pr_state: null, plan_round: 0, handoff_updated_at: null,
     last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, repairs_main: t.repairs_main ?? null,
-    fixing: null, parked_at: null, created_at: ts, updated_at: ts,
+    repairs_cmd: t.repairs_cmd ?? null, fixing: null, parked_at: null, created_at: ts, updated_at: ts,
   }
-  run(`INSERT INTO tickets(id, feature_id, key, slug, title, size, status, expected_files, deps, edit_overrides, plan_round, spec, repairs_main, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec, row.repairs_main, ts, ts)
+  run(`INSERT INTO tickets(id, feature_id, key, slug, title, size, status, expected_files, deps, edit_overrides, plan_round, spec, repairs_main, repairs_cmd, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec, row.repairs_main,
+    row.repairs_cmd, ts, ts)
+  if (row.repairs_main) keepHqSpec(row.id, t.spec)
   patch('ticket', row.id, row as unknown as Record<string, unknown>); writeFeatureMd(f)
   return row
+}
+/** Bug 108: a ticket HQ opened by itself (a repair of main's tests) keeps HQ's spec, with its steps and rules, and its title. What the TPM
+ *  writes for it goes under HQ's spec, never in its place. HQ's part is kept aside, so a later change replaces only what the TPM wrote. */
+export const hqOpened = (t: Ticket): boolean => !!t.repairs_main
+const keepHqSpec = (ticketId: string, spec: string): void => run( // the first one kept stays
+  "INSERT INTO docs(scope, key, text, updated_at) VALUES (?, 'hq_spec', ?, ?) ON CONFLICT(scope, key) DO NOTHING", `ticket:${ticketId}`, spec, now())
+/** The spec of a ticket HQ opened, with the TPM's text under HQ's own. */
+export function withTpmText(t: Ticket, text: string): string {
+  keepHqSpec(t.id, t.spec ?? '') // a repair opened before HQ kept its spec aside: what it says now counts as HQ's
+  const own = one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'hq_spec'", `ticket:${t.id}`)?.text ?? ''
+  return `${own.trimEnd()}\n\n## From the TPM\nThe TPM added this. HQ's steps and rules above still hold.\n\n${text.trim()}`
 }
 
 /** The engineer on a ticket now: its assignee, or another engineer started on it, that hasn't exited. Null when it has none. */

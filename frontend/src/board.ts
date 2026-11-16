@@ -3,10 +3,14 @@
 import { createContext, useContext, useRef, useState } from 'react'
 import { MarkerType, type Edge, type Node } from '@xyflow/react'
 import { api, errText, jsonList, keepNewest, showError, unmergedDeps, waitingFor, type Agent, type State } from './api'
-import { goodNews, keysText, yourTurn, type Ask, type Turn } from './needs.ts'
+import { ALERT_KINDS, goodNews, keysText, yourTurn, type Ask, type Turn } from './needs.ts'
+import { runWords } from './testruns.ts'
+import { fitSets } from './fit.ts'
 
 export type Tone = 'plain' | 'muted' | 'amber' | 'rose' | 'sky' | 'emerald' | 'indigo'
-export type Line = { text: string; tone: Tone; rows?: 1 | 2 } // rows: set by the layout (a long line wraps to two)
+/** `rows`: set by the layout (a long line wraps to two). `since`: something going on right now (Bug 106: HQ's own test run): the line starts with a dot and ends
+ *  with how long it has been going, counted by the page (ui.tsx Elapsed), so the board isn't worked out again every second. `dot`: moving, or still while it waits. */
+export type Line = { text: string; tone: Tone; rows?: 1 | 2; since?: number; dot?: 'running' | 'waiting' }
 export type Act = { kind: 'launch'; waits: string[] } | { kind: 'read-plan' } | { kind: 'approve' } | { kind: 'merge'; into: string; github?: boolean; pr?: number } | { kind: 'make-pr' }
   | { kind: 'link'; label: string; href: string; primary: boolean } | { kind: 'resume'; parked: boolean }
   | { kind: 'fix'; why?: 'tests' | 'change' } // why: its tests' fix stalled (Bug 84), or the change to its spec did; none: its conflicts
@@ -17,7 +21,8 @@ export type FeatureView = { f: any; lines: Line[]; att: any[]; total: number; co
 /** The project's TPM box (Bug 52), always top-centre: where the user talks to the TPM, with its questions and what's ready to start. */
 export type TpmView = { repo: any; tpm: Agent | null; live: boolean; lines: Line[]; att: any[]; turn: Turn; border: string; empty: boolean; tpmIds: string[] }
 export type TicketView = { t: any; eng: Agent | null; review: any | null; titleRows: 1 | 2; actRows: number; lines: Line[]; acts: Act[]; att: any[]; compact: boolean; border: string }
-export type Board = { nodes: Node[]; edges: Edge[]; active: string[]; has: (node: string) => boolean; attNode: (a: any) => string | null; agentNode: (agentId: string) => string | null }
+/** `fits`: which boxes the view tries to show, widest first (Bug 119); Graph.tsx shows the first one that is readable in the pane (fit.ts). */
+export type Board = { nodes: Node[]; edges: Edge[]; fits: string[][]; has: (node: string) => boolean; attNode: (a: any) => string | null; agentNode: (agentId: string) => string | null }
 export type PopKind = 'review' | 'attention' | 'talk'
 export type Pop = { node: string; kind: PopKind } | null
 /** What the boxes need from App: the state, the picked repo (its TPM box), the open popover (one at a time) and the actions. */
@@ -44,10 +49,15 @@ export async function answerReview(r: any, verdict: 'approve' | 'revise', msg = 
 
 // Box sizes. Heights are computed from each box's rows, so they must match .hq-card (p-2 + 1px border, 16px rows) and .btn-sm (22px) in index.css.
 // Widths start at W and grow to fit their header and buttons, up to MAX; past that a long line wraps to two rows and buttons wrap.
+/** A box waits on the user, so the view goes to its feature (Bug 119), by the ⚠ count's rules (needs.ts needsYou): a plan to review, finished
+ *  work to merge or fix, an alerting notice. Good news doesn't count, and a ticket ready to start is on the TPM's Your turn. */
+const waitsOnYou = (v: { review?: any; att: any[]; acts?: Act[] }) => !!v.review || v.att.some((a) => ALERT_KINDS.has(a.kind))
+  || !!v.acts?.some((a) => a.kind === 'merge' || a.kind === 'make-pr' || a.kind === 'fix')
 export const W = { tpm: 340, feature: 240, ticket: 220 }
 const MAX = { tpm: 440, feature: 380, ticket: 320 }
 const ROW = 16, CHROME = 18, COL_GAP = 48, ROW_GAP = 16, GROUP_GAP = 72, TIER_GAP = 56, BTN = 14, GAP = 4
 const actsH = (rows: number) => rows ? 6 + rows * 22 + (rows - 1) * GAP : 0 // mt-1.5 + rows of .btn-sm + gap-1
+const DOT = 10 // a going line's dot (ui.tsx LiveDot: 6px and its gap)
 const INPUT_H = 6 + 44 + GAP + 22 // the TPM box's message box (mt-1.5, h-11) and its buttons (Nodes.tsx TpmNode)
 const agentColor: Record<string, string> = { working: '#10b981', idle: '#71717a', plan_review: '#f59e0b', blocked: '#f43f5e', paused: '#f43f5e', launching: '#0ea5e9', exited: '#3f3f46' }
 const ticketColor: Record<string, string> = { queued: '#3f3f46', planning: '#0ea5e9', plan_review: '#f59e0b', implementing: '#10b981', awaiting_answer: '#f59e0b', escalated: '#f43f5e', pr_ready: '#6366f1', pr_open: '#6366f1',
@@ -66,6 +76,9 @@ export const OPEN_PREVIEW = 'hq-open-preview'
 /** Shows a project's latest auto run summary. Everything opens it this way: one dialog (AutoBanner's), one rule for its alert. */
 export const OPEN_SUMMARY = 'hq-open-summary'
 export const openSummary = (repoId: string): void => { window.dispatchEvent(new CustomEvent(OPEN_SUMMARY, { detail: repoId })) }
+/** Opens the box that holds a project's test command (Auto.tsx AutoDialog): "Turn on auto mode?" while it's off, "How HQ tests …" while it's on. */
+export const OPEN_AUTO = 'hq-open-auto'
+export const openAuto = (repoId: string): void => { window.dispatchEvent(new CustomEvent(OPEN_AUTO, { detail: repoId })) }
 /** A repo's preview app is on (or coming up). */
 export const isOn = (p: any) => p?.status === 'starting' || p?.status === 'running'
 /** What HQ can run for this repo: the user's own ⚙ command or the start steps they OK'd. */
@@ -224,7 +237,7 @@ export const agentWord = (a: Agent): string => ({ working: 'working', idle: 'idl
 export const DO_REST = 'Do the rest automatically'
 /** A notice's kind in words (the ⚠ menu and box lines); unknown kinds lose their underscores. */
 export const kindLabel = (k: string): string => k.startsWith('auto_stopped:') ? 'Auto mode stopped' : k.startsWith('auto_finished:') ? 'Auto mode finished' :
-  k.startsWith('test_cmd_proposed:') ? 'New test command, for your OK' :
+  k.startsWith('test_cmd_proposed:') ? 'New test command, for your OK' : k.startsWith('test_cmd_refused:') ? "Engineers can't run the test command" :
   ({ auto_parked: 'Parked by auto mode', merged: 'Merged', stuck: 'Looks stuck', engineer_exited: 'Engineer stopped', agent_exited: 'Agent stopped',
   message_for_user: 'Message for you', blocked: 'Blocked', dialog: 'Waiting on a dialog', usage_limit: 'Usage limit', merge_conflict: 'Merge conflict', fix_stalled: 'Fix stalled',
   change_stalled: 'Change stalled',
@@ -313,8 +326,9 @@ function actRows(labels: string[], inner: number): number {
   return rows
 }
 const clamp = (n: number, lo: number, hi: number) => Math.round(Math.max(lo, Math.min(hi, n)))
-/** Sets each line's rows in `inner` px; returns their total. */
-const fitLines = (lines: Line[], inner: number) => lines.reduce((sum, l) => sum + (l.rows = rowsIn(l.text, inner)), 0)
+/** Sets each line's rows in `inner` px; returns their total. A going line is measured with its dot and its clock (room for 59:59). */
+const fitLines = (lines: Line[], inner: number) => lines.reduce((sum, l) =>
+  sum + (l.rows = l.since === undefined ? rowsIn(l.text, inner) : rowsIn(`${l.text} · 00:00`, inner - DOT)), 0)
 
 /** Longest dependency path per ticket key, and the keys caught in a dependency loop (their back edge is ignored for depth). */
 function depths(deps: Map<string, string[]>): { depth: Map<string, number>; loop: Set<string> } {
@@ -404,7 +418,12 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
     const waits = t.status === 'queued' ? unmerged(t, all) : [], dead = waits.filter((k) => !all.some((x) => x.key === k))
     const gone = dead.filter((k) => s.tickets.some((x) => x.feature_id === t.feature_id && x.key === k)), unknown = dead.filter((k) => !gone.includes(k))
     const auto = !!repo?.auto_mode && !repo.auto_stopped_why && !t.auto_parked_why // HQ does the next step itself
-    const detail: Line | null = t.auto_parked_why ? { text: `parked: ${t.auto_parked_why}`, tone: 'rose' }
+    // Bug 106: HQ's own test run on this ticket, while it goes. On a finished ticket it takes the place of "HQ tests it, then merges it"; anywhere else (a repair
+    // whose engineer waits for HQ's try of its test command, a parked ticket whose run hasn't ended) it is a line of its own.
+    const run = (s.testRuns ?? []).find((r) => r.ticket_id === t.id) ?? null, going = run?.state === 'running'
+    const testing: Line | null = run ? { text: runWords(run, t.key, base).box, tone: going ? 'emerald' : 'sky', since: run.since, dot: run.state } : null
+    const inPlace = !!run && run.what !== 'command' && (t.status === 'pr_ready' || t.status === 'pr_open') && !t.auto_parked_why
+    const detail: Line | null = inPlace ? testing : t.auto_parked_why ? { text: `parked: ${t.auto_parked_why}`, tone: 'rose' }
       : review ? { text: `Plan R-${review.round} waiting for you`, tone: 'amber' }
       : t.pr_state === 'closed' ? { text: `PR #${t.pr_number} was closed without merging`, tone: 'rose' }
       : t.status === 'resolving' ? (!eng ? { text: `${ticketLabel(t)} · its engineer stopped`, tone: 'rose' }
@@ -427,7 +446,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
         : t.go_ahead ? { text: 'starts when an engineer slot frees up', tone: 'sky' } : auto ? { text: 'HQ starts it when the TPM finishes', tone: 'sky' } : { text: 'ready to start',
           tone: 'emerald' })
       : t.status === 'merged' ? null : { text: 'no engineer running', tone: 'muted' }
-    const lines = [detail, ctxLine(eng), t.auto_parked_why ? null : note(att, eng, !!review)].filter((l): l is Line => !!l) // parked: the first line says it
+    const lines = [detail, inPlace ? null : testing, ctxLine(eng), t.auto_parked_why ? null : note(att, eng, !!review)].filter((l): l is Line => !!l) // parked: the first line says it
     const acts: Act[] = []
     if (t.auto_parked_why) acts.push({ kind: 'auto-retry' })
     if (t.status === 'queued' && !t.assignee_agent_id && !waits.length && !loop && !t.go_ahead && !auto) acts.push({ kind: 'launch', waits }) // go-ahead: starts on its own
@@ -437,7 +456,8 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
     if (tryable(t)) acts.push({ kind: 'try', on: isOn(pv) && pv.ticket_id === t.id }) // look before merging (Bug 22)
     if (!auto) acts.push(...mergeActs(t, base, eng))
     if (!repo?.auto_mode && (review || acts.some((a) => a.kind === 'merge'))) acts.push({ kind: 'do-rest' }) // every stop offers it
-    return { t, eng, review, titleRows: 1, actRows: 0, lines, acts, att, compact: t.status === 'merged', border: eng ? agentColor[eng.status] ?? '#3f3f46' : ticketColor[t.status] ?? '#3f3f46' }
+    const border = inPlace && going ? agentColor.working! : eng ? agentColor[eng.status] ?? '#3f3f46' : ticketColor[t.status] ?? '#3f3f46' // HQ at work on it: green, as a working engineer's
+    return { t, eng, review, titleRows: 1, actRows: 0, lines, acts, att, compact: t.status === 'merged', border }
   }
   // 3. Sizes: a box is as wide as its header and its buttons need (within W..MAX; a feature's tickets share one width so its columns
   //    line up); then each line takes one or two rows, the buttons wrap, and the height adds it all up.
@@ -460,6 +480,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
   const nodes: Node[] = [], edges: Edge[] = []
   const hier = { stroke: '#3f3f46' } // hierarchy edges are right-angled, so stacked first-column tickets hang off one shared line
   let x = 0
+  const groupIds: string[][] = [], needsYou: boolean[] = [] // each feature's boxes; whether one of them waits on the user
   groups.forEach((g, i) => {
     const fv = fviews[i]!, fid = `f:${g.f.id}`
     const vis = g.collapsed ? [] : g.all, byKey = new Map(vis.map((t) => [t.key, t]))
@@ -485,6 +506,8 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
         y += h + ROW_GAP
       }
     })
+    groupIds.push([fid, ...vis.map((t) => `t:${t.id}`)])
+    needsYou.push(!fv.done && (waitsOnYou(fv) || [...tv.values()].some(waitsOnYou)))
     for (const t of vis) for (const k of deps.get(t.key) ?? []) {
       const dep = byKey.get(k)!, bad = loop.has(t.key) && loop.has(k), c = bad ? '#f43f5e' : '#6366f1'
       edges.push({ id: `d-${dep.id}-${t.id}`, source: `t:${dep.id}`, sourceHandle: 'out', target: `t:${t.id}`, targetHandle: 'in', markerEnd: { type: MarkerType.ArrowClosed, color: c }, style: { stroke: c, strokeDasharray: '4 2' } })
@@ -500,7 +523,6 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
     const up = (y.get(a) ?? 0) > (y.get(b) ?? 0)
     edges.push({ id: `m-${m.id}`, source: a, sourceHandle: up ? 'ts' : 'b', target: b, targetHandle: up ? 'bt' : 't', animated: true, style: { stroke: '#22d3ee' } })
   }
-  // What the view fits on: everything. The TPM sits centred over all the branches, so the view keeps it in the middle (Bug 52);
-  // finished features are small boxes, so they cost little room.
-  return { nodes, edges, active: nodes.map((n) => n.id), has, attNode, agentNode }
+  const fits = fitSets(nodes.map((n) => n.id), groupIds.map((ids, i) => ({ ids, done: fviews[i]!.done, needsYou: needsYou[i]! })), turnOn(tv0.turn))
+  return { nodes, edges, fits, has, attNode, agentNode }
 }

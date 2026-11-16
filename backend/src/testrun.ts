@@ -8,13 +8,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR, PATHS } from './config.ts'
-import { getSetting } from './db.ts'
+import { getSetting, now } from './db.ts'
+import { patch } from './events.ts'
 import { withTurn } from './heavy.ts'
 import { combinedCommit } from './localmerge.ts'
 import { killUnder } from './procs.ts'
 import { cacheEnv } from './roles.ts'
 import { git } from './reposync.ts'
-import { real } from './util.ts'
+import { id, real } from './util.ts'
 import { seedPackages } from './worktrees.ts'
 
 export type TestPlan = { install: string | null; test: string }
@@ -201,7 +202,7 @@ export async function sweepTestWorktrees(repoPath: string): Promise<void> {
 }
 
 /** `hung`: it never finished, and HQ stopped it at the time limit. `output` and `earlier` are a run's (RunResult). `stopped`: auto mode went off
- *  during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bug 89). */
+ *  or stopped the project during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bugs 89, 115). */
 export type TestResult = { kind: 'pass'; test: string } | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean } | { kind: 'no_tests' }
   | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' }
 /** Auto mode's own runs under way, by project folder (Bug 89). A repair's try of a test command isn't one: with auto off its result goes to the user. */
@@ -209,7 +210,7 @@ const autoRuns = new Map<string, Set<AbortController>>(), stops = new Map<string
 /** How many times auto mode's runs were stopped in this project. Auto reads it before it looks at anything, and a run started with an older
  *  count is stopped as it starts: auto may go off while HQ is still at the git steps before the run, with nothing yet to stop. */
 export const autoGen = (repoPath: string): number => stops.get(repoPath) ?? 0
-/** Auto mode went off: its runs in this project end now, a run still waiting for its turn never starts, and each one says `stopped`. */
+/** Auto mode went off or stopped the project (Bug 115): its runs in this project end now, a run still waiting for its turn never starts, and each one says `stopped`. */
 export function stopAutoTests(repoPath: string): number {
   stops.set(repoPath, autoGen(repoPath) + 1); const s = autoRuns.get(repoPath); for (const c of s ?? []) c.abort(); return s?.size ?? 0
 }
@@ -220,6 +221,24 @@ const ownedBy = (repoPath: string, gen: number | null): { signal: AbortSignal; d
   return { signal: c.signal, done: () => { s.delete(c); if (!s.size && autoRuns.get(repoPath) === s) autoRuns.delete(repoPath) } }
 }
 export type Failed = Extract<TestResult, { kind: 'fail' }>
+/** Bug 106: HQ's own test runs under way, for the page. While HQ tests a finished ticket every agent can be idle or gone, for minutes, and the board said the same
+ *  words before, during and after. `what`: a ticket merged into main; main alone (as a run starts, or after a ticket failed: was main already broken?); a repair's
+ *  try of a test command. `state`: in line for its turn (heavy.ts), or running; `since`: when that began. Kept in memory, like the runs themselves: a backend that
+ *  stops takes its runs with it, and the next snapshot a page gets has none. */
+export type Shown = { repoId: string; ticketId: string | null; what: 'ticket' | 'main' | 'command' }
+export type TestRunView = { id: string; repo_id: string; ticket_id: string | null; what: Shown['what']; state: 'waiting' | 'running'; since: number }
+const views = new Map<string, TestRunView>()
+export const testRunViews = (): TestRunView[] => [...views.values()].map((v) => ({ ...v }))
+/** Puts a run on the page until `over`, however it ends. `state` moves it between waiting and running. Nothing to show: both do nothing. */
+function onPage(s: Shown | null): { state: (to: TestRunView['state']) => void; over: () => void } {
+  if (!s) return { state: () => {}, over: () => {} }
+  const v: TestRunView = { id: id('test'), repo_id: s.repoId, ticket_id: s.ticketId, what: s.what, state: 'running', since: now() }
+  views.set(v.id, v); patch('test_run', v.id, { ...v })
+  return {
+    state: (to) => { if (v.state === to || !views.has(v.id)) return; v.state = to; v.since = now(); patch('test_run', v.id, { state: to, since: v.since }) },
+    over: () => { if (views.delete(v.id)) patch('test_run', v.id, null) },
+  }
+}
 // At most `max` characters of the start or the end, cut between lines
 const firstChars = (s: string, max: number): string => { if (s.length <= max) return s; const i = s.lastIndexOf('\n', max); return `${s.slice(0, i > 0 ? i : max)}\n…` }
 const lastChars = (s: string, max: number): string => s.length <= max ? s : `…\n${s.slice(s.indexOf('\n', s.length - max) + 1 || s.length - max)}`
@@ -231,9 +250,11 @@ export function failReport(r: Pick<Failed, 'output' | 'earlier'>, max: number): 
   return `${head}\n\nThe end of the output:\n${lastChars(r.output, Math.max(500, max - head.length))}`
 }
 /** The tests on commit `sha`. `custom`: the user's own command (it replaces the test step; the install step still comes from the files).
- *  `auto`: auto mode's own run, which turning it off stops: autoGen's count as auto read it. */
-async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: number | null): Promise<TestResult> {
+ *  `auto`: auto mode's own run, which turning it off or a stop ends: autoGen's count as auto read it. `show`: whose run the page says this is (Bug 106),
+ *  from when HQ knows there are tests to run; a run stopped before that is never shown. */
+async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: number | null, show: Shown | null): Promise<TestResult> {
   const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto), stopped = { kind: 'stopped' } as const
+  let page = onPage(null)
   try {
     if (signal.aborted) return stopped
     await dropWorktree(repoPath, wt)
@@ -243,8 +264,10 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
     const found = detectTests(wt); const plan: TestPlan | null = custom ? { install: found?.install ?? null, test: custom } : found
     if (!plan) return { kind: 'no_tests' }
     const timeoutMs = getSetting('test_timeout_min', DEFAULTS.test_timeout_min) * 60_000
+    page = onPage(signal.aborted ? null : show)
     return await withTurn(`HQ's test of ${key}`, 'tests', async (): Promise<TestResult> => { // in line with engineers' own builds and test runs (Bug 76); the time limit starts with the run
-      if (signal.aborted) return stopped // it waited for its turn and auto went off meanwhile
+      if (signal.aborted) return stopped // it waited for its turn and auto went off or stopped meanwhile
+      page.state('running')
       if (plan.install) {
         const i = await runSandboxed(wt, plan.install, { network: true, timeoutMs, signal })
         if (signal.aborted) return stopped
@@ -256,17 +279,18 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
       if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
       if (r.code === 0) return { kind: 'pass', test: plan.test }
       return { kind: 'fail', test: plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so
-    })
+    }, () => page.state('waiting'))
   } catch (e) { return { kind: 'error', why: (e as Error).message.split('\n')[0] ?? 'unknown error' } }
-  finally { done(); await dropWorktree(repoPath, wt) }
+  finally { done(); await dropWorktree(repoPath, wt).finally(page.over) } // off the page once its checkout has gone: only then does whoever asked hear the result
 }
 /** The tests on `branch` merged into `base` (a ref): main isn't touched, and the commit tested goes away unused. */
-export async function testCombined(repoPath: string, base: string, branch: string, key: string, custom: string | null, auto: number | null = null): Promise<TestResult> {
+export async function testCombined(repoPath: string, base: string, branch: string, key: string, custom: string | null, auto: number | null = null,
+  show: Shown | null = null): Promise<TestResult> {
   const c = await combinedCommit(repoPath, base, branch)
   if ('conflicts' in c) return { kind: 'conflicts', files: c.conflicts }
   if ('error' in c) return { kind: 'error', why: c.error }
-  return runAt(repoPath, c.sha, key, custom, auto)
+  return runAt(repoPath, c.sha, key, custom, auto, show)
 }
 /** The tests on `base` alone: when a ticket fails, is it the ticket, or was main already broken? */
-export const testBase = (repoPath: string, base: string, key: string, custom: string | null, auto: number | null = null): Promise<TestResult> =>
-  runAt(repoPath, base, `${key}-main`, custom, auto)
+export const testBase = (repoPath: string, base: string, key: string, custom: string | null, auto: number | null = null, show: Shown | null = null): Promise<TestResult> =>
+  runAt(repoPath, base, `${key}-main`, custom, auto, show)

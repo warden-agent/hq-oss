@@ -4,8 +4,8 @@
 import { FINISHED, readyTickets } from '../../backend/src/readiness.ts'
 
 type S = { repos: any[]; features: any[]; tickets: any[]; agents: any[]; reviews: any[]; attention: any[]; asks?: any[]; settings?: Record<string, any>; defaults?: Record<string, any>
-  working?: number }
-/** The project a notice's kind names (repo_sync:<id>, auto_stopped:<id>, test_cmd_proposed:<id>): those notices have no ticket or agent to go by. */
+  working?: number; testRuns?: { repo_id: string }[] }
+/** The project a notice's kind names (repo_sync:<id>, auto_stopped:<id>, test_cmd_proposed:<id>, test_cmd_refused:<id>): those notices have no ticket or agent to go by. */
 const kindRepo = (k: string): string | null => /^[a-z_]+:(.+)$/.exec(k)?.[1] ?? null
 /** Only the picked repo's work: its features, their tickets, agents, messages and reviews, and the notices about them or about the
  *  repo itself. Notices about nothing in particular (the usage limit, an HQ error) stay. Each repo is a slate of its own; the others'
@@ -18,6 +18,7 @@ export function forRepo<T extends S & { messages: any[] }>(s: T, repoId: string 
   const about = (a: any) => { const r = kindRepo(a.kind); return r ? r === repoId : mine(a) }
   return { ...s, features: s.features.filter((f) => fids.has(f.id)), tickets, agents, reviews: s.reviews.filter(mine), attention: s.attention.filter(about),
     asks: (s.asks ?? []).filter((a) => a.repo_id === repoId), working: workingEngineers(s),
+    ...(s.testRuns ? { testRuns: s.testRuns.filter((r) => r.repo_id === repoId) } : {}), // HQ's own test runs (Bug 106)
     messages: s.messages.filter((m) => m.repo_id ? m.repo_id === repoId : m.feature_id ? fids.has(m.feature_id) : [m.from_id, m.to_id].every((x) => !x || x === 'user' || x === 'hq' || aids.has(x))) }
 }
 /** Engineers using a parallel slot (finished ones don't). */
@@ -54,8 +55,8 @@ export const ALERT_KINDS = new Set(['stuck', 'blocked', 'dialog', 'message_for_u
 export const goodNews = (kind: string): boolean => kind === 'merged' || kind === 'conflicts_fixed' || kind.startsWith('auto_finished:') || kind.startsWith('project_removed') // Bug 66's notice
 /** Plain information: nothing is wrong and nothing is asked, so neither red nor green (Bug 97: a newer Claude Code is installed, and HQ's agents stay put). */
 export const plainNews = (kind: string): boolean => kind === 'claude_newer'
-/** Auto mode's own notices that need the user: they name their project in the kind. */
-const autoNeeds = (k: string): boolean => /^(auto_stopped|auto_finished|test_cmd_proposed):/.test(k)
+/** Notices about a whole project that need the user: they name their project in the kind. Auto mode's own, and a test command engineers can't run (Bug 107). */
+const autoNeeds = (k: string): boolean => /^(auto_stopped|auto_finished|test_cmd_proposed|test_cmd_refused):/.test(k)
 
 /** Everything that needs the user right now, oldest kind first: the TPM's questions and tickets ready to start (Bug 43), plans
  *  waiting for review, finished tickets waiting for their merge (or for Fix conflicts), then alerting notices. `mergeAct` says what a finished ticket waits for (board.ts mergeActs). */

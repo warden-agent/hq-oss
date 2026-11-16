@@ -1,3 +1,4 @@
+import type { TestRun } from './testruns.ts'
 export type Agent = Record<string, any> & { id: string; role: string; status: string }
 export type State = { autoRuns?: any[]; repos: any[]; features: any[]; tickets: any[]; agents: Agent[]; messages: any[]; reviews: any[]; attention: any[]; asks: any[];
   settings: Record<string, any>; defaults: Record<string, any>; held: number; ports: Record<string, number>; previews: any[]
@@ -5,6 +6,8 @@ export type State = { autoRuns?: any[]; repos: any[]; features: any[]; tickets: 
   build?: string | null
   /** Bug 97: the Claude Code version HQ was checked on, the one its agents run, and the one installed on this computer (null: unknown, or none). */
   claude?: { checked: string; runs: string | null; installed: string | null }
+  /** Bug 106: HQ's own test runs under way now (forRepo keeps the picked repo's). */
+  testRuns?: TestRun[]
   /** Engineers working in every repo (forRepo sets it: the parallel limit counts them all). */
   working?: number }
 export async function api<T = any>(path: string, body?: unknown): Promise<T> {
@@ -33,6 +36,9 @@ export function waitingFor(a: Agent, s: State, now = Date.now()): { count: numbe
   if (lock > now + 86_400_000) return { count, held: true, why: 'held · open in another terminal' }
   if (lock > now) return { count, held: true, why: `held · you typed in its terminal · until ${hhmm(lock)}` }
   if (a.status === 'paused' || (s.settings.paused_roles ?? []).includes(a.role)) return { count, held: true, why: 'held · paused' }
+  // Bug 110: its turn was interrupted (Escape), so HQ types its messages into its terminal, and something there is in the way: a question, or a menu
+  // such as Claude Code's Rewind (Escape twice). HQ never types into those: Enter would pick an option.
+  if (a.interrupted_at && (a.type_waits === 'dialog' || a.type_waits === 'screen')) return { count, held: true, why: 'held · its terminal shows a menu or a question · answer or close it there' }
   return { count, held: false, why: a.status === 'working' ? 'waits for its current turn to end' : 'delivering…' }
 }
 // The backend's own ticket rules (a pure module), so the two can't drift apart.

@@ -17,6 +17,8 @@ export type Repo = {
   tpm_agent_id: string | null; tpm_parked_at: number | null; next_ticket: number; next_feature: number
   /** Auto mode: on or off, why it stopped, why it's waiting, and the user's own test command. */
   auto_mode: number; auto_stopped_why: string | null; auto_waiting: string | null; test_cmd: string | null; test_cmd_proposed: string | null
+  /** Bug 107: the saved test command Claude Code refused in an engineer's session, as JSON (auto.ts Refused). It goes when the command changes. */
+  test_cmd_refused: string | null
 }
 /** One request the project's TPM is working on: a branch of the board. `handle` (F-1…) is how the TPM names it. `tpm_agent_id`
  *  and `tpm_parked_at` are from when every feature had its own TPM (before Bug 52); nothing reads them any more. */
@@ -33,6 +35,7 @@ export type Ticket = {
   pr_number: number | null; pr_url: string | null; pr_state: string | null; plan_round: number; handoff_updated_at: number | null
   last_handoff_hash: string | null; spec: string | null; go_ahead: number; conflict_files: string | null; conflict_with: string | null; auto_tries: number; auto_parked_why: string | null
   repairs_main: string | null // the main a repair ticket of HQ's is fixing (auto mode)
+  repairs_cmd: string | null // Bug 107: on a repair ticket, the test command it is fixing because Claude Code refuses it for engineers. Null: main's tests fail
   fixing: Fixing // what it went back to its engineer for, while `resolving` (Bug 84)
   parked_at: number | null; created_at: number; updated_at: number
 }

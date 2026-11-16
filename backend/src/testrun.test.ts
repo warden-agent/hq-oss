@@ -18,7 +18,7 @@ for (const f of SECRETS) { fs.mkdirSync(path.dirname(path.join(home, f)), { recu
 process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup') // the toolchain stays where it's installed, whatever HOME says
 process.env.HOME = home; process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_ENGINEER_CACHE = path.join(tmp, 'cache')
 const { bwrapArgs, detectTests, failReport, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase, testCombined, sweepTestWorktrees,
-  testWorktree } = await import('./testrun.ts')
+  testRunViews, testWorktree } = await import('./testrun.ts')
 const { db, migrate } = await import('./db.ts'); migrate(); void db
 
 const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd,
@@ -262,4 +262,55 @@ test('Bug 89: auto off before the run has started (HQ still at its git steps) st
   const late = testBase(d, 'main', 'S7', `touch "${cache}/s7"`, gen) // HQ read the count before auto went off, and is only now starting the run
   assert.deepEqual(await late, { kind: 'stopped' }); assert.equal(seen('s7'), false)
   assert.equal((await testBase(d, 'main', 'S8', 'grep -q 1 a.txt', autoGen(d))).kind, 'pass', 'a run that starts after the stop runs')
+})
+
+// Bug 106: the page is told about HQ's own test runs while they go: which project and ticket, what is tested, and whether the run is in line for its turn.
+const { bus } = await import('./events.ts')
+const told: { id: string; patch: Record<string, unknown> | null }[] = []
+bus.on('patch', (p: { entity: string; id: string; patch: Record<string, unknown> | null }) => { if (p.entity === 'test_run') told.push({ id: p.id, patch: p.patch }) })
+const states = (id: string) => told.filter((p) => p.id === id).map((p) => p.patch === null ? 'gone' : p.patch.state)
+/** A command that says it has started (`name` in the cache folder) and then waits until the test lets it go: no run is looked at against a clock. */
+const held = (name: string) => `touch "${cache}/${name}" && until [ -f "${cache}/${name}-go" ]; do sleep 0.1; done`, go = (name: string) => fs.writeFileSync(path.join(cache, `${name}-go`), '')
+test('Bug 106: a run is on the page from when it starts to when its checkout has gone, whether it passes, fails or is stopped', boxed, async () => {
+  const d = oneFile(), show = { repoId: 'r1', ticketId: 't1', what: 'ticket' as const }, t0 = Date.now()
+  const pass = testCombined(d, 'main', 'b', 'P1', `${held('p1')} && grep -q 2 a.txt`, null, show)
+  await until('the run', () => seen('p1'))
+  const [v] = testRunViews(); assert.equal(testRunViews().length, 1)
+  assert.deepEqual([v!.repo_id, v!.ticket_id, v!.what, v!.state], ['r1', 't1', 'ticket', 'running']); assert.ok(v!.since >= t0 && v!.since <= Date.now(), String(v!.since))
+  let checkout: boolean | null = null // was its checkout still there when the page was told the run had gone?
+  const gone = (p: { id: string; patch: unknown }) => { if (p.id === v!.id && p.patch === null) checkout = fs.existsSync(testWorktree(d, 'P1')) }
+  bus.on('patch', gone); go('p1')
+  assert.equal((await pass).kind, 'pass'); bus.off('patch', gone); assert.equal(checkout, false, 'its checkout went first')
+  assert.deepEqual(testRunViews(), []); assert.deepEqual(states(v!.id), ['running', 'gone'])
+
+  const fail = testBase(d, 'main', 'P2', `${held('p2')} && grep -q 2 a.txt`, null, { repoId: 'r1', ticketId: 't1', what: 'main' })
+  await until('the failing run', () => seen('p2')); const f = testRunViews()[0]!; assert.deepEqual([f.what, f.state], ['main', 'running']); go('p2')
+  assert.equal((await fail).kind, 'fail'); assert.deepEqual(testRunViews(), []); assert.deepEqual(states(f.id), ['running', 'gone'])
+
+  const stop = testBase(d, 'main', 'P3', held('p3'), autoGen(d), { repoId: 'r1', ticketId: null, what: 'main' })
+  await until('the run to stop', () => seen('p3')); const s = testRunViews()[0]!; assert.equal(s.ticket_id, null); stopAutoTests(d)
+  assert.deepEqual(await stop, { kind: 'stopped' }); assert.deepEqual(testRunViews(), []); assert.deepEqual(states(s.id), ['running', 'gone'])
+})
+test('Bug 106: nothing reaches the page for a run nobody asked to show, one with no tests to run, or one stopped before it began', boxed, async () => {
+  const d = oneFile(), show = { repoId: 'r1', ticketId: 't1', what: 'ticket' as const }; told.length = 0
+  assert.equal((await testCombined(d, 'main', 'b', 'Q1', 'grep -q 2 a.txt')).kind, 'pass')
+  assert.deepEqual(await testCombined(d, 'main', 'b', 'Q2', null, null, show), { kind: 'no_tests' })
+  const gen = autoGen(d); stopAutoTests(d); assert.deepEqual(await testBase(d, 'main', 'Q3', 'true', gen, show), { kind: 'stopped' })
+  sh(d, 'switch', '-q', 'main'); write(d, { 'a.txt': '3\n' }); sh(d, 'commit', '-qam', 'three')
+  assert.equal((await testCombined(d, 'main', 'b', 'Q4', 'true', null, show)).kind, 'conflicts')
+  assert.deepEqual(told, []); assert.deepEqual(testRunViews(), [])
+})
+test('Bug 106: a run in line for its turn says waiting, and running from the moment its turn comes', boxed, async () => {
+  const d = oneFile(), e = oneFile()
+  const first = testBase(e, 'main', 'W1', held('w1'), null, { repoId: 'r2', ticketId: null, what: 'main' })
+  await until('the first run', () => seen('w1'))
+  const second = testCombined(d, 'main', 'b', 'W2', held('w2'), null, { repoId: 'r1', ticketId: 't1', what: 'ticket' })
+  await until('the second in line', () => testRunViews().some((v) => v.repo_id === 'r1' && v.state === 'waiting'))
+  const w = testRunViews().find((v) => v.repo_id === 'r1')!, waitedFrom = w.since
+  assert.equal(seen('w2'), false, 'it has not started'); assert.deepEqual(testRunViews().map((v) => [v.repo_id, v.state]), [['r2', 'running'], ['r1', 'waiting']])
+  go('w1'); assert.equal((await first).kind, 'pass')
+  await until('its turn', () => seen('w2')); const now = testRunViews().find((v) => v.id === w.id)!
+  assert.equal(now.state, 'running'); assert.ok(now.since >= waitedFrom, 'its clock starts again when its turn comes'); assert.equal(testRunViews().length, 1)
+  go('w2'); assert.equal((await second).kind, 'pass'); assert.deepEqual(testRunViews(), [])
+  assert.deepEqual(states(w.id), ['running', 'waiting', 'running', 'gone'])
 })

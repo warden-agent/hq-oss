@@ -11,7 +11,7 @@ import { actLabel, answerReview, kindLabel, freshBlocker, freshConfirm, freshOff
 import { goodNews, plainNews, type Turn } from './needs.ts'
 import { DoRestBtn } from './Auto'
 import type { Agent } from './api'
-import { ActBtn, Linked, Md, Pill } from './ui'
+import { ActBtn, Elapsed, Linked, LiveDot, Md, Pill } from './ui'
 
 const tone: Record<Tone, string> = { plain: 'text-zinc-200', muted: 'text-zinc-400', amber: 'text-amber-300', rose: 'text-rose-300', sky: 'text-sky-300', emerald: 'text-emerald-300', indigo: 'text-indigo-300' }
 const POP = 'nodrag nopan nowheel' // popovers: the wheel scrolls them and a drag in them doesn't pan the graph
@@ -23,7 +23,8 @@ function Anchors({ sides }: { sides?: boolean }) {
 }
 /** A box's lines: each one or two rows, as the layout measured (board.ts fitLines); longer text ends in … with the rest on hover. */
 const Lines = ({ lines }: { lines: Line[] }) => <>{lines.map((l, i) =>
-  <div key={i} className={`${l.rows === 2 ? 'line-clamp-2 h-8 break-words' : 'h-4 truncate'} ${tone[l.tone]}`} title={l.text}>{l.text}</div>)}</>
+  <div key={i} className={`${l.rows === 2 ? 'line-clamp-2 h-8 break-words' : 'h-4 truncate'} ${tone[l.tone]}`} title={l.text}>
+    {l.since === undefined ? l.text : <><LiveDot on={l.dot !== 'waiting'} />{l.text}{'\u00a0·\u00a0'}<Elapsed since={l.since} /></>}</div>)}</>
 const Acts = ({ children }: { children: React.ReactNode }) => <div className="mt-1.5 flex flex-wrap gap-1">{children}</div>
 /** "Your turn" (Bug 43, on the TPM box since Bug 52): what the project waits on the user for, with the buttons right there: each
  *  question the TPM asked (a button per choice, Answer… to write a reply of their own) and the tickets ready to start. A choice

@@ -26,6 +26,23 @@ export async function sendKeys(name: string, text: string, enter = true): Promis
   if (enter) await tmux('send-keys', '-t', name, 'Enter')
 }
 export async function sendEscape(name: string): Promise<void> { await tmux('send-keys', '-t', name, 'Escape') }
+/** `text` in pieces of at most `max` characters, never cut between the two halves of one character (an emoji). */
+export function pieces(text: string, max: number): string[] {
+  const out: string[] = []
+  for (let i = 0; i < text.length;) {
+    let end = Math.min(i + max, text.length); const c = text.charCodeAt(end - 1)
+    if (end < text.length && c >= 0xd800 && c <= 0xdbff) end += end - 1 > i ? -1 : 1 // the first half of a character: the two stay together
+    out.push(text.slice(i, end)); i = end
+  }
+  return out
+}
+/** Types one line into the session's prompt and sends it with Enter. In small pieces: Claude Code takes more than 800 characters that arrive at once
+ *  for a paste (the box shows "[Pasted text #1]" and the prompt is wrapped as pasted content), and three pieces read together still stay under that.
+ *  `--`: a piece may start with a dash. Checked on 2.1.322 with 8,000 characters. */
+export async function typeLine(name: string, text: string): Promise<void> {
+  for (const p of pieces(text, 250)) await tmux('send-keys', '-t', name, '-l', '--', p)
+  await tmux('send-keys', '-t', name, 'Enter')
+}
 export async function setHook(name: string, hook: string, shell: string): Promise<void> { await tmux('set-hook', '-t', name, hook, `run-shell ${JSON.stringify(shell)}`).catch(() => {}) }
 export async function paneDead(name: string): Promise<boolean> { const out = await tmux('display-message', '-p', '-t', name, '#{pane_dead}').catch(() => '1'); return out.trim() === '1' }
 /** Exit code of a dead pane's command (null while it runs or when the session is gone). One a signal ended has no code of its own: 128 plus the signal,

@@ -58,6 +58,13 @@ test('Bug 63: a test command waiting for the user\'s OK counts for its project',
   assert.deepEqual(needsYou(s, () => null).map((n) => [n.key, n.repoId]), [['attention:11', 'r2']])
 })
 
+test('Bug 107: a test command engineers can\'t run counts for its project, shows only there, and says the name once', () => {
+  const att = { id: 12, kind: 'test_cmd_refused:r2', detail: "api-server: engineers can't run this project's test command." }
+  const s = { ...state(), messages: [], reviews: [], attention: [att] }
+  assert.deepEqual(needsYou(s, () => null).map((n) => [n.key, n.repoId, n.text]), [['attention:12', 'r2', att.detail]])
+  assert.deepEqual(forRepo(s, 'r1').attention, []); assert.deepEqual(forRepo(s, 'r2').attention, [att])
+})
+
 test('goodNews (Bug 61): finished and merged are green; anything that may need the user is not', () => {
   for (const k of ['merged', 'conflicts_fixed', 'auto_finished:r1']) assert.equal(goodNews(k), true, k)
   for (const k of ['auto_stopped:r1', 'auto_parked', 'message_for_user', 'blocked', 'dialog', 'repo_cleared:r1', 'backend_error']) assert.equal(goodNews(k), false, k)

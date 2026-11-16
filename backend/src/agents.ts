@@ -18,7 +18,7 @@ export type Agent = {
   claude_session_id: string | null; transcript_path: string | null; tmux_session: string; cwd: string; token_hash: string; token_revoked_at: number | null
   status: string; in_plan_mode: number; last_event_at: number | null; takeover_locked_until: number | null; mod_seen_at: number | null; last_gate_allow_at: number | null
   paused_reason: string | null; started_at: number; ended_at: number | null; exit_code: number | null; launch_prompt: string | null; display_name: string | null
-  fresh_start_at: number | null; fresh_start_then: string | null; fresh_start_msg: string | null
+  fresh_start_at: number | null; fresh_start_then: string | null; fresh_start_msg: string | null; interrupted_at: number | null
 }
 export const agentDir = (agentId: string): string => path.join(PATHS.agents, agentId)
 export const tmuxName = (agentId: string): string => `hq-${agentId}`
@@ -37,6 +37,7 @@ export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>, show
   const keys = Object.keys(fields) as (keyof typeof fields)[]
   if (keys.length) run(`UPDATE agents SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => fields[k] as never), agentId)
   if (keys.length || Object.keys(shown).length) patch('agent', agentId, { ...fields, ...shown })
+  if (fields.status === 'exited') resolveKind('stuck', agentId) // Bug 114: every way an agent ends (Stop, lost, SessionEnd) passes here; its alert ends with it
   if (keys.length) agentChanged(agentId, fields) // Bug 99: a waiting `next` looks again if delivery reads what changed
 }
 
@@ -60,7 +61,7 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   fs.writeFileSync(path.join(dir, 'token'), token, { mode: 0o600 })
   fs.writeFileSync(path.join(dir, HOOK_HEADER_FILE), hookHeaderLine(token), { mode: 0o600 }) // what the SessionStart hook sends (Bug 87)
-  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(buildSettings(spec.role, token, { agentDir: dir, repoAllowlist: spec.repoAllowlist, editOverrides: spec.editOverrides }), null, 2), { mode: 0o600 })
+  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(buildSettings(spec.role, token, { agentDir: dir, repoId: spec.repoId, repoAllowlist: spec.repoAllowlist, editOverrides: spec.editOverrides }), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(buildMcp(path.join(dir, 'token')), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'prompt.md'), spec.launchPrompt)
   const sessionId = randomUUID(), tmp = agentTmp(agentId) // made in the same tick as the agent's row below: a sweep never sees one without the other
@@ -92,9 +93,14 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   const a = getAgent(agentId)!; patch('agent', agentId, pageAgent(a)); return a
 }
 
+/** Agents HQ is stopping at this moment. The terminal goes a moment before the row says exited, and a check that looks in between
+ *  must not take the agent for one whose process died by itself (Bug 104). */
+const stopping = new Set<string>()
+export const beingStopped = (agentId: string): boolean => stopping.has(agentId)
 export async function stopAgent(agentId: string, reason = 'stopped'): Promise<void> {
   const a = getAgent(agentId); if (!a) return
-  await tmux.killSession(a.tmux_session)
+  stopping.add(agentId)
+  try { await tmux.killSession(a.tmux_session) } finally { stopping.delete(agentId) } // the row is written in this same step, below
   update(agentId, { status: 'exited', ended_at: now() }); revokeToken(agentId); resolveKind('dialog', agentId) // a session that's over has no dialog (Bug 62)
   run('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE agent_id = ? AND ended_at IS NULL', now(), reason, agentId)
   emit({ agentId, source: 'system', kind: 'agent.stopped', payload: { reason } })

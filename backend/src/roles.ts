@@ -25,6 +25,14 @@ export const PACKAGE_REGISTRIES = ['registry.npmjs.org', 'registry.yarnpkg.com',
 export const LAUNCHER_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'ToolSearch']
 export const LAUNCHER_DISALLOWED = ['Edit', 'Write', 'NotebookEdit', 'Agent', ...ENGINEER_DISALLOWED]
 export const PLANNER_DISALLOWED = ['Edit', 'Write', 'NotebookEdit', 'Bash', 'Monitor', 'EnterWorktree', 'ExitWorktree', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'AskUserQuestion', 'Skill']
+/** Bug 111: an agent's session stays in the folder HQ started it in. Claude Code's `/cd <path>` moves a session to another folder
+ *  (typed into a TPM's or Architect's terminal it really does), and `Cd` is the permission rule for that command, not a tool. A deny
+ *  rule `Cd` turns it off, but 2.1.322 then keeps "⚠ Deny rule Cd matches no tool · check for typos" on every agent's start screen:
+ *  its check knows tool names only. An allow rule limits `/cd` to the folders it matches and gets no such check, and nothing can be
+ *  a folder under /dev/null, so this one leaves nowhere to go. The rest of the path is for whoever tries: Claude Code answers "/cd is
+ *  limited to directories matching <this>". Engineers and the Launch helper have no `/cd` at all (`--disable-slash-commands`); they
+ *  get the rule too, in case that flag ever goes. Checked on the real 2.1.300 and 2.1.322, 2026-11-15. */
+export const STAY_IN_FOLDER = 'Cd(//dev/null/hq-keeps-agents-in-their-own-folder)'
 
 export function modelFor(role: Role, size?: string): string {
   const m = getSetting('models', DEFAULTS.models)
@@ -44,9 +52,21 @@ function permissionHook(agentDir: string, answerS: number) {
   return { type: 'command', command, timeout: limit + 15 }
 }
 
+const TURNWAIT = path.join(import.meta.dirname, 'turnwait.mjs')
+/** A build or test run can be held at this hook until its turn comes (heavy.ts). Bug 112: it goes through turnwait.mjs, which keeps asking a backend that's
+ *  down (a restart) when the command is one that takes turns; called straight from Claude Code, a backend that was down meant "no answer", and every build
+ *  and test run began at once. The script stops by itself after the longest wait for HQ plus the longest wait for a turn, and Claude Code's own limit comes
+ *  a little after that. Past either, the command runs anyway (spike 2026-11-09: a hook that times out counts as no answer). */
+function bashHook(agentDir: string, repoId: string | undefined) {
+  const limit = HQ_AWAY_WAIT_S + TURN_WAIT_S + 45
+  const args = [HOOK_URL(), path.join(agentDir, 'token'), String(HQ_AWAY_WAIT_S), String(limit), PATHS.testCmds, repoId ?? '']
+  return { type: 'command', command: [NODE(), TURNWAIT, ...args].map(shq).join(' '), timeout: limit + 15 }
+}
+
 function hookGroup(token: string) { return [{ hooks: [hook(token, 10)] }] }
 
-export function buildSettings(role: Role, token: string, opts: { agentDir: string; repoAllowlist?: string[]; editOverrides?: string[] }): Record<string, unknown> {
+type SettingsOpts = { agentDir: string; repoId?: string; repoAllowlist?: string[]; editOverrides?: string[] }
+export function buildSettings(role: Role, token: string, opts: SettingsOpts): Record<string, unknown> {
   const gateTimeout = getSetting('gate_timeout_s', DEFAULTS.gate_timeout_s)
   const sessionStartCmd = `curl -s -m 5 -X POST -H 'Content-Type: application/json' -H @${shq(path.join(opts.agentDir, HOOK_HEADER_FILE))} --data-binary @- ${HOOK_URL()}`
   const hooks: Record<string, unknown> = {
@@ -63,15 +83,13 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
     SessionEnd: [{ hooks: [hook(token, 5)] }],
   }
   const base: Record<string, unknown> = {
-    permissions: { disableAutoMode: 'disable', disableBypassPermissionsMode: 'disable', deny: ['Cd'] },
+    permissions: { disableAutoMode: 'disable', disableBypassPermissionsMode: 'disable', allow: [STAY_IN_FOLDER] },
     switchModelsOnFlag: false,
     crossSessionInbound: 'refuse',
     hooks,
   }
   if (role !== 'engineer' && role !== 'launcher') return base // the Launch helper gets the engineer's sandbox, and runs no git writes
-  // A build or test run can be held at this hook until its turn comes (heavy.ts), so a Bash command's hook gets longer than that wait. Past it, Claude Code runs
-  // the command anyway (spike 2026-11-09: a hook that times out counts as no answer).
-  hooks.PreToolUse = [{ matcher: 'Bash', hooks: [hook(token, TURN_WAIT_S + 60)] }, { matcher: '^(?!Bash$).*', hooks: hookGroup(token)[0]!.hooks }]
+  hooks.PreToolUse = [{ matcher: 'Bash', hooks: [bashHook(opts.agentDir, opts.repoId)] }, { matcher: '^(?!Bash$).*', hooks: hookGroup(token)[0]!.hooks }]
   const overrides = new Set(opts.editOverrides ?? [])
   const deny = [
     'Read(~/.claude/**)', 'Read(~/.claude.json)', `Read(//${HOME}/.hq/**)`, 'Read(.env)', 'Read(.env.*)', 'Read(**/secrets/**)', 'Read(~/.ssh/**)', 'Read(~/.aws/**)',
@@ -82,11 +100,11 @@ export function buildSettings(role: Role, token: string, opts: { agentDir: strin
     // and friends get past them. What holds is the sandbox (no github.com on the network allowlist, ~/.hq and gh config unreadable,
     // the main repo's .git/config and .git/hooks unwritable: spike S1, 2026-10-25) and engineers holding no credentials.
     ...(role === 'launcher' ? ['Bash(git commit*)', 'Bash(git add*)'] : []),
-    'Cd', 'Bash(claude *)', 'Bash(tmux *)', 'Bash(sudo *)', 'Bash(gh *)', 'Bash(git push*)', 'Bash(git config core.hooksPath*)', 'Bash(open *)', 'Bash(osascript *)',
+    'Bash(claude *)', 'Bash(tmux *)', 'Bash(sudo *)', 'Bash(gh *)', 'Bash(git push*)', 'Bash(git config core.hooksPath*)', 'Bash(open *)', 'Bash(osascript *)',
   ]
   return {
     ...base,
-    permissions: { ...(base.permissions as object), blockReadsOutsideWorkingDirectories: true, allow: ['mcp__hq__*'], deny },
+    permissions: { ...(base.permissions as object), blockReadsOutsideWorkingDirectories: true, allow: [STAY_IN_FOLDER, 'mcp__hq__*'], deny },
     plansDirectory: '.hq-plans',
     // Every package cache sits in ENGINEER_CACHE, outside home: npm's (with the log npm writes on every run), Go's (spike S5), Rust's and
     // Python's. Spike 2026-10-31 (`-p` runs with these settings): `npm test` passed with and without npm_config_cache, so the old

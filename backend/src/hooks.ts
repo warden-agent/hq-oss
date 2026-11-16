@@ -7,7 +7,8 @@ import { emit, patch } from './events.ts'
 import { agentByToken, getAgent, update, tmuxToken, revokeToken, type Agent } from './agents.ts'
 import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
 import { ackBatchFromPrompt, deliveredByStopHook, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway, nextDeadline } from './delivery.ts'
-import { listen, type Waiter } from './wake.ts'
+import { turnEnded } from './delivery.ts'
+import { listen, wake, type Waiter } from './wake.ts'
 import { onPostModelSwitch, onTurnStep } from './modelguard.ts'
 import { attention, resolveKind } from './attention.ts'
 import { getRepo, getTicket, repoOfAgent } from './records.ts'
@@ -17,6 +18,7 @@ import { isBridgePid } from './terminal.ts'
 import * as tmux from './tmux.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
 import { TOKEN_HEADER } from './roles.ts'
+import { sawTestCmd } from './auto.ts'
 
 const TAKEOVER_ATTACHED_MS = 365 * 86_400_000 // "until they detach"
 /** Bug 99: the longest a waiting `next` goes without looking, for a change that woke nothing (a write that wake.ts doesn't hear of). */
@@ -98,6 +100,7 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     case 'PostToolUseFailure': Object.assign(payload, { input: trim(input, 200), use: body.tool_use_id, error: trim(body.error, 300), is_interrupt: body.is_interrupt })
       payload.ran = ranBash(agent, tool, input, body.error ?? ''); break
     case 'Stop': { turn.stop = ++turnSeq; payload.last = trim(body.last_assistant_message, 600); const on = stillOn(agent.id, bg); fields.status = on ? 'working' : 'idle'
+      if (agent.interrupted_at) fields.interrupted_at = null // Bug 110: a turn ended normally (an interrupted one sends no Stop), so the mod's prompts get through again
       Object.assign(live, { activity: on, last_message: trim(body.last_assistant_message, 2000) })
       if (agent.role === 'tpm') recordReply(agent, String(body.last_assistant_message ?? '')); break }
     case 'StopFailure': payload.error = trim(body.error ?? body, 400); fields.status = 'blocked'; break
@@ -116,6 +119,8 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (agent.status === 'exited') delete fields.status // a late hook from a session HQ already counts as gone doesn't bring it back
   update(agent.id, fields, agent.status !== 'exited' ? live : {}) // one patch (Bug 98)
   emit({ agentId: agent.id, sessionId: String(body.session_id ?? ''), source: 'hook', kind: `hook.${ev}${tool ? ':' + tool : ''}`, payload })
+  // Bug 107: a Bash command of an engineer's (or of a helper of its: same session, same worktree) is over. Was it the project's test command, refused by Claude Code?
+  if (tool === 'Bash' && (ev === 'PostToolUse' || ev === 'PostToolUseFailure')) sawTestCmd(agent, String(input.command ?? ''), ev === 'PostToolUse' ? undefined : String(body.error ?? ''))
 
   // ---- decisions ----
   if (ev === 'PermissionRequest') {
@@ -146,7 +151,7 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     if (ev === 'Stop') { const modAlive = agent.mod_seen_at && t - agent.mod_seen_at < 120_000; const pend = pendingFor(agent)
       // The mod has gone quiet: the batch goes in this answer, and the turn goes on with it (Bug 103). So the agent is working again, as
       // after a prompt: a finished engineer isn't stopped while it reads the message, and a helper ending now doesn't make it idle.
-      if (!modAlive && pend.length && !(agent.takeover_locked_until && agent.takeover_locked_until > t)) { const b = nextBatchFor(agent); if (b) {
+      if (!modAlive && pend.length && !(agent.takeover_locked_until && agent.takeover_locked_until > t)) { const b = nextBatchFor({ ...agent, interrupted_at: null }); if (b) {
         deliveredByStopHook(agent, b.id); turn.prompt = ++turnSeq; update(agent.id, { status: 'working' }, { activity: 'Thinking' }) // one patch (Bug 98)
         return json(res, 200, { decision: 'block', reason: `HQ message batch ${b.id}:\n${b.text}` }) } } }
     return json(res, 200, ctx.length ? { hookSpecificOutput: { hookEventName: ev, additionalContext: ctx.join('\n') } } : {})
@@ -215,7 +220,8 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
     if (kind === 'session.start') { resolveKind('mod_missing', agent.id); if (!body.hasToken) attention('mod_token_missing', `${agent.id}: mod could not read its token file`, { agentId: agent.id }) }
     if (kind === 'turn.step') onTurnStep(agent, body)
     if (kind === 'batch_received') markReceived(String(body.id ?? ''))
-    if (kind === 'batch_submitted') markSubmitted(String(body.id ?? ''))
+    if (kind === 'batch_submitted') { markSubmitted(String(body.id ?? '')); if (agent.interrupted_at) wake(agent.id) } // Bug 110: submitted after an interrupt is dropped; look now
+    if (kind === 'turn.complete' && !body.agentId) turnEnded(agent, body.isAborted === true) // the agent's own turn, not a helper's
     if (kind === 'batch_submit_failed') requeue(String(body.id ?? ''), 'submit_failed')
     if (kind === 'plugin.register' && body.name && body.name !== 'hq') attention('foreign_mod', `${agent.id}: another mod tried to load: ${body.name}`, { agentId: agent.id })
     if (kind === 'session.measure') {

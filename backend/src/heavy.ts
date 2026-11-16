@@ -5,48 +5,20 @@
 // costs no tokens (spike 2026-11-09 on 2.1.300, again on 2.1.322: held 40 s, the command began the second the hook answered, and a 5 s limit still let it run). The engineer just
 // sees the command take longer.
 // Nothing waits for good. A turn comes back when its command ends, when its agent moves on to its next tool, when its agent's turn ends, when its agent goes, or
-// when the command's own time limit has passed; and whoever has waited TURN_WAIT_S goes ahead anyway. HQ down or restarted: held hooks fail, and Claude Code runs
-// the command (it treats a failed hook as no answer).
+// when the command's own time limit has passed; and whoever has waited TURN_WAIT_S goes ahead anyway.
+// HQ down or restarted (Bug 112): the engineer's hook is a script (turnwait.mjs) that asks again every second until HQ answers, so a build or test run that
+// starts meanwhile, or that was waiting here when HQ went, is back in this line once HQ is up; it goes by the same rules (heavykind.ts) and by the test
+// commands HQ leaves it in a file (saveTestCmds). After HQ_AWAY_WAIT_S without HQ the command goes ahead anyway.
+import fs from 'node:fs'
 import type http from 'node:http'
-import { bashLimitMs, DEFAULTS, TURN_WAIT_S } from './config.ts'
+import { bashLimitMs, DEFAULTS, PATHS, TURN_WAIT_S } from './config.ts'
 import { getSetting, now } from './db.ts'
 import { bus, emit, patch, type HqEvent } from './events.ts'
 import { update, type Agent } from './agents.ts'
-import { getRepo, repoOfAgent } from './records.ts'
+import { getRepo, repoOfAgent, repos } from './records.ts'
+import { heldKind, type Heavy } from './heavykind.ts'
 
-export type Heavy = 'tests' | 'build'
-const unquoted = (s: string): string => s.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ' Q ') // a commit message that says "npm test" runs nothing
-/** What goes in front of a program without changing which program it is. */
-const WRAPPER = new RegExp(String.raw`^(?:[A-Za-z_]\w*=\S*|time|exec|env|command|nohup|nice(?:\s+-n\s*-?\d+|\s+-\d+)?|caffeinate(?:\s+-[a-z]+)*|timeout(?:\s+-\S+)*\s+\S+`
-  + String.raw`|npx(?:\s+(?:-y|--yes|--no|--no-install))*|bunx|pnpm\s+(?:exec|dlx)|yarn\s+(?:exec|dlx)|uv\s+run|poetry\s+run|pipenv\s+run|python[\d.]*\s+-m)\s+`)
-/** The program each simple command in a shell line runs, with its arguments: split at && || ; | & and brackets, wrappers and the program's folder taken off. */
-export function programs(command: string): string[] {
-  return unquoted(command).split(/&&|\|\||[;|&\n(){}]/).map((part) => {
-    let s = part.trim()
-    for (let i = 0; i < 8; i++) { const next = s.replace(/^\S*\/(?=[^\s/]+(?:\s|$))/, '').replace(WRAPPER, ''); if (next === s) break; s = next }
-    return s
-  }).filter(Boolean)
-}
-// `npm test`, `yarn build`, `npm --workspace web run test:unit`: a package manager, its own options, then a script named for tests or a build
-const PM = String.raw`(?:npm|pnpm|yarn|bun)\s+(?:-\S+(?:\s+[^-\s]\S*)?\s+)*?(?:(?:run|run-script)\s+)?`
-const TESTS = new RegExp(String.raw`^(?:${PM}(?:t|tst|test|e2e)(?:$|[\s:._-])|(?:vitest|jest|mocha|ava|pytest|tox|nox|rspec|phpunit)(?:\s|$)|(?:playwright|cypress)\s+(?:test|run)\b`
-  + String.raw`|node\s+(?:\S+\s+)*?--test(?:[\s=]|$)|deno\s+test\b|cargo\s+(?:test|nextest)\b|go\s+test\b|make\s+(?:test|check)\b|gradlew?\s+(?:\S+\s+)*?(?:test|check)\b`
-  + String.raw`|mvnw?\s+(?:\S+\s+)*?(?:test|verify)\b|swift\s+test\b|dotnet\s+test\b|mix\s+test\b|(?:rails|rake)\s+test\b)`)
-const BUILDS = new RegExp(String.raw`^(?:${PM}build(?:$|[\s:._-])|(?:vite|next|nuxt|astro|ng)\s+build\b|(?:turbo|nx)\s+(?:run\s+)?build\b|webpack(?:\s|$)|tsc\s+(?:-b|--build)\b`
-  + String.raw`|cargo\s+build\b|go\s+build\b|make(?:\s+(?:all|build))?$|gradlew?\s+(?:\S+\s+)*?(?:build|assemble)\b|mvnw?\s+(?:\S+\s+)*?(?:package|install)\b|swift\s+build\b`
-  + String.raw`|dotnet\s+build\b|xcodebuild\b)`)
-const squeezed = (s: string): string => s.trim().replace(/\s+/g, ' ')
-// A test run aimed at up to three named test files (no wildcards), or at tests picked by name, is small: engineers do these all the time while they work
-const TEST_FILE = /(?:^|\s)(?!-)[^\s*?{]*(?:[._-](?:test|spec)\.[cm]?[jt]sx?|_test\.(?:go|py|rb)|(?:^|\/)test_[\w-]+\.py)(?:::\S+)?(?=\s|$)/g
-const BY_NAME = /\s(?:-t|-k|-g|-run|--grep|--filter|--test-name-pattern|--testNamePattern|--testPathPattern)(?:[=\s]|$)/
-const narrow = (program: string): boolean => { const files = program.match(TEST_FILE)?.length ?? 0; return (files >= 1 && files <= 3 && !/[*?{]/.test(program)) || BY_NAME.test(program) }
-/** Is this shell command a full test run or a build: the kind that fills every core for minutes? By the program it runs, or because it is the project's own test
- *  command. A guess both ways, and both are cheap: a small command taken for a big one waits a little, a big one missed runs alongside as before. */
-export function heavyKind(command: string, testCmd: string | null): Heavy | null {
-  if (testCmd?.trim() && squeezed(command).includes(squeezed(testCmd))) return 'tests'
-  const ps = programs(command)
-  return ps.some((p) => TESTS.test(p) && !narrow(p)) ? 'tests' : ps.some((p) => BUILDS.test(p)) ? 'build' : null
-}
+export { heavyKind, programs, type Heavy } from './heavykind.ts'
 
 /** `lane`: who in the agent runs the command: 'main' for the agent itself, else its helper's (subagent's) id. One lane runs one command at a time. */
 type Turn = { id: string; who: string; what: Heavy; agentId: string | null; lane: string; limitMs: number }
@@ -83,9 +55,11 @@ export function take(t: Turn, left?: () => void): { waiting: boolean; got: Promi
   return { waiting: true, got, drop: () => { if (line.includes(w)) leave(w); else release(t.id) } }
 }
 let n = 0
-/** HQ's own heavy work (a test run): waits its turn like an engineer's command, and gives it back however `fn` ends. */
-export async function withTurn<T>(who: string, what: Heavy, fn: () => Promise<T>): Promise<T> {
+/** HQ's own heavy work (a test run): waits its turn like an engineer's command, and gives it back however `fn` ends. `onWait`: it has to wait first
+ *  (Bug 106: the board says so). */
+export async function withTurn<T>(who: string, what: Heavy, fn: () => Promise<T>, onWait?: () => void): Promise<T> {
   const id = `hq:${++n}`, t = take({ id, who, what, agentId: null, lane: 'main', limitMs: Infinity })
+  if (t.waiting) onWait?.()
   if (t.waiting) emit({ agentId: null, source: 'system', kind: 'turns.waiting', payload: { who, what, behind: turns().running } })
   const { waitedMs, late } = await t.got
   if (t.waiting) emit({ agentId: null, source: 'system', kind: 'turns.started', payload: { who, what, waitedS: Math.round(waitedMs / 1000), late } })
@@ -97,8 +71,8 @@ export async function withTurn<T>(who: string, what: Heavy, fn: () => Promise<T>
  *  place in the line goes. Not held: a run_in_background command (a server, not a run), and anything in plan mode (it's refused anyway). */
 export function gateBash(agent: Agent, c: { use: string; command: string; timeout: unknown; background: boolean; lane: string; plan: boolean; activity: string },
   res: http.ServerResponse, answer: () => void): boolean {
-  if ((agent.role !== 'engineer' && agent.role !== 'launcher') || c.plan || c.background) return false
-  const what = heavyKind(c.command, getRepo(repoOfAgent(agent) ?? '')?.test_cmd ?? null); if (!what) return false
+  if (agent.role !== 'engineer' && agent.role !== 'launcher') return false
+  const what = heldKind(c, getRepo(repoOfAgent(agent) ?? '')?.test_cmd ?? null); if (!what) return false
   const who = agent.display_name ?? agent.id, id = `${agent.id}:${c.use || `?${++n}`}`
   let over = false, beat: NodeJS.Timeout | null = null
   const left = () => { // out of the line with no turn: the hook was dropped, or HQ heard the agent move on or go. A hook still held is answered, so nothing hangs on it
@@ -122,6 +96,16 @@ export function gateBash(agent: Agent, c: { use: string; command: string; timeou
     answer()
   })
   return true
+}
+/** Bug 112: every project's test command, in a file. An engineer's Bash hook reads it when HQ is down and can't be asked whether a command is the project's
+ *  test run (turnwait.mjs). Written whole (a removed project drops out) at every start and whenever a command changes (auto.ts setRepo), then moved into
+ *  place, so the hook never reads half a file. A write that fails costs only this: with HQ down, a test command not known by its program's name goes ahead. */
+export function saveTestCmds(): void {
+  try {
+    const cmds = Object.fromEntries(repos().filter((r) => r.test_cmd?.trim()).map((r) => [r.id, r.test_cmd]))
+    const tmp = `${PATHS.testCmds}.${process.pid}`
+    fs.writeFileSync(tmp, JSON.stringify(cmds), { mode: 0o600 }); fs.renameSync(tmp, PATHS.testCmds)
+  } catch (e) { emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { what: 'test commands file', error: String(e) } }) }
 }
 /** Everything an agent holds or waits for, on one lane or (the agent is gone) on all of them. */
 function releaseAgent(agentId: string, lane: string | null): void {

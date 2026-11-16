@@ -96,7 +96,7 @@ async function finishClear(repo: Repo): Promise<void> {
   writeProjectMd(repo.id)
   const failed = [...saved.values()].filter((s) => s.failed).map((s) => `${s.key}: ${s.failed}`)
   emit({ agentId: null, source: 'system', kind: 'repo.cleared', payload: { repo: repo.id, archive: dir, features: F.length, tickets: T.length, agents: A.length, failed } })
-  for (const kind of ['repo_cleared', 'auto_finished', 'auto_stopped', 'test_cmd_proposed']) resolveKind(`${kind}:${repo.id}`, null) // the runs they're about are gone
+  for (const kind of ['repo_cleared', 'auto_finished', 'auto_stopped', 'test_cmd_proposed', 'test_cmd_refused']) resolveKind(`${kind}:${repo.id}`, null) // the runs they're about are gone
   attention(`repo_cleared:${repo.id}`, `Cleared ${repo.name}: ${F.length} feature${F.length === 1 ? '' : 's'} and ${T.length} ticket${T.length === 1 ? '' : 's'}. `
     + `Notes and a summary are in ${dir.replace(process.env.HOME ?? '\0', '~')}.`
     + (failed.length ? ` These worktrees couldn't be removed (their code is safe on its branch): ${failed.join('; ')}.` : ''))
@@ -210,8 +210,9 @@ export function deleteRows(repoId: string, F: string[], T: string[], A: string[]
   del('features', inList('id', F), ...F)
   run("UPDATE previews SET ticket_id = NULL, status = 'stopped', updated_at = ? WHERE id = ?", now(), repoId)
   del('auto_runs', 'repo_id = ?', repoId)
-  run('UPDATE repos SET clearing_at = NULL, tpm_agent_id = NULL, tpm_parked_at = NULL, auto_mode = 0, auto_stopped_why = NULL, auto_waiting = NULL, test_cmd_proposed = NULL WHERE id = ?',
-    repoId) // its sessions' rows went with the board
+  // test_cmd_refused (Bug 107): the command stays, but its repair ticket went with the board, so the next engineer it's refused for says so afresh
+  run(`UPDATE repos SET clearing_at = NULL, tpm_agent_id = NULL, tpm_parked_at = NULL, auto_mode = 0, auto_stopped_why = NULL, auto_waiting = NULL, test_cmd_proposed = NULL,
+    test_cmd_refused = NULL WHERE id = ?`, repoId) // its sessions' rows went with the board
 }
 /** What only goes when the repo itself does (Remove from HQ): Clear keeps all of it. */
 export function deleteRepoRows(repoId: string): void {

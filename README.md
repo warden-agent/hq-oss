@@ -77,6 +77,7 @@ Ports, all bound to 127.0.0.1:
   - If the repair can't be finished, or a run needs more than two, the project stops and asks you.
   - If the test command itself can't work in the sandbox, the engineer proposes another. HQ tries it first, takes it, and lists it in the run's summary with what it leaves out. HQ can prove a command passes, not that it's a good test, so read that line. A second change in one run stops and asks.
   - HQ only takes a command the engineer has run in its own session first. Every engineer has to run it there, and Claude Code refuses some commands that HQ's sandbox would run, such as `node --test $(ls test/*.js)`.
+  - A command you typed in the Auto box is never run by an engineer first. If Claude Code refuses it in an engineer's session (`node --test $(git ls-files test)`, for one), HQ says so once: ⚠ "Engineers can't run the test command". On auto it also opens a ticket that moves the refused part into a script in the repo and proposes the new command. Nothing merges until that's in. If it can't be done, that ticket is parked and the rest carries on, because HQ's own test runs still work.
   - With auto mode off, HQ opens no repair of its own, and a proposed command waits for your OK.
   - Each run tests main once as it starts, alongside the first tickets, so a broken main or a test command that can't work in the sandbox opens its repair straight away. A failure is run once more before a repair opens, so one flaky run can't spend one.
   - This protects your machine from accidents and careless code. It isn't a security boundary against a determined attacker.
@@ -94,10 +95,11 @@ Ports, all bound to 127.0.0.1:
 
   **Moving HQ to a new Claude Code:** run these on the new binary, fix what differs, then raise `CHECKED_VERSION` in `backend/src/claudeversion.ts`. Checked on 2.1.322:
   - the hook answer that skips the plan menu, and the plan menu's own approval being noticed
-  - a command held at its `PreToolUse` hook starts when the hook answers, and runs anyway when the hook times out
+  - a command held at its `PreToolUse` hook starts when the hook answers, and runs anyway when the hook times out. For engineers' Bash commands that hook is a script Claude Code runs (`turnwait.mjs`, which waits out a backend that is down before a build or full test run); Claude Code ends it when the turn is interrupted or the session goes
   - a Bash `timeout` moves the command to the background instead of stopping it: what the hook then carries (`backgroundTaskId`, `timedOutAfterMs`), where its output goes, its process group, and the `<task-notification>` that wakes the agent
   - helpers: their hooks carry `agent_id`, the Agent tool's result carries `isAsync` and `agentId`, and Claude Code's own helper fires `SubagentStop` after the turn has ended
   - the mod: its calls are async, and `$.prompt.submit` delivers a message once the session is idle (not after an Escape, until a normal turn ends)
+  - an interrupted turn: the mod's `turn.complete` says `isAborted` and no `Stop` hook comes; HQ then types messages into the prompt, where a first `!` or `/` makes a command and more than 800 characters arriving at once count as a paste
   - the trust rule and the `~/.claude.json` lock HQ shares with live sessions
   - the session file in `~/.claude/sessions/` that says `waiting` while a dialog is open, which is how a "waiting on a dialog" alert clears itself
   - the screen: the idle prompt's footer and the menus (`backend/src/screen.ts` is tested on real captures)

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { assignPorts, portRange, checkRecipe, commandRecipe, detectCommand, frameBlocked, installMark, installStep, lockfileProblem, needsInstall, parseRunMark, printedPorts, runMark,
+import { assignPorts, portRange, checkRecipe, commandRecipe, detectCommand, frameBlocked, installMark, installStep, lockfileProblem, needsInstall, NO_LOCK_INSTALL, parseRunMark, printedPorts, runMark,
   runScript, RUN_MARK, sameCommands, supervisorSpec, type Recipe } from './apprun.ts'
 
 const repo = (files: Record<string, string>): string => {
@@ -29,8 +29,8 @@ test('install: only when npm\'s record is missing or older than the lockfile', (
   age(fresh, 'package-lock.json', 60); assert.equal(installStep(fresh), null)
   age(fresh, 'node_modules/.package-lock.json', 120); assert.equal(installStep(fresh), 'npm ci') // a merge changed dependencies
   assert.equal(installStep(repo({ 'package.json': deps, 'package-lock.json': '{}' })), 'npm ci') // never installed
-  assert.equal(installStep(repo({ 'package.json': deps })), 'npm install') // no lockfile, nothing installed
-  assert.equal(installStep(repo({ 'package.json': deps, 'node_modules/a/index.js': '' })), null)
+  assert.equal(installStep(repo({ 'package.json': deps })), NO_LOCK_INSTALL) // no lockfile, nothing installed
+  assert.equal(installStep(repo({ 'package.json': deps, 'node_modules/a/index.js': '' })), null) // not npm's (yarn, pnpm): left alone
   assert.equal(installStep(repo({ 'README.md': 'hi' })), null)
 })
 
@@ -43,10 +43,22 @@ test('install: never for a package.json that lists no packages (Bug 90: npm woul
   assert.equal(commandRecipe('npm start', repo({ 'package.json': pkg({ start: 'x' }) })).parts[0].install, undefined)
   // what it must not catch: any kind of dependency, a workspace root, a package.json npm itself would choke on
   for (const k of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'])
-    assert.equal(installStep(repo({ 'package.json': with_({ [k]: { ms: '2.1.3' } }) })), 'npm install', k)
-  assert.equal(installStep(repo({ 'package.json': with_({ workspaces: ['pkgs/*'] }) })), 'npm install')
-  assert.equal(installStep(repo({ 'package.json': '{ not json' })), 'npm install')
-  assert.equal(installStep(repo({ 'package.json': 'null' })), 'npm install')
+    assert.equal(installStep(repo({ 'package.json': with_({ [k]: { ms: '2.1.3' } }) })), NO_LOCK_INSTALL, k)
+  assert.equal(installStep(repo({ 'package.json': with_({ workspaces: ['pkgs/*'] }) })), NO_LOCK_INSTALL)
+  assert.equal(installStep(repo({ 'package.json': '{ not json' })), NO_LOCK_INSTALL)
+  assert.equal(installStep(repo({ 'package.json': 'null' })), NO_LOCK_INSTALL)
+})
+
+test('install with packages but no lockfile: never writes one, and installs again when package.json changes (Bug 116)', () => {
+  assert.equal(NO_LOCK_INSTALL, 'npm install --no-package-lock')
+  const dir = repo({ 'package.json': deps, 'node_modules/.package-lock.json': '{}' })
+  age(dir, 'package.json', 120); age(dir, 'node_modules/.package-lock.json', 60); assert.equal(installStep(dir), null) // installed since
+  age(dir, 'package.json', 30); assert.equal(installStep(dir), NO_LOCK_INSTALL) // a merge or an edit changed it
+  assert.equal(commandRecipe('npm start', dir).parts[0]!.install, NO_LOCK_INSTALL)
+  // npm rewrites its record on every install, even one with nothing to do, so the next start doesn't install again
+  age(dir, 'node_modules/.package-lock.json', 10); assert.equal(installStep(dir), null)
+  // a lockfile the project has is still followed
+  assert.equal(installStep(repo({ 'package.json': deps, 'package-lock.json': '{}' })), 'npm ci')
 })
 
 test('run script: the supervisor with its spec, from the checkout', () => {

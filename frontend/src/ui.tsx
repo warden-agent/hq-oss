@@ -2,10 +2,21 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { onAsk, useBusy, type StopAsk } from './board'
 import { api, askUntilAnswered, errBody, errText, onError } from './api'
 import { projectSlug } from '../../backend/src/projectname.ts'
+import { clock } from './testruns.ts'
 
 const statusColor: Record<string, string> = { working: 'bg-emerald-500/20 text-emerald-300', idle: 'bg-zinc-700/50 text-zinc-300', plan_review: 'bg-amber-500/20 text-amber-300', blocked: 'bg-rose-500/20 text-rose-300', paused: 'bg-rose-500/20 text-rose-300', launching: 'bg-sky-500/20 text-sky-300', exited: 'bg-zinc-800 text-zinc-500',
   planning: 'bg-sky-500/20 text-sky-300', implementing: 'bg-emerald-500/20 text-emerald-300', awaiting_answer: 'bg-amber-500/20 text-amber-300', pr_ready: 'bg-indigo-500/20 text-indigo-300', pr_open: 'bg-indigo-500/20 text-indigo-300', resolving: 'bg-amber-500/20 text-amber-300', merged: 'bg-emerald-500/30 text-emerald-200' }
 export const Pill = ({ s, label, className = '' }: { s: string; label?: string; className?: string }) => <span className={`pill shrink-0 whitespace-nowrap ${statusColor[s] ?? 'bg-zinc-800 text-zinc-300'} ${className}`}>{label ?? s}</span>
+/** Bug 106: the dot in front of something going on right now (HQ's own test run). It moves while the run goes and is still while it waits its turn. 6px and a 4px
+ *  gap: board.ts DOT. */
+export const LiveDot = ({ on }: { on: boolean }) => <span aria-hidden="true"
+  className={`mr-1 inline-block size-1.5 rounded-full align-middle ${on ? 'bg-emerald-400 motion-safe:animate-pulse' : 'bg-sky-400'}`} />
+/** How long something has been going (0:42), counted here once a second: the state it comes from doesn't change meanwhile. */
+export function Elapsed({ since }: { since: number }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t) }, [])
+  return <span className="tabular-nums">{clock(now - since)}</span>
+}
 /** An agent's message as it means it: **bold** and `code` shown as such, and "## Heading" lines in bold (not raw markdown). */
 export function Md({ text }: { text: string }) {
   const inline = (line: string) => line.split(/(\*\*[^*]+\*\*|`[^`]+`)/).map((p, i) => p.startsWith('**') && p.endsWith('**') && p.length > 4 ? <strong key={i}>{p.slice(2, -2)}</strong>

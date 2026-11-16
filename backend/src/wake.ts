@@ -15,8 +15,8 @@ export function wake(agentId: string | null | undefined): void { if (agentId) fo
 /** Something that could give any agent a batch changed (a team message, a role resumed, a delivery setting). */
 export function wakeAll(): void { for (const s of [...waiting.values()]) for (const w of [...s]) w.wake() }
 
-/** Agent columns that delivery reads (besides status): a hold, a fresh start, which project and feature its messages come from. */
-const READS = ['takeover_locked_until', 'fresh_start_at', 'repo_id', 'feature_id', 'role']
+/** Agent columns that delivery reads (besides status): a hold, a fresh start, an interrupted turn, which project and feature its messages come from. */
+const READS = ['takeover_locked_until', 'fresh_start_at', 'interrupted_at', 'repo_id', 'feature_id', 'role']
 /** An agent row changed. Hooks write the row several times a second while it works (`status: 'working'` again and again), so
  *  this wakes only for what delivery reads: a status other than the one its waiting request last saw, or a column in READS. */
 export function agentChanged(agentId: string, fields: Record<string, unknown>): void {

@@ -24,7 +24,10 @@ jobs:
         run: npm --workspace @hq/backend test
       - name: Auto mode end to end, in the real sandbox
         working-directory: backend
-        run: node --experimental-strip-types --test --test-timeout=120000 e2e/auto.test.ts e2e/auto-github.test.ts
+        # Bug 113: once every test had ended, the test file never exited and held the job 16 minutes, with the failure's details unprinted. --test-force-exit
+        # ends each file when its tests are done; the harness itself fails a test whose HQ leaves its output held. The step limit is the backstop (a normal run takes ~3 min).
+        timeout-minutes: 10
+        run: node --experimental-strip-types --test --test-timeout=120000 --test-force-exit e2e/auto.test.ts e2e/auto-github.test.ts
       - name: Frontend typecheck
         working-directory: frontend
         run: npx tsc -b

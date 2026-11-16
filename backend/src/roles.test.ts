@@ -61,15 +61,24 @@ test('Bug 78: an agent\'s hq server is HQ\'s relay, run by a node that exists, a
   assert.match(hq.env.HQ_MCP_URL, /^http:\/\/127\.0\.0\.1:\d+\/mcp$/)
 })
 
-test('Bug 76: a Bash command\'s hook can be held until its turn, so it outlasts that wait; other tools\' hooks, and the TPM\'s, stay short', async () => {
-  const { TURN_WAIT_S } = await import('./config.ts')
+test('Bugs 76, 112: an engineer\'s Bash hook is HQ\'s own script, which outlasts a wait for HQ plus a wait for a turn; other hooks, and the TPM\'s, stay short', async () => {
+  const { TURN_WAIT_S, HQ_AWAY_WAIT_S, PATHS } = await import('./config.ts')
   for (const role of ['engineer', 'launcher'] as const) {
-    const pre = (buildSettings(role, 'tok', { agentDir: tmp }) as any).hooks.PreToolUse
-    assert.deepEqual(pre.map((g: any) => [g.matcher, g.hooks[0].timeout]), [['Bash', TURN_WAIT_S + 60], ['^(?!Bash$).*', 10]], role)
-    assert.ok(new RegExp(pre[1].matcher).test('Read') && !new RegExp(pre[1].matcher).test('Bash')); assert.match(pre[0].hooks[0].url, /\/hooks$/)
+    const pre = (buildSettings(role, 'tok-secret', { agentDir: tmp, repoId: 'repo-1' }) as any).hooks.PreToolUse
+    assert.deepEqual(pre.map((g: any) => g.matcher), ['Bash', '^(?!Bash$).*'], role)
+    assert.ok(new RegExp(pre[1].matcher).test('Read') && !new RegExp(pre[1].matcher).test('Bash'))
+    const bash = pre[0].hooks[0], [node, script, url, ...rest] = [...String(bash.command).matchAll(/'([^']*)'/g)].map((m) => m[1]!)
+    assert.equal(bash.type, 'command'); assert.ok(fs.existsSync(node!), node); assert.equal(path.basename(script!), 'turnwait.mjs'); assert.ok(fs.existsSync(script!))
+    assert.match(url!, /^http:\/\/127\.0\.0\.1:\d+\/hooks$/)
+    const [tokenFile, awayS, totalS, cmdsFile, repoId] = rest
+    assert.deepEqual([tokenFile, awayS, cmdsFile, repoId], [path.join(tmp, 'token'), String(HQ_AWAY_WAIT_S), PATHS.testCmds, 'repo-1'])
+    assert.ok(Number(totalS) > HQ_AWAY_WAIT_S + TURN_WAIT_S, 'the script outlasts HQ being away and then the wait for a turn')
+    assert.ok(bash.timeout > Number(totalS), 'and Claude Code\'s own limit comes after the script\'s')
+    assert.ok(!JSON.stringify(pre[0]).includes('tok-secret'), 'its token stays in its own file') // Bug 87
+    assert.equal(pre[1].hooks[0].type, 'http'); assert.equal(pre[1].hooks[0].timeout, 10); assert.match(pre[1].hooks[0].url, /\/hooks$/)
   }
   const tpm = (buildSettings('tpm', 'tok', { agentDir: tmp }) as any).hooks.PreToolUse
-  assert.equal(tpm.length, 1); assert.equal(tpm[0].matcher, undefined); assert.equal(tpm[0].hooks[0].timeout, 10)
+  assert.equal(tpm.length, 1); assert.equal(tpm[0].matcher, undefined); assert.equal(tpm[0].hooks[0].type, 'http'); assert.equal(tpm[0].hooks[0].timeout, 10)
 })
 
 test("Bug 96: the engineer prompt says what a Bash timeout really does, and never tells engineers to lean on it for a long suite", async () => {
@@ -110,4 +119,24 @@ test('Bug 85: every role asks HQ\'s OK through hookwait.mjs, which waits for a b
     assert.equal(gate.timeout, DEFAULTS.gate_timeout_s + HQ_AWAY_WAIT_S + 15); assert.ok(gate.command.endsWith(`'${DEFAULTS.gate_timeout_s + HQ_AWAY_WAIT_S}'`))
     assert.equal(other.timeout, 30 + HQ_AWAY_WAIT_S + 15)
   }
+})
+
+test('Bug 111: no role denies `Cd` (Claude Code 2.1.322 calls that a typo on every start screen); /cd is limited to a folder that can\'t exist', async () => {
+  const { STAY_IN_FOLDER, roleFlags } = await import('./roles.ts')
+  assert.match(STAY_IN_FOLDER, /^Cd\(\/\/dev\/null\/[a-z-]+\)$/) // an absolute path under /dev/null, where no folder can be, and no wildcard
+  const cd = (rules: unknown) => ((rules ?? []) as string[]).filter((r) => /^Cd\b/.test(r))
+  for (const role of ['tpm', 'architect', 'engineer', 'launcher'] as const) {
+    const p = (buildSettings(role, 'tok', { agentDir: tmp }) as any).permissions
+    assert.deepEqual(cd(p.allow), [STAY_IN_FOLDER], role) // the only one: a second allow rule for Cd would open a folder to move to
+    assert.deepEqual([...cd(p.deny), ...cd(p.ask)], [], role)
+    assert.ok(!roleFlags(role, { worktreeName: 'w', model: 'm' }).includes('Cd'), role) // `--disallowedTools Cd` gets the same warning
+  }
+  // What the change must leave alone: engineers reach HQ's tools unasked and keep their deny list; they and the helper have no /cd at all.
+  for (const role of ['engineer', 'launcher'] as const) {
+    const p = (buildSettings(role, 'tok', { agentDir: tmp }) as any).permissions
+    assert.ok(p.allow.includes('mcp__hq__*'), role)
+    for (const rule of ['Bash(git push*)', 'Bash(tmux *)', 'Read(.env)', 'Edit(.git/**)']) assert.ok(p.deny.includes(rule), `${role} ${rule}`)
+    assert.ok(roleFlags(role, { worktreeName: 'w', model: 'm' }).includes('--disable-slash-commands'), role)
+  }
+  assert.equal((buildSettings('tpm', 'tok', { agentDir: tmp }) as any).permissions.deny, undefined)
 })

@@ -9,10 +9,11 @@ import type http from 'node:http'
 
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-heavy-')))
 process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_TURN_WAIT_S = '1'; process.env.HQ_TURN_BEAT_MS = '40'
-const { migrate, setSetting, q } = await import('./db.ts'); migrate()
-const { gateBash, heavyKind, laneMoved, programs, pump, release, startTurns, take, turns, withTurn } = await import('./heavy.ts')
+const { migrate, setSetting, q, run } = await import('./db.ts'); migrate()
+const { gateBash, heavyKind, laneMoved, programs, pump, release, saveTestCmds, startTurns, take, turns, withTurn } = await import('./heavy.ts')
 const { bus, emit } = await import('./events.ts')
-const { validSetting, bashLimitMs } = await import('./config.ts')
+const { validSetting, bashLimitMs, PATHS } = await import('./config.ts')
+const { heldKind } = await import('./heavykind.ts')
 type Agent = import('./agents.ts').Agent
 after(() => fs.rmSync(tmp, { recursive: true, force: true }))
 startTurns()
@@ -82,10 +83,10 @@ test('one that stops waiting leaves the line; HQ\'s own test run waits like anyo
   take(turn('a')); const b = take(turn('b')), c = take(turn('c')); let cGot = false; void c.got.then(() => { cGot = true })
   b.drop(); assert.deepEqual(turns().waiting, ['c']); release('a'); await tick(); assert.equal(cGot, true); c.drop(); assert.deepEqual(turns(), { running: [], waiting: [] })
   take(turn('eng')); const seen: string[] = []
-  const run = withTurn("HQ's test of T-01", 'tests', async () => { seen.push('ran'); throw new Error('boom') })
-  await tick(); assert.deepEqual(seen, []); assert.deepEqual(turns(), { running: ['eng'], waiting: ["HQ's test of T-01"] })
-  release('eng'); await assert.rejects(run, /boom/); assert.deepEqual(seen, ['ran']); assert.deepEqual(turns(), { running: [], waiting: [] })
-  assert.equal(await withTurn('free', 'build', async () => 7), 7)
+  const run = withTurn("HQ's test of T-01", 'tests', async () => { seen.push('ran'); throw new Error('boom') }, () => seen.push('waits')) // Bug 106: it's told it has to wait
+  await tick(); assert.deepEqual(seen, ['waits']); assert.deepEqual(turns(), { running: ['eng'], waiting: ["HQ's test of T-01"] })
+  release('eng'); await assert.rejects(run, /boom/); assert.deepEqual(seen, ['waits', 'ran']); assert.deepEqual(turns(), { running: [], waiting: [] })
+  assert.equal(await withTurn('free', 'build', async () => 7, () => assert.fail('nobody to wait for')), 7)
   const kinds = q<{ kind: string; payload: string }>("SELECT kind, payload FROM events WHERE kind LIKE 'turns.%' ORDER BY id").map((e) => [e.kind, JSON.parse(e.payload).who])
   assert.deepEqual(kinds, [['turns.waiting', "HQ's test of T-01"], ['turns.started', "HQ's test of T-01"]]) // quiet when nobody had to wait
 })
@@ -140,4 +141,25 @@ test('an engineer\'s command: held at its hook until its turn, which its end, it
   const n = answered; emit({ agentId: 'j', source: 'system', kind: 'agent.lost', payload: {} }); const then = said(); await tick(150); assert.equal(said(), then, 'and not after it left')
   assert.equal(answered, n + 1, 'a hook still held is answered when HQ takes it out of the line, so nothing hangs on it')
   assert.equal(q<{ n: number }>("SELECT COUNT(*) n FROM events WHERE kind = 'turns.left' AND agent_id = 'j'")[0]!.n, 1); release('x')
+})
+
+test('Bug 112: what the Bash hook goes by while HQ is down: the same rules, and each project\'s test command in a file HQ keeps whole', () => {
+  // the rule the hook script and gateBash share: a full run or a build takes a turn, unless it's a background server or the agent is still planning
+  const c = (command: string, o: Partial<{ background: boolean; plan: boolean }> = {}) => ({ command, background: !!o.background, plan: !!o.plan })
+  assert.equal(heldKind(c('npm test'), null), 'tests'); assert.equal(heldKind(c('npx vite build'), null), 'build'); assert.equal(heldKind(c('./verify.sh'), './verify.sh'), 'tests')
+  assert.equal(heldKind(c('npm test', { background: true }), null), null); assert.equal(heldKind(c('npm test', { plan: true }), null), null)
+  assert.equal(heldKind(c('git status'), './verify.sh'), null); assert.equal(heldKind(c('npm test -- src/a.test.ts'), null), null)
+  const file = () => JSON.parse(fs.readFileSync(PATHS.testCmds, 'utf8'))
+  const add = (id: string, cmd: string | null) => run('INSERT INTO repos(id, name, path, test_cmd, created_at) VALUES (?, ?, ?, ?, 1)', id, id, `/tmp/${id}`, cmd)
+  add('r1', 'node scripts/check.mjs --all'); add('r2', null); add('r3', '  ')
+  saveTestCmds(); assert.deepEqual(file(), { r1: 'node scripts/check.mjs --all' }) // only projects that have one
+  run("UPDATE repos SET test_cmd = './verify.sh' WHERE id = 'r2'"); run("DELETE FROM repos WHERE id = 'r1'")
+  saveTestCmds(); assert.deepEqual(file(), { r2: './verify.sh' }) // written whole: a removed project drops out
+  assert.deepEqual(fs.readdirSync(PATHS.home).filter((f) => f.startsWith('test-cmds')), ['test-cmds.json']) // moved into place: no half-written copy is left
+  // a write that fails (here: a folder sits where the new copy goes) leaves the old file, and HQ says so instead of failing whatever changed the command
+  const inTheWay = `${PATHS.testCmds}.${process.pid}`; fs.mkdirSync(inTheWay)
+  try { run("UPDATE repos SET test_cmd = 'make check' WHERE id = 'r2'"); saveTestCmds() } finally { fs.rmdirSync(inTheWay) }
+  assert.deepEqual(file(), { r2: './verify.sh' })
+  assert.equal(q<{ n: number }>("SELECT COUNT(*) n FROM events WHERE kind = 'backend.error' AND payload LIKE '%test commands file%'")[0]!.n, 1)
+  run('DELETE FROM repos')
 })

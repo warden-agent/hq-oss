@@ -36,14 +36,19 @@ export function listsPackages(pkgPath: string): boolean {
   })
 }
 
+/** The install for a project with packages but no lockfile: npm would write a package-lock.json into it (Bug 116). */
+export const NO_LOCK_INSTALL = 'npm install --no-package-lock'
 /** Install first when npm's own record of what's installed (node_modules/.package-lock.json) is missing or older than the
- *  lockfile, e.g. after a merge changed dependencies. Without a lockfile: only when nothing is installed yet. Never for a
- *  package.json that lists no packages, so Launch adds no file to the user's project (Bug 90). */
-export function installStep(repoPath: string): 'npm ci' | 'npm install' | null {
+ *  lockfile, e.g. after a merge changed dependencies. Without a lockfile: when nothing is installed yet, or npm's record is
+ *  older than package.json (npm rewrites it on every install, even one with nothing to do), and never a lockfile written
+ *  (Bug 116). A node_modules with no npm record (yarn's, pnpm's) is left alone. Never for a package.json that lists no
+ *  packages, so Launch adds no file to the user's project (Bug 90). */
+export function installStep(repoPath: string): 'npm ci' | typeof NO_LOCK_INSTALL | null {
   const at = (f: string) => { try { return fs.statSync(path.join(repoPath, f)).mtimeMs } catch { return null } }
-  if (at('package.json') === null || !listsPackages(path.join(repoPath, 'package.json'))) return null
+  const pkg = at('package.json')
+  if (pkg === null || !listsPackages(path.join(repoPath, 'package.json'))) return null
   const lock = at('package-lock.json'), record = at('node_modules/.package-lock.json')
-  if (lock === null) return at('node_modules') === null ? 'npm install' : null
+  if (lock === null) return at('node_modules') === null || (record !== null && record < pkg) ? NO_LOCK_INSTALL : null
   return record === null || record < lock ? 'npm ci' : null
 }
 

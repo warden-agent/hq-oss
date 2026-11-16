@@ -32,10 +32,11 @@ import { approve, dismiss, launchWithoutRecipe, startHelper } from './launchhelp
 import { readJson, asObject, TooLarge } from './util.ts'
 import { answerTestCommand, autoCheck, autoResume, autoRetry, autoRuns, setAuto, setTestCmd, undoRun } from './auto.ts'
 import { claudeInfo } from './claudecheck.ts'
+import { testRunViews } from './testrun.ts'
 import { pageFeed } from './pagefeed.ts'
 
 const TOKEN = uiToken()
-const extras = new Map<string, Record<string, unknown>>() // non-column agent fields from patches (activity, steps, context)
+const extras = new Map<string, Record<string, unknown>>() // non-column agent fields from patches (activity, steps, context, why HQ isn't typing a message yet)
 /** After a restart the context meters start from each running agent's last measurement, not blank until its next turn. */
 function seedExtras(): void {
   for (const r of q<{ agent_id: string; context_tokens: number | null; five_hour_pct: number | null; seven_day_pct: number | null }>(`SELECT u.agent_id, u.context_tokens, u.five_hour_pct,
@@ -43,7 +44,7 @@ function seedExtras(): void {
     extras.set(r.agent_id, { ...(extras.get(r.agent_id) ?? {}), context_tokens: r.context_tokens, five_hour_pct: r.five_hour_pct, seven_day_pct: r.seven_day_pct })
   }
 }
-bus.on('patch', (p: Patch) => { if (p.entity === 'agent' && p.patch) { const cur = extras.get(p.id) ?? {}; for (const [k, v] of Object.entries(p.patch)) if (['activity', 'last_message', 'steps_done', 'steps_total', 'context_tokens', 'five_hour_pct', 'seven_day_pct'].includes(k)) cur[k] = v; extras.set(p.id, cur) } })
+bus.on('patch', (p: Patch) => { if (p.entity === 'agent' && p.patch) { const cur = extras.get(p.id) ?? {}; for (const [k, v] of Object.entries(p.patch)) if (['activity', 'last_message', 'steps_done', 'steps_total', 'context_tokens', 'five_hour_pct', 'seven_day_pct', 'type_waits'].includes(k)) cur[k] = v; extras.set(p.id, cur) } })
 /** What follows a clicked Fresh start: the body's choice, else the user's setting ('wait' parks the work for Resume). */
 const afterFresh = (v: unknown): 'continue' | 'park' => v === 'continue' || v === 'park' ? v : getSetting('after_fresh_start', DEFAULTS.after_fresh_start) === 'wait' ? 'park' : 'continue'
 const agentView = (a: Agent) => ({ ...pageAgent(a), ...(extras.get(a.id) ?? {}) })
@@ -67,7 +68,7 @@ function snapshot() {
   return { autoRuns: autoRuns(), repos: repos(), features: features(), tickets: tickets(), agents: agents.map(agentView), messages: messagesForFeature(null, 300), reviews: pageReviews(),
     attention: openAttention(), asks: openAsks(), settings: Object.fromEntries(q<{ key: string; value: string }>('SELECT key, value FROM settings').map((r) => [r.key,
       JSON.parse(r.value)])), defaults: { ...DEFAULTS, github_account: GITHUB_ACCOUNT, choices: CHOICES, engineer_limit: ENGINEER_LIMIT, note_cap: NOTE_CAP }, held: heldCount(),
-        ports: PORTS, previews: previews(), build: build(), claude: claudeInfo() }
+        ports: PORTS, previews: previews(), build: build(), claude: claudeInfo(), testRuns: testRunViews() }
 }
 const json = (res: http.ServerResponse, code: number, obj: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)) }
 const cookieToken = (req: http.IncomingMessage): string | null => { const m = /(?:^|;\s*)hq=([^;]+)/.exec(req.headers.cookie ?? ''); return m ? decodeURIComponent(m[1]!) : null }

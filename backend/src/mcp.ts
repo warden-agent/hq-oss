@@ -10,7 +10,8 @@ import { emit, patch } from './events.ts'
 import { agentByToken, getAgent, type Agent } from './agents.ts'
 import { readInbox, sendMessage, resolveRecipient, dmAllowed, displayName } from './delivery.ts'
 import { attention } from './attention.ts'
-import { addFeature, changeFinished, createTicket, finishedAndStopped, launchEngineer, liveEngineerOf, setDependencies, waitingOn } from './tickets.ts'
+import { addFeature, changeFinished, createTicket, finishedAndStopped, hqOpened, launchEngineer, liveEngineerOf, setDependencies, waitingOn, withTpmText }
+  from './tickets.ts'
 import { writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { proposeTestCommand } from './auto.ts'
 import { autoOn, features, featureByHandle, tickets, getFeature, setTicket, ticketForAgent, ticketInRepo, type Feature } from './records.ts'
@@ -103,33 +104,42 @@ function registerTools(s: McpServer, agent: Agent): void {
     // A change of mind often changes what a ticket is (no "Reports tab" any more), so the title can change with the spec (Bug 33)
     s.registerTool('update_ticket_spec', {
       description: 'Change a ticket\'s spec and/or title (keep the title matching what will be built). Its engineer is told (with none on it now, the next one'
-        + ' that starts on it). A ticket that is already finished goes back to an engineer to build the new spec, and can\'t be merged until that is done. Not for merged or cancelled tickets.',
+        + ' that starts on it). A ticket that is already finished goes back to an engineer to build the new spec, and can\'t be merged until that is done. Not for merged or cancelled tickets.'
+        + ' A ticket HQ opened by itself (to repair main\'s tests) keeps HQ\'s spec and title: give only what you want to add, and HQ puts it under its own spec as "From the TPM".',
       inputSchema: { key: z.string(), spec: z.string().optional(), title: z.string().optional() },
     }, async (a) => {
       logCall('update_ticket_spec', a); const t = byKey(a.key); if (!t) return fail('no such ticket')
-      const title = a.title?.trim(); if (!a.spec && !title) return fail('give a new spec, a new title, or both')
+      // Bug 108: HQ's own ticket keeps HQ's spec and title. The TPM's text goes under the spec; a new title for it is left out, and said so.
+      const hq = hqOpened(t), asked = a.title?.trim(), title = hq ? undefined : asked
+      if (!a.spec && !asked) return fail('give a new spec, a new title, or both')
       if (t.status === 'merged' || t.status === 'cancelled') return fail(`${t.key} is ${t.status}; create a new ticket instead`)
+      if (hq && !a.spec?.trim()) return fail(`HQ opened ${t.key} by itself: its spec and title stay. Give a spec with what you want to add, and HQ puts it under its own.`)
+      const spec = hq && a.spec ? withTpmText(t, a.spec) : a.spec
+      const ok = !hq ? 'Updated.' : `Added to ${t.key} as "From the TPM", under HQ's own spec, which stays as it is${asked ? ', and so does its title' : ''}.`
+        + ' It takes the place of anything you added before.'
       const done = t.status === 'pr_ready' || t.status === 'pr_open'
-      if (done && a.spec && a.spec !== t.spec) { // already built: an engineer builds the change before anything merges
+      if (done && spec && spec !== t.spec) { // already built: an engineer builds the change before anything merges
         try {
-          const r = await changeFinished(t.id, { spec: a.spec, ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
+          const r = await changeFinished(t.id, { spec, ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
           const who = r.via === 'launch' ? `HQ started an engineer (${r.engineer})` : `HQ told its engineer (${r.engineer})`
-          return text(`Updated. ${t.key} was already finished, so ${who} to build the change. It can't be merged until that's done; HQ tells you when it is.`)
+          return text(`${ok} ${t.key} was already finished, so ${who} to build the change. It can't be merged until that's done; HQ tells you when it is.`)
         } catch (e) {
           return fail(`${t.key} is already finished, and HQ couldn't send it back to an engineer for this change: ${(e as Error).message.replace(/\.$/, '')}.`
             + ' Nothing was changed. Try again in a minute, or create a new ticket for the change.')
         }
       }
-      setTicket(t.id, { ...(a.spec ? { spec: a.spec } : {}), ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
-      const what = [a.spec && 'spec', title && `title (now "${title}")`].filter(Boolean).join(' and ')
-      if (done) return text('Updated.') // a finished ticket's engineer has nothing to do with a new title (and has usually stopped)
+      setTicket(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
+      const what = [spec && 'spec', title && `title (now "${title}")`].filter(Boolean).join(' and ')
+      if (done) return text(ok) // a finished ticket's engineer has nothing to do with a new title (and has usually stopped)
       // Bug 102: the engineer on the ticket now hears it. One that has gone never would: its notice waits, and the next engineer on the
       // ticket gets it when it starts (startEngineer hands over). HQ's notice, not the TPM's message: no DM limits (Bug 86)
-      const eng = liveEngineerOf(t), to = eng ?? t.assignee_agent_id, news = [a.spec && 'spec', title && 'title'].filter(Boolean).join(' and ')
-      if (to) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to, reason: 'fyi', body: `HQ: the TPM updated ${t.key}'s ${what}. Call get_ticket to read it.` })
-      if (eng) return text('Updated.')
-      return text(to ? `Updated. ${t.key}'s engineer (${to}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.`
-        : `Updated. Nobody has started on ${t.key} yet; its engineer gets the new ${news} when it starts.`)
+      const eng = liveEngineerOf(t), to = eng ?? t.assignee_agent_id, news = [spec && 'spec', title && 'title'].filter(Boolean).join(' and ')
+      const body = hq ? `HQ: the TPM added to ${t.key}'s spec, under "From the TPM". HQ's own steps and rules are as they were. Call get_ticket to read it.`
+        : `HQ: the TPM updated ${t.key}'s ${what}. Call get_ticket to read it.`
+      if (to) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to, reason: 'fyi', body })
+      if (eng) return text(ok)
+      return text(to ? `${ok} ${t.key}'s engineer (${to}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.`
+        : `${ok} Nobody has started on ${t.key} yet; its engineer gets ${hq ? 'it' : `the new ${news}`} when it starts.`)
     })
     s.registerTool('set_merge_order', {
       description: 'Set the intended merge order of one feature\'s tickets (their keys).', inputSchema: { feature: z.string().optional(), keys: z.array(z.string()) },
@@ -218,8 +228,9 @@ function registerTools(s: McpServer, agent: Agent): void {
     s.registerTool('update_handoff', { description: 'Append to your handoff log. kind: after_plan | milestone | before_pr. Required before open_pr.', inputSchema: { text: z.string(), kind: z.enum(['after_plan', 'milestone', 'before_pr']) } }, async (a) => { logCall('update_handoff', { kind: a.kind, len: a.text.length }); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound'); const stamp = `### ${new Date().toISOString().slice(0, 16).replace('T', ' ')} — ${a.kind}\n${a.text}`; run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = text || char(10) || char(10) || excluded.text, updated_at = excluded.updated_at', `ticket:${t.id}`, 'handoff', stamp, now()); setTicket(t.id, { handoff_updated_at: now() }); return text('Handoff recorded.') })
     s.registerTool('report_blocked', { description: 'Tell HQ you are blocked and why (the user is notified).', inputSchema: { reason: z.string() } }, async (a) => { logCall('report_blocked', a); attention('blocked', `${agent.display_name ?? agent.id}: ${a.reason}`, { agentId: agent.id, ticketId: agent.ticket_id }); return text('Reported. Stop and wait for a message.') })
     s.registerTool('propose_test_command', {
-      description: 'Repair tickets only: a test command that can work in HQ\'s sandbox, when the current one can\'t. Run it with the Bash tool first, exactly as you propose it: '
-        + 'HQ only takes a command it has seen run in your session. HQ then tries it itself on main plus your branch and messages you the result. '
+      description: 'Repair tickets only: a test command that works in HQ\'s sandbox and in an engineer\'s session, when the current one doesn\'t. '
+        + 'Run it with the Bash tool first, exactly as you propose it: HQ only takes a command it has seen run in your session. '
+        + 'HQ then tries it itself on main plus your branch and messages you the result. '
         + 'left_out: exactly which tests it no longer runs, and why.', inputSchema: { command: z.string().min(1).max(2000), left_out: z.string().min(1).max(1000) },
     }, async (a) => { logCall('propose_test_command', a); try { return text(proposeTestCommand(agent, a.command, a.left_out)) } catch (e) { return fail((e as Error).message) } })
     s.registerTool('open_pr', {

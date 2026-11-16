@@ -24,6 +24,8 @@ import { startAutoLoop } from './auto.ts'
 import { killTestRuns, sweepRunTmp, sweepTestWorktrees } from './testrun.ts'
 import { startLeftoverSweeps, sweepAgentTmp, sweepNow } from './leftovers.ts'
 import { checkClaude, claudeInfo, ensureClaude, startClaudeCheck } from './claudecheck.ts'
+import { saveTestCmds } from './heavy.ts'
+import { listeningOrStop, stopIfPortsTaken } from './ports.ts'
 
 /** The repo's role prompts and mod are what agents get: copied into HQ's home on every start when they differ (new agents
  *  pick them up; running ones keep what they started with). Extra files already in the plugin folder are left alone. */
@@ -43,7 +45,9 @@ function ensureAssets(): void {
   if (changed.length) emit({ agentId: null, source: 'system', kind: 'assets.updated', payload: { files: changed } })
 }
 async function main(): Promise<void> {
+  await stopIfPortsTaken() // Bug 118: a port taken stops HQ here, before it touches the database, agents or leftovers
   migrate(); ensureAssets()
+  saveTestCmds() // Bug 112: for commands saved before this file existed, and projects removed since it was written
   try { await ensureClaude() } catch (e) { console.error((e as Error).message); process.exit(1) } // no agent could start
   // Bug 97: which Claude Code the agents run, and whether HQ was checked on it, before the page or a launch can ask. A look that fails stops nothing
   await checkClaude().catch((e) => emit({ agentId: null, source: 'system', kind: 'claude.check_error', payload: { error: String(e) } }))
@@ -62,7 +66,8 @@ async function main(): Promise<void> {
   await sweepNow() // what agents' commands left running while HQ was down (Bug 75)
   await sweepAgentTmp() // and the temp folders of agents that ended meanwhile (Bug 81)
   startListeners()
-  startHooksServer(); startMcpServer(); startUiServer(); startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
+  await listeningOrStop({ hooks: startHooksServer(), mcp: startMcpServer(), ui: startUiServer() }) // never half-started (Bug 118)
+  startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
   startLeftoverSweeps()
   startClaudeCheck()
   emit({ agentId: null, source: 'system', kind: 'backend.started', payload: { ports: PORTS, claude: claudeInfo() } })

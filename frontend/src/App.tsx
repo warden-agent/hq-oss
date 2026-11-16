@@ -4,8 +4,9 @@ import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
 import { AttentionList, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
 import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, hasParked, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel,
-  removeConfirm, openSummary, boardKeeper, useBoard, type Board, type Pop, type PopKind } from './board'
-import { ActBtn, ErrorBar, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
+  removeConfirm, openAuto, openSummary, boardKeeper, useBoard, type Board, type Pop, type PopKind } from './board'
+import { ActBtn, Elapsed, ErrorBar, LiveDot, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
+import { runWords } from './testruns.ts'
 import { LaunchBtn, PreviewPane } from './Preview'
 import { clampH, clampW, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
 import { useAlerts } from './alerts'
@@ -19,7 +20,11 @@ type Sel = { node: string | null; agentId: string | null; ticketId: string | nul
 /** The screen: a thin top bar (repo, parallel limit, agents, preview, ⚠), the graph, and a resizable panel on the right for the
  *  clicked box's terminal or ticket, messages and events. Everything about one feature or ticket lives on its box in the graph.
  *  The live preview of the picked repo's app shares the graph's cell: below it (Desktop) or to its right (Phone). */
-const live = (s: State): number => s.agents.filter((a) => a.status !== 'exited').length
+const agentsUp = (s: State): number => s.agents.filter((a) => a.status !== 'exited').length
+/** What's at work: running agents, and HQ's own test runs (Bug 106: with every engineer finished and stopped, HQ testing a ticket read as "0 live"). */
+const live = (s: State): number => agentsUp(s) + (s.testRuns?.length ?? 0)
+const liveTip = (s: State): string => { const a = agentsUp(s), r = s.testRuns?.length ?? 0
+  return `${a} agent${a === 1 ? '' : 's'} running here${r ? `, and ${r === 1 ? 'a test run' : `${r} test runs`} of HQ's own` : ''}` }
 
 /** Bug 48: the build this tab runs (its hashed script, as the backend names it), null under `vite dev`. */
 const OWN_BUILD = document.querySelector('script[type=module][src*="/assets/index-"]')?.getAttribute('src')?.split('/').pop() ?? null
@@ -81,6 +86,8 @@ export default function App() {
       }, (w) => { opened = true; delay = 1500; setConn('open'); setWs(w) })
       sock.onclose = () => {
         if (stopped) return
+        // Bug 106: HQ's own test runs end with the backend, so with no word from it none is shown as going (their clocks would tick on). The next snapshot says what runs.
+        setState((s) => s?.testRuns?.length ? { ...s, testRuns: [] } : s)
         // Why: a page whose token HQ doesn't accept gets 401 from the API; otherwise the backend is away (or restarting).
         fetch('/api/state').then((r) => setConn(r.status === 401 ? 'token' : opened ? 'connecting' : 'down'), () => setConn('down'))
         retry = window.setTimeout(open, delay); delay = Math.min(delay * 2, 10_000)
@@ -102,6 +109,7 @@ export default function App() {
       const r = 'review' in n.ref ? all.reviews.find((x) => x.id === (n.ref as { review: string }).review) : null
       const a = 'attention' in n.ref ? all.attention.find((x) => x.id === (n.ref as { attention: string }).attention) : null
       if (a?.kind === `auto_finished:${repoNow?.id}`) return openSummary(repoNow!.id) // it has no box: what it's about is the summary
+      if (a?.kind === `test_cmd_refused:${repoNow?.id}`) return openAuto(repoNow!.id) // nor has this: it's about the test command (Bug 107)
       const node = r ? `t:${r.ticket_id}` : 'ticket' in n.ref ? `t:${n.ref.ticket}` : 'tpm' in n.ref ? 'tpm' : a ? board.attNode(a) : null
       if (!node || !board.has(node)) return
       const kind = r ? 'review' : a ? 'attention' : null
@@ -152,7 +160,7 @@ export default function App() {
     <div className="grid h-screen grid-rows-[auto_minmax(0,1fr)]">
       <div>
       <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-zinc-800 px-3 py-1.5 text-xs">
-        <h1 className="font-semibold tracking-wide text-zinc-400">HQ <span className="text-zinc-600">· {live(state)} live
+        <h1 className="font-semibold tracking-wide text-zinc-400">HQ <span className="text-zinc-600" title={liveTip(state)}>· {live(state)} live
           {live(all!) > live(state) ? ` (+${live(all!) - live(state)} in other repos)` : ''}</span></h1>
         <RepoBar state={state} all={all!} repo={repo} onRepo={switchRepo} onRemoved={removed} now={now} />
         {connText && <span className="text-rose-300" role="status">{connText}</span>}
@@ -160,6 +168,7 @@ export default function App() {
         <TestLimit state={all!} />
         {repo && <AutoSwitch all={all!} repo={repo} />}
         {repo && <LastRunBtn all={all!} repo={repo} />}
+        <TestingNow state={state} />
         <Sessions state={state} repo={repo} />
         <span className="grow" />
         <AgentsMenu state={state} selected={sel.agentId} onPick={pickAgent} />
@@ -173,7 +182,7 @@ export default function App() {
       </div>
       <div className="grid min-h-0" style={{ gridTemplateColumns: panel.open ? `minmax(0,1fr) 6px ${panelW}px` : 'minmax(0,1fr)' }}>
         <main className="grid min-h-0 min-w-0" style={!pvOpen ? { gridTemplateRows: 'minmax(0,1fr)' } : pvBelow ? { gridTemplateRows: `minmax(0,1fr) 6px ${clampH(prefs.h)}px` } : { gridTemplateColumns: `minmax(0,1fr) 6px ${clampW(prefs.w)}px` }}>
-          <div className="min-h-0 min-w-0"><Graph nodes={board.nodes} edges={board.edges} fit={board.active} focus={focusReq} onSelect={selectNode} onPane={() => setPop(null)} /></div>
+          <div className="min-h-0 min-w-0"><Graph nodes={board.nodes} edges={board.edges} fits={board.fits} focus={focusReq} onSelect={selectNode} onPane={() => setPop(null)} /></div>
           {pvOpen && <><Splitter dir={pvBelow ? 'row' : 'col'} label="Resize preview" size={pvBelow ? clampH(prefs.h) : clampW(prefs.w)} def={pvBelow ? Math.round(window.innerHeight * 0.45) : rightWidth(prefs.device)}
             set={(n) => { const c = pvBelow ? clampH(n) : clampW(n); setPrefs(pvBelow ? { h: c } : { w: c }, false); return c }} save={(n) => setPrefs(pvBelow ? { h: n } : { w: n })} />
             <PreviewPane all={all!} p={pv} repo={repo} prefs={prefs} setPrefs={setPrefs} ws={ws} feed={feed} onRepo={switchRepo} /></>}
@@ -207,7 +216,7 @@ const same = (a: unknown, b: unknown): boolean => a === b || (typeof a === 'obje
 function applyPatch(s: State, m: { entity: string; id: string; patch: Record<string, any> | null }): State {
   if (m.entity === 'setting') return same(s.settings[m.id], m.patch?.value) ? s : { ...s, settings: { ...s.settings, [m.id]: m.patch?.value } }
   const key = ({ agent: 'agents', ticket: 'tickets', feature: 'features', message: 'messages', review: 'reviews', attention: 'attention', repo: 'repos', preview: 'previews',
-    ask: 'asks', auto_run: 'autoRuns' } as Record<string, keyof State>)[m.entity]
+    ask: 'asks', auto_run: 'autoRuns', test_run: 'testRuns' } as Record<string, keyof State>)[m.entity]
   if (!key) return s
   const list = (s[key] as any[]) ?? []; const i = list.findIndex((x) => x.id === m.id)
   if (m.entity === 'repo' && i < 0 && !m.patch?.name) return s // a late change to a project just removed from HQ
@@ -304,12 +313,25 @@ function ParallelLimit({ state }: { state: State }) {
 function TestLimit({ state }: { state: State }) {
   const [draft, setDraft] = useState<number | null>(null) // shown until the next snapshot carries the saved value
   const cap = draft ?? Number(state.settings.heavy_at_once ?? state.defaults.heavy_at_once ?? 1)
-  const waiting = state.agents.filter((a) => a.status !== 'exited' && String(a.activity ?? '').startsWith('Waiting its turn')).length
+  const engs = state.agents.filter((a) => a.status !== 'exited' && String(a.activity ?? '').startsWith('Waiting its turn')).length
+  const hq = (state.testRuns ?? []).filter((r) => r.state === 'waiting').length, waiting = engs + hq // HQ's own test runs wait in the same line (Bug 106)
+  const who = [engs ? `${engs} engineer${engs === 1 ? '' : 's'}` : '', hq ? `${hq === 1 ? 'a test run' : `${hq} test runs`} of HQ's own` : ''].filter(Boolean).join(' and ')
   const set = (n: number) => { if (!Number.isInteger(n) || n < 1) return; setDraft(n); api('settings', { key: 'heavy_at_once', value: n }).catch((e) => showError(errText(e))) }
   const why = 'How many builds and full test runs may run at the same time on this computer. The others wait their turn, so the computer stays usable'
   return <div className="flex items-center gap-1.5 text-zinc-400" title={why}>
     Test runs at once <input type="number" min={1} max={10} aria-label="Test runs at once" className="input w-14! py-0.5! text-xs!" value={cap} onChange={(e) => set(Number(e.target.value))} />
-    {waiting > 0 && <span className="text-zinc-600" title={`${waiting} engineer${waiting === 1 ? ' is' : 's are'} waiting for a turn`}>{waiting} waiting</span>}</div>
+    {waiting > 0 && <span className="text-zinc-600" title={`${who} ${waiting === 1 ? 'is' : 'are'} waiting for a turn`}>{waiting} waiting</span>}</div>
+}
+/** Bug 106: HQ's own test runs in this project, in the top bar, while they go: what HQ is testing and for how long, or that the run waits its turn. A run with
+ *  no ticket (main's own tests as an auto run starts) has no box to say it, and a finished ticket's box may be off screen. */
+function TestingNow({ state }: { state: State }) {
+  return <>{(state.testRuns ?? []).map((r) => {
+    const t = state.tickets.find((x) => x.id === r.ticket_id), base = state.repos.find((x) => x.id === r.repo_id)?.default_branch ?? 'main'
+    const text = runWords(r, t?.key ?? null, base).bar, going = r.state === 'running'
+    const tip = going ? `${text}, in its sandbox. Engineers' builds and full test runs wait their turn meanwhile.`
+      : `${text}: builds and full test runs go a few at a time ("Test runs at once"), and this one is in line.`
+    return <span key={r.id} className={`whitespace-nowrap ${going ? 'text-emerald-300' : 'text-sky-300'}`} title={tip}><LiveDot on={going} />{text} · <Elapsed since={r.since} /></span>
+  })}</>
 }
 /** Every agent, including ones with no box on the graph (exited, architects, engineers on cancelled tickets). */
 function AgentsMenu({ state, selected, onPick }: { state: State; selected: string | null; onPick: (a: Agent) => void }) {
@@ -352,9 +374,10 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
   const n = turn.asks.length + (turn.start.length ? 1 : 0) + reviews.length + merges.length + state.attention.length
   const good = n > 0 && state.attention.filter((a) => goodNews(a.kind)).length === n // only good news: green, not red
   const showT = (close: () => void) => <button className="btn-sm shrink-0" onClick={() => { b.focus('tpm'); close() }}>Show</button>
-  /** Where a notice's Show goes: this project's finished run has its summary, anything else its box. */
+  /** Where a notice's Show goes: this project's finished run has its summary, a test command engineers can't run the box it's written in (Bug 107), anything else its box. */
   const showAtt = (a: any, close: () => void) => {
     if (repo && a.kind === `auto_finished:${repo.id}`) return () => { openSummary(repo.id); close() }
+    if (repo && a.kind === `test_cmd_refused:${repo.id}`) return () => { openAuto(repo.id); close() }
     const node = board.attNode(a); return node ? () => { b.focus(node, 'attention'); close() } : null
   }
   const tone = good ? 'border-emerald-500/50! text-emerald-300!' : count ? 'border-rose-500/50! text-rose-300!' : ''

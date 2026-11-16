@@ -23,5 +23,6 @@ test('a hook writing the same status again wakes nothing; a status change or a h
   agentChanged('a', { status: 'idle' }); assert.equal(a.woken(), 1)
   a.w.status = 'paused'; agentChanged('a', { status: 'working' }); assert.equal(a.woken(), 2) // a pause lifted
   agentChanged('a', { takeover_locked_until: 0 }); agentChanged('a', { fresh_start_at: 5 }); assert.equal(a.woken(), 4)
+  agentChanged('a', { interrupted_at: 6 }); agentChanged('a', { interrupted_at: null }); assert.equal(a.woken(), 6) // Bug 110: who delivers its messages changed
   off()
 })

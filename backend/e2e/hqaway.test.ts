@@ -1,6 +1,8 @@
 // Bug 85 end to end (see harness.ts): an agent's request for HQ's OK, run with the command HQ wrote into its settings.json the way
 // Claude Code runs it, waits while the backend is away and is answered when it's back. An agent that was told to stop and wait
 // (HQ away too long) hears from HQ once it's back: at the start, and when its next hook arrives.
+// Bug 112: an engineer's build or full test run that starts while the backend is away, or that was waiting its turn when it went, waits for it and is in
+// HQ's line again once it's back; small commands go ahead at once.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -9,13 +11,16 @@ import { spawn } from 'node:child_process'
 import { startHq, waitFor, pendingAfter, type Hq } from './harness.ts'
 
 let hq: Hq
+/** Hook commands still running, by the process group each has to itself: a test that fails halfway leaves none waiting for an HQ that's gone. */
+const hooks = new Set<number>()
 before(async () => { hq = await startHq() })
-after(async () => { await hq?.stop() })
+after(async () => { for (const pid of hooks) { try { process.kill(-pid, 'SIGKILL') } catch { /* ended */ } } await hq?.stop() })
 
 /** Runs a hook command as Claude Code does (a shell, the hook's JSON on stdin) and resolves with what it printed. */
 const runHook = (command: string, input: unknown): Promise<string> => new Promise((resolve, reject) => {
-  const p = spawn('/bin/sh', ['-c', command], { stdio: ['pipe', 'pipe', 'inherit'] }); let out = ''
-  p.stdout.on('data', (d) => { out += d }); p.on('error', reject); p.on('close', () => resolve(out)); p.stdin.end(JSON.stringify(input))
+  const p = spawn('/bin/sh', ['-c', command], { stdio: ['pipe', 'pipe', 'inherit'], detached: true }); let out = ''
+  if (p.pid) hooks.add(p.pid)
+  p.stdout.on('data', (d) => { out += d }); p.on('error', reject); p.on('close', () => { hooks.delete(p.pid!); resolve(out) }); p.stdin.end(JSON.stringify(input))
 })
 const fromHq = async (agentId: string) => (await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === agentId && /HQ is back/.test(m.body))
 
@@ -54,4 +59,50 @@ test('Bug 85: a request for HQ\'s OK made while the backend is away waits for it
   await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'Waiting for HQ.' })
   await hq.down(); await hq.up()
   assert.equal((await fromHq(eng.id)).length, 2) // once per note, never again
+})
+
+test('Bug 112: with the backend away, engineers\' builds and test runs wait for it and then take turns; small commands go ahead at once', async () => {
+  const engineer = async (name: string) => {
+    const repo = (await hq.api('repos', { path: hq.repo(name) })).json, f = (await hq.api('features', { repoId: repo.id, title: name, request: 'Build it' })).json
+    const t = (await hq.api('tickets', { featureId: f.id, title: 'One', size: 'S', spec: 'One.' })).json, eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+    const bash = JSON.parse(fs.readFileSync(path.join(hq.hqHome, 'agents', eng.id, 'settings.json'), 'utf8')).hooks.PreToolUse[0]
+    assert.equal(bash.matcher, 'Bash'); assert.equal(bash.hooks[0].type, 'command'); assert.ok(bash.hooks[0].command.includes('turnwait.mjs'))
+    assert.ok(!bash.hooks[0].command.includes(hq.agentToken(eng.id))) // its token stays in its own file (Bug 87)
+    return { repo, t, eng, hook: bash.hooks[0].command as string }
+  }
+  const pre = (use: string, command: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_use_id: use, tool_input: { command }, permission_mode: 'acceptEdits', session_id: 's' })
+  const ended = (agentId: string, use: string) => hq.hook(agentId, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_use_id: use, tool_input: {} })
+  const events = async (kind: string) => ((await hq.api('events?limit=300')).json as any[]).filter((e) => e.kind === kind).map((e) => ({ agent: e.agent_id, ...JSON.parse(e.payload) })).reverse()
+  await hq.api('settings', { key: 'concurrency_cap', value: 20 })
+  const a = await engineer('away-a'), b = await engineer('away-b')
+  // project b's test command is one no rule knows by name; saved the way the Auto box saves it, it is in the file the hook reads while HQ is away
+  assert.equal((await hq.api(`repos/${b.repo.id}/test-cmd`, { cmd: './verify.sh' })).status, 200)
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(hq.hqHome, 'test-cmds.json'), 'utf8')), { [b.repo.id]: './verify.sh' })
+
+  assert.equal(await runHook(a.hook, pre('u1', 'npm test')), '{}'); await ended(a.eng.id, 'u1') // HQ up and nobody running: answered at once, as before
+
+  await hq.down()
+  assert.equal(await runHook(a.hook, pre('u2', 'git status')), '{}') // a small command doesn't wait for HQ
+  assert.equal(await runHook(a.hook, pre('u3', './verify.sh')), '{}') // nor does another project's test command
+  const runA = runHook(a.hook, pre('u4', 'npm test')), runB = runHook(b.hook, pre('u5', './verify.sh 2>&1 | tail -20'))
+  assert.equal(await pendingAfter(Promise.race([runA, runB]), 2500), true) // before: both began here, at the same moment
+  await hq.up()
+  const first = await Promise.race([runA.then((out) => ({ out, x: a, use: 'u4', other: runB, y: b })), runB.then((out) => ({ out, x: b, use: 'u5', other: runA, y: a }))])
+  assert.equal(first.out, '{}') // HQ is back: one of them has the turn…
+  assert.equal(await pendingAfter(first.other, 1500), true) // …and the other waits in HQ's line, where the board shows it
+  const waiting = await waitFor('the other in HQ\'s line', async () => (await events('turns.waiting')).find((e) => e.agent === first.y.eng.id))
+  assert.deepEqual(waiting.behind, [`eng ${first.x.t.key}`])
+  assert.match((await hq.state()).agents.find((x: any) => x.id === first.y.eng.id).activity, /^Waiting its turn to run tests$/)
+  await ended(first.x.eng.id, first.use); assert.equal(await first.other, '{}') // the first run ends: the other begins
+  await ended(first.y.eng.id, first.use === 'u4' ? 'u5' : 'u4')
+
+  // The backend goes while a run waits in its line: the cut connection used to count as HQ's answer, and the run began
+  assert.deepEqual(await hq.hook(a.eng.id, pre('u6', 'npm test')), {}) // a is running its tests
+  const held = runHook(b.hook, pre('u7', 'npm run build'))
+  await waitFor('b in HQ\'s line', async () => (await events('turns.waiting')).some((e) => e.use === 'u7'))
+  await hq.down()
+  assert.equal(await pendingAfter(held, 2500), true)
+  await hq.up()
+  assert.equal(await held, '{}') // it asked again; a restarted HQ no longer knows a's run, so b's goes at once
+  assert.ok((await events('hook.PreToolUse:Bash')).some((e) => e.use === 'u7' && e.agent === b.eng.id))
 })

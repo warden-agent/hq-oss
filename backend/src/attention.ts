@@ -1,4 +1,4 @@
-import { run, now, q } from './db.ts'
+import { one, run, now, q } from './db.ts'
 import { emit, patch } from './events.ts'
 import { id } from './util.ts'
 export type Attention = { id: string; agent_id: string | null; ticket_id: string | null; kind: string; detail: string; created_at: number; resolved_at: number | null }
@@ -31,4 +31,6 @@ export function resolveKindForTicket(kind: string, ticketId: string): void {
 }
 /** Every open notice about one ticket: moot once that ticket is merged. */
 export function resolveForTicket(ticketId: string): void { for (const r of q<Attention>('SELECT * FROM needs_attention WHERE ticket_id = ? AND resolved_at IS NULL', ticketId)) resolveAttention(r.id) }
+/** The notice as it is now, or undefined once it's resolved (or replaced: attention() resolves the old one). */
+export const stillOpen = (attId: string): Attention | undefined => one<Attention>('SELECT * FROM needs_attention WHERE id = ? AND resolved_at IS NULL', attId)
 export function openAttention(): Attention[] { return q<Attention>('SELECT * FROM needs_attention WHERE resolved_at IS NULL ORDER BY created_at DESC') }

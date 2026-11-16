@@ -111,16 +111,126 @@ test('Bug 103: a message the Stop hook hands over counts as delivered and is not
   assert.equal((await hq.state()).attention.filter((a: any) => a.kind === 'delivery_failed' && a.agent_id === tpm.id).length, 0)
 })
 
-test('Bug 103: a batch the mod submitted whose prompt never started is still handed out again', async () => {
+// ---- Bug 110: after an interrupted turn (Escape in the terminal) Claude Code drops what the mod submits, so HQ types the agent's messages ----
+const RULE = '─'.repeat(60)
+/** Claude Code's screen after Escape stopped a turn (2.1.322): the waiting prompt, with nothing running. */
+const INTERRUPTED = `⏺ Reading PROJECT.md\n  ⎿  Interrupted · What should Claude do instead?\n\n${RULE} TPM demo ─\n❯ \n${RULE}\n  ⏸ manual mode on · ? for shortcuts\n`
+const WORKING = `✶ Tempering… (9s · ↓ 1.1k tokens · thinking)\n\n${RULE} TPM demo ─\n❯ \n${RULE}\n  ⏸ manual mode on · esc to interrupt\n`
+const MENU = `${RULE}\n Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to do differently (esc)\n`
+const pane = (a: any): string => hq.tmux('capture-pane', '-p', '-J', '-t', a.tmux_session)
+/** Draws the agent's screen and waits until its terminal shows it (the stand-in Claude Code redraws a few times a second). */
+async function draw(a: any, text: string, shows: string): Promise<void> { await hq.screen(a.id, text); await waitFor(`the screen to show "${shows}"`, () => pane(a).includes(shows)) }
+/** The agent's own turn ends the way Escape ends it: the mod says so, and no Stop hook comes. */
+const interrupt = (a: any) => hq.modEvent(a.id, { kind: 'turn.complete', turnId: 't', agentId: null, isAborted: true, durationMs: 9000, answer: '' })
+const agentNow = async (a: any) => (await hq.state()).agents.find((x: any) => x.id === a.id)
+const msgNow = async (body: string) => (await hq.state()).messages.find((x: any) => x.body === body)
+/** The agent's events of one kind, oldest first. */
+const payloads = async (agentId: string, kind: string) => (await kinds(agentId, kind)).map((e: any) => JSON.parse(e.payload)).reverse()
+/** Waits for HQ to have typed its `n`th batch into the agent's terminal; the batch's id. */
+const typed = async (a: any, n = 1): Promise<string> => (await waitFor(`typed batch ${n}`, async () => (await payloads(a.id, 'batch.typed'))[n - 1])).id
+
+test('Bug 110: after an interrupted turn the next message is typed into the terminal, and the mod gets it again once a turn has ended normally', async () => {
+  const { tpm } = await setup('interrupted')
+  await takeLaunch(tpm.id); await draw(tpm, INTERRUPTED, 'Interrupted')
+  await interrupt(tpm); assert.ok((await agentNow(tpm)).interrupted_at, 'HQ knows the turn was interrupted')
+  await say(tpm.id, 'Typed note.\nOn two lines.')
+  assert.deepEqual(await hq.modNext(tpm.id), {}, 'nothing for the mod: its prompt would be dropped')
+  const id = await typed(tpm)
+  await waitFor('the line in the terminal', () => pane(tpm).includes('Typed note. On two lines.')) // one line: Enter sends it
+  const m = await msgNow('Typed note.\nOn two lines.'); assert.equal(m.batch_id, id); assert.equal(m.delivery_method, 'tmux'); assert.equal(m.ack_at, null)
+  await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'Typed note. On two lines.' }) // Claude Code starts on what was typed
+  assert.ok((await msgNow('Typed note.\nOn two lines.')).ack_at, 'acknowledged by the prompt')
+  await say(tpm.id, 'While it works.') // the typed turn is still running: this one waits for it, typed or not
+  assert.ok((await agentNow(tpm)).interrupted_at, 'still set while the turn runs')
+  await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Noted.' }) // a turn ended normally
+  assert.equal((await agentNow(tpm)).interrupted_at, null)
+  const b = (await hq.modNext(tpm.id)).batch; assert.ok(b, 'the mod delivers again'); assert.match(b.text, /While it works/)
+  assert.equal((await payloads(tpm.id, 'batch.typed')).length, 1)
+  assert.equal((await hq.state()).attention.filter((a: any) => a.kind === 'delivery_failed' && a.agent_id === tpm.id).length, 0)
+})
+
+test('Bug 110: a message in the mod\'s hands when the turn is interrupted is typed at once, and that never counts as a failed delivery', async () => {
+  const { tpm } = await setup('in-flight')
+  await takeLaunch(tpm.id); await draw(tpm, INTERRUPTED, 'Interrupted')
+  for (let n = 1; n <= 3; n++) { // three in ten minutes would be "Message not delivered" if they counted
+    await say(tpm.id, `In flight ${n}.`)
+    const b = (await hq.modNext(tpm.id)).batch; assert.match(b.text, new RegExp(`In flight ${n}`))
+    await hq.modEvent(tpm.id, { kind: 'batch_received', id: b.id }) // it waits in the mod for the turn to end...
+    await hq.modEvent(tpm.id, { kind: 'batch_submitted', id: b.id }); await interrupt(tpm) // ...Escape: submitted, dropped, and the turn reported as interrupted
+    assert.deepEqual(await hq.modNext(tpm.id), {})
+    await typed(tpm, n); await waitFor('the line in the terminal', () => pane(tpm).includes(`In flight ${n}.`))
+    assert.deepEqual((await payloads(tpm.id, 'batch.requeued')).at(-1), { id: b.id, why: 'interrupted', launch: false })
+    await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: `In flight ${n}.` }); assert.ok((await msgNow(`In flight ${n}.`)).ack_at)
+    await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Noted.' })
+  }
+  assert.equal((await payloads(tpm.id, 'batch.requeued')).length, 3)
+  assert.equal((await hq.state()).attention.filter((a: any) => a.kind === 'delivery_failed' && a.agent_id === tpm.id).length, 0)
+})
+
+test('Bug 110: nothing is typed into a menu, a dialog or a working session; the message goes in once the prompt is back', async () => {
+  const { tpm } = await setup('not-into-a-menu')
+  await takeLaunch(tpm.id); await interrupt(tpm)
+  const waits = async (why: string) => {
+    assert.deepEqual(await hq.modNext(tpm.id), {}); await waitFor(`HQ to hold back (${why})`, async () => (await payloads(tpm.id, 'batch.type_waits')).some((p: any) => p.why === why))
+  }
+  const untouched = async () => { assert.equal((await msgNow('Careful note.')).delivered_at, null); assert.ok(!pane(tpm).includes('Careful note.'), 'not typed') }
+  await draw(tpm, MENU, 'Do you want to proceed?'); await say(tpm.id, 'Careful note.')
+  await waits('dialog'); await untouched() // Enter there would pick "Yes"
+  assert.equal((await agentNow(tpm)).type_waits, 'dialog') // the page gets the reason: its box says a menu or a question is in the way
+  await draw(tpm, WORKING, 'esc to interrupt'); await waits('busy'); await untouched()
+  await draw(tpm, INTERRUPTED, 'Interrupted') // the prompt is back, but HQ was told of a dialog (the notice comes about 6 s after it opens)
+  await hq.hook(tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Claude needs your permission to use Bash' })
+  await waits('status'); await untouched()
+  await hq.hook(tpm.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: 'a.txt' } }) // answered: it works again, then Escape
+  assert.deepEqual(await hq.modNext(tpm.id), {})
+  await typed(tpm); await waitFor('the line in the terminal', () => pane(tpm).includes('Careful note.'))
+  assert.equal((await payloads(tpm.id, 'batch.typed')).length, 1); assert.equal((await agentNow(tpm)).type_waits, null)
+})
+
+test('Bug 110: a typed line can\'t be taken for a command: a message that starts with / or ! goes in labelled', async () => {
+  const { tpm } = await setup('slash')
+  await takeLaunch(tpm.id); await draw(tpm, INTERRUPTED, 'Interrupted'); await interrupt(tpm)
+  await say(tpm.id, '/clear the old list, please'); assert.deepEqual(await hq.modNext(tpm.id), {})
+  const id = await typed(tpm), m = await msgNow('/clear the old list, please')
+  const line = `HQ message batch ${id}: [fyi] from the user [msg ${m.id}]: /clear the old list, please`
+  await waitFor('the labelled line in the terminal', () => pane(tpm).includes(line))
+  await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: line }); assert.ok((await msgNow('/clear the old list, please')).ack_at)
+  await say(tpm.id, '!ls'); await say(tpm.id, 'and a second one') // still interrupted: no Stop yet. The batch starts with the first message's "!"
+  assert.deepEqual(await hq.modNext(tpm.id), {})
+  const id2 = await typed(tpm, 2)
+  const both = new RegExp(`HQ message batch ${id2}: \\[fyi\\] from the user \\[msg [^\\]]+\\]: !ls \\[fyi\\] from the user \\[msg [^\\]]+\\]: and a second one`)
+  await waitFor('both messages on one labelled line', () => both.test(pane(tpm)))
+})
+
+test('Bug 110: an interrupt outlives a backend restart, and a long message is typed whole', async () => {
+  const { tpm } = await setup('restart')
+  await takeLaunch(tpm.id); await draw(tpm, INTERRUPTED, 'Interrupted'); await interrupt(tpm)
+  await hq.restart()
+  assert.ok((await agentNow(tpm)).interrupted_at, 'still known after the restart')
+  // About 800 characters, typed in four pieces. No longer: the stand-in Claude Code never reads its terminal, which then keeps only its first 1,024 bytes
+  const long = `Long note. ${Array.from({ length: 24 }, (_, i) => `Sentence ${i} of the long note 🙂.`).join(' ')} The end.`
+  await say(tpm.id, long); assert.deepEqual(await hq.modNext(tpm.id), {})
+  await typed(tpm)
+  await waitFor('the whole line in the terminal', () => pane(tpm).replace(/\n/g, '').includes(long))
+})
+
+test('Bug 110: a batch the mod submitted whose prompt never started is typed the second time; three that never start are given up', async () => {
   const { tpm } = await setup('never-started')
-  await takeLaunch(tpm.id)
+  await takeLaunch(tpm.id); await draw(tpm, INTERRUPTED, 'Interrupted') // HQ never heard of the interrupt (its backend was restarting, say)
   await say(tpm.id, 'Lost after Escape.')
   const b = (await hq.modNext(tpm.id)).batch; assert.match(b.text, /Lost after Escape/)
   await hq.modEvent(tpm.id, { kind: 'batch_received', id: b.id }); await hq.modEvent(tpm.id, { kind: 'batch_submitted', id: b.id }) // and no UserPromptSubmit
   ageBatch(b.id)
-  const again = (await hq.modNext(tpm.id)).batch
-  assert.ok(again, 'handed out again'); assert.notEqual(again.id, b.id); assert.equal(again.text, b.text)
-  assert.deepEqual((await kinds(tpm.id, 'batch.requeued')).map((e: any) => JSON.parse(e.payload)), [{ id: b.id, why: 'not_acked', launch: false }])
+  assert.deepEqual(await hq.modNext(tpm.id), {}, 'not handed to the mod again: it would be dropped again')
+  const second = await typed(tpm); assert.notEqual(second, b.id)
+  assert.deepEqual(await payloads(tpm.id, 'batch.requeued'), [{ id: b.id, why: 'not_acked', launch: false }])
+  assert.deepEqual(await payloads(tpm.id, 'agent.interrupted'), [{ why: 'not_acked', batch: b.id }]); assert.ok((await agentNow(tpm)).interrupted_at)
+  ageBatch(second); assert.deepEqual(await hq.modNext(tpm.id), {}) // typed, and still no prompt: once more
+  const third = await typed(tpm, 2); assert.notEqual(third, second)
+  ageBatch(third); assert.deepEqual(await hq.modNext(tpm.id), {}) // the third time HQ stops and says so
+  const att = await waitFor('the alert', async () => (await hq.state()).attention.find((a: any) => a.kind === 'delivery_failed' && a.agent_id === tpm.id))
+  assert.match(att.detail, /3 times \(it went in but the agent never started on it\)/)
+  assert.equal((await msgNow('Lost after Escape.')).delivery_method, 'failed'); assert.equal((await payloads(tpm.id, 'batch.typed')).length, 2)
 })
 
 test('only an answer answers an engineer\'s question; HQ\'s notices come from HQ', async () => {

@@ -43,6 +43,9 @@ const IDLE_322 = [
     '✻ Waiting for 1 background agent to finish'),
   // a draft somebody typed and didn't send
   box('❯ a draft typed by a person', '  ⏸ manual mode on', '✻ Baked for 9s · done 5:45 PM'),
+  // right after Escape stopped a turn (Bug 110; 2026-11-15): HQ types the agent's messages into this prompt
+  box('❯ ', '  ⏸ manual mode on · ? for shortcuts', '  Searched for 1 pattern, read 9 files\n  ⎿  Interrupted · What should Claude do instead?'),
+  box('❯ now write the 700-word explanation', '  ⏸ manual mode on · ? for shortcuts', '⏺ hq: HQ: delivering B-1a2dde22 (waits for idle)\n  ⎿  Interrupted · What should Claude do instead?'),
 ]
 const BUSY_322 = [
   box('❯ ', '  ⏵⏵ accept edits on · 1 shell · esc to interrupt · ↓ to manage', '✳ Considering… (6s · ↓ 205 tokens)\n  ⎿  Tip: Use /theme to change the color theme'),

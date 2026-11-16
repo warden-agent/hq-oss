@@ -42,11 +42,15 @@ export function onTurnStep(agent: Agent, ev: Record<string, unknown>): void {
   if (ev.agentId) return // subagent request; main loop only
   const model = String(ev.usageModel ?? ev.model ?? '')
   if (!model) return
-  if (agent.model_live !== model) update(agent.id, { model_live: model })
   const fam = familyOf(model)
+  // Bug 105: a request that asks to leave plan mode was made while planning, whatever the mode is by the time it's reported. Claude Code runs
+  // a call's hooks as soon as it has read the call, and the mod reports the request only once its response has ended: a plan HQ approves at
+  // once (auto mode) can be approved before the request that asked is reported. Reported that late, it isn't the model the agent is on now.
+  const planning = Array.isArray(ev.tools) && ev.tools.includes('ExitPlanMode') && expectedFamilies(agent, true).includes(fam)
+  if (agent.model_live !== model && !(planning && !agent.in_plan_mode)) update(agent.id, { model_live: model })
   if (fam === 'haiku') return // background model allowlist
   const expected = expectedFamilies(agent)
-  if (!expected.includes(fam) && alerted.get(agent.id) !== model) {
+  if (!expected.includes(fam) && !planning && alerted.get(agent.id) !== model) {
     alerted.set(agent.id, model)
     attention('model_mismatch', `${agent.role} ${agent.id}: main-loop request on ${model}, expected ${expected.join('/')}${agent.in_plan_mode ? ' (plan mode)' : ''}`, { agentId: agent.id, ticketId: agent.ticket_id })
   }

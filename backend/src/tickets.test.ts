@@ -10,11 +10,11 @@ import path from 'node:path'
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-tickets-'))
 const { migrate, run, q } = await import('./db.ts')
 migrate()
-const { addFeature, createTicket, cancelTicket } = await import('./tickets.ts')
+const { addFeature, createTicket, cancelTicket, hqOpened, withTpmText } = await import('./tickets.ts')
 const { restartTpm } = await import('./tpm.ts')
 const { tpmPrompt } = await import('./handover.ts')
 const { writeFeatureMd, tpmWorkspace } = await import('./projectmd.ts')
-const { getFeature, getRepo, tickets } = await import('./records.ts')
+const { getFeature, getRepo, getTicket, tickets } = await import('./records.ts')
 const { mergeTicket } = await import('./mergewatch.ts')
 const { nextWorkerSlot, releaseSlot, slotEnv } = await import('./slots.ts')
 const { resolveRecipient } = await import('./delivery.ts')
@@ -85,6 +85,25 @@ test('features get handles and ticket keys count up per project, past any key al
   assert.deepEqual(keys, ['T-03', 'T-05']) // T-04 is taken in another feature of the project: skipped
   assert.throws(() => createTicket(f.id, { key: 'APP-1', title: 'x', size: 'S', spec: 'x' }), /ticket APP-1 exists/) // unique in the project, not only the feature
   assert.equal(createTicket('f2', { title: 'other repo', size: 'S', spec: 'x' }).key, 'T-01') // each project counts on its own
+})
+
+test('Bug 108: a ticket HQ opened keeps HQ\'s spec; the TPM\'s text goes under it, and a later one replaces only the TPM\'s', () => {
+  const hq = '## What\nmain\'s own tests fail.\n\n## Rules\n- Don\'t delete or weaken a test.'
+  const kept = (id: string) => q<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'hq_spec'", `ticket:${id}`).map((d) => d.text)
+  const r = createTicket('f1', { title: 'Fix main\'s tests', size: 'S', spec: hq, repairs_main: 'abc123' })
+  assert.equal(hqOpened(r), true); assert.deepEqual(kept(r.id), [hq])
+  const one = withTpmText(r, '  Only the offline tests.\n')
+  assert.equal(one, `${hq}\n\n## From the TPM\nThe TPM added this. HQ's steps and rules above still hold.\n\nOnly the offline tests.`)
+  run('UPDATE tickets SET spec = ? WHERE id = ?', one, r.id)
+  const two = withTpmText(getTicket(r.id)!, 'Leave the date tests alone.') // built on HQ's own, not on the spec as it stands
+  assert.ok(two.startsWith(`${hq}\n\n## From the TPM\n`)); assert.ok(two.endsWith('\n\nLeave the date tests alone.')); assert.ok(!two.includes('offline'))
+  assert.equal(two.split('## From the TPM').length, 2); assert.deepEqual(kept(r.id), [hq])
+  // a repair opened before HQ kept its spec aside: what it says now counts as HQ's, from then on
+  run(`INSERT INTO tickets(id, feature_id, key, slug, title, status, spec, repairs_main, created_at, updated_at)
+    VALUES ('t-old', 'f1', 'APP-7', 'old', 'Fix main', 'queued', 'Old steps.', 'abc', ?, ?)`, now, now)
+  assert.ok(withTpmText(getTicket('t-old')!, 'A.').startsWith('Old steps.\n\n## From the TPM\n')); assert.deepEqual(kept('t-old'), ['Old steps.'])
+  // the TPM's own tickets aren't HQ's: nothing is kept aside for them
+  const mine = createTicket('f1', { title: 'Shelf', size: 'S', spec: 'A shelf.' }); assert.equal(hqOpened(mine), false); assert.deepEqual(kept(mine.id), [])
 })
 
 test('Merge refuses tickets that aren\'t finished; GitHub repos merge on GitHub (Bug 45)', async () => {

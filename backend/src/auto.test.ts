@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-auto-unit-'))
-const { autoRuns, failedLine } = await import('./auto.ts')
+const { autoRuns, failedLine, testChange } = await import('./auto.ts')
 const { migrate, run } = await import('./db.ts'); migrate()
 
 test('failedLine: names what failed in node, pytest and go output, and falls back on the last line', () => {
@@ -24,4 +24,14 @@ test('Bug 63: every project keeps its newest runs, so a busy one can\'t push out
   assert.ok(runs.some((r) => r.id === 'quiet'))
   assert.equal(busy.length, 20); assert.equal(busy[0]!.id, 'busy-29') // the newest of them
   assert.deepEqual(runs.map((r) => r.started_at), runs.map((r) => r.started_at).sort((a, b) => b - a)) // newest first, as the UI and tests read it
+})
+
+test('Bug 109: a recorded change to the command it replaced is no change; a real one, or one from the command HQ found, still is', () => {
+  const rec = (was: string | null, now: string) => ({ test_change: JSON.stringify({ was, now, left_out: 'x' }) })
+  assert.equal(testChange(rec('npm run test:offline', 'npm run test:offline')), null)
+  assert.equal(testChange(rec('npm run  test:offline', ' npm run test:offline\n')), null, 'spacing aside')
+  assert.equal(testChange(rec('npm test', 'npm run test:offline'))?.now, 'npm run test:offline')
+  assert.equal(testChange(rec('npm test', 'npm test -- --offline'))?.was, 'npm test', 'a longer line that holds the old one is a change')
+  assert.equal(testChange(rec(null, 'npm test'))?.now, 'npm test') // was: the one HQ found, which the record doesn't name
+  assert.equal(testChange({ test_change: null }), null); assert.equal(testChange(undefined), null); assert.equal(testChange({ test_change: 'not json' }), null)
 })

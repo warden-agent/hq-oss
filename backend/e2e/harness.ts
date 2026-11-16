@@ -10,9 +10,11 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { pidsUnder } from '../src/procs.ts'
 import { CHECKED_VERSION } from '../src/claudeversion.ts'
+import { PORT_TAKEN_EXIT } from '../src/ports.ts'
 
 const BACKEND = path.resolve(import.meta.dirname, '..')
 const FAKE = path.join(import.meta.dirname, 'fake-claude.mjs')
+const STOP_MS = 10_000, PIPE_MS = 3000 // a backend exits at once on SIGTERM (index.ts), and its pipes close with it
 
 export const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 /** Polls `fn` every 100ms until it returns something truthy. */
@@ -114,15 +116,16 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
   }
   const state = async (): Promise<any> => (await api('state')).json
   /** Starts the backend and waits until it listens on all three of its ports. Bug 92: a port can be taken between the pick and the backend's
-   *  listen (by a test HQ in another file, say). HQ then runs on without that server, and a test's MCP calls reached a hooks server (404).
-   *  False when a port was taken: the backend is stopped again. */
+   *  listen (by a test HQ in another file, say). HQ then ran on without that server, and a test's MCP calls reached a hooks server (404).
+   *  Since Bug 118 the backend stops by itself then, with its own exit code. False when a port was taken. */
   async function tryStart(): Promise<boolean> {
     const p = spawn(process.execPath, ['--experimental-strip-types', 'src/index.ts'], { cwd: BACKEND, env, stdio: ['ignore', 'pipe', 'pipe'] })
-    proc = p; const from = log.length // this start's output
+    proc = p; started.push(p); const from = log.length // this start's output
     p.stdout!.on('data', (d) => { log += d }); p.stderr!.on('data', (d) => { log += d })
     const got = await waitFor('the backend to listen on its ports', () => {
-      if (p.exitCode !== null || p.signalCode !== null) throw new Error(`the test HQ exited at startup:\n${log}`)
-      const mine = listeningPorts(p.pid!); return Object.values(ports).every((x) => mine.includes(x)) ? 'all' : /EADDRINUSE/.test(log.slice(from)) ? 'taken' : null
+      if (p.exitCode === PORT_TAKEN_EXIT) return 'taken'
+      if (p.exitCode !== null || p.signalCode !== null) throw new Error(`the test HQ exited at startup:\n${log.slice(from)}`)
+      const mine = listeningPorts(p.pid!); return Object.values(ports).every((x) => mine.includes(x)) ? 'all' : null
     }, 20_000)
     if (got === 'taken') { await stopBackend(); return false }
     await waitFor('the backend to answer', async () => (await fetch(`http://127.0.0.1:${ports.ui}/api/state`, { headers: { authorization: `Bearer ${uiToken()}` } }).catch(() => null))?.ok, 20_000)
@@ -132,10 +135,21 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
   async function startBackend(): Promise<void> {
     if (!await tryStart()) throw new Error(`a port of this test HQ (${JSON.stringify(ports)}) was taken while it was down:\n${log}`)
   }
+  /** Bug 113: every wait has a time limit, teardown too. A backend still there STOP_MS after SIGTERM is killed, and the test is told. */
   async function stopBackend(): Promise<void> {
     const p = proc; proc = null; if (!p || p.exitCode !== null || p.signalCode !== null) return // killed from outside: its exit event has already gone
-    const gone = new Promise((r) => p.once('exit', r)); p.kill('SIGTERM'); await gone
+    const gone = new Promise((r) => p.once('exit', r)); p.kill('SIGTERM')
+    if (!await pendingAfter(gone, STOP_MS)) return
+    p.kill('SIGKILL'); await gone; throw new Error(`the test HQ's backend didn't stop within ${STOP_MS / 1000} s of SIGTERM, so it was killed`)
   }
+  /** Bug 113: something HQ started that still holds the backend's output keeps the test file from ever exiting (CI waited 16 minutes). Its pipes close
+   *  here, and the test is told. False when they were already closed. */
+  const outputHeld = async (p: ChildProcess): Promise<boolean> => {
+    const closed = (s: NodeJS.ReadableStream & { closed?: boolean } | null) => !s || s.closed ? Promise.resolve() : new Promise((r) => s.once('close', r))
+    if (!await pendingAfter(Promise.all([closed(p.stdout), closed(p.stderr)]), PIPE_MS)) return false
+    p.stdout?.destroy(); p.stderr?.destroy(); return true
+  }
+  const started: ChildProcess[] = [] // every backend process this test HQ ran (restarts too), kept past stopBackend for their pipes
   const abort = () => { // the test process is going: its folders go too, last, since no tmux call may come after (Bug 81)
     try { proc?.kill('SIGKILL') } catch { /* gone */ }
     killTmux(); killLeftovers(root)
@@ -157,10 +171,13 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
     /** Stops everything and deletes the temp dirs; the backend's output stays in <tmpdir>/hq-e2e-last.log (the shared one, past own-tmp.mjs's). */
     async stop(): Promise<void> { // twice is fine: a test may stop it and its afterEach again
       if (stopped) return; stopped = true
-      await stopBackend(); fs.writeFileSync(path.join(process.env.HQ_OUTER_TMPDIR ?? os.tmpdir(), 'hq-e2e-last.log'), log)
+      const problems: string[] = []; await stopBackend().catch((e) => { problems.push((e as Error).message) })
+      fs.writeFileSync(path.join(process.env.HQ_OUTER_TMPDIR ?? os.tmpdir(), 'hq-e2e-last.log'), log)
       live.delete(abort); killLeftovers(root) // previews first: HQ leaves them running on purpose (a restart picks them up)
       killTmux()
       fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(tmuxDir, { recursive: true, force: true })
+      if ((await Promise.all(started.map(outputHeld))).some(Boolean)) problems.push(`a process the test HQ started still held its output ${PIPE_MS / 1000} s after it stopped`)
+      if (problems.length) throw new Error(problems.join('; '))
     },
     /** What Claude Code's status file says for this agent (Bug 62, presence.ts): `status` busy, idle or waiting, changed now unless `at` says when. */
     async session(agentId: string, status: string, at = Date.now()): Promise<void> {
@@ -201,7 +218,7 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
       return first
     },
     hookOnce,
-    /** The mod's long-poll for the next message batch (what register.js asks every 1.5 s). `{}` means nothing to deliver. */
+    /** The mod's long-poll for the next message batch (what register.js asks; modhost.ts runs the real one). `{}` means nothing to deliver. */
     async modNext(agentId: string, wait = 0, signal?: AbortSignal): Promise<any> {
       const r = await fetch(`http://127.0.0.1:${ports.hooks}/mod/${agentToken(agentId)}/next?wait=${wait}`, { signal }); return r.json()
     },

@@ -2,12 +2,12 @@
 // waits or finishes, and "Do the rest automatically" at every stop (it opens the same dialog). HQ does the work (backend auto.ts).
 import { useEffect, useState } from 'react'
 import { api, askUntilAnswered, errText, type State } from './api'
-import { DO_REST, OPEN_SUMMARY, openSummary, undoConfirm, useBusy } from './board'
+import { DO_REST, OPEN_AUTO, OPEN_SUMMARY, openAuto, openSummary, undoConfirm, useBusy } from './board'
 import { Md } from './ui'
 import { yourTurn } from './needs.ts'
 
-const OPEN_AUTO = 'hq-open-auto'
-const openAuto = (repoId: string): void => { window.dispatchEvent(new CustomEvent(OPEN_AUTO, { detail: repoId })) }
+/** Bug 107: the saved test command Claude Code refused in an engineer's session, if HQ has seen that, and the ticket HQ opened to fix it. */
+const refusedCmd = (repo: any): { cmd: string; ticket?: string } | null => { try { return repo.test_cmd_refused ? JSON.parse(repo.test_cmd_refused) : null } catch { return null } }
 const runsOf = (all: State, repoId: string): any[] => (all.autoRuns ?? []).filter((r) => r.repo_id === repoId)
 const latestRun = (all: State, repoId: string): any => runsOf(all, repoId).filter((r) => r.summary).sort((a, b) => b.started_at - a.started_at)[0]
 const finishedNotice = (all: State, repoId: string): any => all.attention.find((a) => a.kind === `auto_finished:${repoId}`)
@@ -63,6 +63,7 @@ export function AutoDialog({ all }: { all: State }) {
   })
   if (!repo) return null
   const now = autoPreview(all, repo.id), noTests = !!check && !check.found && !cmd.trim(), refused = !repo.auto_mode ? check?.sandbox : null
+  const bad = refusedCmd(repo), cantRun = !!cmd.trim() && bad?.cmd === cmd.trim() // while the box holds that command: typing another one takes the line away
   const go = async () => {
     setBusy(true); setErr('')
     try {
@@ -82,6 +83,9 @@ export function AutoDialog({ all }: { all: State }) {
       <label className="flex flex-col gap-1">Test command
         <input className="input" value={cmd} onChange={(e) => setCmd(e.target.value)} placeholder={check ? check.found ?? 'No tests found' : 'Looking…'} aria-label="Test command" /></label>
       {noTests && <div className="text-amber-300/80">HQ found no tests here, so it will build but not merge. The TPM can add tests, or write a command above.</div>}
+      {cantRun && <div role="note" className="break-words text-amber-300/80">Claude Code refuses this command in an engineer's session, so engineers can't run the full tests.
+        {bad?.ticket ? ` HQ opened ${bad.ticket} to fix it.` : ' With auto mode on, HQ opens a ticket that fixes it.'} Or write
+        one that works above: the same line inside a script in the repo (an npm script, for one) does.</div>}
       {repo.kind === 'github' && repo.can_push !== 0 && <div>Merges go to {repo.default_branch} on GitHub as {all.defaults?.github_account ?? 'the HQ account'}.</div>}
       {!refused && <div>Your computer stays awake during a run, but closing a laptop's lid still sleeps it.</div>}
       {away && <div role="status" className="text-amber-300/80">Can't reach HQ. It may be restarting. Trying again…</div>}
