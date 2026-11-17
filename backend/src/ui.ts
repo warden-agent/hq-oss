@@ -21,7 +21,7 @@ import { addRepo, defaultParent, pickParent, pickRepo, repoAroundProject, syncRe
 import { createProject, githubReady, RepoHere } from './newproject.ts'
 import { makePr, mergeTicket } from './mergewatch.ts'
 import { answerReview, openReviews, pageReviews, getReview, getRevision, heldCount, isVerdict, VERDICTS } from './gate.ts'
-import { interruptAndType, sendMessage, messagesForFeature } from './delivery.ts'
+import { interruptAndType, sendMessage, messagesForFeature, openQuestions } from './delivery.ts'
 import { wakeAll } from './wake.ts'
 import { openAttention, resolveAttention } from './attention.ts'
 import { resumeRole } from './modelguard.ts'
@@ -34,6 +34,7 @@ import { answerTestCommand, autoCheck, autoResume, autoRetry, autoRuns, setAuto,
 import { claudeInfo } from './claudecheck.ts'
 import { testRunViews } from './testrun.ts'
 import { pageFeed } from './pagefeed.ts'
+import { agentEvents, eventLine, lineOwner } from './eventtext.ts'
 
 const TOKEN = uiToken()
 const extras = new Map<string, Record<string, unknown>>() // non-column agent fields from patches (activity, steps, context, why HQ isn't typing a message yet)
@@ -47,7 +48,8 @@ function seedExtras(): void {
 bus.on('patch', (p: Patch) => { if (p.entity === 'agent' && p.patch) { const cur = extras.get(p.id) ?? {}; for (const [k, v] of Object.entries(p.patch)) if (['activity', 'last_message', 'steps_done', 'steps_total', 'context_tokens', 'five_hour_pct', 'seven_day_pct', 'type_waits'].includes(k)) cur[k] = v; extras.set(p.id, cur) } })
 /** What follows a clicked Fresh start: the body's choice, else the user's setting ('wait' parks the work for Resume). */
 const afterFresh = (v: unknown): 'continue' | 'park' => v === 'continue' || v === 'park' ? v : getSetting('after_fresh_start', DEFAULTS.after_fresh_start) === 'wait' ? 'park' : 'continue'
-const agentView = (a: Agent) => ({ ...pageAgent(a), ...(extras.get(a.id) ?? {}) })
+/** Bug 122: an exited agent has no activity line, even when a late patch (a build's turn coming up after it was stopped) left one in `extras`. */
+const agentView = (a: Agent) => ({ ...pageAgent(a), ...(extras.get(a.id) ?? {}), ...(a.status === 'exited' ? { activity: null } : {}) })
 
 /** Bug 48: the frontend build HQ serves (its hashed script, e.g. index-pXb_ChmJ.js), or null when there's no build. A tab still
  *  running another build reloads itself (App.tsx). */
@@ -66,7 +68,7 @@ function build(): string | null {
 function snapshot() {
   const agents = allAgents(); for (const id of extras.keys()) if (!agents.some((a) => a.id === id)) extras.delete(id) // agents too old to show
   return { autoRuns: autoRuns(), repos: repos(), features: features(), tickets: tickets(), agents: agents.map(agentView), messages: messagesForFeature(null, 300), reviews: pageReviews(),
-    attention: openAttention(), asks: openAsks(), settings: Object.fromEntries(q<{ key: string; value: string }>('SELECT key, value FROM settings').map((r) => [r.key,
+    attention: openAttention(), asks: openAsks(), questions: openQuestions(), settings: Object.fromEntries(q<{ key: string; value: string }>('SELECT key, value FROM settings').map((r) => [r.key,
       JSON.parse(r.value)])), defaults: { ...DEFAULTS, github_account: GITHUB_ACCOUNT, choices: CHOICES, engineer_limit: ENGINEER_LIMIT, note_cap: NOTE_CAP }, held: heldCount(),
         ports: PORTS, previews: previews(), build: build(), claude: claudeInfo(), testRuns: testRunViews() }
 }
@@ -77,7 +79,7 @@ const authed = (req: http.IncomingMessage): boolean => { const bearer = (req.hea
 /** What a GET may do: read. Every change is a POST, so a page shown inside HQ (the live preview) can't make one with a link
  *  or an <img> (a cross-origin POST carries an Origin, which originOk refuses). */
 const readRoute = ([r0, r1, r2, r3]: (string | undefined)[]): boolean => !r3 && ((['state', 'events', 'docs'].includes(r0 ?? '') && !r1)
-  || (r0 === 'reviews' && !r2) || (r0 === 'ticket' && !!r1 && !r2) || (r0 === 'agents' && !!r1 && r2 === 'screen'))
+  || (r0 === 'reviews' && !r2) || (r0 === 'ticket' && !!r1 && !r2) || (r0 === 'agents' && !!r1 && (r2 === 'screen' || r2 === 'events')))
 const originOk = (req: http.IncomingMessage): boolean => { const o = req.headers.origin; if (!o) return true; return [`http://127.0.0.1:${PORTS.ui}`, `http://localhost:${PORTS.ui}`, `http://127.0.0.1:5173`, `http://localhost:5173`].includes(o) }
 
 async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse): Promise<void> {
@@ -155,6 +157,8 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'agents' && r1 && r2 === 'stop') { await stopAgent(r1, 'user'); return json(res, 200, { ok: true }) }
     if (r0 === 'agents' && r1 && r2 === 'takeover') { update(r1, { takeover_locked_until: body.locked ? now() + 365 * 86_400_000 : 0 }); return json(res, 200, { ok: true }) }
     if (r0 === 'agents' && r1 && r2 === 'type') { const a = getAgent(r1); if (!a) return json(res, 404, {}); update(r1, { takeover_locked_until: now() + getSetting('takeover_lock_s', DEFAULTS.takeover_lock_s) * 1000 }); await tmux.sendKeys(a.tmux_session, String(body.text ?? ''), body.enter !== false); return json(res, 200, { ok: true }) }
+    if (r0 === 'agents' && r1 && r2 === 'events') { if (!getAgent(r1)) return json(res, 404, { error: 'no such agent' }) // Bug 121: its Events tab
+      return json(res, 200, { events: agentEvents(r1, Math.min(Number(url.searchParams.get('limit')) || 300, 1000)) }) }
     if (r0 === 'agents' && r1 && r2 === 'screen') { const a = getAgent(r1); if (!a) return json(res, 404, {}); return json(res, 200, { text: await tmux.capturePane(a.tmux_session, 200) }) }
     if (r0 === 'reviews' && r1 && !r2) { const rv = getReview(r1); if (!rv) return json(res, 404, {}); return json(res, 200, { ...rv, revision: getRevision(rv.plan_revision_id) }) }
     if (r0 === 'reviews' && r1 && r2 === 'answer') { const verdict = body.verdict; if (!isVerdict(verdict)) return json(res, 400, { error: `unknown verdict '${String(verdict)}' (one of ${VERDICTS.join(', ')})` }); return json(res, 200, answerReview(r1, verdict, { plan: body.plan ? String(body.plan) : undefined, message: body.message ? String(body.message) : undefined, note: typeof body.note === 'string' ? body.note : undefined, by: String(body.by ?? 'user') })) }
@@ -221,7 +225,8 @@ function onClient(ws: WebSocket): void {
   const sendSnapshot = () => { const data = snapshot(); feed.snapshot(data.agents); send({ type: 'snapshot', data }) }
   sendSnapshot()
   const onPatch = (p: Patch) => { const q = feed.patch(p); if (q) send({ type: 'patch', ...q }) }
-  const onEvent = (e: HqEvent) => send({ type: 'event', event: { ...e, payload: e.payload } })
+  // Bug 121: the Events tab's line, not the payload (a spec can be 10 KB); kinds the tab leaves out aren't sent
+  const onEvent = (e: HqEvent) => { const text = eventLine(e.kind, e.payload); if (text) send({ type: 'event', event: { id: e.id, at: e.at, agentId: lineOwner(e.agentId, e.payload), text } }) }
   const onSnapshot = () => sendSnapshot() // after a clear: whole rows are gone
   bus.on('patch', onPatch); bus.on('event', onEvent); bus.on('resnapshot', onSnapshot)
   ws.on('message', (raw) => {

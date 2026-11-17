@@ -1,6 +1,7 @@
 import type { TestRun } from './testruns.ts'
+import type { Question } from './needs.ts'
 export type Agent = Record<string, any> & { id: string; role: string; status: string }
-export type State = { autoRuns?: any[]; repos: any[]; features: any[]; tickets: any[]; agents: Agent[]; messages: any[]; reviews: any[]; attention: any[]; asks: any[];
+export type State = { autoRuns?: any[]; repos: any[]; features: any[]; tickets: any[]; agents: Agent[]; messages: any[]; reviews: any[]; attention: any[]; asks: any[]; questions?: Question[];
   settings: Record<string, any>; defaults: Record<string, any>; held: number; ports: Record<string, number>; previews: any[]
   /** The frontend build HQ serves now (Bug 48): a tab running another one is out of date. */
   build?: string | null
@@ -40,6 +41,22 @@ export function waitingFor(a: Agent, s: State, now = Date.now()): { count: numbe
   // such as Claude Code's Rewind (Escape twice). HQ never types into those: Enter would pick an option.
   if (a.interrupted_at && (a.type_waits === 'dialog' || a.type_waits === 'screen')) return { count, held: true, why: 'held · its terminal shows a menu or a question · answer or close it there' }
   return { count, held: false, why: a.status === 'working' ? 'waits for its current turn to end' : 'delivering…' }
+}
+/** Bug 122: what the Agents menu says under an agent that has ended, in place of its last activity line: why it ended (its `ended_why`, from the backend) and
+ *  when. A fresh start reads "replaced" once a newer agent has its place (same ticket; a TPM, the same project). Old rows with nothing recorded say only when. */
+export function endedLine(a: Agent, s: Pick<State, 'agents'>, now = Date.now()): string | null {
+  if (a.status !== 'exited') return null
+  const why = String(a.ended_why ?? '')
+  const newer = s.agents.some((x) => x.id !== a.id && x.role === a.role && (x.started_at ?? 0) > (a.started_at ?? 0) && (a.ticket_id ? x.ticket_id === a.ticket_id : x.repo_id === a.repo_id))
+  const words: Record<string, string> = { fresh_start: newer ? 'replaced by a fresh start' : 'ended for a fresh start', user: 'stopped by you',
+    finished: 'stopped: its ticket is done', merged: 'stopped: its work was merged', cancelled: 'stopped: its ticket was cancelled', parked: 'stopped: its work was parked',
+    cleared: 'stopped: the project was cleared', 'removed from HQ': 'stopped: the project was removed from HQ', 'replaced by auto mode': 'replaced by auto mode',
+    'launch helper done': 'stopped: its launch work is done', 'stray launch helper': 'stopped: nothing was waiting for it', lost: 'its process ended without HQ stopping it' }
+  const text = !why ? 'ended' : why.startsWith('session:') ? 'its session ended' : words[why] ?? 'stopped by HQ'
+  if (!a.ended_at) return why ? text : null
+  const at = new Date(a.ended_at), day = at.toDateString() === new Date(now).toDateString()
+  const when = at.toLocaleString([], { ...(day ? {} : { month: 'short', day: 'numeric' }), hour: 'numeric', minute: '2-digit' })
+  return `${text} · ${when}`
 }
 // The backend's own ticket rules (a pure module), so the two can't drift apart.
 export { FINISHED, unmergedDeps } from '../../backend/src/readiness.ts'

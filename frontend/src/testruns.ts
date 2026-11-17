@@ -24,3 +24,40 @@ export function runWords(r: Pick<TestRun, 'what' | 'state'>, key: string | null,
   return go ? { box: `its tests failed · HQ is testing ${base} without it`, bar: `HQ is testing ${alone}` }
     : { box: `its tests failed · HQ's test of ${base} without it ${turn}`, bar: `HQ's test of ${alone} ${turn}` }
 }
+
+// Bug 126: what HQ ran on a ticket before it merged, once it has. Nothing on the board showed it, and a TPM told the user "HQ ran the tests before each merge"
+// after six merges HQ never tested. The backend saves it on the ticket as it merges (records.ts MergeTest, the same type).
+export type Counts = { passed: number; failed: number; skipped: number }
+export type MergeTest = { ran: 'pass'; test: string; counts: Counts | null; ms: number; on: string; at: number } | { ran: 'none'; by: 'user' | 'outside'; at: number }
+/** The ticket's `merge_test`, or null: merged before HQ kept a record, or not merged. Bad JSON is no record. */
+export function mergeTestOf(t: { merge_test?: string | null }): MergeTest | null {
+  try { const m = t.merge_test ? JSON.parse(t.merge_test) as MergeTest : null; return m && (m.ran === 'pass' || m.ran === 'none') ? m : null } catch { return null }
+}
+/** "under 1 s", "8 s", "2 min 5 s" */
+export const took = (ms: number): string => { const s = Math.round(ms / 1000), m = Math.floor(s / 60); return !s ? 'under 1 s' : m ? `${m} min${s % 60 ? ` ${s % 60} s` : ''}` : `${s} s` }
+/** "412 passed, 6 skipped": skipped and failed only when there are some. */
+export const countWords = (c: Counts): string =>
+  [`${c.passed} passed`, c.failed ? `${c.failed} failed` : '', c.skipped ? `${c.skipped} skipped` : ''].filter(Boolean).join(', ')
+/** A merge's tests in words. `box`: a few words for the merged box's one row. `long`: the whole of it, for its tooltip and the Ticket tab. `passed`: tested and passed.
+ *  `none`: null, the ticket merged before HQ kept a record (its box says nothing rather than "no tests", which may be untrue). */
+export function mergeTestWords(m: MergeTest | null): { box: string; long: string; passed: boolean } | null {
+  if (!m) return null
+  if (m.ran === 'none') return { box: 'no HQ test', passed: false,
+    long: m.by === 'user'
+      ? 'You merged it with Merge, which runs no tests: HQ did not test it as it merged (only auto mode tests before it merges).' : 'It was merged outside HQ, so HQ did not test it as it merged.' }
+  return { box: 'tests passed', passed: true, long: `HQ's tests passed on ${m.on} with it merged in, before it merged · ${m.counts ? `${countWords(m.counts)} · ` : ''}${took(m.ms)}` }
+}
+/** A finished feature folds its tickets away (one "✓ done" box), so it says what HQ ran on them right before they merged (Bug 126: after F-4's six merges, none of them
+ *  tested, the board showed only "✓ done · all 6 merged"). `tip`: each ticket's own line. Null when HQ has a record of none of them. */
+export function featureTestsLine(ts: { key: string; merge_test?: string | null }[]): { text: string; tip: string; passed: boolean } | null {
+  const all = [...ts].sort((x, y) => x.key.localeCompare(y.key, undefined, { numeric: true })).map((t) => ({ key: t.key, m: mergeTestOf(t) }))
+  const known = all.filter((x) => x.m), tested = known.filter((x) => x.m!.ran === 'pass').length
+  if (!known.length) return null
+  const none = all.length - known.length, unknown = none ? ` · ${none} with no record` : ''
+  const text = tested === known.length ? `HQ tested ${known.length === 1 ? 'it' : `all ${known.length}`} right before ${known.length === 1 ? 'it' : 'they'} merged${unknown}`
+    : tested ? `HQ tested ${tested} of ${known.length} right before they merged${unknown}` : `none tested by HQ as they merged${unknown}`
+  const tip = all.map(({ key, m }) => {
+    const w = mergeTestWords(m); return `${key}: ${!w ? 'no record (merged before HQ kept one)' : w.passed ? w.long.replace("HQ's tests passed", 'tests passed') : w.long}`
+  })
+  return { text, tip: tip.join('\n'), passed: tested === all.length }
+}

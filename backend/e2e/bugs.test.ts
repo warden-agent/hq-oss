@@ -155,6 +155,7 @@ test('Bug 7: Start TPM again: a fresh project TPM briefed from HQ\'s records get
   s = await hq.state()
   assert.equal(s.repos.find((x: any) => x.id === repo.id).tpm_agent_id, fresh.id)
   assert.equal(s.messages.find((m: any) => m.id === q.id).to_id, fresh.id) // the question now waits for the new TPM
+  assert.deepEqual(s.questions.filter((x: any) => x.message_id === q.id).map((x: any) => x.to_target), [fresh.id]) // and the page says so (Bug 129)
   const prompt = fs.readFileSync(path.join(hq.hqHome, 'agents', fresh.id, 'prompt.md'), 'utf8')
   assert.match(prompt, new RegExp(`^You are taking over as the TPM of project "bug7".*The previous TPM session \\(${oldTpm}\\) has ended`))
   assert.match(prompt, /On the board now:\n- F-1 bug7\n  - T-01 \(S\) Api: its engineer waits for an answer · branch hq\/bug7\/T-01-api/)
@@ -179,6 +180,12 @@ test('Bug 61: pressing Merge on a ticket nothing waits on leaves no "merged" ale
   sh(dir, 'merge', '--no-edit', (await hq.state()).tickets.find((x: any) => x.id === t2.id).branch)
   await hq.api(`repos/${repo.id}/sync`, {}) // a sync re-checks merges (as the 2-minute watcher would)
   await waitFor('the outside merge to be noticed', async () => (await merged(t2)).length === 1)
+  // Bug 126: each says what HQ ran on it first: nothing, and the TPM hears that too (a TPM said "HQ ran the tests before each merge" when it never had)
+  const record = async (t: any) => JSON.parse((await hq.state()).tickets.find((x: any) => x.id === t.id).merge_test)
+  assert.deepEqual({ ...(await record(t1)), at: 0 }, { ran: 'none', by: 'user', at: 0 }); assert.deepEqual({ ...(await record(t2)), at: 0 }, { ran: 'none', by: 'outside', at: 0 })
+  const toTpm = (await hq.state()).messages.filter((m: any) => m.to_id === f.tpm_agent_id && / merged\./.test(m.body)).map((m: any) => m.body)
+  assert.ok(toTpm.includes('HQ: T-01 merged. The user merged it with Merge, which runs no tests: HQ did not test it as it merged.'), toTpm.join('\n'))
+  assert.ok(toTpm.includes('HQ: T-02 merged. It was merged outside HQ, so HQ did not test it as it merged.'), toTpm.join('\n'))
 })
 
 test('Bug 8: notices clear themselves: a merge clears what was said about its ticket, and "Ready now" goes once those have started', async () => {

@@ -163,6 +163,13 @@ test('a request runs to the end with nobody pressing anything: starts after the 
   const e1 = await engineer(t1); await work(p, t1, e1, { 'orders.txt': 'r\n' })
   await until(t1, 'merged')
   assert.ok(fs.existsSync(path.join(p.dir, 'orders.txt')), 'the work is on main')
+  // Bug 126: the merged ticket says what HQ ran on it and how it ended, with the output a click away, and its TPM hears the same
+  const m = JSON.parse((await tk(t1)).merge_test)
+  assert.deepEqual({ ...m, ms: 0, at: 0 }, { ran: 'pass', test: 'npm test', counts: { passed: 1, failed: 0, skipped: 0 }, ms: 0, on: 'main', at: 0 }); assert.ok(m.ms > 0)
+  const out = (await hq.api(`docs?scope=${encodeURIComponent(`ticket:${t1.id}`)}`)).json.find((d: any) => d.key === 'merge_test_output')
+  assert.match(out.text, /ℹ pass 1/)
+  const heard = (await hq.state()).messages.find((x: any) => x.to_id === p.tpm.id && x.body.startsWith(`HQ: ${t1.key} merged.`))
+  assert.match(heard.body, new RegExp(`^HQ: ${t1.key} merged\\. HQ's tests passed on main first \\(\`npm test\`: 1 passed, (\\d+|under 1) s\\)\\.`))
   const review = (await hq.state()).reviews.find((r: any) => r.ticket_id === t1.id); assert.equal(review.closed_reason, 'approve'); assert.match(review.plan_text ?? `Plan for ${t1.key}`, /Plan for/)
   await waitFor('the first engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === e1.id)?.status === 'exited')
   await turnEnds(p) // the TPM heard the merge and answered
@@ -170,7 +177,8 @@ test('a request runs to the end with nobody pressing anything: starts after the 
   await until(t2, 'merged')
   await turnEnds(p)
   const r = await waitFor('the run to finish', async () => (await runs(p)).find((x: any) => x.status === 'finished'))
-  assert.match(r.summary, new RegExp(`${t1.key}: Orders`)); assert.match(r.summary, new RegExp(`${t2.key}: Invoices`)); assert.ok(r.start_sha && r.end_sha && r.start_sha !== r.end_sha)
+  assert.match(r.summary, new RegExp(`${t1.key}: Orders \\(tests passed: 1 passed, (\\d+|under 1) s\\)`))
+  assert.match(r.summary, new RegExp(`${t2.key}: Invoices`)); assert.ok(r.start_sha && r.end_sha && r.start_sha !== r.end_sha)
   assert.ok((await hq.state()).attention.some((a: any) => a.kind === `auto_finished:${p.repo.id}`))
   assert.equal(sh(p.dir, 'status', '--porcelain'), ''); assert.equal(sh(p.dir, 'worktree', 'list').split('\n').filter((l) => l.includes('hq-test')).length, 0)
 })
@@ -286,7 +294,7 @@ test('Bug 108: what the TPM writes for HQ\'s repair ticket goes under HQ\'s spec
   const p = await project('kept', { auto: false }); breakMain(p)
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
   const shelf = await ticket(p, 'Shelf'), r = await repair(p), under = /^Added to .+ as "From the TPM", under HQ's own spec, which stays as it is/
-  const spec = (t: any, a: { spec?: string; title?: string }) => hq.mcp(p.tpm.id, 'update_ticket_spec', { key: t.key, ...a })
+  const spec = (t: any, a: { spec?: string; title?: string; user_asked?: boolean }) => hq.mcp(p.tpm.id, 'update_ticket_spec', { key: t.key, ...a })
   const tpmPart = async () => { const s: string = (await tk(r)).spec; assert.ok(s.startsWith(`${r.spec}\n\n## From the TPM\n`), s.slice(-300)); return s.slice(r.spec.length) }
   const toTpm = await waitFor('the TPM to hear', async () => (await hq.state()).messages.find((m: any) => m.to_id === p.tpm.id && /opened .+ to repair/.test(m.body)))
   assert.match(toTpm.body, /Its spec is HQ's and stays as it is/)
@@ -312,7 +320,7 @@ test('Bug 108: what the TPM writes for HQ\'s repair ticket goes under HQ\'s spec
   assert.equal((await hq.hook(er.id, exitPlanMode('Plan'))).hookSpecificOutput.decision.behavior, 'allow')
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200)
   fs.writeFileSync(path.join(wt(p, r), 'test', 'main.test.js'), PASS); sh(wt(p, r), 'add', '.'); sh(wt(p, r), 'commit', '-qm', 'fix'); await openPr(er); await until(r, 'pr_ready')
-  const late = await spec(r, { spec: 'Keep the slow test too.' }); assert.equal(late.isError, false, late.text)
+  const late = await spec(r, { spec: 'Keep the slow test too.', user_asked: true }); assert.equal(late.isError, false, late.text)
   assert.match(late.text, under); assert.match(late.text, new RegExp(`added before\\. ${r.key} was already finished, so HQ told its engineer \\(${er.id}\\) to build the change\\.`))
   assert.equal((await tk(r)).status, 'resolving'); assert.ok((await tpmPart()).endsWith('\n\nKeep the slow test too.'))
 })

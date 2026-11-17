@@ -132,3 +132,13 @@ test('Cancel: a merged ticket refuses; a cancelled one stays cancelled', async (
   assert.equal(tickets('f1').find((t) => t.id === 't10')!.status, 'cancelled')
   assert.deepEqual(await cancelTicket('t10', { tell: false }), { key: 'APP-10', stopped: null })
 })
+
+test('Bug 126: what the TPM hears HQ ran on a ticket before it merged', async () => {
+  const { testedWords } = await import('./mergewatch.ts')
+  assert.equal(testedWords({ ran: 'none', by: 'user', at: 1 }, 'main'), 'The user merged it with Merge, which runs no tests: HQ did not test it as it merged.')
+  assert.equal(testedWords({ ran: 'none', by: 'outside', at: 1 }, 'main'), 'It was merged outside HQ, so HQ did not test it as it merged.')
+  const pass = { ran: 'pass' as const, test: 'uv run pytest -q', counts: { passed: 410, failed: 0, skipped: 6 }, ms: 81_200, on: 'main', at: 1 }
+  assert.equal(testedWords(pass, 'main'), "HQ's tests passed on main first (`uv run pytest -q`: 410 passed, 6 skipped, 1 min 21 s).")
+  assert.equal(testedWords({ ...pass, counts: null, ms: 900 }, 'trunk'), "HQ's tests passed on trunk first (`uv run pytest -q`, 1 s).")
+  assert.match(testedWords({ ...pass, test: `npm test -- ${'x'.repeat(300)}` }, 'main'), /^HQ's tests passed on main first \(`npm test -- x{105}\.\.\.`: 410/, 'a long command is cut')
+})

@@ -22,12 +22,13 @@ import { resumeRepo } from './freshstart.ts'
 import { answerReview } from './gate.ts'
 import { inMergeQueue, mergeNow } from './mergewatch.ts'
 import { features, getFeature, getRepo, getTicket, liveTpm, notClearing, repoOfAgent, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type Repo,
-  type Ticket } from './records.ts'
+  type MergeTest, type Ticket } from './records.ts'
 import { isRefusal, ranTestCmd, refusedTestCmd } from './refused.ts'
 import { readyTickets } from './readiness.ts'
 import { ensureFresh, ghOpts, git, syncRepo } from './repos.ts'
 import { canLaunch } from './scheduler.ts'
 import { autoGen, detectTests, failReport, sandboxProblem, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
+import { countWords, took } from './testcounts.ts'
 import { addFeature, cancelTicket, createTicket, fillSlots, fixConflicts, fixTests, resumeEngineer, testCmdNote } from './tickets.ts'
 import { restartTpm, tpmStarting } from './tpm.ts'
 import { dialogGone } from './presence.ts'
@@ -352,7 +353,7 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
     const cur = still(); if (!cur) return // turned off, stopped or moved on during the test: not merged
     const fresh = await ensureFresh(repo.id).catch(() => repo)
     if (await ref(fresh) !== tip) return // main moved during the test: the next tick tests again
-    try { await mergeNow(t.id, fresh) } catch (e) {
+    try { await mergeNow(t.id, fresh, { ran: 'pass', test: r.test, counts: r.counts, ms: r.ms, on: base.name, at: now(), output: r.output }) } catch (e) { // the run that let it merge (Bug 126)
       if (getTicket(t.id)?.conflict_files != null) return // the next tick fixes it
       stopProject(repo, (e as Error).message)
     }
@@ -370,6 +371,11 @@ async function keepTpm(repo: Repo, all: Ticket[]): Promise<void> {
 }
 
 const inRun = (r: AutoRun): Ticket[] => repoTickets(r.repo_id).filter((t) => t.status === 'merged' && t.updated_at >= r.started_at)
+/** Bug 126: what HQ ran on a merged ticket, after its line in the run's summary. Nothing for one with no record. */
+const testedNote = (t: Ticket): string => {
+  const m = j<MergeTest | null>(t.merge_test, null); if (!m) return ''
+  return m.ran === 'pass' ? ` (tests passed${m.counts ? `: ${countWords(m.counts)}` : ''}, ${took(m.ms)})` : ' (HQ did not test it as it merged)'
+}
 function summary(repo: Repo, r: AutoRun, all: Ticket[]): string {
   const done = all.filter((t) => t.status === 'merged' && t.updated_at >= r.started_at), parked = all.filter((t) => t.auto_parked_why), behind = stuckBehindParked(all)
   const fs0 = [...new Set(done.map((t) => t.feature_id))].map((id0) => getFeature(id0)!).filter(Boolean)
@@ -377,7 +383,7 @@ function summary(repo: Repo, r: AutoRun, all: Ticket[]): string {
   const decided = [...fs0.map((f) => [`feature:${f.id}`, 0] as const), [`repo:${repo.id}`, r.started_at] as const].flatMap(([scope, since]) =>
     q<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'Decided in auto mode' AND updated_at >= ?", scope, since).map((d) => d.text))
   const waiting = all.filter((t) => repo.auto_waiting === NO_TESTS && FINISHED_NOT_MERGED.includes(t.status)), changed = testChange(r)
-  return [`## Built\n${done.map((t) => `- ${t.key}: ${t.title}`).join('\n') || '- Nothing was merged.'}`,
+  return [`## Built\n${done.map((t) => `- ${t.key}: ${t.title}${testedNote(t)}`).join('\n') || '- Nothing was merged.'}`,
     decided.length ? `## Decided for you\n${decided.join('\n')}` : '',
     parked.length ? `## Parked, needs you\n${parked.map((t) => `- ${t.key}: ${t.auto_parked_why}`).join('\n')}` : '',
     behind.size ? `## Waiting on a parked ticket\n${all.filter((t) => behind.has(t.id)).map((t) => `- ${t.key}: ${t.title}`).join('\n')}` : '',
@@ -523,7 +529,8 @@ export async function setAuto(repoId: string, on: boolean): Promise<{ on: boolea
     stopAutoTests(repo.path) // its test run ends now, not at its time limit, with no result (Bug 89)
     resolveKind(`auto_stopped:${repoId}`, null) // the banner goes with auto_stopped_why; so does its ⚠ line
     if (r) await closeRun(getRepo(repoId)!, r, 'off')
-    tellTpm(repoId, 'HQ: the user turned auto mode off. They start, approve and merge from HQ again, and your normal rules apply. Running engineers finish their tickets.')
+    tellTpm(repoId, 'HQ: the user turned auto mode off. They start, approve and merge from HQ again, and your normal rules apply: the user decides '
+      + 'what each ticket covers, so ask_user before a ticket grows or shrinks or a known failure stays. Running engineers finish their tickets.')
   }
   emit({ agentId: null, source: 'ui', kind: 'auto.switched', payload: { repo: repoId, on } })
   keepAwake(); if (on) autoSoon()

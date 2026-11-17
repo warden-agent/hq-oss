@@ -3,15 +3,19 @@
 import { createContext, useContext, useRef, useState } from 'react'
 import { MarkerType, type Edge, type Node } from '@xyflow/react'
 import { api, errText, jsonList, keepNewest, showError, unmergedDeps, waitingFor, type Agent, type State } from './api'
-import { ALERT_KINDS, goodNews, keysText, yourTurn, type Ask, type Turn } from './needs.ts'
-import { runWords } from './testruns.ts'
+import { ALERT_KINDS, askedWho, firstLine, goodNews, keysText, ticketQuestion, turnQuestionText, yourTurn, type Ask, type Question, type Turn } from './needs.ts'
+import { featureTestsLine, mergeTestOf, mergeTestWords, runWords } from './testruns.ts'
 import { fitSets } from './fit.ts'
+import { MORE, replyPreview } from './reply.ts'
 
 export type Tone = 'plain' | 'muted' | 'amber' | 'rose' | 'sky' | 'emerald' | 'indigo'
 /** `rows`: set by the layout (a long line wraps to two). `since`: something going on right now (Bug 106: HQ's own test run): the line starts with a dot and ends
- *  with how long it has been going, counted by the page (ui.tsx Elapsed), so the board isn't worked out again every second. `dot`: moving, or still while it waits. */
-export type Line = { text: string; tone: Tone; rows?: 1 | 2; since?: number; dot?: 'running' | 'waiting' }
-export type Act = { kind: 'launch'; waits: string[] } | { kind: 'read-plan' } | { kind: 'approve' } | { kind: 'merge'; into: string; github?: boolean; pr?: number } | { kind: 'make-pr' }
+ *  with how long it has been going, counted by the page (ui.tsx Elapsed), so the board isn't worked out again every second. `dot`: moving, or still while it waits.
+ *  `more`: the text leads into more than the box shows (Bug 124); it ends with a link to the rest, which stays in view however the text is cut. */
+export type Line = { text: string; tone: Tone; rows?: 1 | 2; since?: number; dot?: 'running' | 'waiting'; more?: boolean
+  tip?: string } // tip: the hover text, when not the line itself
+export type Act = { kind: 'launch'; waits: string[] } | { kind: 'read-plan' } | { kind: 'read-question' }
+  | { kind: 'approve' } | { kind: 'merge'; into: string; github?: boolean; pr?: number } | { kind: 'make-pr' }
   | { kind: 'link'; label: string; href: string; primary: boolean } | { kind: 'resume'; parked: boolean }
   | { kind: 'fix'; why?: 'tests' | 'change' } // why: its tests' fix stalled (Bug 84), or the change to its spec did; none: its conflicts
   | { kind: 'try'; on: boolean } // on: the preview is running this ticket now
@@ -20,10 +24,12 @@ export type Act = { kind: 'launch'; waits: string[] } | { kind: 'read-plan' } | 
 export type FeatureView = { f: any; lines: Line[]; att: any[]; total: number; collapsed: boolean; done: boolean; border: string }
 /** The project's TPM box (Bug 52), always top-centre: where the user talks to the TPM, with its questions and what's ready to start. */
 export type TpmView = { repo: any; tpm: Agent | null; live: boolean; lines: Line[]; att: any[]; turn: Turn; border: string; empty: boolean; tpmIds: string[] }
-export type TicketView = { t: any; eng: Agent | null; review: any | null; titleRows: 1 | 2; actRows: number; lines: Line[]; acts: Act[]; att: any[]; compact: boolean; border: string }
+/** `question`: the open question its engineer asked, and `askedWho` whom (Bug 129). */
+export type TicketView = { t: any; eng: Agent | null; review: any | null; question: Question | null; askedWho: string
+  titleRows: 1 | 2; actRows: number; lines: Line[]; acts: Act[]; att: any[]; compact: boolean; border: string }
 /** `fits`: which boxes the view tries to show, widest first (Bug 119); Graph.tsx shows the first one that is readable in the pane (fit.ts). */
 export type Board = { nodes: Node[]; edges: Edge[]; fits: string[][]; has: (node: string) => boolean; attNode: (a: any) => string | null; agentNode: (agentId: string) => string | null }
-export type PopKind = 'review' | 'attention' | 'talk'
+export type PopKind = 'review' | 'attention' | 'talk' | 'question'
 export type Pop = { node: string; kind: PopKind } | null
 /** What the boxes need from App: the state, the picked repo (its TPM box), the open popover (one at a time) and the actions. */
 export type Ctx = { state: State; repo: any | null; pop: Pop; setPop: (p: Pop) => void; focus: (node: string, kind?: PopKind) => void; selected: string | null }
@@ -51,7 +57,8 @@ export async function answerReview(r: any, verdict: 'approve' | 'revise', msg = 
 // Widths start at W and grow to fit their header and buttons, up to MAX; past that a long line wraps to two rows and buttons wrap.
 /** A box waits on the user, so the view goes to its feature (Bug 119), by the ⚠ count's rules (needs.ts needsYou): a plan to review, finished
  *  work to merge or fix, an alerting notice. Good news doesn't count, and a ticket ready to start is on the TPM's Your turn. */
-const waitsOnYou = (v: { review?: any; att: any[]; acts?: Act[] }) => !!v.review || v.att.some((a) => ALERT_KINDS.has(a.kind))
+const waitsOnYou = (v: { review?: any; question?: Question | null; att: any[]; acts?: Act[] }) => !!v.review || v.question?.to_target === 'user'
+  || v.att.some((a) => ALERT_KINDS.has(a.kind))
   || !!v.acts?.some((a) => a.kind === 'merge' || a.kind === 'make-pr' || a.kind === 'fix')
 export const W = { tpm: 340, feature: 240, ticket: 220 }
 const MAX = { tpm: 440, feature: 380, ticket: 320 }
@@ -134,7 +141,8 @@ export function mergeConfirm(t: any, a: { into: string; github?: boolean; pr?: n
   const how = a.github ? `HQ ${a.pr ? `merges PR #${a.pr}` : 'opens a pull request for it and merges it'} on GitHub right away, as ${account}.`
     : `HQ merges ${t.branch} into ${a.into} in your checkout.`
   return ask({ title: `Merge ${t.key} into ${a.into}?`, go: 'Merge', danger: true, leaving: null, apps: [], parks: [], stays: [],
-    body: `${t.key} · ${t.title}. ${how} ${a.into} gets its changes for good; HQ can't undo a merge. Tried it? Try it on the box runs this version first.` })
+    body: `${t.key} · ${t.title}. ${how} HQ runs no tests first: only auto mode tests before it merges. ${a.into} gets its changes for good; HQ can't undo a merge.`
+      + ' Tried it? Try it on the box runs this version first.' })
 }
 /** HQ's are-you-sure before removing a ticket or cancelling a feature (Bug 50), in place of the browser's own box. */
 export function cancelConfirm(title: string, body: string, go: string): Promise<boolean> {
@@ -248,7 +256,6 @@ export const kindLabel = (k: string): string => k.startsWith('auto_stopped:') ? 
   engineer_idle: 'Engineer idle', claude_unchecked: 'Claude Code not checked', claude_newer: 'Newer Claude Code installed' } as Record<string, string>)[k]
   ?? (k.startsWith('repo_') ? 'Repo' : k.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()))
 const steps = (a: Agent) => a.steps_total ? ` · step ${a.steps_done}/${a.steps_total}` : ''
-const firstLine = (text: string): string => String(text).split('\n').map((l) => l.replace(/^[#>*\-\s]+/, '').replace(/\*\*|`/g, '').trim()).find(Boolean) ?? ''
 // "Your turn" on the TPM box (Bug 43, Bug 52): the TPM's questions with a button per choice, and the tickets ready to start.
 export const askText = (a: Ask): string => `The TPM asked: ${a.question}`
 /** The buttons under a question: its choices and Answer… (a reply of the user's own, in the TPM box). A choice answers it even
@@ -257,7 +264,7 @@ export const askLabels = (a: Ask): string[] => a.action ? a.choices : [...a.choi
 /** With a question still open, it says to answer first: the answer may change those tickets (seen with a real TPM). */
 export const startText = (keys: string[], asking = false): string => `${keysText(keys)} ${keys.length > 1 ? 'are' : 'is'} ready to start.${asking ? ' Answer the TPM first: it may change them.' : ''}`
 export const startLabel = (keys: string[]): string => keys.length <= 3 ? `Start ${keys.join(', ')}` : `Start ${keys.length} ready`
-export const turnOn = (turn: Turn): boolean => turn.asks.length > 0 || turn.start.length > 0
+export const turnOn = (turn: Turn): boolean => turn.asks.length > 0 || turn.start.length > 0 || !!turn.questions?.length
 /** A ticket's status in words where the stored one would mislead (a local branch has no PR; a finished one may conflict; one sent
  *  back is fixing its conflicts or, on auto, its tests, or building a change to its spec). */
 export const ticketLabel = (t: any): string => (t.status === 'pr_ready' || t.status === 'pr_open') && t.conflict_files != null ? 'conflicts'
@@ -305,6 +312,7 @@ function turnH(turn: Turn, inner: number): number {
   const si = inner - 14, btns = (n: number) => n * 22 + (n - 1) * GAP
   let h = 6 + 2 + 12 + ROW
   for (const a of turn.asks) { const l = askLabels(a); h += GAP + wrapRows(askText(a), si) * ROW + GAP + btns(actRows(l, si)) }
+  for (const x of turn.questions ?? []) h += GAP + Math.min(3, wrapRows(turnQuestionText(x), si)) * ROW + GAP + 22 // its text (3 rows at most) and Read question
   if (turn.start.length) h += GAP + wrapRows(startText(turn.start, turn.asks.length > 0), si) * ROW + GAP + 22
   if (!turn.auto) h += GAP + 22 // Do the rest automatically
   return h
@@ -313,7 +321,8 @@ function turnH(turn: Turn, inner: number): number {
 const rowsIn = (text: string, inner: number, bold = false): 1 | 2 => textW(text, bold) <= inner ? 1 : 2
 /** The label a box's button shows (measured for layout, shown by Nodes.tsx). */
 export function actLabel(a: Act): string {
-  return a.kind === 'launch' ? 'Launch engineer' : a.kind === 'read-plan' ? 'Read plan' : a.kind === 'approve' ? 'Approve' : a.kind === 'merge' ? `Merge into ${a.into}`
+  return a.kind === 'launch' ? 'Launch engineer' : a.kind === 'read-plan' ? 'Read plan'
+    : a.kind === 'read-question' ? 'Read question' : a.kind === 'approve' ? 'Approve' : a.kind === 'merge' ? `Merge into ${a.into}`
     : a.kind === 'make-pr' ? 'Make PR' : a.kind === 'do-rest' ? DO_REST : a.kind === 'auto-retry' ? 'Try again'
     : a.kind === 'link' ? a.label : a.kind === 'fix' ? (a.why === 'change' ? 'Build the change' : a.why === 'tests' ? 'Fix tests' : 'Fix conflicts')
     : a.kind === 'try' ? (a.on ? 'Back to main' : 'Try it') : 'Resume'
@@ -326,9 +335,10 @@ function actRows(labels: string[], inner: number): number {
   return rows
 }
 const clamp = (n: number, lo: number, hi: number) => Math.round(Math.max(lo, Math.min(hi, n)))
-/** Sets each line's rows in `inner` px; returns their total. A going line is measured with its dot and its clock (room for 59:59). */
+/** Sets each line's rows in `inner` px; returns their total. A going line is measured with its dot and its clock (room for 59:59), a line
+ *  with more to it in what is left beside its link (Nodes.tsx Lines). */
 const fitLines = (lines: Line[], inner: number) => lines.reduce((sum, l) =>
-  sum + (l.rows = l.since === undefined ? rowsIn(l.text, inner) : rowsIn(`${l.text} · 00:00`, inner - DOT)), 0)
+  sum + (l.rows = l.since !== undefined ? rowsIn(`${l.text} · 00:00`, inner - DOT) : l.more ? rowsIn(l.text, inner - GAP - textW(MORE)) : rowsIn(l.text, inner)), 0)
 
 /** Longest dependency path per ticket key, and the keys caught in a dependency loop (their back edge is ignored for depth). */
 function depths(deps: Map<string, string[]>): { depth: Map<string, number>; loop: Set<string> } {
@@ -394,6 +404,8 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
     const merged = g.all.filter((t) => t.status === 'merged').length
     const lines: Line[] = done ? [{ text: `✓ done · all ${g.all.length} merged`, tone: 'emerald' }]
       : [{ text: g.all.length ? `${merged}/${g.all.length} merged` : f.status === 'cancelled' ? 'cancelled' : 'no tickets yet', tone: 'muted' }]
+    const tested = done ? featureTestsLine(g.all) : null // its tickets are folded away: what HQ ran on them (Bug 126)
+    if (tested) lines.push({ text: tested.text, tone: tested.passed ? 'emerald' : 'amber', tip: tested.tip })
     const n = done ? null : note(att, null); if (n) lines.push(n)
     return { f, lines, att, total: g.all.length, collapsed: g.collapsed, done, border: '#3f3f46' }
   }
@@ -406,7 +418,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
       : parked ? { text: 'parked · handoff note saved · your message brings it back', tone: 'sky' }
       : { text: tpm ? 'not running · your message starts it again' : 'starts when you send it a message', tone: 'muted' }]
     const c = ctxLine(tpm); if (c) lines.push(c)
-    if (reply) lines.push({ text: `💬 ${firstLine(reply.body)}`, tone: 'plain' })
+    if (reply) { const p = replyPreview(reply.body); lines.push({ text: `💬 ${p.text}`, tone: 'plain', more: p.more }) }
     const n = note(att, tpm); if (n) lines.push(n)
     const turn = yourTurn(s, repo?.id ?? null), mine = turnOn(turn)
     return { repo, tpm, live: up, lines, att, turn, tpmIds, empty: !s.features.length && !reply,
@@ -415,6 +427,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
   const ticketView = (t: any, all: any[], base: string, loop: boolean): TicketView => {
     const eng = liveEngineer(t, s), att = attOf.get(`t:${t.id}`) ?? []
     const review = s.reviews.find((r) => r.ticket_id === t.id && r.status === 'open') ?? null // a newer plan closes the older round
+    const question = ticketQuestion(s, t), who = question ? askedWho(question, s.agents) : '' // Bug 129: whom it waits on, and what it asked
     const waits = t.status === 'queued' ? unmerged(t, all) : [], dead = waits.filter((k) => !all.some((x) => x.key === k))
     const gone = dead.filter((k) => s.tickets.some((x) => x.feature_id === t.feature_id && x.key === k)), unknown = dead.filter((k) => !gone.includes(k))
     const auto = !!repo?.auto_mode && !repo.auto_stopped_why && !t.auto_parked_why // HQ does the next step itself
@@ -437,6 +450,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
       : t.status === 'pr_ready' && t.pr_state === 'waiting' ? { text: 'done · try it, then merge it or make a PR', tone: 'indigo' }
       : t.status === 'pr_ready' ? { text: "done · HQ couldn't open a PR; Merge still works", tone: 'indigo' }
       : t.status === 'pr_open' ? { text: `done · PR #${t.pr_number} is open: merge it here or on GitHub`, tone: 'indigo' }
+      : question ? { text: `asked ${who}: ${firstLine(question.body)}`, tone: 'amber' }
       : !eng && t.parked_at && RESUMABLE.includes(t.status) ? { text: 'parked · handoff note saved', tone: 'sky' }
       : eng ? { text: `engineer · ${eng.in_plan_mode && eng.status === 'working' ? 'planning' : agentWord(eng)}${steps(eng)}`, tone: 'muted' }
       : t.status === 'queued' ? (loop ? { text: "dependency loop, can't start", tone: 'rose' }
@@ -446,22 +460,28 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
         : t.go_ahead ? { text: 'starts when an engineer slot frees up', tone: 'sky' } : auto ? { text: 'HQ starts it when the TPM finishes', tone: 'sky' } : { text: 'ready to start',
           tone: 'emerald' })
       : t.status === 'merged' ? null : { text: 'no engineer running', tone: 'muted' }
-    const lines = [detail, inPlace ? null : testing, ctxLine(eng), t.auto_parked_why ? null : note(att, eng, !!review)].filter((l): l is Line => !!l) // parked: the first line says it
+    const told = question?.to_target === 'user' ? att.filter((a) => a.kind !== 'message_for_user') : att // a question for the user: its first line says it already
+    const lines = [detail, inPlace ? null : testing, ctxLine(eng), t.auto_parked_why ? null : note(told, eng, !!review)].filter((l): l is Line => !!l) // parked: the first line says it
     const acts: Act[] = []
     if (t.auto_parked_why) acts.push({ kind: 'auto-retry' })
     if (t.status === 'queued' && !t.assignee_agent_id && !waits.length && !loop && !t.go_ahead && !auto) acts.push({ kind: 'launch', waits }) // go-ahead: starts on its own
     if (review) acts.push({ kind: 'read-plan' }, { kind: 'approve' })
+    if (question) acts.push({ kind: 'read-question' })
     if (!eng && RESUMABLE.includes(t.status) && t.branch) acts.push({ kind: 'resume', parked: !!t.parked_at })
     const pv = s.previews.find((p) => p.id === s.features.find((f) => f.id === t.feature_id)?.repo_id)
     if (tryable(t)) acts.push({ kind: 'try', on: isOn(pv) && pv.ticket_id === t.id }) // look before merging (Bug 22)
     if (!auto) acts.push(...mergeActs(t, base, eng))
     if (!repo?.auto_mode && (review || acts.some((a) => a.kind === 'merge'))) acts.push({ kind: 'do-rest' }) // every stop offers it
     const border = inPlace && going ? agentColor.working! : eng ? agentColor[eng.status] ?? '#3f3f46' : ticketColor[t.status] ?? '#3f3f46' // HQ at work on it: green, as a working engineer's
-    return { t, eng, review, titleRows: 1, actRows: 0, lines, acts, att, compact: t.status === 'merged', border }
+    return { t, eng, review, question, askedWho: who, titleRows: 1, actRows: 0, lines, acts, att, compact: t.status === 'merged', border }
   }
   // 3. Sizes: a box is as wide as its header and its buttons need (within W..MAX; a feature's tickets share one width so its columns
   //    line up); then each line takes one or two rows, the buttons wrap, and the height adds it all up.
   const ticketWant = (v: TicketView) => {
+    if (v.compact) { // one row: ✓ key · merged · what HQ ran on it (Bug 126), its PR, its ⚠
+      const tested = mergeTestWords(mergeTestOf(v.t)), pr = v.t.pr_url && v.t.pr_number ? textW(`PR #${v.t.pr_number} ↗`) + GAP : 0
+      return CHROME + textW(`✓ ${v.t.key}`) + textW('· merged') + (tested ? textW(`· ${tested.box}`) + GAP : 0) + pr + (v.att.length ? 30 : 0) + 3 * GAP + 12
+    }
     const t = v.t, icons = (v.att.length ? 30 : 0) + (v.eng ? 16 : 0) + (t.status !== 'merged' && t.status !== 'cancelled' ? 16 : 0)
     return CHROME + Math.max(textW(t.key, true) + textW(t.size) + textW(ticketLabel(t)) + 16 + icons + 20, rowW(v.acts.map(actLabel)))
   }
@@ -473,7 +493,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
   const fviews = groups.map(featureView), tv0 = tpmView()
   const fw = fviews.map((v) => v.done ? W.ticket : clamp(CHROME + textW(v.f.title, true) + 64, W.feature, MAX.feature))
   const fh = fviews.map((v, i) => CHROME + ROW + fitLines(v.lines, fw[i]! - CHROME) * ROW)
-  const tw0 = clamp(tv0.turn.asks.length ? 400 : W.tpm, W.tpm, MAX.tpm), ti = tw0 - CHROME
+  const tw0 = clamp(tv0.turn.asks.length || tv0.turn.questions?.length ? 400 : W.tpm, W.tpm, MAX.tpm), ti = tw0 - CHROME
   const th0 = CHROME + ROW + fitLines(tv0.lines, ti) * ROW + turnH(tv0.turn, ti) + INPUT_H
   // 4. Positions: tiers top to bottom; within a feature, one column per dependency depth, same-depth tickets stacked.
   const FEATURE_Y = th0 + TIER_GAP, TICKET_Y = FEATURE_Y + Math.max(0, ...fh) + TIER_GAP

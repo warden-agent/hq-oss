@@ -1,15 +1,16 @@
 // Append-only event log + in-process bus. Every inbound record (hook, mod, status line, system)
 // goes through here, then reducers update state and the WS layer broadcasts patches.
 import { EventEmitter } from 'node:events'
-import { run, now } from './db.ts'
+import { insert, now } from './db.ts'
 
-export type HqEvent = { agentId: string | null; sessionId?: string | null; source: 'hook' | 'mod' | 'statusline' | 'system' | 'mcp' | 'ui'; kind: string; payload: Record<string, unknown>; at: number }
+export type HqEvent = { id?: number; agentId: string | null; sessionId?: string | null; source: 'hook' | 'mod' | 'statusline' | 'system' | 'mcp' | 'ui'; kind: string; payload: Record<string, unknown>; at: number }
 export const bus = new EventEmitter()
 bus.setMaxListeners(100)
 
 export function emit(ev: Omit<HqEvent, 'at'> & { at?: number }): HqEvent {
   const full: HqEvent = { ...ev, at: ev.at ?? now() }
-  run('INSERT INTO events(agent_id, session_id, source, kind, payload, created_at) VALUES (?,?,?,?,?,?)', full.agentId, full.sessionId ?? null, full.source, full.kind, JSON.stringify(full.payload), full.at)
+  full.id = insert('INSERT INTO events(agent_id, session_id, source, kind, payload, created_at) VALUES (?,?,?,?,?,?)',
+    full.agentId, full.sessionId ?? null, full.source, full.kind, JSON.stringify(full.payload), full.at) // Bug 121: the Events tab joins its history and live lines by row id
   bus.emit('event', full)
   bus.emit(`event:${full.kind}`, full)
   return full

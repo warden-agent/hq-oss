@@ -17,6 +17,7 @@ import { cacheEnv } from './roles.ts'
 import { git } from './reposync.ts'
 import { id, real } from './util.ts'
 import { seedPackages } from './worktrees.ts'
+import { summaryLines, testCounts, type Counts } from './testcounts.ts'
 
 export type TestPlan = { install: string | null; test: string }
 const has = (root: string, ...p: string[]) => fs.existsSync(path.join(root, ...p))
@@ -108,8 +109,9 @@ export async function sandboxProblem(): Promise<string | null> {
   const why = r.output.split('\n')[0]?.slice(0, 200) || 'it stopped with no message'
   return mac ? `HQ couldn't start macOS's sandbox: ${why}` : `bubblewrap is installed but can't run here: ${why} Some systems and containers block it; HQ's README says what to change.`
 }
-/** `output`: the last TAIL characters. `earlier`: the lines before those that named a failure or an error, '' when none did (Bug 82). */
-export type RunResult = { code: number | null; output: string; earlier: string; timedOut: boolean; sandboxFailed: boolean }
+/** `output`: the last TAIL characters. `earlier`: the lines before those that named a failure or an error, '' when none did (Bug 82). `summary`: the test runners'
+ *  summary lines from anywhere in the output, null when there were too many to keep (testcounts.ts, Bug 126). */
+export type RunResult = { code: number | null; output: string; earlier: string; timedOut: boolean; sandboxFailed: boolean; summary?: string[] | null }
 const TAIL = 8000, EARLIER = 4000
 /** How long a run past its time limit gets after Ctrl+C before it's killed: node's test runner names the tests still running when it
  *  gets one, and prints nothing when it's killed outright (Bug 82: one engineer got 3,000 characters of passing tests). Seen on
@@ -174,7 +176,7 @@ export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; ti
     const { bin, args } = sandboxCommand(cwd, cmd, o)
     const p = spawn(bin, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); if (p.pid) running.set(p.pid, cwd)
     let output = '', total = 0, timedOut = false, hard: NodeJS.Timeout | undefined
-    const fails = failureLines(), take = (s: string) => { total += s.length; output = (output + s).slice(-TAIL); fails.take(s) }
+    const fails = failureLines(), sums = summaryLines(), take = (s: string) => { total += s.length; output = (output + s).slice(-TAIL); fails.take(s); sums.take(s) }
     p.stdout.setEncoding('utf8').on('data', take); p.stderr.setEncoding('utf8').on('data', take)
     const signal = (s: NodeJS.Signals) => { try { process.kill(-p.pid!, s) } catch { /* gone */ } }, kill = () => signal('SIGKILL')
     const timer = setTimeout(() => { timedOut = true; signal('SIGINT'); hard = setTimeout(kill, GRACE_MS) }, o.timeoutMs)
@@ -185,7 +187,7 @@ export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; ti
     p.on('error', (e) => done({ code: null, output: `${bin} wouldn't start, and HQ won't run the tests without it: ${(e as Error).message}`, earlier: '', timedOut,
       sandboxFailed: true }))
     p.on('close', (code) => { kill(); running.delete(p.pid!)
-      done({ code, output: output.trim(), earlier: fails.before(total - output.length), timedOut, sandboxFailed: /^(sandbox-exec|bwrap): /m.test(output) }) })
+      done({ code, output: output.trim(), earlier: fails.before(total - output.length), timedOut, sandboxFailed: /^(sandbox-exec|bwrap): /m.test(output), summary: sums.lines() }) })
   })
 }
 
@@ -203,7 +205,8 @@ export async function sweepTestWorktrees(repoPath: string): Promise<void> {
 
 /** `hung`: it never finished, and HQ stopped it at the time limit. `output` and `earlier` are a run's (RunResult). `stopped`: auto mode went off
  *  or stopped the project during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bugs 89, 115). */
-export type TestResult = { kind: 'pass'; test: string } | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean } | { kind: 'no_tests' }
+export type TestResult = { kind: 'pass'; test: string; output: string; counts: Counts | null; ms: number }
+  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean } | { kind: 'no_tests' }
   | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' }
 /** Auto mode's own runs under way, by project folder (Bug 89). A repair's try of a test command isn't one: with auto off its result goes to the user. */
 const autoRuns = new Map<string, Set<AbortController>>(), stops = new Map<string, number>()
@@ -274,10 +277,10 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
         if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
         if (i.code !== 0) return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier }
       }
-      const r = await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal })
+      const began = Date.now(), r = await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal })
       if (signal.aborted) return stopped
       if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
-      if (r.code === 0) return { kind: 'pass', test: plan.test }
+      if (r.code === 0) return { kind: 'pass', test: plan.test, output: r.output.replace(ANSI, ''), counts: testCounts(r.summary ?? null), ms: Date.now() - began } // Bug 126
       return { kind: 'fail', test: plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so
     }, () => page.state('waiting'))
   } catch (e) { return { kind: 'error', why: (e as Error).message.split('\n')[0] ?? 'unknown error' } }

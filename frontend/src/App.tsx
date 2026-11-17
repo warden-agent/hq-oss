@@ -1,18 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { api, connectWs, errText, jsonList, showError, waitingFor, FINISHED, type Agent, type State, type WsMsg } from './api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { api, connectWs, endedLine, errText, jsonList, showError, waitingFor, FINISHED, type Agent, type State, type WsMsg } from './api'
 import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
 import { AttentionList, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
 import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, hasParked, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel,
-  removeConfirm, openAuto, openSummary, boardKeeper, useBoard, type Board, type Pop, type PopKind } from './board'
+  removeConfirm, openAuto, openSummary, boardKeeper, turnOn, useBoard, type Board, type Pop, type PopKind } from './board'
 import { ActBtn, Elapsed, ErrorBar, LiveDot, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
-import { runWords } from './testruns.ts'
+import { mergeTestOf, mergeTestWords, runWords } from './testruns.ts'
+import { pauseAt, usageParts } from './usage.ts'
 import { LaunchBtn, PreviewPane } from './Preview'
 import { clampH, clampW, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
 import { useAlerts } from './alerts'
 import { AlertsLine } from './AlertsLine'
-import { claudeLine, goodNews, keysText, splitNeeds, yourTurn, type Need } from './needs.ts'
+import { askedWho, claudeLine, goodNews, keysText, splitNeeds, ticketQuestion, turnQuestionText, uncountedQuestions, yourTurn, type Need } from './needs.ts'
 import { AutoBanner, AutoDialog, AutoSwitch, DoRestBtn, LastRunBtn } from './Auto'
+import { Events } from './Events'
+import { eventLog } from './eventlog.ts'
 
 type Tab = 'agent' | 'ticket' | 'messages' | 'events'
 type Sel = { node: string | null; agentId: string | null; ticketId: string | null }
@@ -194,29 +197,18 @@ export default function App() {
             <div className="min-h-0 grow">{panel.tab === 'agent' ? (selAgent ? <AgentPane a={selAgent} ws={ws} feed={feed} /> : <div className="p-4 text-sm text-zinc-500">Click a box on the graph to see its agent here.</div>)
               : panel.tab === 'ticket' ? <TicketInfo t={selTicket} state={state} />
               : panel.tab === 'messages' ? <Messages state={state} featureId={sel.node?.startsWith('f:') ? sel.node.slice(2) : selTicket?.feature_id ?? null} />
-              : <Events log={events} />}</div>
+              : <Events log={events} agent={selAgent} ticketKey={selTicket?.key ?? null} ws={ws} />}</div>
           </aside></>}
       </div>
     </div>
   </BoardCtx.Provider>
-}
-/** The newest 300 events, for the Events tab. */
-function eventLog() {
-  let list: any[] = []; const subs = new Set<() => void>()
-  return { add(evs: any[]) { list = [...[...evs].reverse(), ...list].slice(0, 300); for (const f of subs) f() }, get: () => list,
-    subscribe: (f: () => void) => { subs.add(f); return () => { subs.delete(f) } } }
-}
-function Events({ log }: { log: ReturnType<typeof eventLog> }) {
-  const events = useSyncExternalStore(log.subscribe, log.get)
-  return <div className="h-full overflow-y-auto text-[11px] text-zinc-500">{events.map((e, i) => <div key={i} className="truncate"><span className="text-zinc-600">
-    {new Date(e.at).toLocaleTimeString()}</span> <span className="text-zinc-400">{e.agentId ?? '·'}</span> {e.kind}</div>)}</div>
 }
 const same = (a: unknown, b: unknown): boolean => a === b || (typeof a === 'object' && typeof b === 'object' && a !== null && b !== null && JSON.stringify(a) === JSON.stringify(b))
 /** One patch on the state. Bug 98: one that changes nothing gives back the same state, so nothing is worked out or drawn again. */
 function applyPatch(s: State, m: { entity: string; id: string; patch: Record<string, any> | null }): State {
   if (m.entity === 'setting') return same(s.settings[m.id], m.patch?.value) ? s : { ...s, settings: { ...s.settings, [m.id]: m.patch?.value } }
   const key = ({ agent: 'agents', ticket: 'tickets', feature: 'features', message: 'messages', review: 'reviews', attention: 'attention', repo: 'repos', preview: 'previews',
-    ask: 'asks', auto_run: 'autoRuns', test_run: 'testRuns' } as Record<string, keyof State>)[m.entity]
+    ask: 'asks', question: 'questions', auto_run: 'autoRuns', test_run: 'testRuns' } as Record<string, keyof State>)[m.entity]
   if (!key) return s
   const list = (s[key] as any[]) ?? []; const i = list.findIndex((x) => x.id === m.id)
   if (m.entity === 'repo' && i < 0 && !m.patch?.name) return s // a late change to a project just removed from HQ
@@ -225,7 +217,7 @@ function applyPatch(s: State, m: { entity: string; id: string; patch: Record<str
   else if (i >= 0) { if (Object.entries(m.patch).every(([k, v]) => k in list[i] && same(list[i][k], v))) return s; next = list.map((x) => x.id === m.id ? { ...x, ...m.patch } : x) }
   else next = [{ id: m.id, ...m.patch }, ...list]
   if (key === 'attention') next = next.filter((x) => !x.resolved_at)
-  if (key === 'asks') next = next.filter((x) => !x.answered_at)
+  if (key === 'asks' || key === 'questions') next = next.filter((x) => !x.answered_at)
   if (key === 'messages' && next.length > 500) next = next.slice(0, 500) // newest first; the snapshot starts with 300
   return { ...s, [key]: next }
 }
@@ -342,7 +334,8 @@ function AgentsMenu({ state, selected, onPick }: { state: State; selected: strin
     {state.agents.map((a) => { const w = waitingFor(a, state); return <button key={a.id} onClick={() => { onPick(a); close() }} className={`card w-full p-2! text-left text-xs ${selected === a.id ? 'border-indigo-500/60!' : ''}`}>
       <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate font-medium" title={a.display_name ?? a.id}>{a.display_name ?? a.id}</span><Pill s={a.status} /></div>
       <div className="mt-1 text-zinc-500">{a.role} · {a.model_live ?? a.model_alias}{a.in_plan_mode ? ' · plan' : ''}{a.steps_total ? ` · step ${a.steps_done}/${a.steps_total}` : ''}</div>
-      {a.activity && <div className="mt-1 truncate text-zinc-400">{a.activity}</div>}
+      {a.status === 'exited' ? (() => { const e = endedLine(a, state); return e && <div className="mt-1 break-words text-zinc-500">{e}</div> })()
+        : a.activity && <div className="mt-1 truncate text-zinc-400">{a.activity}</div>}
       {w && <div className={`mt-1 ${w.held ? 'text-amber-300' : 'text-zinc-400'}`}>✉ {w.count} waiting · {w.why}</div>}
     </button> })}</div>}</Menu>
 }
@@ -371,7 +364,7 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
   const merges = state.tickets.flatMap((t) => { const f = base(t), acts = f.cancelled || (onAuto && !t.auto_parked_why) ? [] : mergeActs(t, f.branch, liveEngineer(t, state));
     return acts.length ? [{ t, acts }] : [] })
   const repo = b.repo, turn = repo ? yourTurn(state, repo.id) : { asks: [], start: [] } // Bug 43, on the project's TPM since Bug 52
-  const n = turn.asks.length + (turn.start.length ? 1 : 0) + reviews.length + merges.length + state.attention.length
+  const n = turn.asks.length + (turn.start.length ? 1 : 0) + uncountedQuestions(state, turn).length + reviews.length + merges.length + state.attention.length
   const good = n > 0 && state.attention.filter((a) => goodNews(a.kind)).length === n // only good news: green, not red
   const showT = (close: () => void) => <button className="btn-sm shrink-0" onClick={() => { b.focus('tpm'); close() }}>Show</button>
   /** Where a notice's Show goes: this project's finished run has its summary, a test command engineers can't run the box it's written in (Bug 107), anything else its box. */
@@ -385,12 +378,14 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
     <AlertsLine />
     {!n && <div className="p-1 text-zinc-500">Nothing needs you right now.</div>}
     {repo && !repo.auto_mode && (turn.asks.length > 0 || turn.start.length > 0 || reviews.length > 0 || merges.length > 0) && <div className="flex justify-end"><DoRestBtn repoId={repo.id} /></div>}
-    {(turn.asks.length > 0 || turn.start.length > 0) && <div className="font-semibold text-zinc-400">Your turn</div>}
-    {(turn.asks.length > 0 || turn.start.length > 0) && <div className="flex flex-col gap-1.5 rounded-md border border-amber-500/40 p-2">
+    {turnOn(turn) && <div className="font-semibold text-zinc-400">Your turn</div>}
+    {turnOn(turn) && <div className="flex flex-col gap-1.5 rounded-md border border-amber-500/40 p-2">
       {turn.asks.map((a) => <div key={a.id} className="flex flex-col gap-1">
         <div className="flex items-start gap-2"><span className="min-w-0 grow break-words text-amber-200">The TPM asked: {a.question}</span>{showT(close)}</div>
         {a.choices.length > 0 && <div className="flex flex-wrap gap-1">
           {a.choices.map((c) => <ActBtn key={c} primary label={c} busyLabel="Sending…" run={() => api(`asks/${a.id}/answer`, { answer: c })} />)}</div>}</div>)}
+      {(turn.questions ?? []).map((x) => <div key={x.id} className="flex items-start gap-2"><span className="min-w-0 grow break-words text-amber-200">{turnQuestionText(x)}</span>
+        {board.has(`t:${x.ticketId}`) && <button className="btn-sm shrink-0" onClick={() => { b.focus(`t:${x.ticketId}`, 'question'); close() }}>Show</button>}</div>)}
       {turn.start.length > 0 && <div className="flex items-center gap-2">
         <span className="min-w-0 grow break-words text-amber-200">{keysText(turn.start)} {turn.start.length > 1 ? 'are' : 'is'} ready to start</span>
         <ActBtn primary label="Start" busyLabel="Starting…" run={() => api(`repos/${repo.id}/start-ready`, {})} />{showT(close)}</div>}
@@ -411,29 +406,49 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
 }
 function TicketInfo({ t, state }: { t: any | null; state: State }) {
   if (!t) return <div className="p-4 text-sm text-zinc-500">Click a ticket box to see its details here.</div>
-  const f = state.features.find((x) => x.id === t.feature_id), deps = jsonList(t.deps), files = jsonList(t.expected_files)
+  const f = state.features.find((x) => x.id === t.feature_id), deps = jsonList(t.deps), files = jsonList(t.expected_files), ask = ticketQuestion(state, t)
   return <div className="h-full overflow-y-auto pr-1 text-xs">
     <div className="flex items-center gap-2"><span className="font-semibold">{t.key}</span><span className="text-zinc-500">{t.size}</span><Pill s={t.status} label={ticketLabel(t)} /></div>
     <div className="mt-1 text-sm text-zinc-200">{t.title}</div>
     <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1 text-zinc-400">
+      {ask && <><dt>Question</dt><dd className="break-words text-amber-200">asked {askedWho(ask, state.agents)}: {ask.body}</dd></>}
       <dt>Feature</dt><dd className="text-zinc-300">{f?.title ?? '—'}</dd>
       <dt>Depends on</dt><dd className="text-zinc-300">{deps.join(', ') || '—'}</dd>
       <dt>Expected files</dt><dd className="break-all font-mono text-zinc-300">{files.join(', ') || '—'}</dd>
       <dt>Branch</dt><dd className="select-all break-all font-mono text-zinc-300">{t.branch ?? '—'}</dd>
       {t.pr_url && <><dt>PR</dt><dd><a className="text-indigo-300 underline" href={t.pr_url} target="_blank" rel="noreferrer">{t.pr_number ? `#${t.pr_number}` : 'open'} ↗</a></dd></>}
     </dl>
+    {t.status === 'merged' && <MergeTests key={`${t.id}:${t.merge_test}`} t={t} />}
     <div className="mt-3 font-semibold text-zinc-400">Spec</div>
     <pre className="mt-1 whitespace-pre-wrap text-[11px] text-zinc-300">{t.spec || '—'}</pre>
     <HandoffNote scope={`resume:ticket:${t.id}`} stamp={`${t.parked_at}:${t.assignee_agent_id}`} />
   </div>
 }
+/** Bug 126: what HQ ran on a merged ticket before it merged, and how it ended, with the run's output a click away (fetched only then: it can be 8,000 characters).
+ *  Keyed by the ticket and its record, so another ticket or a new record starts closed. */
+function MergeTests({ t }: { t: any }) {
+  const m = mergeTestOf(t), words = mergeTestWords(m), [out, setOut] = useState<string | null>(null), [open, setOpen] = useState(false)
+  const show = () => { setOpen(!open); if (out === null) api<any[]>(`docs?scope=${encodeURIComponent(`ticket:${t.id}`)}`).then((r) =>
+    setOut(r.find((d) => d.key === 'merge_test_output')?.text ?? ''), () => setOut('')) }
+  return <><div className="mt-3 font-semibold text-zinc-400">Tests before it merged</div>
+    {!words ? <div className="mt-1 text-zinc-500">HQ has no record: it merged before HQ kept one.</div>
+      : <div className={`mt-1 ${words.passed ? 'text-emerald-300' : 'text-amber-300'}`}>{words.long}</div>}
+    {m?.ran === 'pass' && <>
+      <div className="mt-1 text-zinc-400">Ran: <span className="select-all break-all font-mono text-zinc-300">{m.test}</span></div>
+      <button className="btn-sm mt-1" onClick={show}>{open ? 'Hide output' : 'Show output'}</button>
+      {open && <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md border border-zinc-800 p-2 text-[11px] text-zinc-300">
+        {out === null ? 'Loading…' : out || 'HQ kept no output for this run.'}</pre>}
+    </>}</>
+}
 function AgentPane({ a, ws, feed }: { a: any; ws: WebSocket | null; feed: (id: string, cb: (d: string) => void) => () => void }) {
   const [text, setText] = useState(''); const { state } = useBoard()
   const lim = ctxLimit(state, a.role), ctx = a.context_tokens ? `${kTok(a.context_tokens)}${lim ? ` / ${kTok(lim)}` : ''}` : ''
+  const who = `${a.role} · ${a.model_live ?? a.model_alias}${ctx ? ` · context ${ctx}` : ''}`, usage = usageParts(a, pauseAt(state.settings, state.defaults))
   return <div className="flex h-full flex-col gap-2">
     <div className="flex flex-wrap items-center gap-2 text-xs"><span className="shrink-0 whitespace-nowrap font-semibold">{a.display_name ?? a.id}</span><Pill s={a.status} />
-      <span className="min-w-0 truncate text-zinc-500">{a.role} · {a.model_live ?? a.model_alias}{ctx ? ` · context ${ctx}` : ''} · 5h {a.five_hour_pct ?? '?'}%</span>
-      <span className="grow" /><FreshBtn a={a} label="Fresh start" /><button className="btn" onClick={() => api(`agents/${a.id}/stop`, {})}>Stop</button></div>
+      <span className="grow" /><FreshBtn a={a} label="Fresh start" /><button className="btn" onClick={() => api(`agents/${a.id}/stop`, {})}>Stop</button>
+      <span className="basis-full text-zinc-500">{who}{usage.map((u) => <span key={u.key}>{'\u00a0· '}{/* a wrap never starts a line with the dot */}
+        <span className="cursor-help whitespace-nowrap" title={u.tip}>{u.text}</span></span>)}</span></div>
     <div className="min-h-0 grow overflow-hidden rounded-md border border-zinc-800">{a.status !== 'exited' ? <AgentTerminal agentId={a.id} ws={ws} feed={feed} /> : <div className="p-4 text-zinc-500">Exited.</div>}</div>
     <form className="flex gap-1" onSubmit={(e) => { e.preventDefault(); if (!text.trim()) return; api(`agents/${a.id}/message`, { body: text, reason: 'fyi' }); setText('') }}>
       <input className="input" placeholder={`Message ${a.display_name ?? a.id} (delivered when idle)`} value={text} onChange={(e) => setText(e.target.value)} /><button className="btn btn-primary">Send</button>

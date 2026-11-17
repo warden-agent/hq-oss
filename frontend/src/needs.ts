@@ -3,7 +3,8 @@
 
 import { FINISHED, readyTickets } from '../../backend/src/readiness.ts'
 
-type S = { repos: any[]; features: any[]; tickets: any[]; agents: any[]; reviews: any[]; attention: any[]; asks?: any[]; settings?: Record<string, any>; defaults?: Record<string, any>
+type S = { repos: any[]; features: any[]; tickets: any[]; agents: any[]; reviews: any[]; attention: any[]; asks?: any[]; questions?: Question[]; settings?: Record<string, any>
+  defaults?: Record<string, any>
   working?: number; testRuns?: { repo_id: string }[] }
 /** The project a notice's kind names (repo_sync:<id>, auto_stopped:<id>, test_cmd_proposed:<id>, test_cmd_refused:<id>): those notices have no ticket or agent to go by. */
 const kindRepo = (k: string): string | null => /^[a-z_]+:(.+)$/.exec(k)?.[1] ?? null
@@ -17,19 +18,42 @@ export function forRepo<T extends S & { messages: any[] }>(s: T, repoId: string 
   const mine = (x: { agent_id?: string | null; ticket_id?: string | null }) => x.ticket_id ? tids.has(x.ticket_id) : x.agent_id ? aids.has(x.agent_id) : true
   const about = (a: any) => { const r = kindRepo(a.kind); return r ? r === repoId : mine(a) }
   return { ...s, features: s.features.filter((f) => fids.has(f.id)), tickets, agents, reviews: s.reviews.filter(mine), attention: s.attention.filter(about),
-    asks: (s.asks ?? []).filter((a) => a.repo_id === repoId), working: workingEngineers(s),
+    asks: (s.asks ?? []).filter((a) => a.repo_id === repoId), working: workingEngineers(s), questions: (s.questions ?? []).filter((x) => tids.has(x.ticket_id ?? '')),
     ...(s.testRuns ? { testRuns: s.testRuns.filter((r) => r.repo_id === repoId) } : {}), // HQ's own test runs (Bug 106)
     messages: s.messages.filter((m) => m.repo_id ? m.repo_id === repoId : m.feature_id ? fids.has(m.feature_id) : [m.from_id, m.to_id].every((x) => !x || x === 'user' || x === 'hq' || aids.has(x))) }
 }
 /** Engineers using a parallel slot (finished ones don't). */
 export const workingEngineers = (s: { agents: any[]; tickets: any[] }): number =>
   s.agents.filter((a) => a.role === 'engineer' && a.status !== 'exited' && !FINISHED.includes(s.tickets.find((t) => t.id === a.ticket_id)?.status ?? '')).length
+/** An engineer's open question (Bug 129; the backend's delivery.ts QuestionView). `to_target`: an agent id, 'user' or 'team'. */
+export type Question = { id: string; ticket_id: string | null; from_agent_id: string; to_target: string; message_id: string; asked_at: number; answered_at?: number | null; body: string }
+/** The question a ticket waits on: the newest open one, and only while the ticket says it has a question. */
+export function ticketQuestion(s: { questions?: Question[] }, t: any): Question | null {
+  if (t?.status !== 'awaiting_answer') return null
+  return (s.questions ?? []).filter((x) => x.ticket_id === t.id && !x.answered_at).sort((a, b) => b.asked_at - a.asked_at || b.id.localeCompare(a.id))[0] ?? null
+}
+/** Who a question waits on, in words: "you", "the TPM", "the team", or the agent's name. */
+export function askedWho(x: Question, agents: any[]): string {
+  if (x.to_target === 'user') return 'you'
+  if (x.to_target === 'team') return 'the team'
+  const a = agents.find((g) => g.id === x.to_target)
+  return a?.role === 'tpm' ? 'the TPM' : a ? String(a.display_name ?? a.id) : 'another agent'
+}
+/** The question's first line with words in it (markdown marks taken off), for a box's one or two rows. */
+export const firstLine = (text: string): string => String(text).split('\n').map((l) => l.replace(/^[#>*\-\s]+/, '').replace(/\*\*|`/g, '').trim()).find(Boolean) ?? ''
+/** A question for the user in Your turn: the ticket it's about and what its engineer asked. */
+export type TurnQuestion = { id: string; ticketId: string; key: string; text: string; agentId: string }
+export const turnQuestionText = (x: TurnQuestion): string => `${x.key}'s engineer asked you: ${x.text}`
+/** Your turn's questions that ⚠ doesn't count yet: a question for the user is counted by its engineer's "Message for you" notice, and on its own
+ *  once that notice is gone (✓ hides it while the question is still open), so it is never counted twice or not at all. */
+export const uncountedQuestions = (s: { attention: any[] }, turn: Turn): TurnQuestion[] => (turn.questions ?? [])
+  .filter((x) => !s.attention.some((a) => !a.resolved_at && a.kind === 'message_for_user' && a.agent_id === x.agentId))
 /** A question the TPM asked with ask_user, its choices as a list. */
 export type Ask = { id: string; question: string; choices: string[]; action?: boolean }
 /** What the project waits on the user for (Bug 43, on the TPM box since Bug 52): the TPM's open questions, and the ready
  *  tickets of every feature (each in its merge order) when an engineer slot is free. A full parallel limit doesn't nag: those
  *  tickets start as engineers finish. */
-export type Turn = { asks: Ask[]; start: string[]; auto?: boolean }
+export type Turn = { asks: Ask[]; start: string[]; auto?: boolean; questions?: TurnQuestion[] } // questions: engineers' questions for the user (Bug 129)
 const list = (v: unknown): string[] => { try { const x = JSON.parse(String(v || '[]')); return Array.isArray(x) ? x.map(String) : [] } catch { return [] } }
 export function yourTurn(s: S, repoId: string | null): Turn {
   const open = (s.asks ?? []).filter((a) => a.repo_id === repoId && !a.answered_at)
@@ -39,7 +63,11 @@ export function yourTurn(s: S, repoId: string | null): Turn {
     .flatMap((f) => readyTickets(s.tickets.filter((t) => t.feature_id === f.id && !going.has(t.id)), list(f.merge_order)).map((t) => t.key))
   const cap = Number(s.settings?.concurrency_cap ?? s.defaults?.concurrency_cap ?? 2), r = s.repos?.find((x) => x.id === repoId)
   const auto = !!r?.auto_mode && !r.auto_stopped_why // HQ starts them itself
-  return { asks, start: !auto && ready.length && (s.working ?? workingEngineers(s)) < cap ? ready : [], ...(r?.auto_mode ? { auto: true } : {}) }
+  const fids = new Set(s.features.filter((f) => f.repo_id === repoId).map((f) => f.id))
+  const questions = s.tickets.filter((t) => fids.has(t.feature_id)).flatMap((t) => { const x = ticketQuestion(s, t)
+    return x && x.to_target === 'user' ? [{ id: x.id, ticketId: t.id, key: String(t.key), text: firstLine(x.body), agentId: x.from_agent_id }] : [] })
+  return { asks, start: !auto && ready.length && (s.working ?? workingEngineers(s)) < cap ? ready : [], ...(r?.auto_mode ? { auto: true } : {}),
+    ...(questions.length ? { questions } : {}) }
 }
 /** "T1", "T1 and T2", "T1, T2 and T3". */
 export const keysText = (keys: string[]): string => keys.length < 2 ? keys.join('') : `${keys.slice(0, -1).join(', ')} and ${keys.at(-1)}`
@@ -69,6 +97,7 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
   for (const r of s.repos) {
     const turn = yourTurn(s, r.id), ref = { tpm: r.id }
     for (const a of turn.asks) out.push({ key: `ask:${a.id}`, text: `${where(r.id)}the TPM asked: ${a.question.slice(0, 160)}`, repoId: r.id, ref })
+    for (const x of uncountedQuestions(s, turn)) out.push({ key: `question:${x.id}`, text: `${where(r.id)}${turnQuestionText(x).slice(0, 160)}`, repoId: r.id, ref: { ticket: x.ticketId } })
     const are = turn.start.length > 1 ? 'are' : 'is'
     if (turn.start.length) out.push({ key: `start:${r.id}:${turn.start.join(',')}`, text: `${where(r.id)}${keysText(turn.start)} ${are} ready to start`, repoId: r.id, ref })
   }

@@ -32,7 +32,7 @@ const notices = async (t: any, kind: string) => (await hq.state()).attention.fil
 const fix = (t: any) => hq.api(`tickets/${t.id}/fix-conflicts`, {})
 const merge = (t: any) => hq.api(`tickets/${t.id}/merge`, {})
 const sent = async (from: string, to: string) => (await hq.state()).messages.filter((m: any) => m.from_id === from && m.to_id === to)
-const spec = (tpm: string, t: any, change: { spec?: string; title?: string }) => hq.mcp(tpm, 'update_ticket_spec', { key: t.key, ...change })
+const spec = (tpm: string, t: any, change: { spec?: string; title?: string }) => hq.mcp(tpm, 'update_ticket_spec', { key: t.key, ...change, user_asked: true }) // the user's change of mind
 /** The engineer's last steps: commit `text` as version.txt, write the handoff, call open_pr. */
 async function finish(eng: any, wt: string, text: string): Promise<{ text: string; isError: boolean }> {
   fs.writeFileSync(path.join(wt, 'version.txt'), text); sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', `version: ${text.trim().split('\n').at(-1)}`)
@@ -147,7 +147,7 @@ test('an engineer whose ticket is finished stops once its turn has ended; the ti
   assert.deepEqual((await hq.state()).attention.filter((a: any) => !before.includes(a.id)).map((a: any) => a.detail), [])
   // Nobody reads its messages any more. Whoever writes to it hears that, and what to do instead, not "Unknown recipient".
   let r = await hq.mcp(tpm, 'send_message', { to: e.id, reason: 'fyi', body: 'One more thing.' }); assert.equal(r.isError, true)
-  assert.equal(r.text, gone(e, t, 'To change T-01, call update_ticket_spec: HQ starts an engineer to build the change.'))
+  assert.equal(r.text, gone(e, t, 'To change T-01, call update_ticket_spec (user_asked: true when the user asked for it): HQ starts an engineer to build the change.'))
   const was = (await tk(t2)).status
   r = await hq.mcp(e2.id, 'send_message', { to: e.id, reason: 'question', body: 'Which port do you use?' }); assert.equal(r.isError, true)
   assert.equal(r.text, gone(e, t, 'Its work is on branch hq/s3/T-01-orders; ask the TPM for anything else.'))
@@ -238,7 +238,7 @@ test('a ticket that comes back while its engineer is being stopped gets a fresh 
     // Its turn ends and HQ starts stopping it (two seconds here). In the middle of that the TPM writes to it and the user presses Fix conflicts.
     await turnEnds(e2.id); await wait(500); assert.equal((await agent(e2.id)).status, 'idle')
     const said = await hq.mcp(tpm, 'send_message', { to: e2.id, reason: 'fyi', body: 'T-01 merged.' })
-    assert.equal(said.text, gone(e2, t2, 'To change T-02, call update_ticket_spec: HQ starts an engineer to build the change.'))
+    assert.equal(said.text, gone(e2, t2, 'To change T-02, call update_ticket_spec (user_asked: true when the user asked for it): HQ starts an engineer to build the change.'))
     const r = await fix(t2); assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.via, 'launch')
     const e3 = await liveEngineer(t2, e2.id); assert.equal(r.json.engineer, e3.id)
     assert.equal((await agent(e2.id)).status, 'exited'); assert.equal(await why(e2), 'finished')

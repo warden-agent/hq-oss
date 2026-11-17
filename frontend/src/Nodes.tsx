@@ -1,35 +1,62 @@
 // The graph's boxes: the project's TPM (always on top, with a box to write to it: Bug 52), one per feature, one per ticket. Each
 // carries its own buttons; longer things (the plan, attention items, the conversation with the TPM) open in a popover pinned
-// under the box (NodeToolbar: it doesn't scale with zoom).
-// Opening one goes through focus(), which first pans the box near the top of the pane so the popover isn't cut off.
+// under the box (BoardPop: it doesn't scale with zoom, stays inside the visible board and over the zoom buttons, Bug 120).
+// Opening one goes through focus(), which first pans the box near the top of the pane so the popover has room below it.
 import { useState } from 'react'
-import { Handle, NodeToolbar, Position, type Node, type NodeProps } from '@xyflow/react'
+import { createPortal } from 'react-dom'
+import { Handle, Position, useStore, type Node, type NodeProps } from '@xyflow/react'
 import { api } from './api'
 import { askLabels, askText, cancelConfirm, mergeConfirm, startLabel, startText, turnOn, waitingOn } from './board'
 import { actLabel, answerReview, kindLabel, freshBlocker, freshConfirm, freshOffered, localOnly, OPEN_PREVIEW, stopOthers, ticketLabel, useBoard, useBusy, useRevisionCap,
   type Act, type FeatureView, type Line, type TicketView, type TpmView, type Tone } from './board'
-import { goodNews, plainNews, type Turn } from './needs.ts'
+import { goodNews, plainNews, turnQuestionText, type Question, type Turn } from './needs.ts'
+import { MORE } from './reply.ts'
+import { mergeTestOf, mergeTestWords } from './testruns.ts'
 import { DoRestBtn } from './Auto'
 import type { Agent } from './api'
 import { ActBtn, Elapsed, Linked, LiveDot, Md, Pill } from './ui'
+import { placePop } from './fit'
 
 const tone: Record<Tone, string> = { plain: 'text-zinc-200', muted: 'text-zinc-400', amber: 'text-amber-300', rose: 'text-rose-300', sky: 'text-sky-300', emerald: 'text-emerald-300', indigo: 'text-indigo-300' }
 const POP = 'nodrag nopan nowheel' // popovers: the wheel scrolls them and a drag in them doesn't pan the graph
+/** A popover pinned to box `id` (Bug 120): inside the visible board (left of the side panel, inside the window) wherever the box is,
+ *  as the view moves and the pane changes size: up to `want` px wide, under the box or over it (fit.ts placePop). Its height limit is
+ *  the CSS variable --pop-h, which the panel inside takes as its max-height so its body scrolls and its buttons stay in view.
+ *  Drawn in the board's own element, over ReactFlow's layers: the zoom buttons (z-index 5) sit over everything in the boxes' layer
+ *  (4), NodeToolbar included, and covered the corner of Approve. Keeps NodeToolbar's class, which ownClick (Graph.tsx) looks for.
+ *  Rendered only while open: it follows every pan. */
+function BoardPop({ id, want, children }: { id: string; want: number; children: React.ReactNode }) {
+  const n = useStore((s) => s.nodeLookup.get(id)), [tx, ty, zoom] = useStore((s) => s.transform), root = useStore((s) => s.domNode)
+  const w = useStore((s) => s.width), h = useStore((s) => s.height)
+  if (!n || !root) return null
+  const { x, y } = n.internals.positionAbsolute
+  const p = placePop({ x: x * zoom + tx, y: y * zoom + ty, w: (n.measured.width ?? 0) * zoom, h: (n.measured.height ?? 0) * zoom }, want, w, h)
+  const style = { position: 'absolute', left: 0, top: 0, zIndex: 6, width: p.width, '--pop-h': `${p.maxHeight}px`,
+    transform: `translate(${p.left}px, ${p.y}px)${p.above ? ' translateY(-100%)' : ''}` }
+  return createPortal(<div className={`react-flow__node-toolbar ${POP}`} style={style as React.CSSProperties}>{children}</div>, root)
+}
 /** Edge anchors. Every box has top in/out and bottom out/in (messages run both ways); tickets add left in / right out for
  *  dependencies. Always rendered (React Flow measures them once) and invisible; nothing can be connected by hand. */
 function Anchors({ sides }: { sides?: boolean }) {
   const h = (type: 'source' | 'target', position: Position, id: string) => <Handle type={type} position={position} id={id} isConnectable={false} className="hq-anchor" />
   return <>{h('target', Position.Top, 't')}{h('source', Position.Top, 'ts')}{h('source', Position.Bottom, 'b')}{h('target', Position.Bottom, 'bt')}{sides && <>{h('target', Position.Left, 'in')}{h('source', Position.Right, 'out')}</>}</>
 }
-/** A box's lines: each one or two rows, as the layout measured (board.ts fitLines); longer text ends in … with the rest on hover. */
-const Lines = ({ lines }: { lines: Line[] }) => <>{lines.map((l, i) =>
-  <div key={i} className={`${l.rows === 2 ? 'line-clamp-2 h-8 break-words' : 'h-4 truncate'} ${tone[l.tone]}`} title={l.text}>
-    {l.since === undefined ? l.text : <><LiveDot on={l.dot !== 'waiting'} />{l.text}{'\u00a0·\u00a0'}<Elapsed since={l.since} /></>}</div>)}</>
+/** A box's lines: each one or two rows, as the layout measured (board.ts fitLines); longer text ends in … with the rest on hover.
+ *  A line with more to it (Bug 124) ends with a link that `onMore` opens; it sits beside the text, so cutting the text never hides it. */
+const Lines = ({ lines, onMore }: { lines: Line[]; onMore?: () => void }) => <>{lines.map((l, i) => {
+  const cut = l.rows === 2 ? 'line-clamp-2 h-8 break-words' : 'h-4 truncate'
+  if (l.more && onMore) return <div key={i} className={`flex items-end gap-1 ${l.rows === 2 ? 'h-8' : 'h-4'} ${tone[l.tone]}`}>
+    <span className={`min-w-0 ${cut}`} title={l.tip ?? l.text}>{l.text}</span>
+    <button className="nopan h-4 shrink-0 whitespace-nowrap text-indigo-300 hover:underline" title="The whole reply is in Chat" onClick={onMore}>{MORE}</button></div>
+  return <div key={i} className={`${cut} ${tone[l.tone]}`} title={l.tip ?? l.text}>
+    {l.since === undefined ? l.text : <><LiveDot on={l.dot !== 'waiting'} />{l.text}{'\u00a0·\u00a0'}<Elapsed since={l.since} /></>}</div>
+})}</>
 const Acts = ({ children }: { children: React.ReactNode }) => <div className="mt-1.5 flex flex-wrap gap-1">{children}</div>
 /** "Your turn" (Bug 43, on the TPM box since Bug 52): what the project waits on the user for, with the buttons right there: each
  *  question the TPM asked (a button per choice, Answer… to write a reply of their own) and the tickets ready to start. A choice
  *  answers it even while the TPM is stopped: the answer starts it again. Sized by board.ts turnH. */
 function TurnBox({ turn, repoId, answer }: { turn: Turn; repoId: string; answer: () => void }) {
+  const b = useBoard()
   return <div className="nopan mt-1.5 flex cursor-auto flex-col gap-1 rounded-md border border-amber-500/60 bg-amber-950/40 p-1.5 text-amber-100">
     <div className="text-[10px] font-semibold tracking-wide text-amber-300 uppercase">Your turn</div>
     {turn.asks.map((a) => <div key={a.id} className="contents">
@@ -37,6 +64,11 @@ function TurnBox({ turn, repoId, answer }: { turn: Turn; repoId: string; answer:
       <div className="flex flex-wrap gap-1">{askLabels(a).map((l) => l === 'Answer…'
         ? <button key={l} className="btn-sm" title="Write your own answer in the box below" onClick={answer}>{l}</button>
         : <ActBtn key={l} primary label={l} busyLabel="Sending…" title={`Answer "${l}"`} run={() => api(`asks/${a.id}/answer`, { answer: l })} />)}</div>
+    </div>)}
+    {(turn.questions ?? []).map((x) => <div key={x.id} className="contents">
+      <div className="line-clamp-3 break-words" title={turnQuestionText(x)}>{turnQuestionText(x)}</div>
+      <div className="flex"><button className="btn-sm btn-primary" title={`Read ${x.key}'s question and answer it`} onClick={() => b.focus(`t:${x.ticketId}`, 'question')}>
+        Read question</button></div>
     </div>)}
     {turn.start.length > 0 && <>
       <div className="break-words">{startText(turn.start, turn.asks.length > 0)}</div>
@@ -102,9 +134,9 @@ export function AttentionList({ items, show }: { items: any[]; show?: (a: any) =
     <div className="mt-1 break-words text-zinc-400"><Linked text={a.detail} /></div></div> })}</div>
 }
 /** A box's notices, under it. Only while it has some: a reply can clear the last one, and an empty popover has no chip to close it. */
-function AttPop({ open, items }: { open: boolean; items: any[] }) {
-  return <NodeToolbar isVisible={open && items.length > 0} position={Position.Bottom} className={POP}>
-    <div className="hq-pop w-[380px] max-w-[70vw]"><AttentionList items={items} /></div></NodeToolbar>
+function AttPop({ id, open, items }: { id: string; open: boolean; items: any[] }) {
+  return !open || !items.length ? null : <BoardPop id={id} want={380}>
+    <div className="hq-pop max-h-[var(--pop-h,70vh)] w-full overflow-y-auto"><AttentionList items={items} /></div></BoardPop>
 }
 /** A plan's "In plain words" section (engineers start their plans with one, for the user) and everything else. */
 function splitPlan(text: string): { plain: string; rest: string } {
@@ -113,7 +145,8 @@ function splitPlan(text: string): { plain: string; rest: string } {
   const plain = (next ? after.slice(0, next.index) : after).trim()
   return { plain, rest: (text.slice(0, m.index) + (next ? after.slice(next.index) : '')).trim() }
 }
-/** The plan under review with Approve / Revise. On a box it closes with × or Esc; in the top-bar menu it has no ×. */
+/** The plan under review with Approve / Revise. On a box it closes with × or Esc; in the top-bar menu it has no ×. Its header and
+ *  its note box and buttons always show; the plan between them scrolls (Bug 120). */
 export function ReviewPanel({ r, label, onDone }: { r: any; label: string; onDone?: () => void }) {
   const [msg, setMsg] = useState(''); const [busy, run] = useBusy(); const cap = useRevisionCap(); const b = useBoard()
   const repoId = b.state.features.find((f) => f.id === b.state.tickets.find((t) => t.id === r.ticket_id)?.feature_id)?.repo_id, autoIsOn = !!b.state.repos.find((x) => x.id === repoId)?.auto_mode
@@ -122,14 +155,16 @@ export function ReviewPanel({ r, label, onDone }: { r: any; label: string; onDon
   const { plain, rest } = splitPlan(String(r.plan_text ?? ''))
   const reviseTitle = capped ? `Sent back ${r.revises_used} times already: approve it or cancel the ticket`
     : msg.trim() ? 'Send the blocking issues back to the engineer' : 'Write the blocking issues first'
-  return <div className="hq-pop w-[520px] max-w-[70vw] border-amber-500/40!">
+  return <div className="hq-pop flex max-h-[var(--pop-h,70vh)] w-full flex-col border-amber-500/40!">
     <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium text-amber-300" title={label}>{label}</span>{onDone && <button className="btn" title="Close (Esc)" onClick={onDone}>×</button>}</div>
-    {plain && <div className="mt-2 whitespace-pre-wrap break-words rounded-md bg-zinc-800/60 p-2 text-[13px] leading-5 text-zinc-100">{plain}</div>}
-    <details className="mt-2" open={!plain}><summary className="cursor-pointer text-zinc-400">{plain ? 'Technical details' : 'The plan'}</summary>
-      <pre className="mt-1 max-h-[45vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-zinc-800 bg-zinc-950 p-2 text-[11px] text-zinc-300">{rest}</pre></details>
+    <div className="min-h-0 overflow-y-auto">
+      {plain && <div className="mt-2"><div className="text-zinc-400">In plain words</div>{/* Bug 130: says it sums up the plan */}
+        <div className="mt-1 whitespace-pre-wrap break-words rounded-md bg-zinc-800/60 p-2 text-[13px] leading-5 text-zinc-100">{plain}</div></div>}
+      <details className="mt-2" open={!plain}><summary className="cursor-pointer text-zinc-400">{plain ? 'Technical details' : 'The plan'}</summary>
+        <pre className="mt-1 whitespace-pre-wrap break-words rounded-md border border-zinc-800 bg-zinc-950 p-2 text-[11px] text-zinc-300">{rest}</pre></details></div>
     {capped ? <div className="mt-2 text-xs text-rose-300">Sent back {r.revises_used} times already, the limit. Approve it, or cancel the ticket with ✕.</div>
-      : <textarea className="input mt-2 h-16 text-xs!" placeholder="What should change? In your own words, e.g. 'keep the old colours' (needed for Revise)" value={msg} onChange={(e) => setMsg(e.target.value)} />}
-    <div className="mt-2 flex gap-1"><button className="btn btn-primary" disabled={busy} onClick={() => answer('approve')}>Approve</button>
+      : <textarea className="input mt-2 h-16 shrink-0 text-xs!" placeholder="What should change? In your own words, e.g. 'keep the old colours' (needed for Revise)" value={msg} onChange={(e) => setMsg(e.target.value)} />}
+    <div className="mt-2 flex shrink-0 flex-wrap gap-1"><button className="btn btn-primary" disabled={busy} onClick={() => answer('approve')}>Approve</button>
       <button className="btn" disabled={busy || capped || !msg.trim()} title={reviseTitle} onClick={() => answer('revise')}>Revise</button>
       {repoId && !autoIsOn && <DoRestBtn repoId={repoId} />}</div>
   </div>
@@ -142,15 +177,16 @@ const drafts = new Map<string, string>() // what the user is writing to each pro
 export function TpmNode({ id, data }: NodeProps<Node<{ view: TpmView }>>) {
   const b = useBoard(); const v = data.view, repo = v.repo, pop = b.pop?.node === id ? b.pop.kind : null
   const focus = () => (document.getElementById('hq-tpm-input') as HTMLTextAreaElement | null)?.focus()
+  const chat = () => b.focus(id, 'talk')
   return <Card id={id} border={v.border} className="cursor-default!"><Anchors />
     <div className="flex h-4 items-center gap-1"><span className="shrink-0 font-semibold">TPM</span>
       <span className="min-w-0 truncate text-zinc-500" title={repo?.name}>· {repo?.name ?? 'no project'}</span><span className="grow" />
       <AttChip id={id} items={v.att} /><FreshBtn a={v.tpm} /></div>
-    <Lines lines={v.lines} />
+    <Lines lines={v.lines} onMore={chat} />
     {turnOn(v.turn) && repo && <TurnBox turn={v.turn} repoId={repo.id} answer={focus} />}
-    <TpmInput key={repo?.id ?? 'none'} v={v} chat={pop === 'talk'} toggleChat={() => pop === 'talk' ? b.setPop(null) : b.focus(id, 'talk')} />
-    <AttPop open={pop === 'attention'} items={v.att} />
-    <NodeToolbar isVisible={pop === 'talk'} position={Position.Bottom} className={POP}><TalkPanel v={v} onDone={() => b.setPop(null)} /></NodeToolbar>
+    <TpmInput key={repo?.id ?? 'none'} v={v} chat={pop === 'talk'} toggleChat={() => pop === 'talk' ? b.setPop(null) : chat()} />
+    <AttPop id={id} open={pop === 'attention'} items={v.att} />
+    {pop === 'talk' && <BoardPop id={id} want={520}><TalkPanel v={v} onDone={() => b.setPop(null)} /></BoardPop>}
   </Card>
 }
 
@@ -185,7 +221,7 @@ export function FeatureNode({ id, data }: NodeProps<Node<{ view: FeatureView }>>
       {!v.done && f.status !== 'cancelled' && <CancelBtn tip="Cancel this feature…" title={`Cancel "${f.title}"?`} go="Cancel feature" path={`features/${f.id}/cancel`}
         body={featureCancelText(v, b.state)} />}</div>
     <Lines lines={v.lines} />
-    <AttPop open={pop === 'attention'} items={v.att} />
+    <AttPop id={id} open={pop === 'attention'} items={v.att} />
   </Card>
 }
 /** You and the project's TPM: its replies (taken from the end of each of its turns) and what you sent it, newest last, across its
@@ -194,10 +230,10 @@ function TalkPanel({ v, onDone }: { v: TpmView; onDone: () => void }) {
   const b = useBoard(); const tpms = new Set(v.tpmIds)
   const talk = b.state.messages.filter((m) => (m.from_id === 'user' && tpms.has(m.to_id)) || (tpms.has(m.from_id) && m.to_id === 'user'))
     .sort((x, y) => x.created_at - y.created_at).slice(-12)
-  return <div className="hq-pop flex w-[520px] max-w-[80vw] flex-col gap-2">
+  return <div className="hq-pop flex max-h-[var(--pop-h,80vh)] w-full flex-col gap-2">
     <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium">You and the TPM · {v.repo?.name}</span>
       <button className="btn" title="Close (Esc)" onClick={onDone}>×</button></div>
-    <div className="flex max-h-[50vh] flex-col gap-2 overflow-y-auto">
+    <div className="flex max-h-[50vh] min-h-0 flex-col gap-2 overflow-y-auto">
       {!talk.length && <div className="text-zinc-500">Nothing yet. Write to the TPM in its box; its answers show up here.</div>}
       {talk.map((m) => <div key={m.id} className={`rounded-md p-2 ${m.from_id === 'user' ? 'ml-8 bg-indigo-950/60 text-indigo-100' : 'mr-8 bg-zinc-800/70 text-zinc-200'}`}>
         <div className="mb-0.5 text-[10px] text-zinc-500">{m.from_id === 'user' ? 'You' : 'TPM'} · {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
@@ -219,9 +255,13 @@ const featureCancelText = (v: FeatureView, s: any): string => {
 export function TicketNode({ id, data }: NodeProps<Node<{ view: TicketView }>>) {
   const b = useBoard(); const v = data.view, t = v.t
   const pop = b.pop?.node === id ? b.pop.kind : null
-  const attPop = <AttPop open={pop === 'attention'} items={v.att} />
+  const attPop = <AttPop id={id} open={pop === 'attention'} items={v.att} />
+  const tested = v.compact ? mergeTestWords(mergeTestOf(t)) : null // what HQ ran on it before it merged (Bug 126)
   if (v.compact) return <Card id={id} border={v.border}><Anchors sides />
-    <div className="flex h-4 items-center gap-1"><span className="min-w-0 truncate text-emerald-300" title={`${t.key}: ${t.title}`}>✓ {t.key}</span><span className="shrink-0 text-zinc-500">· merged</span><span className="grow" />
+    <div className="flex h-4 items-center gap-1"><span className="min-w-0 truncate text-emerald-300" title={`${t.key}: ${t.title}`}>✓ {t.key}</span>
+      <span className="shrink-0 text-zinc-500">· merged</span>
+      {tested && <span className={`shrink-0 ${tested.passed ? 'text-emerald-400/80' : 'text-amber-300/80'}`}
+      title={`${tested.long.replace(/\.$/, '')}. Click the box for the details.`}>· {tested.box}</span>}<span className="grow" />
       {t.pr_url && t.pr_number ? <a className="nopan shrink-0 text-indigo-300 underline" href={t.pr_url} target="_blank" rel="noreferrer">PR #{t.pr_number} ↗</a> : null}<AttChip id={id} items={v.att} /></div>
     {attPop}
   </Card>
@@ -234,8 +274,9 @@ export function TicketNode({ id, data }: NodeProps<Node<{ view: TicketView }>>) 
     <div className={v.titleRows === 2 ? 'line-clamp-2 h-8' : 'h-4 truncate'} title={t.title}>{t.title}</div>
     <Lines lines={v.lines} />
     {v.acts.length > 0 && <Acts>{v.acts.map((a, i) => <TicketAct key={i} a={a} v={v} id={id} />)}</Acts>}
-    <NodeToolbar isVisible={pop === 'review' && !!v.review} position={Position.Bottom} className={POP}>{v.review && <ReviewPanel r={v.review} onDone={() => b.setPop(null)}
-      label={`Plan R-${v.review.round} · ${t.key}${eng ? ` · ${eng.display_name ?? eng.id}` : ''}`} />}</NodeToolbar>
+    {pop === 'review' && v.review && <BoardPop id={id} want={520}><ReviewPanel r={v.review} onDone={() => b.setPop(null)}
+      label={`Plan R-${v.review.round} · ${t.key}${eng ? ` · ${eng.display_name ?? eng.id}` : ''}`} /></BoardPop>}
+    {pop === 'question' && v.question && <BoardPop id={id} want={380}><QuestionPanel x={v.question} v={v} onDone={() => b.setPop(null)} /></BoardPop>}
     {attPop}
   </Card>
 }
@@ -243,6 +284,9 @@ function TicketAct({ a, v, id }: { a: Act; v: TicketView; id: string }) {
   const b = useBoard()
   if (a.kind === 'launch') return <ActBtn label={actLabel(a)} busyLabel="Launching…" title="Start an engineer on this ticket now" run={() => api(`tickets/${v.t.id}/launch`, {})} />
   if (a.kind === 'read-plan') { const open = b.pop?.node === id && b.pop.kind === 'review'; return <button className="btn-sm nopan" onClick={() => open ? b.setPop(null) : b.focus(id, 'review')}>{open ? 'Hide plan' : 'Read plan'}</button> }
+  if (a.kind === 'read-question') { const open = b.pop?.node === id && b.pop.kind === 'question'
+    return <button className={`btn-sm nopan ${v.question?.to_target === 'user' ? 'btn-primary' : ''}`} onClick={() => open ? b.setPop(null) : b.focus(id, 'question')}>
+      {open ? 'Hide question' : 'Read question'}</button> }
   if (a.kind === 'resume') return <ActBtn primary={a.parked} label="Resume" busyLabel="Starting…" run={() => api(`tickets/${v.t.id}/resume`, {})}
     title={a.parked ? 'A new engineer picks up from the handoff note the last one left, on the same branch'
       : 'Its engineer stopped: start a new one on the same branch, briefed with what git shows'} />
@@ -251,6 +295,25 @@ function TicketAct({ a, v, id }: { a: Act; v: TicketView; id: string }) {
   if (a.kind === 'do-rest') return <DoRestBtn repoId={b.repo?.id} />
   if (a.kind === 'auto-retry') return <ActBtn primary label="Try again" busyLabel="Trying…" title="Auto mode gives this ticket another go" run={() => api(`tickets/${v.t.id}/auto-retry`, {})} />
   return <MergeAct a={a} t={v.t} />
+}
+/** The question a ticket's engineer asked (Bug 129): whom, when, and all of it. One for the user has a box to answer it: the answer goes to the
+ *  engineer and takes the ticket back to work. One for the TPM or another agent is theirs to answer; the user can still write to the engineer
+ *  in its Agent tab. Closes with × or Esc, and by itself once the question is answered. */
+function QuestionPanel({ x, v, onDone }: { x: Question; v: TicketView; onDone: () => void }) {
+  const [text, setText] = useState(''); const [busy, run] = useBusy(), you = x.to_target === 'user', to = v.eng?.id ?? x.from_agent_id
+  const at = new Date(x.asked_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  const send = () => { if (text.trim()) run(() => api(`agents/${to}/message`, { body: text, reason: 'answer' }).then(() => { setText(''); onDone() })) }
+  return <div className={`hq-pop flex max-h-[var(--pop-h,70vh)] w-full flex-col gap-2 ${you ? 'border-amber-500/40!' : ''}`}>
+    <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium text-amber-300">{v.t.key}'s engineer asked {v.askedWho} · {at}</span>
+      <button className="btn" title="Close (Esc)" onClick={onDone}>×</button></div>
+    <div className="max-h-[40vh] min-h-0 overflow-y-auto rounded-md bg-zinc-800/60 p-2 text-[13px] leading-5 text-zinc-100"><Md text={x.body} /></div>
+    {you ? <>
+      <textarea className="input h-16 shrink-0 text-xs!" placeholder="Your answer, in your own words (Enter sends)" value={text} onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }} />
+      <div className="flex gap-1"><button className="btn btn-primary" disabled={busy || !text.trim()} onClick={send}>{busy ? 'Sending…' : 'Send answer'}</button></div></>
+      : <div className="text-xs text-zinc-400">Waiting for {v.askedWho} to answer. {v.t.key} goes back to work once {v.askedWho === 'the TPM' ? 'it does' : 'they do'}.
+        To add something yourself, write to the engineer in its Agent tab.</div>}
+  </div>
 }
 /** Try it (Bug 22): the preview runs this ticket's version, with a copy of your data, so you can look before merging; Back to main
  *  returns to main. Merging the ticket goes back to main by itself. */

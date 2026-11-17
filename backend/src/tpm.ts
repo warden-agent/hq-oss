@@ -10,7 +10,7 @@ import { getAgent, launchAgent, type Agent } from './agents.ts'
 import { modelFor } from './roles.ts'
 import { features, getRepo, liveTpm, localOnly, notClearing, tickets, type Repo } from './records.ts'
 import { ensureFresh } from './repos.ts'
-import { sendMessage, type Message } from './delivery.ts'
+import { patchQuestion, sendMessage, type Message } from './delivery.ts'
 import { wake } from './wake.ts'
 import { resolveKind } from './attention.ts'
 import { tpmPrompt } from './handover.ts'
@@ -97,6 +97,7 @@ function recordUserMessage(repoId: string, to: string, body: string): Message {
 export function handOver(oldId: string, newId: string): void {
   const moved = q<{ id: string }>('SELECT id FROM messages WHERE to_id = ? AND delivered_at IS NULL', oldId)
   const told = q<{ id: string }>("SELECT id FROM needs_attention WHERE agent_id = ? AND kind = 'message_for_user' AND resolved_at IS NULL", oldId)
+  const asked = q<{ id: string }>('SELECT id FROM questions WHERE (to_target = ? OR from_agent_id = ?) AND answered_at IS NULL', oldId, oldId)
   tx(() => {
     run('UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered_at IS NULL', newId, oldId)
     run('UPDATE questions SET to_target = ? WHERE to_target = ? AND answered_at IS NULL', newId, oldId)
@@ -106,4 +107,5 @@ export function handOver(oldId: string, newId: string): void {
   for (const m of moved) patch('message', m.id, { to_id: newId })
   if (moved.length) wake(newId) // Bug 99: its waiting `next` hands them out
   for (const a of told) patch('attention', a.id, { agent_id: newId })
+  for (const x of asked) patchQuestion(x.id) // Bug 129: the page says who it waits on, and the answer goes to the new session
 }

@@ -50,3 +50,37 @@ test('the page gets agents without their token\'s hash or launch prompt, and a p
     for (const m of t.msgs.filter((x) => x.type === 'patch' && x.entity === 'agent')) assert.deepEqual(kept(m.patch ?? {}), [])
   } finally { t.close() }
 })
+
+test('Bug 122: an agent that ends loses its activity line at once, in an open tab too, and keeps why it ended across a restart', async () => {
+  await hq.api('settings', { key: 'concurrency_cap', value: 20 }) // the first test's engineer still runs
+  const repo = (await hq.api('repos', { path: hq.repo('ended') })).json
+  const f = (await hq.api('features', { repoId: repo.id, title: 'Ended', request: 'Build it' })).json
+  await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
+  const one = async (id: string) => (await hq.state()).agents.find((a: any) => a.id === id)
+  const start = async (title: string) => {
+    const tk = (await hq.api('tickets', { featureId: f.id, title, size: 'S', spec: `${title}.` })).json, e = (await hq.api(`tickets/${tk.id}/launch`, {})).json
+    await waitFor('the engineer', async () => (await one(e.id))?.status === 'working')
+    await hq.hook(e.id, { hook_event_name: 'PreToolUse', tool_name: 'mcp__hq__get_ticket', tool_input: {} })
+    await waitFor('its activity line', async () => (await one(e.id))?.activity === 'Calling hq.get_ticket'); return e
+  }
+  const stopped = await start('Stopped'), quit = await start('Quit')
+  const t = await tab()
+  try {
+    await waitFor('the snapshot', () => t.msgs.find((m) => m.type === 'snapshot'))
+    assert.equal((await hq.api(`agents/${stopped.id}/stop`, {})).status, 200)
+    const p = await waitFor('the patch the stop sends', () => t.msgs.find((m) => m.type === 'patch' && m.entity === 'agent' && m.id === stopped.id && m.patch?.status === 'exited'))
+    assert.deepEqual([p.patch.activity, p.patch.ended_why], [null, 'user'], 'the same patch clears the line and says why')
+    // A session that ends by itself says so; what doesn't end it (a /clear) keeps the line
+    await hq.hook(quit.id, { hook_event_name: 'SessionEnd', reason: 'clear' }); assert.equal((await one(quit.id)).activity, 'Calling hq.get_ticket')
+    await hq.hook(quit.id, { hook_event_name: 'SessionEnd', reason: 'prompt_input_exit' })
+    assert.deepEqual([(await one(quit.id)).status, (await one(quit.id)).activity, (await one(quit.id)).ended_why], ['exited', null, 'session:prompt_input_exit'])
+    assert.equal((await one(f.tpm_agent_id)).ended_why, null, 'a running agent has no ending')
+  } finally { t.close() }
+  await hq.restart()
+  for (const [id, why] of [[stopped.id, 'user'], [quit.id, 'session:prompt_input_exit']]) assert.deepEqual([(await one(id)).activity ?? null, (await one(id)).ended_why], [null, why])
+  // Stop on an agent that has already ended (its Agent tab still offers it) changes neither why nor when it ended
+  for (const id of [stopped.id, quit.id]) {
+    const was = await one(id); assert.equal((await hq.api(`agents/${id}/stop`, {})).status, 200)
+    assert.deepEqual([(await one(id)).ended_why, (await one(id)).ended_at], [was.ended_why, was.ended_at], id)
+  }
+})

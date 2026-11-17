@@ -12,7 +12,7 @@ import type { TicketStatus } from './readiness.ts'
 import { getAgent, launchAgent, liveAgents, stopAgent, type Agent } from './agents.ts'
 import { pendingFor, sendMessage, type Message } from './delivery.ts'
 import { modelFor } from './roles.ts'
-import { closedWhy, features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTicket, sweepNotices, ticketInRepo, tickets, type Feature, type Fixing, type Ticket }
+import { autoOn, closedWhy, features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTicket, sweepNotices, ticketInRepo, tickets, type Feature, type Fixing, type Ticket }
   from './records.ts'
 import { ensureFresh, git } from './repos.ts'
 import { nextWorkerSlot, releaseSlot } from './slots.ts'
@@ -82,7 +82,7 @@ export function createTicket(featureId: string, t: { key?: string; title: string
     prior_status: null, assignee_agent_id: null, expected_files: JSON.stringify(t.expected_files ?? []), deps: JSON.stringify(t.depends_on ?? []),
     edit_overrides: '[]', branch: null, worktree_path: null, pr_number: null, pr_url: null, pr_state: null, plan_round: 0, handoff_updated_at: null,
     last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, repairs_main: t.repairs_main ?? null,
-    repairs_cmd: t.repairs_cmd ?? null, fixing: null, parked_at: null, created_at: ts, updated_at: ts,
+    repairs_cmd: t.repairs_cmd ?? null, fixing: null, merge_test: null, parked_at: null, created_at: ts, updated_at: ts,
   }
   run(`INSERT INTO tickets(id, feature_id, key, slug, title, size, status, expected_files, deps, edit_overrides, plan_round, spec, repairs_main, repairs_cmd, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec, row.repairs_main,
@@ -111,7 +111,7 @@ export function liveEngineerOf(t: Ticket): string | null {
 /** Start an engineer on a ticket. Every caller (TPM, Launch engineer, Start ready) gets the same rules: one engineer per ticket,
  *  dependencies merged first, the parallel limit. They're all checked before the first await, so a second launch of the same
  *  ticket is refused while the first is still under way. */
-export async function launchEngineer(ticketId: string, opts: { synced?: boolean } = {}): Promise<Agent> {
+export async function launchEngineer(ticketId: string, opts: { synced?: boolean; quiet?: boolean } = {}): Promise<Agent> {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
   const live = liveEngineerOf(t)
   const blocked = launchBlocker(t, { starting: starting.has(t.id), liveEngineer: live }); if (blocked) throw new Error(blocked)
@@ -123,7 +123,8 @@ export async function launchEngineer(ticketId: string, opts: { synced?: boolean 
 /** `fix`: an engineer that finished work goes back to (Fix conflicts, auto mode's failed test on main, or a spec the TPM changed, as
  *  `fixing` says): it starts in acceptEdits with HQ's instructions as its prompt (no plan to review), and the ticket goes to `resolving`. */
 type Resume = { prompt: (worktree: string) => Promise<string>; mode: 'plan' | 'acceptEdits'; status: TicketStatus }
-async function startEngineer(t: Ticket, opts: { synced?: boolean; fix?: (worktree: string) => string; fixing?: Fixing; resume?: Resume }): Promise<Agent> {
+/** `quiet`: the caller tells the TPM itself (fillSlots, Bug 127: one notice for all the engineers one click started). */
+async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolean; fix?: (worktree: string) => string; fixing?: Fixing; resume?: Resume }): Promise<Agent> {
   const f = getFeature(t.feature_id)!; notClearing(f.repo_id); const repo = opts.synced ? getRepo(f.repo_id)! : await ensureFresh(f.repo_id)
   const branch = t.branch ?? `hq/${f.slug}/${t.key}-${t.slug}`
   const wtName = t.key; const wtPath = path.join(repo.path, '.claude', 'worktrees', wtName)
@@ -164,7 +165,7 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; fix?: (worktre
   if (prev?.status === 'exited') handOver(prev.id, a.id)
   emit({ agentId: a.id, source: 'system', kind: 'ticket.launched', payload: { ticket: t.id, branch, worktree: wtPath, slot: slot.idx, fix: !!opts.fix } })
   const why = opts.fix ? ` to ${fixWords(opts.fixing ?? null, mergeBase(repo).name).to}` : opts.resume ? ' to take over after a fresh start (the last engineer left a handoff note)' : ''
-  tellTpm(f, `HQ: engineer ${a.id} started on ${t.key}${why} (branch ${branch}). Address messages for this ticket to id ${a.id}.`)
+  if (!opts.quiet) tellTpm(f, `HQ: engineer ${a.id} started on ${t.key}${why} (branch ${branch}). Address messages for this ticket to id ${a.id}.`)
   return a
 }
 
@@ -414,45 +415,77 @@ export async function cancelFeature(featureId: string): Promise<{ tickets: strin
   emit({ agentId: null, source: 'ui', kind: 'feature.cancelled', payload: { feature: f.id, tickets: done, stopped } })
   return { tickets: done, stopped }
 }
-/** "Start" on the TPM box's Your turn (Bug 52): every feature's ready tickets in the project. */
+/** "Start" on the TPM box's Your turn (Bug 52): every feature's ready tickets in the project. All of them get the go-ahead before
+ *  one fill, so the TPM hears about the click once (Bug 127), not once per feature. */
 export async function startReadyRepo(repoId: string): Promise<{ started: string[]; queued: string[] }> {
-  const out = { started: [] as string[], queued: [] as string[] }
-  for (const f of features().filter((x) => x.repo_id === repoId && x.status !== 'cancelled')) {
-    const r = await startReady(f.id); out.started.push(...r.started); out.queued.push(...r.queued)
-  }
-  return out
+  notClearing(repoId)
+  const mine = features().filter((x) => x.repo_id === repoId && x.status !== 'cancelled')
+  for (const f of mine) goAhead(f)
+  const started = await fillSlots()
+  return { started, queued: mine.flatMap((f) => waitingForSlot(tickets(f.id))) }
 }
+/** Every ticket of the feature that may start now gets the go-ahead, except one the user is being asked whether to remove (Bug 50). */
+function goAhead(f: Feature): void {
+  const going = new Set(openAsks().map((a) => actionOf(a)?.ticket))
+  for (const t of readyTickets(tickets(f.id), j<string[]>(f.merge_order, []))) if (!going.has(t.id)) setTicket(t.id, { go_ahead: 1 })
+}
+const waitingForSlot = (all: Ticket[]): string[] => all.filter((t) => t.go_ahead && t.status === 'queued' && !t.assignee_agent_id).map((t) => t.key)
 /** "Start ready": every ticket of the feature that may start now gets the go-ahead; they start as parallel slots allow. */
 export async function startReady(featureId: string): Promise<{ started: string[]; queued: string[]; blocked: { key: string; on: string[] }[] }> {
   const f = getFeature(featureId); if (!f || f.status === 'cancelled') throw new Error('unknown feature')
   notClearing(f.repo_id)
-  const going = new Set(openAsks().map((a) => actionOf(a)?.ticket)) // Bug 50: the user is being asked whether to remove it
-  for (const t of readyTickets(tickets(featureId), j<string[]>(f.merge_order, []))) if (!going.has(t.id)) setTicket(t.id, { go_ahead: 1 })
+  goAhead(f)
   const started = await fillSlots()
   const all = tickets(featureId)
   return {
     started,
-    queued: all.filter((t) => t.go_ahead && t.status === 'queued' && !t.assignee_agent_id).map((t) => t.key),
+    queued: waitingForSlot(all),
     blocked: all.filter((t) => t.status === 'queued' && unmergedDeps(t, all).length).map((t) => ({ key: t.key, on: unmergedDeps(t, all) })),
   }
 }
 let filling: Promise<unknown> = Promise.resolve()
+type Started = { ticketId: string; agentId: string }
+/** One notice to the project's TPM for the engineers one fill started (Bug 127), each with its id and branch: the TPM addresses a
+ *  ticket's messages to its engineer. One engineer: the same words as any other start. Go-ahead tickets that still wait for a slot are
+ *  named, so the TPM doesn't tell the user they are "ready to start" (nothing to click: HQ starts them as slots free up). On auto, HQ
+ *  gave the go-ahead, not the user. */
+function tellStarted(repoId: string, started: Started[]): void {
+  const tpm = liveTpm(repoId); if (!tpm) return // a TPM that starts later is briefed with the board as it stands
+  // Read again: one cancelled while the rest were starting was already reported, with its engineer stopped
+  const rows = started.map((s) => ({ t: getTicket(s.ticketId), id: s.agentId })).filter((r): r is { t: Ticket; id: string } => !!r.t && r.t.status !== 'cancelled')
+  if (!rows.length) return
+  const fids = new Set(rows.map((r) => r.t.feature_id)), featureId = fids.size === 1 ? [...fids][0] : null
+  const waiting = features().filter((f) => f.repo_id === repoId && f.status !== 'cancelled').flatMap((f) => waitingForSlot(tickets(f.id)))
+  const one1 = rows.length === 1 ? rows[0] : null
+  const head = one1 ? `HQ: engineer ${one1.id} started on ${one1.t.key} (branch ${one1.t.branch}). Address messages for this ticket to id ${one1.id}.`
+    : `HQ: ${rows.length} engineers started, one per ticket: ${rows.map((r) => `${r.id} on ${r.t.key} (branch ${r.t.branch})`).join(', ')}. `
+      + 'Address messages for a ticket to its engineer\'s id.'
+  const many = waiting.length > 1, auto = autoOn(repoId)
+  const how = `${many ? 'have' : 'has'} ${auto ? 'the go-ahead' : 'the user\'s go-ahead'} too and `
+    + (many ? 'start by themselves as engineer slots free' : 'starts by itself when an engineer slot frees')
+  const rest = waiting.length ? ` ${listKeys(waiting)} ${how} up${auto ? '.' : ': there is nothing for the user to click.'}` : ''
+  sendMessage({ repoId, featureId, channel: 'dm', from: 'hq', to: tpm.id, reason: 'fyi', body: head + rest })
+}
 /** Start go-ahead tickets while parallel slots are free, oldest feature first. One fill at a time so no ticket starts twice;
- *  each repo is synced once per fill, not once per ticket. */
+ *  each repo is synced once per fill, not once per ticket. Each project's TPM is told once, when the fill ends (Bug 127): one notice
+ *  per engineer woke it after the first start, and it answered while the rest were still starting ("still ready to start"). */
 export function fillSlots(): Promise<string[]> {
   const job = filling.then(async () => {
-    const started: string[] = []; const synced = new Set<string>()
-    for (;;) {
+    const started: string[] = []; const synced = new Set<string>(); const told = new Map<string, Started[]>()
+    try { for (;;) {
       const asking = new Set(openAsks().map((a) => actionOf(a)?.ticket)) // Bug 50: not while the user is asked whether to remove it
       const next = features().filter((f) => f.status !== 'cancelled' && !closedWhy(f.repo_id)).reverse()
         .flatMap((f) => readyTickets(tickets(f.id), j<string[]>(f.merge_order, [])).filter((t) => t.go_ahead && !starting.has(t.id) && !asking.has(t.id)))
         .sort((a, b) => Number(!!b.repairs_main) - Number(!!a.repairs_main))[0] // a repair first: nothing merges until it's in
       if (!next || !canLaunch({ ignoreCap: !!next.repairs_main }).ok) break
       const repoId = getFeature(next.feature_id)!.repo_id
-      try { await launchEngineer(next.id, { synced: synced.has(repoId) }); synced.add(repoId); started.push(next.key) } catch (e) {
+      try {
+        const a = await launchEngineer(next.id, { synced: synced.has(repoId), quiet: true }); synced.add(repoId); started.push(next.key)
+        told.set(repoId, [...told.get(repoId) ?? [], { ticketId: next.id, agentId: a.id }])
+      } catch (e) {
         setTicket(next.id, { go_ahead: 0 }); attention('launch_failed', `${next.key} could not start: ${(e as Error).message}`, { ticketId: next.id }); break
       }
-    }
+    } } finally { for (const [repoId, s] of told) tellStarted(repoId, s) } // also when the loop stopped on a failed launch
     return started
   })
   filling = job.catch(() => {}); return job

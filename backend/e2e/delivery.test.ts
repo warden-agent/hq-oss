@@ -244,17 +244,26 @@ test('only an answer answers an engineer\'s question; HQ\'s notices come from HQ
 
   const ask = await hq.mcp(eng.id, 'send_message', { to: 'tpm', reason: 'question', body: 'Wood or metal?' }); assert.equal(ask.isError, false, ask.text)
   assert.equal((await ticketOf(t)).status, 'awaiting_answer')
-  assert.equal((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, spec: 'A wooden shelf.' })).isError, false)
+  // Bug 129: the page is told whom it asked and what, so the box can say so and open it
+  const open = async () => (await hq.state()).questions.filter((x: any) => x.ticket_id === t.id)
+  assert.deepEqual((await open()).map((x: any) => [x.to_target, x.from_agent_id, x.body]), [[tpm.id, eng.id, 'Wood or metal?']])
+  assert.equal((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, spec: 'A wooden shelf.', user_asked: true })).isError, false)
   assert.equal((await ticketOf(t)).status, 'awaiting_answer') // the "spec updated" FYI is not an answer
   assert.equal((await hq.mcp(tpm.id, 'send_message', { to: eng.id, reason: 'fyi', body: 'Thinking about it.' })).isError, false)
   assert.equal((await ticketOf(t)).status, 'awaiting_answer')
   assert.equal((await hq.mcp(tpm.id, 'send_message', { to: eng.id, reason: 'answer', body: 'Wood.' })).isError, false)
   assert.notEqual((await ticketOf(t)).status, 'awaiting_answer')
+  assert.deepEqual(await open(), []) // answered: off the page
 
   await hq.mcp(eng.id, 'send_message', { to: 'tpm', reason: 'question', body: 'Oak or pine?' })
   assert.equal((await ticketOf(t)).status, 'awaiting_answer')
   await say(eng.id, 'Pine.') // The user's reply from HQ's message box answers it
   assert.notEqual((await ticketOf(t)).status, 'awaiting_answer')
+
+  await hq.mcp(eng.id, 'send_message', { to: 'user', reason: 'question', body: 'Two shelves or three?' }) // one for the user (Bug 129)
+  assert.deepEqual((await open()).map((x: any) => [x.to_target, x.body]), [['user', 'Two shelves or three?']])
+  await hq.api(`agents/${eng.id}/message`, { body: 'Three.', reason: 'answer' }) // what the question's box sends
+  assert.notEqual((await ticketOf(t)).status, 'awaiting_answer'); assert.deepEqual(await open(), [])
   await hq.api('settings', { key: 'dm_per_peer_min', value: 5 })
 })
 
@@ -349,13 +358,38 @@ test('Bug 33: the TPM can retitle a ticket after a change of mind; the engineer 
   assert.match((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key })).text, /give a new spec, a new title, or both/)
   const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
   await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
-  await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Totals line' })
+  await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Totals line', user_asked: true })
   await waitFor('the engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /^HQ: the TPM updated .*title \(now "Totals line"\)\./.test(m.body)))
+})
+
+test('Bug 125: with auto off, the TPM changes a started ticket only when the user asked; a queued one, as before', async () => {
+  const { f, tpm } = await setup('scope')
+  const spec = (t: any, a: Record<string, unknown>) => hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, ...a })
+  const told = async (to: string) => (await hq.state()).messages.filter((m: any) => m.to_id === to && /^HQ: the TPM updated/.test(m.body))
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Shelf', size: 'S', spec: 'A shelf.' })).json
+  assert.equal((await spec(t, { spec: 'A pine shelf.' })).isError, false) // not started: still the TPM's split to shape
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  // The engineer found something outside its ticket; the TPM widens it on its own: refused, nothing changes, nobody is told
+  const wide = await spec(t, { spec: 'A pine shelf, and fix the wobbly table too.', title: 'Shelf plus a fix for the table' })
+  assert.equal(wide.isError, true); assert.match(wide.text, /^Auto mode is off, so the user decides what .+ covers now that it has started\. .*call ask_user first/)
+  assert.match(wide.text, /Nothing was changed\.$/)
+  assert.deepEqual([(await ticketOf(t)).title, (await ticketOf(t)).spec], ['Shelf', 'A pine shelf.']); assert.equal((await told(eng.id)).length, 0)
+  // ask_user is still open to it in manual mode, and shows as Your turn
+  const ask = await hq.mcp(tpm.id, 'ask_user', { question: 'The engineer found the table wobbles. Fix it too?', choices: ['Fix it in its own ticket (suggested)', 'Fix it in this ticket'] })
+  assert.equal(ask.isError, false, ask.text); assert.ok((await hq.state()).asks.find((a: any) => /table wobbles/.test(a.question) && !a.answered_at))
+  // The user chose; the TPM passes it on with user_asked, and the engineer is told
+  assert.equal((await spec(t, { spec: 'A pine shelf.', user_asked: 'false' })).isError, true)
+  const ok = await spec(t, { spec: 'A pine shelf, and fix the wobbly table too.', user_asked: true }); assert.equal(ok.isError, false, ok.text)
+  assert.equal((await ticketOf(t)).spec, 'A pine shelf, and fix the wobbly table too.')
+  await waitFor('the engineer to be told', async () => (await told(eng.id)).length === 1)
+  // A TPM started before user_asked existed has no schema for it and sends the string "true"
+  const old = await spec(t, { title: 'Pine shelf', user_asked: 'true' }); assert.equal(old.isError, false, old.text); assert.equal((await ticketOf(t)).title, 'Pine shelf')
 })
 
 test('Bug 102: a spec change while a ticket has no engineer waits for the next one, and the TPM hears so', async () => {
   const { f, tpm } = await setup('spec-gone')
-  const spec = (t: any, a: Record<string, string>) => hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, ...a })
+  const spec = (t: any, a: Record<string, string>) => hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, ...a, user_asked: true })
   const msgs = async (to: string) => (await hq.state()).messages.filter((m: any) => m.to_id === to && m.from_id === 'hq' && /^HQ: the TPM updated/.test(m.body))
   const t = (await hq.api('tickets', { featureId: f.id, title: 'Shelf', size: 'S', spec: 'A shelf.' })).json
   assert.equal((await spec(t, { spec: 'A pine shelf.' })).text, `Updated. Nobody has started on ${t.key} yet; its engineer gets the new spec when it starts.`)
@@ -390,7 +424,7 @@ test('Bug 102: a relaunch over an engineer that left a question open gets its un
   assert.equal((await ticketOf(t)).status, 'awaiting_answer')
   await hq.api(`agents/${e1.id}/stop`, {})
   await waitFor('the engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === e1.id).status === 'exited')
-  await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, spec: 'A steel rack.' })
+  await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, spec: 'A steel rack.', user_asked: true })
   const e2 = (await hq.api(`tickets/${t.id}/launch`, {})).json; assert.ok(e2.id, JSON.stringify(e2))
   await waitFor('the new engineer', async () => (await hq.state()).agents.find((a: any) => a.id === e2.id && a.status === 'working'))
   assert.equal((await ticketOf(t)).status, 'planning')

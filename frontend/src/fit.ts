@@ -1,5 +1,5 @@
-// Where the board's view goes (Bug 119): on load, when boxes come or go, when the pane changes size, and on ⛶. Pure, so the
-// backend's test runner unit-tests it (src/fit.test.ts).
+// Where the board's view goes (Bug 119): on load, when boxes come or go, when the pane changes size, and on ⛶. Where a box's popover goes
+// (Bug 120). Pure, so the backend's test runner unit-tests it (src/fit.test.ts).
 
 /** A box on the board, in board coordinates (its position and its style size, which the layout sets exactly). */
 export type Box = { id: string; x: number; y: number; w: number; h: number }
@@ -50,4 +50,22 @@ export function fitSets(all: string[], groups: Group[], tpmTurn: boolean): strin
   const focus = want ? want.ids : tpmTurn || !going.length ? ['tpm'] : going.at(-1)!.ids
   const sets = [all, ['tpm', ...going.flatMap((g) => g.ids)], [...new Set(['tpm', ...focus])], focus]
   return sets.filter((set, i) => sets.findIndex((o) => o.join(' ') === set.join(' ')) === i)
+}
+
+/** A popover keeps this much room from the board's edges, sits this far from its box, and opens above the box when there's less than
+ *  POP_ROOM below it (and more above). It never gets shorter than POP_FLOOR: only a box panned off the board leaves less room. */
+export const POP_EDGE = 8, POP_GAP = 10, POP_ROOM = 240, POP_FLOOR = 150
+/** A popover's place in the pane: its left edge and either its top (below the box) or its bottom (`above`), its width and its
+ *  height limit (the panel inside scrolls its body past that). */
+export type PopPlace = { left: number; y: number; above: boolean; width: number; maxHeight: number }
+/** Where a box's popover goes in a `w`×`h` pane (Bug 120: the visible board, which ends at the side panel). `box` is where the box is
+ *  on screen, in pane pixels. The popover is as wide as it `want`s up to the pane less an edge each side, centred under the box and
+ *  moved sideways to stay inside the pane. It opens below the box with the rest of the pane's height to grow in, or above when the
+ *  room below is short and there's more above. */
+export function placePop(box: { x: number; y: number; w: number; h: number }, want: number, w: number, h: number): PopPlace {
+  const width = Math.max(0, Math.min(want, w - 2 * POP_EDGE))
+  const left = Math.max(POP_EDGE, Math.min(box.x + box.w / 2 - width / 2, w - POP_EDGE - width))
+  const below = h - (box.y + box.h + POP_GAP) - POP_EDGE, over = box.y - POP_GAP - POP_EDGE
+  const above = below < POP_ROOM && over > below
+  return { left, width, above, y: above ? box.y - POP_GAP : box.y + box.h + POP_GAP, maxHeight: Math.max(POP_FLOOR, above ? over : below) }
 }

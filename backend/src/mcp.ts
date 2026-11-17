@@ -8,7 +8,7 @@ import { BIND, NOTE_CAP, PORTS } from './config.ts'
 import { run, now, one } from './db.ts'
 import { emit, patch } from './events.ts'
 import { agentByToken, getAgent, type Agent } from './agents.ts'
-import { readInbox, sendMessage, resolveRecipient, dmAllowed, displayName } from './delivery.ts'
+import { readInbox, sendMessage, resolveRecipient, dmAllowed, displayName, patchQuestion } from './delivery.ts'
 import { attention } from './attention.ts'
 import { addFeature, changeFinished, createTicket, finishedAndStopped, hqOpened, launchEngineer, liveEngineerOf, setDependencies, waitingOn, withTpmText }
   from './tickets.ts'
@@ -27,6 +27,7 @@ type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean
 const text = (s: string): ToolResult => ({ content: [{ type: 'text', text: s }] })
 const fail = (s: string): ToolResult => ({ content: [{ type: 'text', text: s }], isError: true })
 
+const GO_AHEAD = 'started: HQ starts an engineer on it as soon as a slot is free, nothing for the user to click'
 function registerTools(s: McpServer, agent: Agent): void {
   const logCall = (tool: string, args: unknown) => emit({ agentId: agent.id, source: 'mcp', kind: `mcp.${tool}`, payload: { args } })
   s.registerTool('read_inbox', { description: 'Read HQ messages addressed to you that have not been delivered yet.', inputSchema: {} }, async () => { logCall('read_inbox', {}); const m = readInbox(agent); return text(m.length ? m.map((x) => `[${x.reason}] from ${displayName(x.from_id)} (${x.id}): ${x.body}`).join('\n\n') : 'No new messages.') })
@@ -37,7 +38,7 @@ function registerTools(s: McpServer, agent: Agent): void {
       + ` running: send the TPM a message to start it. "${a.body.slice(0, 300)}"`, { agentId: agent.id, ticketId: agent.ticket_id })
     const done = !to || to === a.to ? finishedAndStopped(a.to) : undefined // a finished ticket's engineer that HQ has stopped: say so, plainly
     if (done && getFeature(done.feature_id)?.repo_id === agent.repo_id) {
-      const next = agent.role === 'tpm' ? `To change ${done.key}, call update_ticket_spec: HQ starts an engineer to build the change.`
+      const next = agent.role === 'tpm' ? `To change ${done.key}, call update_ticket_spec (user_asked: true when the user asked for it): HQ starts an engineer to build the change.`
         : `Its work is on branch ${done.branch}; ask the TPM for anything else.`
       return fail(`${done.key} is finished and its engineer (${a.to}) has stopped, so nobody would read this. Nothing was sent. ${next}`)
     }
@@ -53,7 +54,11 @@ function registerTools(s: McpServer, agent: Agent): void {
         + `If it still matters, put it in your next message to ${displayName(to)}.`)
     }
     const m = sendMessage({ repoId: agent.repo_id, featureId: agent.feature_id, channel: to === 'team' ? 'team' : 'dm', from: agent.id, to: to === 'team' ? null : to, reason: a.reason, body: a.body, inReplyTo: a.in_reply_to ?? null })
-    if (agent.role === 'engineer' && a.reason === 'question' && agent.ticket_id) { const t = ticketForAgent(agent)!; setTicket(t.id, { prior_status: t.status, status: 'awaiting_answer' }); run('INSERT INTO questions(id, ticket_id, from_agent_id, to_target, message_id, asked_at) VALUES (?,?,?,?,?,?)', id('q'), t.id, agent.id, to, m.id, now()) }
+    if (agent.role === 'engineer' && a.reason === 'question' && agent.ticket_id) {
+      const t = ticketForAgent(agent)!, qid = id('q'); setTicket(t.id, { prior_status: t.status, status: 'awaiting_answer' })
+      run('INSERT INTO questions(id, ticket_id, from_agent_id, to_target, message_id, asked_at) VALUES (?,?,?,?,?,?)', qid, t.id, agent.id, to, m.id, now())
+      patchQuestion(qid) // Bug 129: the box says who it asked, and opens the question
+    }
     return text(`Sent (${m.id}) to ${to === 'user' ? 'the user' : displayName(to)}. ${a.reason === 'question' ? 'End your turn now; the answer will arrive as a new message.' : ''}`)
   })
   if (agent.role === 'tpm' || agent.role === 'engineer') {
@@ -82,7 +87,8 @@ function registerTools(s: McpServer, agent: Agent): void {
       logCall('list_tickets', {})
       const all = features().filter((f) => f.repo_id === repoId && f.status !== 'cancelled').reverse().map((f) => ({ feature: f.handle, title: f.title,
         done: featureDone(f.id), merge_order: j(f.merge_order, []), tickets: tickets(f.id).filter((t) => t.status !== 'cancelled').map((t) => ({ key: t.key, title: t.title, size: t.size,
-          status: t.status, assignee: t.assignee_agent_id, expected_files: j(t.expected_files, []), depends_on: j(t.deps, []), branch: t.branch, pr: t.pr_url })) }))
+          status: t.status, ...(t.status === 'queued' && t.go_ahead ? { go_ahead: GO_AHEAD } : {}), // Bug 127: started (by the user, or auto); not "ready to start" any more
+          assignee: t.assignee_agent_id, expected_files: j(t.expected_files, []), depends_on: j(t.deps, []), branch: t.branch, pr: t.pr_url })) }))
       return text(JSON.stringify(all, null, 1))
     })
     s.registerTool('start_feature', {
@@ -105,10 +111,19 @@ function registerTools(s: McpServer, agent: Agent): void {
     s.registerTool('update_ticket_spec', {
       description: 'Change a ticket\'s spec and/or title (keep the title matching what will be built). Its engineer is told (with none on it now, the next one'
         + ' that starts on it). A ticket that is already finished goes back to an engineer to build the new spec, and can\'t be merged until that is done. Not for merged or cancelled tickets.'
-        + ' A ticket HQ opened by itself (to repair main\'s tests) keeps HQ\'s spec and title: give only what you want to add, and HQ puts it under its own spec as "From the TPM".',
-      inputSchema: { key: z.string(), spec: z.string().optional(), title: z.string().optional() },
+        + ' A ticket HQ opened by itself (to repair main\'s tests) keeps HQ\'s spec and title: give only what you want to add, and HQ puts it under its own spec as "From the TPM".'
+        + ' With auto mode off, the user decides what a started ticket covers: change one only when they asked for it (user_asked: true).',
+      inputSchema: { key: z.string(), spec: z.string().optional(), title: z.string().optional(),
+        // a TPM started before this field existed has no schema for it and sends the string "true" (seen live, Bug 125)
+        user_asked: z.union([z.boolean(), z.enum(['true', 'false'])]).default(false).describe('true only when the user asked for this change, in a message or an answer to ask_user') },
     }, async (a) => {
       logCall('update_ticket_spec', a); const t = byKey(a.key); if (!t) return fail('no such ticket')
+      // Bug 125: with auto off, the TPM widened a started ticket and kept a known failure on its own, and told the user afterwards
+      if (!autoOn(repoId) && a.user_asked !== true && a.user_asked !== 'true' && t.status !== 'queued' && t.status !== 'merged' && t.status !== 'cancelled') {
+        return fail(`Auto mode is off, so the user decides what ${t.key} covers now that it has started. If they asked for this change, call again with`
+          + ' user_asked: true. If it is your idea or the engineer\'s (a wider ticket, a part dropped, a known failure kept), call ask_user first with your'
+          + ' suggestion as the first choice, and change the ticket only after they answer. Nothing was changed.')
+      }
       // Bug 108: HQ's own ticket keeps HQ's spec and title. The TPM's text goes under the spec; a new title for it is left out, and said so.
       const hq = hqOpened(t), asked = a.title?.trim(), title = hq ? undefined : asked
       if (!a.spec && !asked) return fail('give a new spec, a new title, or both')
@@ -157,7 +172,8 @@ function registerTools(s: McpServer, agent: Agent): void {
     // Bug 43: a question HQ can show the user as "Your turn", with a button per choice, instead of one lost at the end of a reply
     s.registerTool('ask_user', {
       description: 'Ask the user to decide something. HQ shows it on your box as "Your turn", with a button per choice. '
-        + 'One plain question per call; 2-4 short choices when they fit. Their answer comes back as a message.',
+        + 'One plain question per call; 2-4 short choices when they fit. Their answer comes back as a message. '
+        + 'With auto mode off, ask before a ticket grows or shrinks, or a known failure stays, with your suggestion as the first choice.',
       inputSchema: { question: z.string(), choices: z.array(z.string()).default([]),
         hard_to_undo: z.boolean().default(false).describe('In auto mode, only for things hard to undo: deleting the user\'s data, spending money, using logins or keys') },
     }, async (a) => {

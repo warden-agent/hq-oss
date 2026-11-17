@@ -8,7 +8,7 @@ const nodeTypes = { tpm: TpmNode, feature: FeatureNode, ticket: TicketNode }
 export type Focus = { node: string; n: number } | null
 type Props = { nodes: Node[]; edges: Edge[]; fits: string[][]; focus: Focus; onSelect: (id: string) => void; onPane: () => void }
 /** A click on a box's own controls (buttons, links, inputs, its popover) is theirs; only a click on the box itself selects it.
- *  Needed because React bubbles clicks from a NodeToolbar portal up to the box. */
+ *  Needed because React bubbles clicks from a popover's portal (BoardPop in Nodes.tsx) up to the box. */
 const ownClick = (t: EventTarget | null) => t instanceof Element && !!t.closest('.react-flow__node-toolbar, button, a, input, textarea, select')
 /** A box as the layout placed it: its position and its style size (set exactly by buildBoard), so the view needs no measuring. */
 const boxOf = (n: Node): Box => ({ id: n.id, x: n.position.x, y: n.position.y, w: Number(n.style?.width) || 0, h: Number(n.style?.height) || 0 })

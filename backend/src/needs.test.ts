@@ -1,7 +1,9 @@
 // The UI's "needs you" list (Bug 24, frontend/src/needs.ts): what counts in the tab title and what pops up a notification.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { claudeLine, forRepo, goodNews, keysText, needsYou, newNeeds, plainNews, splitNeeds, titleFor, yourTurn } from '../../frontend/src/needs.ts'
+import { askedWho, claudeLine, firstLine, forRepo, goodNews, keysText, needsYou, newNeeds, plainNews, splitNeeds, ticketQuestion, titleFor, turnQuestionText, uncountedQuestions,
+  yourTurn }
+  from '../../frontend/src/needs.ts'
 
 const state = () => ({
   repos: [{ id: 'r1', name: 'demo' }, { id: 'r2', name: 'api-server' }],
@@ -136,4 +138,36 @@ test('Bug 97: the Agents menu says which Claude Code runs, and warns only when i
     { warn: false, text: "Agents run Claude Code 2.1.322, the version HQ was checked on. This computer's own is 2.1.340." })
   assert.deepEqual(claudeLine({ checked: '2.1.322', runs: '2.1.340', installed: '2.1.340' }), { warn: true, text: 'Agents run Claude Code 2.1.340. HQ was checked on 2.1.322.' })
   assert.deepEqual(claudeLine({ checked: '2.1.322', runs: null, installed: null }), { warn: true, text: "HQ can't tell which Claude Code agents run. It was checked on 2.1.322." })
+})
+
+test('Bug 129: a ticket with a question says whom it asked and what; one for the user is in Your turn, and counted once', () => {
+  const qn = (id: string, ticket: string, to: string, body: string, at: number, answered: number | null = null) =>
+    ({ id, ticket_id: ticket, from_agent_id: `e-${ticket}`, to_target: to, message_id: `m-${id}`, asked_at: at, answered_at: answered, body })
+  const s: any = { repos: [{ id: 'r1', name: 'home' }, { id: 'r2', name: 'shop' }], features: [{ id: 'f1', repo_id: 'r1', status: 'active', created_at: 1 }, { id: 'f2', repo_id: 'r2', status: 'active', created_at: 1 }],
+    tickets: [{ id: 'a', key: 'T1', feature_id: 'f1', status: 'awaiting_answer', deps: '[]' }, { id: 'b', key: 'T2', feature_id: 'f1', status: 'awaiting_answer', deps: '[]' },
+      { id: 'c', key: 'T3', feature_id: 'f1', status: 'implementing', deps: '[]' }, { id: 'd', key: 'X1', feature_id: 'f2', status: 'awaiting_answer', deps: '[]' }],
+    agents: [{ id: 'tpm-1', role: 'tpm', repo_id: 'r1' }, { id: 'e-a', role: 'engineer', display_name: 'eng T1', feature_id: 'f1' }],
+    reviews: [], attention: [{ id: 'n1', kind: 'message_for_user', agent_id: 'e-b', detail: 'eng T2 (question): Blue or green?', created_at: 1 },
+      { id: 'n2', kind: 'message_for_user', agent_id: 'e-d', ticket_id: 'd', detail: 'eng X1 (question): Elsewhere', created_at: 2 }], messages: [], settings: {}, defaults: {},
+    questions: [qn('q1', 'a', 'tpm-1', 'Which file?', 10), qn('q0', 'a', 'tpm-1', 'Older one', 5), qn('q2', 'b', 'user', '## Colour\n**Blue** or green?', 11),
+      qn('q3', 'c', 'user', 'Answered long ago, ticket moved on', 3), qn('q4', 'd', 'user', 'Elsewhere', 12), qn('q5', 'b', 'tpm-1', 'Answered', 20, 21)] }
+  assert.equal(ticketQuestion(s, s.tickets[0])?.id, 'q1', 'the newest open one')
+  assert.equal(ticketQuestion(s, s.tickets[1])?.id, 'q2', 'an answered one is never shown, even if newer')
+  assert.equal(ticketQuestion(s, s.tickets[2]), null, 'only while the ticket says it has a question')
+  assert.equal(askedWho(s.questions[0], s.agents), 'the TPM'); assert.equal(askedWho(s.questions[2], s.agents), 'you')
+  assert.equal(askedWho({ ...s.questions[0], to_target: 'e-a' }, s.agents), 'eng T1'); assert.equal(askedWho({ ...s.questions[0], to_target: 'team' }, s.agents), 'the team')
+  assert.equal(askedWho({ ...s.questions[0], to_target: 'gone-agent' }, s.agents), 'another agent')
+  assert.equal(firstLine(s.questions[2].body), 'Colour')
+  const turn = yourTurn(s, 'r1')
+  assert.deepEqual(turn.questions, [{ id: 'q2', ticketId: 'b', key: 'T2', text: 'Colour', agentId: 'e-b' }], 'only the one for the user, only this project')
+  assert.equal(turnQuestionText(turn.questions![0]!), "T2's engineer asked you: Colour")
+  assert.equal(yourTurn({ ...s, questions: [] }, 'r1').questions, undefined)
+  assert.deepEqual(forRepo(s, 'r1').questions.map((x: any) => x.id).sort(), ['q0', 'q1', 'q2', 'q3', 'q5'])
+  // The ⚠ count has its notice ("Message for you") and nothing more: Your turn shows the question, it doesn't count it again
+  assert.deepEqual(needsYou(s, () => null).map((n) => n.key), ['attention:n1', 'attention:n2'])
+  assert.deepEqual(uncountedQuestions(s, turn), [])
+  // The user hid that notice with ✓, and the question is still open: now the question itself counts, once
+  const hid = { ...s, attention: [{ ...s.attention[0], resolved_at: 50 }, s.attention[1]] }
+  assert.deepEqual(needsYou(hid, () => null).map((n) => [n.key, n.text, n.ref]), [['question:q2', "home: T2's engineer asked you: Colour", { ticket: 'b' }],
+    ['attention:n2', 'shop: eng X1 (question): Elsewhere', { attention: 'n2' }]])
 })

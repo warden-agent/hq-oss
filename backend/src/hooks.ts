@@ -110,13 +110,13 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     case 'ConfigChange': Object.assign(payload, { csource: body.source, file: body.file_path }); break
     case 'SessionEnd': payload.reason = body.reason; bg.clear(); if (cleared) break
       endRuns(agent.id, 'all', 'session')
-      Object.assign(fields, { status: 'exited', ended_at: t }); live.activity = null; run('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE agent_id = ? AND ended_at IS NULL', t, String(body.reason ?? ''), agent.id); break
+      Object.assign(fields, { status: 'exited', ended_at: t, ended_why: `session:${String(body.reason ?? '')}` }); live.activity = null; run('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE agent_id = ? AND ended_at IS NULL', t, String(body.reason ?? ''), agent.id); break
     case 'TaskCreated': case 'TaskCompleted': payload.task = trim(body.task ?? body, 300); break
   }
   if (fields.status && fields.status !== 'paused' && agent.paused_reason?.startsWith('quota_auto_resume')) { // the usage wait is over: a turn moved on
     fields.paused_reason = null; resolveKind('usage_limit', agent.id)
   }
-  if (agent.status === 'exited') delete fields.status // a late hook from a session HQ already counts as gone doesn't bring it back
+  if (agent.status === 'exited') { delete fields.status; delete fields.ended_why } // a late hook from a session HQ already counts as gone doesn't bring it back, or say why it went
   update(agent.id, fields, agent.status !== 'exited' ? live : {}) // one patch (Bug 98)
   emit({ agentId: agent.id, sessionId: String(body.session_id ?? ''), source: 'hook', kind: `hook.${ev}${tool ? ':' + tool : ''}`, payload })
   // Bug 107: a Bash command of an engineer's (or of a helper of its: same session, same worktree) is over. Was it the project's test command, refused by Claude Code?

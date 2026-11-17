@@ -160,7 +160,7 @@ export function answerReview(reviewId: string, verdict: Verdict, opts: { plan?: 
   emit({ agentId: rev.agent_id, source: 'system', kind: 'gate.verdict', payload: { review: reviewId, verdict, by: opts.by, held: !!h } })
   const tk = getTicket(review.ticket_id), f = tk ? getFeature(tk.feature_id) : undefined
   if (!approve && opts.note?.trim() && tk && f) tellTpm(f, `HQ: the user sent ${tk.key}'s plan back (round ${review.round}) with: "${opts.note.trim()}". The engineer is revising it. `
-    + 'If this changes what the ticket builds, keep its spec and title in step (update_ticket_spec).')
+    + 'If this changes what the ticket builds, keep its spec and title in step (update_ticket_spec, user_asked: true).')
   if (h) {
     const no = verdict === 'escalate' ? 'Plan escalated to the user; wait for a message from HQ.' : 'Plan not approved. Revise and call ExitPlanMode again.'
     clearTimeout(h.timer); jsonEnd(h.res, approve ? allowAnswer(planText, rev.plan_file_path) : denyAnswer(opts.message ?? no))

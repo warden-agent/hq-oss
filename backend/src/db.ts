@@ -162,6 +162,11 @@ CREATE INDEX auto_runs_repo ON auto_runs(repo_id, started_at);`,
 // Bug 110: when the agent's own turn was last interrupted (Escape in its terminal) with no turn ended normally since. Until one does, Claude Code
 // drops every prompt a mod submits, so HQ types the agent's messages into its terminal instead (delivery.ts).
 `ALTER TABLE agents ADD COLUMN interrupted_at INTEGER;`,
+// Bug 126: what HQ ran on a ticket before it merged and how it ended (JSON, records.ts MergeTest), so its box can say so. NULL: merged before HQ kept a record.
+`ALTER TABLE tickets ADD COLUMN merge_test TEXT;`,
+// Bug 122: why an agent ended, in HQ's words: the reason HQ stopped it (stopAgent's `reason`: 'fresh_start', 'finished', 'user', …), 'lost' when its process
+// went without HQ stopping it, or 'session:<Claude Code's reason>' when its session ended by itself. The Agents menu says it beside the time it ended.
+`ALTER TABLE agents ADD COLUMN ended_why TEXT;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */
@@ -176,6 +181,8 @@ export const now = (): number => Date.now()
 export function q<T = Row>(sql: string, ...params: SQLInputValue[]): T[] { return db.prepare(sql).all(...params) as T[] }
 export function one<T = Row>(sql: string, ...params: SQLInputValue[]): T | undefined { return db.prepare(sql).get(...params) as T | undefined }
 export function run(sql: string, ...params: SQLInputValue[]): void { db.prepare(sql).run(...params) }
+/** An INSERT: the new row's id. */
+export function insert(sql: string, ...params: SQLInputValue[]): number { return Number(db.prepare(sql).run(...params).lastInsertRowid) }
 let depth = 0
 /** Runs `fn` as one transaction: all of its writes or none. Synchronous only (an await inside would let other requests'
  *  writes into it); a tx inside a tx joins the outer one. */

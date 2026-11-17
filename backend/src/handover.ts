@@ -8,7 +8,8 @@ import type { Feature, Repo, Ticket } from './records.ts'
 function standing(t: Ticket, all: Ticket[]): string {
   const waits = unmergedDeps(t, all)
   switch (t.status) {
-    case 'queued': return waits.length ? `waits for ${waits.join(', ')} to merge` : 'ready to start (the user starts it from HQ)'
+    case 'queued': return waits.length ? `waits for ${waits.join(', ')} to merge` : t.go_ahead ? 'started: HQ starts an engineer on it when a slot frees up (Bug 127)'
+      : 'ready to start (the user starts it from HQ)'
     case 'planning': return 'an engineer is writing its plan'
     case 'plan_review': return "its plan waits for the user's review"
     case 'implementing': return 'an engineer is building it'

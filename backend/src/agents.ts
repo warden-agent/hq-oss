@@ -18,7 +18,7 @@ export type Agent = {
   claude_session_id: string | null; transcript_path: string | null; tmux_session: string; cwd: string; token_hash: string; token_revoked_at: number | null
   status: string; in_plan_mode: number; last_event_at: number | null; takeover_locked_until: number | null; mod_seen_at: number | null; last_gate_allow_at: number | null
   paused_reason: string | null; started_at: number; ended_at: number | null; exit_code: number | null; launch_prompt: string | null; display_name: string | null
-  fresh_start_at: number | null; fresh_start_then: string | null; fresh_start_msg: string | null; interrupted_at: number | null
+  fresh_start_at: number | null; fresh_start_then: string | null; fresh_start_msg: string | null; interrupted_at: number | null; ended_why: string | null
 }
 export const agentDir = (agentId: string): string => path.join(PATHS.agents, agentId)
 export const tmuxName = (agentId: string): string => `hq-${agentId}`
@@ -36,6 +36,7 @@ export function liveAgents(): Agent[] { return q<Agent>("SELECT * FROM agents WH
 export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>, shown: Record<string, unknown> = {}): void {
   const keys = Object.keys(fields) as (keyof typeof fields)[]
   if (keys.length) run(`UPDATE agents SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => fields[k] as never), agentId)
+  if (fields.status === 'exited') shown = { ...shown, activity: null } // Bug 122: an agent that has ended is doing nothing, however it ended
   if (keys.length || Object.keys(shown).length) patch('agent', agentId, { ...fields, ...shown })
   if (fields.status === 'exited') resolveKind('stuck', agentId) // Bug 114: every way an agent ends (Stop, lost, SessionEnd) passes here; its alert ends with it
   if (keys.length) agentChanged(agentId, fields) // Bug 99: a waiting `next` looks again if delivery reads what changed
@@ -97,17 +98,23 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
  *  must not take the agent for one whose process died by itself (Bug 104). */
 const stopping = new Set<string>()
 export const beingStopped = (agentId: string): boolean => stopping.has(agentId)
+/** `reason` is kept as the agent's `ended_why` (Bug 122), with the time, unless the agent had already ended when the stop began (a second Stop
+ *  must not turn "replaced by a fresh start" into "stopped by you"). It's written after the terminal is gone, so a SessionEnd hook arriving while
+ *  HQ stops a running agent doesn't leave Claude Code's reason in place of HQ's. */
 export async function stopAgent(agentId: string, reason = 'stopped'): Promise<void> {
   const a = getAgent(agentId); if (!a) return
   stopping.add(agentId)
   try { await tmux.killSession(a.tmux_session) } finally { stopping.delete(agentId) } // the row is written in this same step, below
-  update(agentId, { status: 'exited', ended_at: now() }); revokeToken(agentId); resolveKind('dialog', agentId) // a session that's over has no dialog (Bug 62)
+  update(agentId, a.status === 'exited' ? { status: 'exited' } : { status: 'exited', ended_at: now(), ended_why: reason })
+  revokeToken(agentId); resolveKind('dialog', agentId) // a session that's over has no dialog (Bug 62)
   run('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE agent_id = ? AND ended_at IS NULL', now(), reason, agentId)
   emit({ agentId, source: 'system', kind: 'agent.stopped', payload: { reason } })
 }
 /** An agent whose process is gone without HQ stopping it: exited, token revoked, and `agent.lost` for whoever cleans up. */
 export function lost(agentId: string, payload: Record<string, unknown> = {}): void {
-  update(agentId, { status: 'exited', ended_at: now() }); revokeToken(agentId); resolveKind('dialog', agentId); emit({ agentId, source: 'system', kind: 'agent.lost', payload })
+  const ended = getAgent(agentId)?.status === 'exited' // already gone another way: why and when it ended stay (Bug 122)
+  update(agentId, ended ? { status: 'exited' } : { status: 'exited', ended_at: now(), ended_why: 'lost' })
+  revokeToken(agentId); resolveKind('dialog', agentId); emit({ agentId, source: 'system', kind: 'agent.lost', payload })
 }
 export function revokeToken(agentId: string): void {
   update(agentId, { token_revoked_at: now() })

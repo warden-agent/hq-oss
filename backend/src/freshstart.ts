@@ -82,8 +82,9 @@ export async function completeFreshStart(agentId: string, by: 'note' | 'fallback
   const then: Then = a.fresh_start_then === 'park' || a.fresh_start_then === 'clear' ? a.fresh_start_then : 'continue'
   try {
     if (by === 'fallback') saveNote(a, fallbackNote(a, why))
-    if (a.status !== 'exited') await stopAgent(a.id, 'fresh_start')
-    update(a.id, { fresh_start_at: null, fresh_start_then: null, fresh_start_msg: null })
+    const endedWhy = then === 'clear' ? 'cleared' : 'fresh_start' // what the Agents menu says it ended for (Bug 122), also when its session had already ended
+    if (a.status !== 'exited') await stopAgent(a.id, endedWhy)
+    update(a.id, { fresh_start_at: null, fresh_start_then: null, fresh_start_msg: null, ended_why: endedWhy })
     for (const kind of ['context_high', 'stuck', 'agent_exited', 'engineer_exited']) resolveKind(kind, a.id)
     emit({ agentId: a.id, source: 'system', kind: 'fresh_start.done', payload: { by, then, why } })
     if (then === 'clear') { const repoId = repoOfAgent(a); if (repoId) void maybeFinishClear(repoId).catch(() => {}); return }

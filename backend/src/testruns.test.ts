@@ -1,7 +1,7 @@
 // Bug 106 (frontend/src/testruns.ts): what the board says while HQ runs its own tests on a finished ticket, on main, or on a repair's test command.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { clock, runWords } from '../../frontend/src/testruns.ts'
+import { clock, featureTestsLine, mergeTestOf, mergeTestWords, runWords } from '../../frontend/src/testruns.ts'
 import { forRepo } from '../../frontend/src/needs.ts'
 
 test('Bug 106: how long a run has been going reads as a clock, and never as a minus', () => {
@@ -27,4 +27,32 @@ test('Bug 106: each project sees its own runs, and a state from before this fiel
   assert.deepEqual(forRepo({ ...s, testRuns: runs }, 'r1').testRuns.map((r) => r.id), ['a', 'c'])
   assert.deepEqual(forRepo({ ...s, testRuns: runs }, 'r3').testRuns, [])
   assert.equal('testRuns' in forRepo(s, 'r1'), false)
+})
+
+test('Bug 126: a merged ticket says what HQ ran on it first and how it ended, and says nothing it has no record of', () => {
+  const words = (m: string | null) => mergeTestWords(mergeTestOf({ merge_test: m }))
+  const pass = { ran: 'pass', test: 'npm test', counts: { passed: 412, failed: 0, skipped: 6 }, ms: 8200, on: 'main', at: 1 }
+  assert.deepEqual(words(JSON.stringify(pass)), { box: 'tests passed', passed: true,
+    long: "HQ's tests passed on main with it merged in, before it merged · 412 passed, 6 skipped · 8 s" })
+  assert.equal(words(JSON.stringify({ ...pass, counts: null, ms: 125_000 }))!.long, "HQ's tests passed on main with it merged in, before it merged · 2 min 5 s", 'no counts: none made up')
+  assert.deepEqual(words(JSON.stringify({ ran: 'none', by: 'user', at: 1 })), { box: 'no HQ test', passed: false,
+    long: 'You merged it with Merge, which runs no tests: HQ did not test it as it merged (only auto mode tests before it merges).' })
+  assert.equal(words(JSON.stringify({ ran: 'none', by: 'outside', at: 1 }))!.long, 'It was merged outside HQ, so HQ did not test it as it merged.')
+  assert.equal(words(null), null, 'merged before HQ kept a record: not "no tests", which may be untrue')
+  assert.equal(words('{not json'), null); assert.equal(words('{"ran":"maybe"}'), null)
+})
+test('Bug 126: a finished feature, its tickets folded away, says what HQ ran on them', () => {
+  const pass = JSON.stringify({ ran: 'pass', test: 'npm test', counts: { passed: 2, failed: 0, skipped: 1 }, ms: 3000, on: 'main', at: 1 })
+  const user = JSON.stringify({ ran: 'none', by: 'user', at: 1 }), outside = JSON.stringify({ ran: 'none', by: 'outside', at: 1 })
+  const line = (...ms: (string | null)[]) => featureTestsLine(ms.map((m, i) => ({ key: `T-0${i + 1}`, merge_test: m })))
+  assert.deepEqual(line(pass, pass), { text: 'HQ tested all 2 right before they merged', passed: true,
+    tip: "T-01: tests passed on main with it merged in, before it merged · 2 passed, 1 skipped · 3 s\nT-02: tests passed on main with it merged in, before it merged · 2 passed, 1 skipped · 3 s" })
+  assert.equal(line(pass)!.text, 'HQ tested it right before it merged')
+  assert.deepEqual({ ...line(user, user, outside, user, user, user)!, tip: '' }, { text: 'none tested by HQ as they merged', passed: false, tip: '' }, "F-4's six merges")
+  assert.equal(line(pass, user, outside, null)!.text, 'HQ tested 1 of 3 right before they merged · 1 with no record')
+  assert.match(line(pass, user, outside, null)!.tip,
+    /\nT-02: You merged it with Merge, which runs no tests: .*\nT-03: It was merged outside HQ, so HQ did not test it as it merged\.\nT-04: no record \(merged before HQ kept one\)$/)
+  assert.equal(line(pass, null)!.passed, false, 'one with no record: not "all tested"')
+  assert.equal(line(null, null), null, 'no record of any: nothing said')
+  assert.match(featureTestsLine([{ key: 'T-10', merge_test: null }, { key: 'T-9', merge_test: null }, { key: 'T-2', merge_test: pass }])!.tip, /^T-2: .*\nT-9: .*\nT-10: /, 'in key order, as numbers')
 })

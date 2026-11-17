@@ -25,7 +25,7 @@ test('Bugs 35/36: the user\'s revise note reaches the TPM; the engineer is asked
   assert.match(denied.hookSpecificOutput.decision.message, /update the "In plain words" summary/)
   const m = await waitFor('the TPM told', async () => (await hq.state()).messages.find((x: any) => x.to_id === tpm.id && x.from_id === 'hq' && /sent T-01's plan back/.test(x.body)))
   assert.equal(m.body, `HQ: the user sent T-01's plan back (round 1) with: "${note}". The engineer is revising it. `
-    + 'If this changes what the ticket builds, keep its spec and title in step (update_ticket_spec).')
+    + 'If this changes what the ticket builds, keep its spec and title in step (update_ticket_spec, user_asked: true).')
   // an approval tells the TPM nothing new
   const held2 = hq.hook(e.id, exitPlanMode('## In plain words\nAn Archive button with Undo.\n\n## Plan\n1. Button. 2. Undo.'))
   const rv2 = await waitFor('round 2', async () => (await hq.state()).reviews.find((r: any) => r.ticket_id === t.id && r.status === 'open' && r.id !== rv.id))

@@ -81,7 +81,7 @@ export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo }:
           : <Notice p={p} repo={repo} can={can} start={start} toServer={() => setTab('server')} toClaude={() => setTab('claude')} onRepo={onRepo} />}
       </div>
       {tab === 'server' && (stopped ? <div className="p-4 text-sm text-zinc-500">Not running. Start it to see its output here.</div>
-        : <AgentTerminal key={p.started_at} agentId={`preview:${p.id}`} ws={ws} feed={feed} />)}
+        : <AgentTerminal key={p.started_at} agentId={`preview:${p.id}`} ws={ws} feed={feed} minCols={0} />)}
       {tab === 'claude' && helper && <div className="absolute inset-0"><AgentTerminal key={helper} agentId={helper} ws={ws} feed={feed} /></div>}
     </div>
   </section>

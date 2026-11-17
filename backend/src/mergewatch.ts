@@ -12,7 +12,9 @@ import { conflictsWith, mergeIntoMain, names } from './localmerge.ts'
 import { clearConflict, clearStalled, fixWords, forTests, mergeBase, setConflict, stalledKind, whoMergedFirst } from './conflicts.ts'
 import { getAgent, stopAgent, type Agent } from './agents.ts'
 import { sendMessage } from './delivery.ts'
-import { autoOn, getFeature, getRepo, getTicket, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type Repo, type Ticket, liveTpm, closedWhy } from './records.ts'
+import { autoOn, getFeature, getRepo, getTicket, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type MergeTest, type Repo, type Ticket, liveTpm,
+  closedWhy } from './records.ts'
+import { countWords, took } from './testcounts.ts'
 import { ghOpts, git, syncRepo } from './repos.ts'
 import { releaseWorktree } from './slots.ts'
 import { writeFeatureMd } from './projectmd.ts'
@@ -183,9 +185,31 @@ async function checkConflict(t0: Ticket, repo: Repo, pr?: Pr): Promise<void> {
   }
   clearConflict(t.id)
 }
-/** `byUser`: they pressed Merge in HQ, so a plain "X merged" tells them nothing. "Start ready" still does. */
-function markMerged(t: Ticket, pr: Pr | null, o: { byUser?: boolean } = {}): void {
-  if (getTicket(t.id)?.status === 'merged') return // the watcher and Merge into main can both see the same merge
+/** Auto mode's passing test of a ticket, handed to the merge it allowed (Bug 126): the record is the merge's own, never a test read back later. */
+export type Tested = Extract<MergeTest, { ran: 'pass' }> & { output: string }
+/** What HQ ran on a ticket before it merged, for its TPM: an agent says what HQ did, so HQ says it first (Bug 126: a TPM told the user "HQ ran the tests before
+ *  each merge" after six merges HQ never tested). */
+export function testedWords(m: MergeTest, base: string): string {
+  if (m.ran === 'none') return m.by === 'user'
+    ? 'The user merged it with Merge, which runs no tests: HQ did not test it as it merged.' : 'It was merged outside HQ, so HQ did not test it as it merged.'
+  return `HQ's tests passed on ${base} first (\`${m.test.length > 120 ? `${m.test.slice(0, 117)}...` : m.test}\`${m.counts ? `: ${countWords(m.counts)}` : ''}, ${took(m.ms)}).`
+}
+const passed = ({ output: _, ...m }: Tested): MergeTest => m
+/** Saves what HQ ran on it before the merge; a passing run's output goes beside it, for the Ticket tab. */
+function saveMergeTest(ticketId: string, m: MergeTest, output: string | null): void {
+  if (output !== null) run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
+    `ticket:${ticketId}`, 'merge_test_output', output, now())
+  setTicket(ticketId, { merge_test: JSON.stringify(m) })
+}
+/** `byUser`: they pressed Merge in HQ, so a plain "X merged" tells them nothing. "Start ready" still does. `tested`: auto mode's passing test that let it merge;
+ *  without one HQ did not test it as it merged, and the ticket says so (Bug 126). */
+function markMerged(t: Ticket, pr: Pr | null, o: { byUser?: boolean; tested?: Tested } = {}): void {
+  const m: MergeTest = o.tested ? passed(o.tested) : { ran: 'none', by: o.byUser ? 'user' : 'outside', at: now() }
+  if (getTicket(t.id)?.status === 'merged') { // the watcher and Merge can both see the same merge, the watcher first: HQ's own merge has the true record
+    if (o.tested || o.byUser) saveMergeTest(t.id, m, o.tested?.output ?? null)
+    return
+  }
+  saveMergeTest(t.id, m, o.tested?.output ?? null)
   setTicket(t.id, { status: 'merged', pr_state: 'merged', conflict_files: null, conflict_with: null, ...(pr ? { pr_number: pr.number, pr_url: pr.url } : {}) })
   emit({ agentId: t.assignee_agent_id, source: 'system', kind: 'ticket.merged', payload: { ticket: t.id, key: t.key, pr: pr?.number ?? null } })
   const a = t.assignee_agent_id ? getAgent(t.assignee_agent_id) : undefined
@@ -198,7 +222,8 @@ function markMerged(t: Ticket, pr: Pr | null, o: { byUser?: boolean } = {}): voi
   const what = `${t.key} merged${pr ? ` (PR #${pr.number})` : ''}.${ready.length ? ` Ready now: ${ready.join(', ')}.` : ''}`
   const auto = autoOn(f.repo_id) // auto mode starts what's ready and sums the run up at the end
   if (!auto && (ready.length || !o.byUser)) attention('merged', ready.length ? `${what} Start them with "Start ready".` : what, { agentId: t.assignee_agent_id, ticketId: t.id })
-  tellTpm(f, `HQ: ${what}${ready.length ? auto ? ' HQ starts them.' : ' The user starts them from HQ.' : ''}`)
+  const tested = `${t.key} merged${pr ? ` (PR #${pr.number})` : ''}. ${testedWords(m, getRepo(f.repo_id)?.default_branch ?? 'main')}` // what HQ ran on it first (Bug 126)
+  tellTpm(f, `HQ: ${tested}${ready.length ? ` Ready now: ${ready.join(', ')}.${auto ? ' HQ starts them.' : ' The user starts them from HQ.'}` : ''}`)
 }
 const merging = new Map<string, Promise<unknown>>() // one merge per repo at a time
 /** Merge for a finished ticket. GitHub repos: mergeOnGithub. Local repos (or a GitHub one HQ can't push to): HQ merges its branch with fixed rules (localmerge.ts: refuses,
@@ -215,10 +240,10 @@ export function inMergeQueue<T>(repoId: string, fn: () => Promise<T>): Promise<T
   const job = (merging.get(repoId) ?? Promise.resolve()).then(fn); merging.set(repoId, job.catch(() => {})); return job
 }
 /** The merge itself. Only inside inMergeQueue. */
-export async function mergeNow(ticketId: string, repo: Repo): Promise<{ merged: true; sha: string; already: boolean }> {
+export async function mergeNow(ticketId: string, repo: Repo, tested?: Tested): Promise<{ merged: true; sha: string; already: boolean }> {
     const t = getTicket(ticketId)!
     if (t.status === 'merged') return { merged: true as const, sha: '', already: true }
-    if (usesGithub(repo) && t.pr_state !== 'local') return mergeOnGithub(t, repo) // finished while local-only: still merged here
+    if (usesGithub(repo) && t.pr_state !== 'local') return mergeOnGithub(t, repo, tested) // finished while local-only: still merged here
     if (t.status === 'resolving') throw new Error(`${t.key}'s engineer is ${fixWords(t.fixing, repo.default_branch).ing}; merge it once that's done.`)
     if (t.status !== 'pr_ready' || t.pr_state !== 'local' || !t.branch) throw new Error(`${t.key} isn't finished yet (${t.status}).`)
     const doc = one<{ text: string }>('SELECT text FROM docs WHERE scope = ? AND key = ?', `ticket:${t.id}`, 'pr')?.text ?? ''
@@ -234,14 +259,14 @@ export async function mergeNow(ticketId: string, repo: Repo): Promise<{ merged: 
       emit({ agentId: null, source: 'ui', kind: 'ticket.merge_refused', payload: { ticket: t.id, key: t.key, why, conflicts: r.conflicts ?? null } }); throw new Error(why)
     }
     emit({ agentId: t.assignee_agent_id, source: 'ui', kind: 'ticket.merged_by_hq', payload: { ticket: t.id, key: t.key, sha: r.sha, already: r.already } })
-    markMerged(t, null, { byUser: true })
+    markMerged(t, null, { byUser: true, tested })
     void syncRepo(repo.id).catch(() => {}) // the repo's head, for the UI
     return { merged: true as const, sha: r.sha, already: r.already }
 }
 /** Merge for a GitHub repo (Bug 45: through a PR, so GitHub keeps the record): the branch is checked against GitHub's
  *  main and pushed again, a PR is opened if it has none, and GitHub merges it with a normal merge commit. Then it's like any merge
  *  HQ notices, and local main fast-forwards. Nothing changes when GitHub refuses; the user reads why. */
-async function mergeOnGithub(t: Ticket, repo: Repo): Promise<{ merged: true; sha: string; already: boolean }> {
+async function mergeOnGithub(t: Ticket, repo: Repo, tested?: Tested): Promise<{ merged: true; sha: string; already: boolean }> {
   const slug = parseGithubRemote(repo.remote ?? '')!, o = ghOpts()
   if (t.status === 'resolving') throw new Error(`${t.key}'s engineer is ${fixWords(t.fixing, repo.default_branch).ing}; merge it once that's done.`)
   if (!['pr_ready', 'pr_open'].includes(t.status) || !t.branch) throw new Error(`${t.key} isn't finished yet (${t.status}).`)
@@ -254,7 +279,7 @@ async function mergeOnGithub(t: Ticket, repo: Repo): Promise<{ merged: true; sha
   }
   await pushBranch(repo.path, slug, t.branch, o) // GitHub merges the commits HQ ran in Try it
   let pr = decidingPr(await prsForBranch(slug, t.branch, o))
-  if (pr?.state === 'MERGED') { markMerged(t, pr, { byUser: true }); return { merged: true, sha: '', already: true } }
+  if (pr?.state === 'MERGED') { markMerged(t, pr, { byUser: true, tested }); return { merged: true, sha: '', already: true } }
   if (pr?.state !== 'OPEN') {
     const { title, body } = prText(t)
     try { pr = await createPr(slug, repo.default_branch, t.branch, title, body, o) } catch (e) { throw new Error(`HQ couldn't open a PR to merge ${t.key}: ${(e as Error).message}`) }
@@ -266,7 +291,7 @@ async function mergeOnGithub(t: Ticket, repo: Repo): Promise<{ merged: true; sha
     const why = (e as Error).message; emit({ agentId: null, source: 'ui', kind: 'ticket.merge_refused', payload: { ticket: t.id, key: t.key, why, pr: pr.number } }); throw e
   }
   emit({ agentId: t.assignee_agent_id, source: 'ui', kind: 'ticket.merged_by_hq', payload: { ticket: t.id, key: t.key, sha, pr: pr.number } })
-  markMerged(getTicket(t.id)!, { ...pr, state: 'MERGED' }, { byUser: true })
+  markMerged(getTicket(t.id)!, { ...pr, state: 'MERGED' }, { byUser: true, tested })
   void syncRepo(repo.id).catch(() => {}) // local main gets the merge
   return { merged: true, sha, already: false }
 }

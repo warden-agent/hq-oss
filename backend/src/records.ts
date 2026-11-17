@@ -7,6 +7,7 @@ import { patch } from './events.ts'
 import { j } from './util.ts'
 import { parseGithubRemote } from './reposync.ts'
 import type { Agent } from './agents.ts'
+import type { Counts } from './testcounts.ts'
 
 export type Repo = {
   id: string; name: string; path: string; remote: string | null; default_branch: string; context_doc_path: string | null
@@ -37,8 +38,15 @@ export type Ticket = {
   repairs_main: string | null // the main a repair ticket of HQ's is fixing (auto mode)
   repairs_cmd: string | null // Bug 107: on a repair ticket, the test command it is fixing because Claude Code refuses it for engineers. Null: main's tests fail
   fixing: Fixing // what it went back to its engineer for, while `resolving` (Bug 84)
+  merge_test: string | null // Bug 126: JSON MergeTest, set when it merges; null on tickets merged before HQ kept a record
   parked_at: number | null; created_at: number; updated_at: number
 }
+
+/** Bug 126: what HQ ran on a ticket before it merged. `pass`: auto mode's test of it on `on` (main with this ticket merged in) passed: the command, the counts
+ *  its summary gave (null when HQ couldn't read them), how long the test step took. `none`: HQ did not test it as it merged
+ *  (it may have tested an earlier version): the user pressed Merge (`user`), or it was merged
+ *  outside HQ, on GitHub or by hand (`outside`). Frontend testruns.ts has the same type and says it in words. */
+export type MergeTest = { ran: 'pass'; test: string; counts: Counts | null; ms: number; on: string; at: number } | { ran: 'none'; by: 'user' | 'outside'; at: number }
 
 /** Whether finished work goes to GitHub (push + PR) or stays local (Merge into main): a GitHub repo HQ can't push to (an
  *  open-source repo, say) is worked on locally. can_push null (GitHub couldn't be asked) keeps the GitHub way. */

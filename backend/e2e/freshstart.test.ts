@@ -58,6 +58,8 @@ test('fresh start: the note is capped, the engineer is replaced, and the new one
   assert.match(ask.body, /nobody rejected it/)
   assert.deepEqual(await hq.modNext(eng.id), {}) // the other message waits for the new session
 
+  await hq.hook(eng.id, { hook_event_name: 'PreToolUse', tool_name: 'mcp__hq__write_handoff_note', tool_input: {} }) // its last activity line (Bug 122)
+  await waitFor('the activity line', async () => (await agent(eng.id))?.activity === 'Calling hq.write_handoff_note')
   const long = await hq.mcp(eng.id, 'write_handoff_note', { text: 'x'.repeat(2501) })
   assert.equal(long.isError, true); assert.match(long.text, /2,501 characters; the limit is 2,500/)
   const ok = await hq.mcp(eng.id, 'write_handoff_note', { text: '## Where I stopped\n- hello.txt half written (NOTE-MARKER)' })
@@ -66,6 +68,8 @@ test('fresh start: the note is capped, the engineer is replaced, and the new one
   // Its row exists a moment before the ticket points at it, so wait for both: the test used to read that gap now and then
   const next = await waitFor('the new engineer', async () => { const a = await live(t); return a?.id !== eng.id && (await tk(t)).assignee_agent_id === a?.id && a })
   assert.equal((await agent(eng.id)).status, 'exited')
+  // Bug 122: the old one is not still "Calling hq.write_handoff_note" beside the new one, and the menu can say it was replaced
+  assert.deepEqual([(await agent(eng.id)).activity ?? null, (await agent(eng.id)).ended_why], [null, 'fresh_start'])
   const p = await prompt(next.id)
   assert.match(p, /taking over ticket/); assert.match(p, /NOTE-MARKER/); assert.match(p, /\?\? hello\.txt/); assert.match(p, /PLAN-MARKER/)
   assert.equal((await tk(t)).status, 'implementing'); assert.equal((await tk(t)).assignee_agent_id, next.id); assert.equal((await tk(t)).parked_at, null)

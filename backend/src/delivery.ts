@@ -307,9 +307,22 @@ export function dmAllowed(agent: Agent, to: string, reason: string): { ok: boole
   return { ok: true }
 }
 
+/** An engineer's open question as the page shows it (Bug 129): who it asked (`to_target`: an agent id, 'user' or 'team') and what, with
+ *  the message's text, which may be older than the page's last 300 messages. Only for tickets still waiting on the answer. */
+export type QuestionView = { id: string; ticket_id: string | null; from_agent_id: string; to_target: string; message_id: string; asked_at: number; answered_at: number | null; body: string }
+const QUESTION_SQL = `SELECT q.id, q.ticket_id, q.from_agent_id, q.to_target, q.message_id, q.asked_at, q.answered_at, substr(m.body, 1, 4000) AS body
+  FROM questions q JOIN messages m ON m.id = q.message_id`
+export const openQuestions = (): QuestionView[] => q<QuestionView>(`${QUESTION_SQL} JOIN tickets t ON t.id = q.ticket_id
+  WHERE q.answered_at IS NULL AND t.status = 'awaiting_answer' ORDER BY q.asked_at DESC`)
+/** Sends the page a question as it is now: asked, or moved to a new session (tpm.ts handOver). */
+export function patchQuestion(questionId: string): void {
+  const row = one<QuestionView>(`${QUESTION_SQL} WHERE q.id = ?`, questionId); if (row) patch('question', row.id, row as unknown as Record<string, unknown>)
+}
 export function resolveQuestion(engineerId: string, answerMessageId: string, inReplyTo: string | null): void {
   const qrow = inReplyTo ? one<{ id: string; ticket_id: string | null }>('SELECT id, ticket_id FROM questions WHERE message_id = ? AND answered_at IS NULL', inReplyTo) : one<{ id: string; ticket_id: string | null }>('SELECT id, ticket_id FROM questions WHERE from_agent_id = ? AND answered_at IS NULL ORDER BY asked_at', engineerId)
   if (!qrow) return
   // tickets.ts hears question.answered and takes the ticket out of awaiting_answer (it owns ticket writes; no import cycle).
-  tx(() => { run('UPDATE questions SET answered_at = ?, answer_message_id = ? WHERE id = ?', now(), answerMessageId, qrow.id); emit({ agentId: engineerId, source: 'system', kind: 'question.answered', payload: { question: qrow.id, answer: answerMessageId, ticket: qrow.ticket_id } }) })
+  tx(() => { const at = now(); run('UPDATE questions SET answered_at = ?, answer_message_id = ? WHERE id = ?', at, answerMessageId, qrow.id)
+    patch('question', qrow.id, { answered_at: at })
+    emit({ agentId: engineerId, source: 'system', kind: 'question.answered', payload: { question: qrow.id, answer: answerMessageId, ticket: qrow.ticket_id } }) })
 }
