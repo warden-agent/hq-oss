@@ -11,6 +11,8 @@ process.env.HQ_HOME = path.join(root, 'hq'); process.env.HQ_IDLE_FIX_S = '0'
 const bin = path.join(root, 'bin'); fs.mkdirSync(bin)
 fs.writeFileSync(path.join(root, 'screen'), '─'.repeat(20) + '\n❯ \n  ⏸ manual mode on\n')
 fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
+[ "$1" = -S ] || exit 9 # every call names HQ's socket (Bug 242)
+shift 2
 case "$1" in
   has-session) [ -e "${root}/gone-$3" ] && exit 1; exit 0 ;;
   display-message) echo 0 ;;

@@ -147,14 +147,6 @@ export function startFreshStartLoop(): void {
   if (!timer) { sweepFreshStarts(); timer = setInterval(() => { try { sweepFreshStarts() } catch {} }, 10_000) }
 }
 
-/** Every ticket of the feature (at least one, not counting cancelled ones) is merged: its TPM has nothing left to coordinate. */
-export const featureDone = (fid: string): boolean => { const all = tickets(fid).filter((t) => t.status !== 'cancelled'); return all.length > 0 && all.every((t) => t.status === 'merged') }
-/** Where a feature stands, in its board box's words (frontend/src/board.ts featureView), not its stored status word: that stays
- *  "planning" until it's cancelled, done or not (Bug 222). */
-export const featureState = (f: Feature): string => {
-  const all = tickets(f.id).filter((t) => t.status !== 'cancelled'), merged = all.filter((t) => t.status === 'merged').length
-  return featureDone(f.id) ? `✓ done · all ${all.length} merged` : f.status === 'cancelled' ? 'cancelled' : all.length ? `${merged}/${all.length} merged` : 'no tickets yet'
-}
 export const inRepo = (repoId: string): Set<string> => new Set(features().filter((f) => f.repo_id === repoId).map((f) => f.id))
 /** The repo's live TPM and engineers (the project TPM has no feature: Bug 52). */
 const workers = (repoId: string): Agent[] => liveAgents().filter((x) => (x.role === 'tpm' || x.role === 'engineer') && repoOfAgent(x) === repoId)

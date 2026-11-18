@@ -249,3 +249,27 @@ test("Bug 196: HQ's own note from an earlier clear isn't the TPM's: a second cle
   assert.match(note('resume:repo:r14') ?? '', /^\(Written by HQ: the TPM didn't leave a note: none came within 3 minutes\.\)/)
   assert.doesNotMatch(note('resume:repo:r14') ?? '', /old reason/)
 })
+
+test('Bug 251: only a clean clear is good news; one that left a worktree, or whose TPM didn\'t start again, says so under its own kind', async () => {
+  const { openAttention } = await import('./attention.ts')
+  const open = (r: string) => openAttention().filter((a) => a.kind.endsWith(`:${r}`)).map((a) => a.kind).sort()
+  // a worktree git can't handle (not a repo): its code can't be saved, so the folder stays
+  const odd = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-clear-odd-'))
+  run("INSERT INTO repos(id, name, path, kind, created_at) VALUES ('r15', 'fifteenth', ?, 'local', ?)", repoDir, now)
+  feature('f15', 'r15'); ticket('f15-t', 'f15', 'T1', 'implementing', { worktree: odd })
+  await clearRepo('r15')
+  assert.deepEqual(open('r15'), ['repo_cleared_left:r15'])
+  assert.match(openAttention().find((a) => a.kind === 'repo_cleared_left:r15')!.detail, /These worktrees couldn't be removed/)
+  // its TPM ran before the clear but can't start again: the project's folder is gone
+  run("INSERT INTO repos(id, name, path, kind, created_at) VALUES ('r16', 'sixteenth', '/tmp/sixteenth', 'local', ?)", now)
+  feature('f16', 'r16')
+  run("UPDATE repos SET clearing_at = ?, clear_tpm_was_on = 1 WHERE id = 'r16'", now) // a clear its TPM's note just finished
+  assert.equal(await maybeFinishClear('r16'), true)
+  const deadline = Date.now() + 10_000
+  while (!open('r16').includes('repo_clear_tpm:r16') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20))
+  assert.deepEqual(open('r16'), ['repo_clear_tpm:r16', 'repo_cleared:r16']) // the clear itself still worked
+  assert.match(openAttention().find((a) => a.kind === 'repo_clear_tpm:r16')!.detail, /^Cleared sixteenth, but its TPM didn't start again: .*does not exist/)
+  // the next clear ends all of them
+  await clearRepo('r15'); await clearRepo('r16')
+  assert.deepEqual(open('r15'), ['repo_cleared:r15']); assert.deepEqual(open('r16'), ['repo_cleared:r16'])
+})

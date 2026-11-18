@@ -9,8 +9,8 @@ import path from 'node:path'
 import { PATHS } from './config.ts'
 import { one, q, run, now } from './db.ts'
 import { emit, patch, type HqEvent } from './events.ts'
-import { assignPorts, commandRecipe, detectCommand, frameBlocked, PREVIEW_PORTS, portBusy, printedPorts, recipeProblem, runScript, supervisorSpec,
-  type Recipe } from './apprun.ts'
+import { assignPorts, commandRecipe, detectCommand, frameBlocked, PREVIEW_PORTS, portBusy, printedPorts, recipeProblem, refusedWords, runScript, supervisorSpec,
+  type Recipe, type Refusal } from './apprun.ts'
 import { groupPids, pgidOf, portHolders, whoAnswers, whose, type Holder, type Whose } from './procs.ts'
 import { markFor, runOver, runStarting, sweepNow } from './leftovers.ts'
 import { git } from './reposync.ts'
@@ -59,8 +59,8 @@ export function runnableRecipe(p: Preview | undefined, cwd: string): Recipe | nu
 /** Thrown when there's nothing to run yet: no ⚙ command and no OK'd recipe. */
 export class NeedsSetup extends Error {}
 /** Thrown when the OK'd recipe's install fails today's lockfile check in this checkout (Bug 156: saved before the check, or a
- *  lockfile came or went since). `reason`: the check's words, for the helper that fixes the steps. */
-export class StepsOutdated extends Error { reason: string; constructor(msg: string, reason: string) { super(msg); this.reason = reason } }
+ *  lockfile came or went since). `reason`: the check's words, for the helper that fixes the steps, and the lockfile it names. */
+export class StepsOutdated extends Error { reason: Refusal; constructor(msg: string, reason: Refusal) { super(msg); this.reason = reason } }
 /** One repo's preview as the UI sees it: the saved row (or "stopped") with its recipes parsed, and the root npm script HQ
  *  would suggest for ⚙ (a hint only: it no longer starts anything by itself). */
 type PreviewView = Omit<Preview, 'recipe' | 'draft_recipe' | 'port_holders' | 'helper_ports'> & {
@@ -214,69 +214,80 @@ export function heldText(port: number, part: string, hs: PortHolder[]): string {
 const SUPERVISOR = path.join(import.meta.dirname, 'supervise.mjs')
 
 export function startPreview(repoId: string, why: string | null = null, opts: { ticket?: string | null } = {}): Promise<ReturnType<typeof previewView>> {
-  return serial(repoId, async () => {
-    const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
-    notClearing(repoId)
-    const cur = row(repoId)
-    const asked = opts.ticket !== undefined, tid = asked ? opts.ticket ?? null : cur?.ticket_id ?? null
-    let tk = tid ? getTicket(tid) : undefined
-    if (tid && (!tryable(tk) || getFeature(tk.feature_id)?.repo_id !== repoId)) {
-      if (asked) throw new Error(`${tk?.key ?? 'That ticket'} can't be tried: only a finished ticket waiting for its merge, with no conflicts to fix, can.`)
-      tk = undefined
-    }
-    const cwd = tk?.worktree_path ?? repo.path
-    const recipe = runnableRecipe(cur, cwd)
-    if (!recipe) throw new NeedsSetup(`HQ doesn't know how to start ${repo.name} yet. Launch asks Claude to work it out (or set your own command with ⚙).`)
-    unwatch(repoId); await kill(repoId, 'restart')
-    const stale = cur?.command ? null : recipeProblem(recipe, cwd) // the user's own command chose its install from npm's record
-    if (stale) {
-      const msg = `HQ didn't start ${repo.name}: its saved start steps would write a package-lock.json into the project, or not follow the one it has.`
-      save(repoId, { status: 'stopped', detail: `${msg} Start it again and Claude fixes them for your OK.`, url: null, port_holders: null, stopping: null })
-      throw new StepsOutdated(msg, stale) // the check's own words go to the helper, not to the user
-    }
-    const got = await assignPorts(recipe, cur?.port ?? null, portBusy, helperPortsHeld(repoId))
-    const range = `ports ${PREVIEW_PORTS[0]}–${PREVIEW_PORTS.at(-1)} are all in use`
-    if (!got) { save(repoId, { status: 'stopped', detail: range, port_holders: null, stopping: null }); throw new Error(range) }
-    if (got.taken.length) { // something else answers there (the user's own dev server, say): this app would talk to it, not to its own part
-      const all = repos(), held = await Promise.all(got.taken.map(async (x) =>
-        (await portHolders(x.port)).map((h): PortHolder => ({ ...h, ...whose(h.cwd, all, repoId), port: x.port, part: x.part }))))
-      const known = held.flat(), msg = `Can't start ${repo.name}: ${got.taken.map((x, i) => heldText(x.port, x.part, held[i]!)).join('; ')}.`
-        + (known.length ? ' Stop it here, then Launch.' : ' Stop it, then Launch.')
-      save(repoId, { status: 'stopped', detail: msg, url: null, port_holders: known.length ? JSON.stringify(known) : null, stopping: null })
-      throw new PortTaken(msg, got.taken.map((x) => x.port))
-    }
-    const port = got.ports[recipe.show]!
-    const copied = tk && asked ? await copyMainData(repo.path, cwd, recipe.worktree_files).catch(() => []) : [] // a restart keeps what the user did while trying
-    const branch = await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => null)
-    const head = await git(cwd, ['rev-parse', '--short', 'HEAD']).catch(() => null)
-    const dir = path.join(PATHS.home, 'previews', repoId); fs.mkdirSync(dir, { recursive: true })
-    const marksFile = path.join(dir, 'installed.json')
-    const marks = (() => { try { return JSON.parse(fs.readFileSync(marksFile, 'utf8')) as Record<string, string> } catch { return {} } })()
-    const command = recipe.parts.map((x) => x.run).join(' + ')
-    const spec = supervisorSpec({ recipe, root: cwd, ports: got.ports, marks, marksFile,
-      header: `HQ preview: ${recipe.parts.map((x) => `${recipe.parts.length > 1 ? `${x.name}: ` : ''}${x.run} · port ${got.ports[x.name]}`).join(' | ')}`
-        + ` · ${tk ? `${tk.key} · ` : ''}${branch ?? '?'}@${head ?? '?'}` })
-    const install = spec.parts.filter((x) => x.install).map((x) => x.install).join(', ') || null
-    fs.writeFileSync(path.join(dir, 'spec.json'), JSON.stringify(spec, null, 1))
-    const script = path.join(dir, 'run.sh'), t = now(), mark = markFor(repoId, t)
-    fs.writeFileSync(script, runScript({ cwd, node: process.execPath, supervisor: SUPERVISOR, spec: path.join(dir, 'spec.json'), mark }), { mode: 0o700 })
-    runStarting(mark, true) // from the first moment its programs exist, they are a live run's
-    try {
-      await tmux.newSession(previewSession(repoId), `bash ${shq(script)}`, { cwd })
-      await tmux.tmux('set-option', '-t', previewSession(repoId), 'status', 'off').catch(() => {}) // the Server tab is just the app's output
-      save(repoId, { status: 'starting', detail: install ? `installing packages (${install})…` : 'starting…', port, url: null, port_holders: null,
-        frameable: null, branch, head, started_at: t, ticket_id: tk?.id ?? null, stopping: null })
-    } finally { runStarting(mark, false) }
-    emit({ agentId: null, source: 'system', kind: 'preview.started', payload: { repo: repo.name, command, port, ports: got.ports, head, install, why, ticket: tk?.key ?? null, copied } })
-    watch(repoId, t, why)
-    return previewView(repo)
-  }).catch((e) => { // Bug 39: a start that never got going still leaves a trace in the Events tab and the log
-    if (!(e instanceof NeedsSetup)) {
-      const error = e instanceof Error ? e.message : String(e), ticket = (opts.ticket && getTicket(opts.ticket)?.key) || null
-      emit({ agentId: null, source: 'system', kind: 'preview.error', payload: { repo: getRepo(repoId)?.name ?? repoId, error, why, ticket } })
-    }
-    throw e
-  })
+  return serial(repoId, () => startJob(repoId, why, opts).catch(async (e) => { await gaveUp(repoId, e); throw e }))
+    .catch((e) => { // Bug 39: a start that never got going still leaves a trace in the Events tab and the log
+      if (!(e instanceof NeedsSetup)) {
+        const error = e instanceof Error ? e.message : String(e), ticket = (opts.ticket && getTicket(opts.ticket)?.key) || null
+        emit({ agentId: null, source: 'system', kind: 'preview.error', payload: { repo: getRepo(repoId)?.name ?? repoId, error, why, ticket } })
+      }
+      throw e
+    })
+}
+/** Bug 236: a start that fails once it has begun ending the old run (a file HQ can't write, tmux can't make the session) left the row saying
+ *  "running" with nothing running, and its `stopping` mark had the next backend start it again. Now the row says what is true: nothing runs, and why.
+ *  The failures startJob names itself have saved their own words and cleared `stopping` already; before the old run is touched nothing changed. */
+async function gaveUp(repoId: string, e: unknown): Promise<void> {
+  if (!row(repoId)?.stopping) return
+  await tmux.killSession(previewSession(repoId)) // a session made before the failure would run with no row that knows it
+  const error = e instanceof Error ? e.message : String(e), name = getRepo(repoId)?.name ?? 'the app'
+  save(repoId, { status: 'stopped', detail: `HQ couldn't start ${name}: ${error}`, url: null, frameable: null, port_holders: null, stopping: null })
+}
+async function startJob(repoId: string, why: string | null, opts: { ticket?: string | null }): Promise<ReturnType<typeof previewView>> {
+  const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
+  notClearing(repoId)
+  const cur = row(repoId)
+  const asked = opts.ticket !== undefined, tid = asked ? opts.ticket ?? null : cur?.ticket_id ?? null
+  let tk = tid ? getTicket(tid) : undefined
+  if (tid && (!tryable(tk) || getFeature(tk.feature_id)?.repo_id !== repoId)) {
+    if (asked) throw new Error(`${tk?.key ?? 'That ticket'} can't be tried: only a finished ticket waiting for its merge, with no conflicts to fix, can.`)
+    tk = undefined
+  }
+  const cwd = tk?.worktree_path ?? repo.path
+  const recipe = runnableRecipe(cur, cwd)
+  if (!recipe) throw new NeedsSetup(`HQ doesn't know how to start ${repo.name} yet. Launch asks Claude to work it out (or set your own command with ⚙).`)
+  unwatch(repoId); await kill(repoId, 'restart')
+  const stale = cur?.command ? null : recipeProblem(recipe, cwd) // the user's own command chose its install from npm's record
+  if (stale) {
+    const msg = `HQ didn't start ${repo.name}: its saved start steps ${refusedWords(stale.lock)}.` // Bug 238: the lockfile they'd touch
+    save(repoId, { status: 'stopped', detail: `${msg} Start it again and Claude fixes them for your OK.`, url: null, port_holders: null, stopping: null })
+    throw new StepsOutdated(msg, stale) // the check's own words go to the helper, not to the user
+  }
+  const got = await assignPorts(recipe, cur?.port ?? null, portBusy, helperPortsHeld(repoId))
+  const range = `ports ${PREVIEW_PORTS[0]}–${PREVIEW_PORTS.at(-1)} are all in use`
+  if (!got) { save(repoId, { status: 'stopped', detail: range, port_holders: null, stopping: null }); throw new Error(range) }
+  if (got.taken.length) { // something else answers there (the user's own dev server, say): this app would talk to it, not to its own part
+    const all = repos(), held = await Promise.all(got.taken.map(async (x) =>
+      (await portHolders(x.port)).map((h): PortHolder => ({ ...h, ...whose(h.cwd, all, repoId), port: x.port, part: x.part }))))
+    const known = held.flat(), msg = `Can't start ${repo.name}: ${got.taken.map((x, i) => heldText(x.port, x.part, held[i]!)).join('; ')}.`
+      + (known.length ? ' Stop it here, then Launch.' : ' Stop it, then Launch.')
+    save(repoId, { status: 'stopped', detail: msg, url: null, port_holders: known.length ? JSON.stringify(known) : null, stopping: null })
+    throw new PortTaken(msg, got.taken.map((x) => x.port))
+  }
+  const port = got.ports[recipe.show]!
+  const copied = tk && asked ? await copyMainData(repo.path, cwd, recipe.worktree_files).catch(() => []) : [] // a restart keeps what the user did while trying
+  const branch = await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => null)
+  const head = await git(cwd, ['rev-parse', '--short', 'HEAD']).catch(() => null)
+  const dir = path.join(PATHS.home, 'previews', repoId); fs.mkdirSync(dir, { recursive: true })
+  const marksFile = path.join(dir, 'installed.json')
+  const marks = (() => { try { return JSON.parse(fs.readFileSync(marksFile, 'utf8')) as Record<string, string> } catch { return {} } })()
+  const command = recipe.parts.map((x) => x.run).join(' + ')
+  const spec = supervisorSpec({ recipe, root: cwd, ports: got.ports, marks, marksFile,
+    header: `HQ preview: ${recipe.parts.map((x) => `${recipe.parts.length > 1 ? `${x.name}: ` : ''}${x.run} · port ${got.ports[x.name]}`).join(' | ')}`
+      + ` · ${tk ? `${tk.key} · ` : ''}${branch ?? '?'}@${head ?? '?'}` })
+  const install = spec.parts.filter((x) => x.install).map((x) => x.install).join(', ') || null
+  fs.writeFileSync(path.join(dir, 'spec.json'), JSON.stringify(spec, null, 1))
+  const script = path.join(dir, 'run.sh'), t = now(), mark = markFor(repoId, t)
+  fs.writeFileSync(script, runScript({ cwd, node: process.execPath, supervisor: SUPERVISOR, spec: path.join(dir, 'spec.json'), mark }), { mode: 0o700 })
+  runStarting(mark, true) // from the first moment its programs exist, they are a live run's
+  try {
+    await tmux.newSession(previewSession(repoId), `bash ${shq(script)}`, { cwd })
+    await tmux.tmux('set-option', '-t', previewSession(repoId), 'status', 'off').catch(() => {}) // the Server tab is just the app's output
+    save(repoId, { status: 'starting', detail: install ? `installing packages (${install})…` : 'starting…', port, url: null, port_holders: null,
+      frameable: null, branch, head, started_at: t, ticket_id: tk?.id ?? null, stopping: null })
+  } finally { runStarting(mark, false) }
+  emit({ agentId: null, source: 'system', kind: 'preview.started', payload: { repo: repo.name, command, port, ports: got.ports, head, install, why, ticket: tk?.key ?? null, copied } })
+  watch(repoId, t, why)
+  return previewView(repo)
 }
 /** `resumed` (Bug 215): finishing, at start-up, a Stop the last backend began; no leftover look yet (index.ts does it once agents' commands are read back). */
 export function stopPreview(repoId: string, resumed = false): Promise<ReturnType<typeof previewView>> {

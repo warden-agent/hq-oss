@@ -10,13 +10,14 @@ import path from 'node:path'
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-tickets-'))
 const { migrate, run, q } = await import('./db.ts')
 migrate()
-const { addFeature, createTicket, cancelTicket, hqOpened, withTpmText } = await import('./tickets.ts')
+const { addFeature, createTicket, cancelFeature, cancelTicket, hqOpened, withTpmText } = await import('./tickets.ts')
 const { restartTpm } = await import('./tpm.ts')
 const { tpmPrompt } = await import('./handover.ts')
 const { writeFeatureMd, tpmWorkspace } = await import('./projectmd.ts')
 const { getFeature, getRepo, getTicket, tickets } = await import('./records.ts')
 const { mergeTicket } = await import('./mergewatch.ts')
-const { nextWorkerSlot, releaseSlot, slotEnv } = await import('./slots.ts')
+const { nextWorkerSlot, releaseSlot, slotBasesNow } = await import('./slots.ts')
+const SLOT_BASES = slotBasesNow()
 const { resolveRecipient } = await import('./delivery.ts')
 
 const now = Date.now()
@@ -130,6 +131,37 @@ test('Bug 193: on auto, the TPM\'s briefing says HQ starts, checks, tests and me
   assert.doesNotMatch(master.replace(/X-6 [^\n]*/, ''), /\bmain\b/) // X-6's parked reason is HQ's own text from the test data
 })
 
+test("Bug 243: a finished ticket that conflicts with main says so on the TPM's board, with its files and who presses Fix conflicts", () => {
+  const base = { feature_id: 'f9', size: 'S', deps: '[]', go_ahead: 0, auto_parked_why: null, pr_number: null, branch: null, conflict_with: null } as const
+  const clash = { conflict_files: '["src/app.js","README.md"]', conflict_with: '["T-01"]' }
+  const board = [
+    { ...base, key: 'T-02', title: 'Local', status: 'pr_ready', pr_state: 'local', ...clash },
+    { ...base, key: 'T-03', title: 'Pushed', status: 'pr_ready', pr_state: 'pushed', conflict_files: '[]' }, // GitHub says so, no files known yet
+    { ...base, key: 'T-04', title: 'Open', status: 'pr_open', pr_state: 'open', pr_number: 7, ...clash },
+    { ...base, key: 'T-05', title: 'Clean', status: 'pr_ready', pr_state: 'local', conflict_files: null },
+    { ...base, key: 'T-06', title: 'Parked', status: 'pr_ready', pr_state: 'local', ...clash, auto_parked_why: "Its conflicts with main weren't fixed in 2 tries." },
+  ] as never[]
+  const brief = (r: object) => tpmPrompt({ ...getRepo('r1')!, ...r } as never, { ws: '/ws', previous: null, messages: [], board: [{ f: { title: 'Nine', handle: 'F-9' } as never, tickets: board }] })
+  const off = brief({ auto_mode: 0 })
+  assert.match(off, /T-02 \(S\) Local: finished, but it conflicts with main in src\/app\.js, README\.md \(T-01 merged first\); the user presses Fix conflicts in HQ, and its engineer merges main in\n/)
+  assert.match(off, /T-03 \(S\) Pushed: finished and pushed, but it conflicts with main; the user presses Fix conflicts in HQ, and its engineer merges main in\n/)
+  assert.match(off, /T-04 \(S\) Open: finished, but PR #7 conflicts with main in src\/app\.js, README\.md \(T-01 merged first\); the user presses Fix conflicts/)
+  assert.match(off, /T-05 \(S\) Clean: finished; waits for the user to merge it\n/) // what it must not catch: a clean one reads as before
+  assert.doesNotMatch(off.replace(/T-05 [^\n]*/, ''), /waits for the user to merge it|waits for the user's merge|HQ has its engineer/)
+  const on = brief({ auto_mode: 1 })
+  assert.match(on, /T-02 \(S\) Local: finished, but it conflicts with main in src\/app\.js, README\.md \(T-01 merged first\); HQ has its engineer merge main in and fix them\n/)
+  assert.match(on, /T-04 \(S\) Open: finished, but PR #7 conflicts with main in [^\n]*; HQ has its engineer merge main in and fix them\n/)
+  assert.match(on, /T-05 \(S\) Clean: finished; HQ tests it on main and merges it\n/)
+  // parked, or auto stopped: the user's Fix conflicts again, as the box's button says
+  assert.match(on, /T-06 \(S\) Parked: finished, but it conflicts with main [^\n]*; the user presses Fix conflicts in HQ, and its engineer merges main in \(auto mode parked it: Its conflicts/)
+  const stopped = brief({ auto_mode: 1, auto_stopped_why: 'HQ couldn\'t test T-05.' })
+  assert.match(stopped, /T-02 \(S\) Local: finished, but it conflicts with main [^\n]*; the user presses Fix conflicts in HQ/)
+  // Bug 210: the project's own default branch
+  const master = brief({ auto_mode: 0, default_branch: 'master' })
+  assert.match(master, /T-02 \(S\) Local: finished, but it conflicts with master in src\/app\.js, README\.md \(T-01 merged first\); the user presses Fix conflicts in HQ,/)
+  assert.match(master, /T-02 [^\n]*and its engineer merges master in\n/); assert.doesNotMatch(master, /\bmain\b/)
+})
+
 test('an engineer that still uses the old TPM\'s id reaches the project\'s current TPM', () => {
   const eng = q<any>("SELECT * FROM agents WHERE id = 'eng-2'")[0]
   assert.equal(resolveRecipient(eng, 'tpm-old'), 'tpm-old') // not replaced yet: same as "tpm"
@@ -179,15 +211,28 @@ test('Merge refuses tickets that aren\'t finished; GitHub repos merge on GitHub 
   await assert.rejects(mergeTicket('nope'), /unknown ticket/)
 })
 
-test('Worker slots: ports never overlap, and a slot whose agent is gone is free again', () => {
-  const ports = (i: number) => { const b = Number(slotEnv(i).HQ_PORT_BASE); return [b, b + 9] }
-  for (let i = 1; i <= 20; i++) { assert.equal(slotEnv(i).PORT, slotEnv(i).HQ_PORT_BASE); assert.ok(ports(i)[1]! < ports(i + 1)[0]!); assert.ok(ports(i)[0]! > 3099) } // the preview uses 3090-3099
+test('Worker slots: ports never overlap, and a slot whose agent is gone is free again', async () => {
+  const free = async () => false, base = async (id: string) => Number((await nextWorkerSlot(id, free)).env.HQ_PORT_BASE)
   agent('eng-a', 'engineer', 'working', 'f1'); agent('eng-b', 'engineer', 'working', 'f1')
-  assert.equal(nextWorkerSlot('eng-a').idx, 1); assert.equal(nextWorkerSlot('pending-x').idx, 2) // a launch under way holds its slot
-  assert.equal(nextWorkerSlot('eng-b').idx, 3)
+  const a = await nextWorkerSlot('eng-a', free); assert.equal(a.idx, 1); assert.equal(a.env.PORT, a.env.HQ_PORT_BASE)
+  assert.equal(a.env.HQ_PORT_BASE, String(SLOT_BASES[0])); assert.equal(a.env.DB_NAME, `hq_w1_${SLOT_BASES[0]}`)
+  assert.equal((await nextWorkerSlot('pending-x', free)).idx, 2) // a launch under way holds its slot
+  const b = await nextWorkerSlot('eng-b', free); assert.equal(b.idx, 3); assert.equal(b.env.HQ_PORT_BASE, String(SLOT_BASES[2]))
   run("UPDATE agents SET status = 'exited' WHERE id = 'eng-a'") // gone without its slot being released
-  agent('eng-c', 'engineer', 'working', 'f1'); assert.equal(nextWorkerSlot('eng-c').idx, 1)
-  releaseSlot('pending-x'); assert.equal(nextWorkerSlot('eng-d').idx, 2)
+  agent('eng-c', 'engineer', 'working', 'f1'); const c = await nextWorkerSlot('eng-c', free); assert.equal(c.idx, 1); assert.equal(c.env.HQ_PORT_BASE, String(SLOT_BASES[0]))
+  releaseSlot('pending-x'); agent('eng-d', 'engineer', 'working', 'f1'); assert.equal(await base('eng-d'), SLOT_BASES[1])
+  // Bug 259: a block something on the machine already listens on (another HQ's engineer, any program) is skipped, whatever its slot number
+  agent('eng-e', 'engineer', 'working', 'f1'); const busy = async (p: number) => p === SLOT_BASES[3]! + 7
+  const e = await nextWorkerSlot('eng-e', busy); assert.equal(e.idx, 4); assert.equal(e.env.HQ_PORT_BASE, String(SLOT_BASES[4]))
+  assert.equal(e.env.HQ_WORKER, '4'); assert.equal(e.env.DB_NAME, `hq_w4_${SLOT_BASES[4]}`)
+  // two launches at once never get the same block, though both found it free
+  agent('eng-f', 'engineer', 'working', 'f1'); agent('eng-g', 'engineer', 'working', 'f1')
+  const [f, g] = await Promise.all([nextWorkerSlot('eng-f', free), nextWorkerSlot('eng-g', free)])
+  assert.notEqual(f.idx, g.idx); assert.notEqual(f.env.HQ_PORT_BASE, g.env.HQ_PORT_BASE)
+  // every block in use: a plain refusal, nothing written
+  const before = q('SELECT * FROM worker_slots').length
+  await assert.rejects(nextWorkerSlot('eng-h', async () => true), /No free ports for another engineer: HQ's engineer ports \d+–\d+ are all in use \(by its engineers or other programs\)\./)
+  assert.equal(q('SELECT * FROM worker_slots').length, before)
 })
 
 test('Cancel: a merged ticket refuses; a cancelled one stays cancelled', async () => {
@@ -197,6 +242,17 @@ test('Cancel: a merged ticket refuses; a cancelled one stays cancelled', async (
   assert.deepEqual(await cancelTicket('t10', { tell: false }), { key: 'APP-10', stopped: null })
   assert.equal(tickets('f1').find((t) => t.id === 't10')!.status, 'cancelled')
   assert.deepEqual(await cancelTicket('t10', { tell: false }), { key: 'APP-10', stopped: null })
+})
+
+test('Bug 250: a feature\'s file says where it stands in the board\'s words, not its stored "planning", and is rewritten when cancelled', async () => {
+  const status = (f: { handle: string | null }) => /^status: (.*)$/m.exec(fs.readFileSync(path.join(tpmWorkspace('r1'), 'features', `${f.handle}.md`), 'utf8'))?.[1]
+  const f = addFeature('r1', 'Bug 250 list', 'a list'); assert.equal(status(f), 'no tickets yet')
+  const a = createTicket(f.id, { title: 'one', size: 'S', spec: 'x' }); createTicket(f.id, { title: 'two', size: 'S', spec: 'x' })
+  assert.equal(status(f), '0/2 merged')
+  run("UPDATE tickets SET status = 'merged' WHERE id = ?", a.id); writeFeatureMd(getFeature(f.id)!)
+  assert.equal(status(f), '1/2 merged'); assert.equal(getFeature(f.id)!.status, 'planning', 'the stored word is unchanged: only the file\'s words moved')
+  await cancelFeature(f.id)
+  assert.equal(status(f), 'cancelled · 1 merged before that', 'rewritten after the feature itself was marked cancelled, not "done" for its merged part')
 })
 
 test('Bug 126: what the TPM hears HQ ran on a ticket before it merged', async () => {

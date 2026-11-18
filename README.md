@@ -56,6 +56,8 @@ Ports, all bound to 127.0.0.1:
 - 4781: hook ingress
 - 4782: the MCP server `hq`
 
+Each running engineer gets 10 ports of its own for its dev and test servers (`PORT` is the first, the launch prompt names them). They come from a window of 200 ports that HQ picks from its UI port (15400–15599 for 4780), so two HQs on one machine never hand out the same ones; `HQ_SLOT_PORTS=20000-20199` picks the window by hand. A block something already listens on is skipped.
+
 ## Tests
 
 - `npm --workspace @hq/backend test`: unit tests, using a real SQLite DB in a temp `HQ_HOME`.

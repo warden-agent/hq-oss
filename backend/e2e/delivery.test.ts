@@ -6,6 +6,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, type Hq } from './harness.ts'
+import { slotWindow } from '../src/slotports.ts'
 
 let hq: Hq
 before(async () => { hq = await startHq() })
@@ -457,7 +458,12 @@ test('a stopped agent\'s token stops working; /clear keeps a session alive; a lo
   await waitFor('engineer 1', async () => (await hq.state()).agents.find((a: any) => a.id === e1.id && a.status === 'working'))
   const worker = (id: string) => /export HQ_WORKER='(\d+)'/.exec(fs.readFileSync(path.join(hq.hqHome, 'agents', id, 'launch.sh'), 'utf8'))?.[1]
   const port = (id: string) => /export PORT='(\d+)'/.exec(fs.readFileSync(path.join(hq.hqHome, 'agents', id, 'launch.sh'), 'utf8'))?.[1]
-  const w1 = worker(e1.id); assert.ok(w1); assert.equal(port(e1.id), String(3100 + Number(w1) * 10))
+  const w1 = worker(e1.id); assert.ok(w1)
+  const w = slotWindow(hq.ports.ui), p1 = Number(port(e1.id)) // Bug 259: from this HQ's own window, not 3100+10n on every HQ
+  assert.ok(p1 >= w[0] && p1 + 9 <= w[1] && (p1 - w[0]) % 10 === 0, `${p1} in ${w}`)
+  const prompt = fs.readFileSync(path.join(hq.hqHome, 'agents', e1.id, 'prompt.md'), 'utf8')
+  assert.match(prompt, new RegExp(`Your ports for this ticket: ${p1}–${p1 + 9}`)) // and it's told so
+  assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', e1.id, 'launch.sh'), 'utf8'), new RegExp(`export HQ_PORT_BASE='${p1}'`))
   const tok = hq.agentToken(e1.id)
   hq.tmux('kill-session', '-t', `hq-${e1.id}`) // the engineer's process dies without a SessionEnd
   await hq.restart() // recoverAgents finds it gone

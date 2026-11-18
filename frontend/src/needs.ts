@@ -8,9 +8,13 @@ type S = { repos: any[]; features: any[]; tickets: any[]; agents: any[]; reviews
   working?: number; testRuns?: { repo_id: string }[] }
 /** Whether an open plan review waits for HQ's plan check and not for the user: its project is on auto (also while auto is stopped: running engineers finish,
  *  and HQ still answers their plans). Such a plan is never "your turn", and nothing pops up for it. */
-export function hqAnswersPlan(s: Pick<S, 'repos' | 'features' | 'tickets'>, review: { ticket_id: string }): boolean {
+export function hqAnswersPlan(s: Pick<S, 'repos' | 'features' | 'tickets'>, review: { ticket_id: string }): boolean { return !!reviewRepo(s, review)?.auto_mode }
+/** Bug 231: an open plan nobody may answer now: its project is being cleared (the clear stopped its engineer, and HQ refuses an answer). It is still
+ *  readable, but it is nobody's turn. */
+export const clearingPlan = (s: Pick<S, 'repos' | 'features' | 'tickets'>, review: { ticket_id: string }): boolean => !!reviewRepo(s, review)?.clearing_at
+function reviewRepo(s: Pick<S, 'repos' | 'features' | 'tickets'>, review: { ticket_id: string }): any {
   const t = s.tickets.find((x) => x.id === review.ticket_id), f = t && s.features.find((x) => x.id === t.feature_id)
-  return !!f && !!s.repos.find((r) => r.id === f.repo_id)?.auto_mode
+  return f ? s.repos.find((r) => r.id === f.repo_id) : undefined
 }
 /** The project a notice's kind names (repo_sync:<id>, auto_stopped:<id>, test_cmd_proposed:<id>, test_cmd_refused:<id>): those notices have no ticket or agent to go by. */
 const kindRepo = (k: string): string | null => /^[a-z_]+:(.+)$/.exec(k)?.[1] ?? null
@@ -93,6 +97,7 @@ export const ALERT_KINDS = new Set(['stuck', 'blocked', 'dialog', 'message_for_u
   'claude_unchecked']) // Bug 97: agents on a Claude Code HQ wasn't checked on. A newer one merely installed (claude_newer) is information
 /** Good news: green, not red, because nothing is wrong (Bug 61). */
 export const goodNews = (kind: string): boolean => kind === 'merged' || kind === 'conflicts_fixed' || kind.startsWith('auto_finished:') || kind.startsWith('project_removed') // Bug 66's notice
+  || kind.startsWith('repo_cleared:') || kind.startsWith('repo_testsetup_ok:') // Bug 251: a clean Clear, a checked test setup (their problems have kinds of their own)
 /** Plain information: nothing is wrong and nothing is asked, so neither red nor green (Bug 97: a newer Claude Code is installed, and HQ's agents stay put). */
 export const plainNews = (kind: string): boolean => kind === 'claude_newer'
 /** Notices about a whole project that need the user: they name their project in the kind. Auto mode's own, and a test command engineers can't run (Bug 107). */
@@ -115,7 +120,7 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
   }
   for (const r of s.reviews.filter((x) => x.status === 'open')) {
     const t = s.tickets.find((x) => x.id === r.ticket_id), repo = repoOf(t)
-    if (hqAnswersPlan(s, r)) continue // on auto its plan waits for HQ's plan check, not for you
+    if (hqAnswersPlan(s, r) || clearingPlan(s, r)) continue // on auto its plan waits for HQ's plan check, not for you; during a Clear for nobody
     out.push({ key: `review:${r.id}`, text: `${where(repo)}${t?.key ?? 'a ticket'}'s plan is waiting for you`, repoId: repo, ref: { review: r.id } })
   }
   for (const t of s.tickets) {

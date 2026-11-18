@@ -1,10 +1,31 @@
 // Thin tmux wrapper. One tmux session per agent, named hq-<agentId>.
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+
+/** Bug 242: the tmux server HQ's sessions live on, named with `-S` in every call. A bare `tmux` takes `$TMUX` first, then `$TMUX_TMPDIR`, and
+ *  when that folder is gone it falls back to /tmp: the user's own default server (Bug 74). This is the same choice without that fallback.
+ *  Inside tmux (live HQ runs in hq-backend): the server it runs on, the one a bare call reached before, so a restart still finds its sessions. */
+export function socketPath(env: NodeJS.ProcessEnv = process.env, uid = process.getuid?.() ?? 0): string {
+  const inside = (env.TMUX ?? '').split(',')[0]
+  return inside || path.join(env.TMUX_TMPDIR || '/tmp', `tmux-${uid}`, 'default')
+}
+let chosen: string | null = null
+/** The socket this backend uses, chosen once: its server never changes while it runs. */
+export const socket = (): string => (chosen ??= socketPath())
+/** At start-up: the socket's folder, as tmux would make it (only its own default path gets one). A `TMUX_TMPDIR` that doesn't exist stops HQ
+ *  here: a bare tmux would have gone to the default server instead, and HQ never runs half-started. */
+export function prepareSocket(sock = socket()): string {
+  const dir = path.dirname(sock)
+  if (fs.existsSync(dir)) return sock
+  if (!fs.existsSync(path.dirname(dir))) throw new Error(`HQ can't start: its tmux folder ${path.dirname(dir)} (TMUX_TMPDIR) doesn't exist. Create it or unset TMUX_TMPDIR.`)
+  fs.mkdirSync(dir, { mode: 0o700 }); return sock
+}
 
 export function tmux(...args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile('tmux', args, { maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile('tmux', ['-S', socket(), ...args], { maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) reject(new Error(`tmux ${args[0]}: ${stderr || err.message}`)); else resolve(stdout)
     })
   })

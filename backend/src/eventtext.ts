@@ -153,6 +153,7 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'ticket.launched': return `${p.fix ? 'Back on' : 'Started on'} ${keyOf(p.ticket, p.key)}`
     case 'ticket.resumed': return `Picked up ${keyOf(p.ticket, p.key)} again`
     case 'ticket.pr_open': return `Opened a pull request for ${keyOf(p.ticket, p.key)}`
+    case 'ticket.pr_refused': return `HQ didn't take ${keyOf(p.ticket, p.key)} as finished (open pr): ${one(p.why, 600)}` // Bug 248
     case 'ticket.pr_ready': return `${keyOf(p.ticket, p.key)} is ready to merge`
     case 'ticket.merged_by_hq': return `HQ merged ${keyOf(p.ticket, p.key)}`
     case 'ticket.merged': return `${keyOf(p.ticket, p.key)} is in ${baseOf(p.ticket)}`

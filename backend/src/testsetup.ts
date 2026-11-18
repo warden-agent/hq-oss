@@ -23,7 +23,10 @@ import { runScenario, type ScenarioResult } from './scenario.ts'
 import { checkSetup, mergeSetup, readSetup, writeSetup, type SetupFile, type TestSetup } from './testsetupstore.ts'
 
 export const SETUP_SAVES = 4
-const notice = (repoId: string) => `repo_testsetup:${repoId}`
+const notice = (repoId: string, good = false) => `${good ? 'repo_testsetup_ok' : 'repo_testsetup'}:${repoId}`
+/** One notice about a project's test setup at a time. A checked, saved setup is good news (green, Bug 251), so it has a kind of its own. */
+const tell = (repoId: string, detail: string, good = false): void => { resolveKind(notice(repoId, !good), null); attention(notice(repoId, good), detail) }
+const untell = (repoId: string): void => { resolveKind(notice(repoId), null); resolveKind(notice(repoId, true), null) }
 /** The setup helper's model: Opus, unless the user has set one for it. */
 const model = (): string => (getSetting('models', DEFAULTS.models) as Record<string, string>).test_setup ?? 'opus'
 const live = (agentId: string | null | undefined): Agent | undefined => { const a = agentId ? getAgent(agentId) : undefined; return a && a.status !== 'exited' ? a : undefined }
@@ -60,7 +63,7 @@ async function startOne(repoId: string): Promise<ReturnType<typeof setupState>> 
   await git(repo.path, ['worktree', 'add', '-q', '-b', `hq-testsetup/${name}`, wt, mergeBase(repo).name])
   await excludeHqFolders(repo.path)
   await seedPackages(repo.path, wt).catch(() => [])
-  resolveKind(notice(repoId), null)
+  untell(repoId)
   let a: Agent
   try {
     a = await launchAgent({ role: 'launcher', repoId, model: model(), cwd: repo.path, displayName: `test setup ${repo.name}`, worktreeName: name,
@@ -122,7 +125,7 @@ export function saveTestSetup(agent: Agent, input: unknown): Result {
   if ('error' in checked) return { ok: false, text: `Not saved: ${checked.error}. Fix it and call save_test_setup again.` }
   const saves = f.job.saves + 1
   if (saves > SETUP_SAVES) {
-    attention(notice(repoId), `${repo.name}: Claude tried ${SETUP_SAVES} times and couldn't get HQ's testing set up.`)
+    tell(repoId, `${repo.name}: Claude tried ${SETUP_SAVES} times and couldn't get HQ's testing set up.`)
     setTimeout(() => { void finishSetup(repoId, { state: 'failed', note: `Claude tried ${SETUP_SAVES} times and couldn't get it to work.`, at: Date.now() }) }, 1500)
     return { ok: false, text: `That was save ${saves}; HQ allows ${SETUP_SAVES}. HQ stops you now and tells the user.` }
   }
@@ -142,7 +145,7 @@ async function checkDraft(repoId: string, agentId: string, setup: TestSetup): Pr
     return
   }
   update(repoId, (x) => ({ ...x, setup, saved_at: Date.now(), by: 'Claude (test setup)', seen: false, checked: { ok: true, at: Date.now(), why: null, scenario: c.scenario?.id ?? null } }))
-  attention(notice(repoId), `${repo.name}: Claude worked out how HQ tests the app (production start, a clean seed, resets). See it under ⚙ in the preview.`)
+  tell(repoId, `${repo.name}: Claude worked out how HQ tests the app (production start, a clean seed, resets). See it under ⚙ in the preview.`, true)
   const passed = `HQ's check passed: ${c.scenario?.summary ?? 'the app started, reset and started again'}. HQ saved your setup and ends your session now; do nothing else.`
   if (helper) sendMessage({ channel: 'dm', from: 'hq', to: agentId, reason: 'fyi', body: passed })
   setTimeout(() => { void finishSetup(repoId, null) }, 3000)
@@ -151,13 +154,13 @@ async function checkDraft(repoId: string, agentId: string, setup: TestSetup): Pr
 /** report_cant_test: the app can't be tested here (it needs a real database server, an account). The user hears why. */
 export function cantTest(agent: Agent, reason: string): Result {
   const repoId = repoOfAgent(agent.id), repo = repoId ? getRepo(repoId) : undefined; if (!repoId || !repo) return { ok: false, text: 'HQ is not waiting on you any more.' }
-  attention(notice(repoId), `${repo.name}: Claude can't set up HQ's testing: ${reason}`)
+  tell(repoId, `${repo.name}: Claude can't set up HQ's testing: ${reason}`)
   setTimeout(() => { void finishSetup(repoId, { state: 'cant_test', note: reason, at: Date.now() }) }, 1500)
   return { ok: true, text: 'Told the user. HQ ends this session now.' }
 }
 /** The user stops the helper (or says they've seen the setup). */
 export async function dismissSetup(repoId: string): Promise<SetupFile> {
-  resolveKind(notice(repoId), null)
+  untell(repoId)
   const f = readSetup(repoId)
   if (f.job) await finishSetup(repoId, null)
   return update(repoId, (x) => ({ ...x, seen: true }))
@@ -216,10 +219,10 @@ export async function checkMerged(repoId: string): Promise<void> {
       const done = (x: SetupFile): SetupFile => ({ ...x, merged: x.merged.filter((m) => m.ticket_id !== next.ticket_id) })
       if (c.problem) {
         update(repoId, done)
-        attention(notice(repoId), `${repo.name}: ${next.key} changed how HQ tests the app, and HQ's check of it failed (${c.problem.split('\n')[0]}). HQ kept the setup it had.`)
+        tell(repoId, `${repo.name}: ${next.key} changed how HQ tests the app, and HQ's check of it failed (${c.problem.split('\n')[0]}). HQ kept the setup it had.`)
       } else {
         update(repoId, (x) => ({ ...done(x), setup: candidate, saved_at: Date.now(), by: next.key, seen: false, checked: { ok: true, at: Date.now(), why: null, scenario: c.scenario?.id ?? null } }))
-        attention(notice(repoId), `${repo.name}: ${next.key} changed how HQ tests the app; HQ checked it. See it under ⚙ in the preview.`)
+        tell(repoId, `${repo.name}: ${next.key} changed how HQ tests the app; HQ checked it. See it under ⚙ in the preview.`, true)
       }
     }
   } finally { checking.delete(repoId) }

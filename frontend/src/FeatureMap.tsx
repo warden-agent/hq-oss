@@ -4,7 +4,7 @@
 import { useEffect, useState } from 'react'
 import { api, errText, type MapView, type State } from './api'
 import { runnable, useBusy } from './board'
-import { Elapsed, Md } from './ui'
+import { Backdrop, Elapsed, Md } from './ui'
 
 const CAP = 5000 // featuremap.ts MAP_CAP
 const when = (at: number): string => new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
@@ -26,7 +26,7 @@ function MapDialog({ all, repo, m, onClose }: { all: State; repo: any; m: MapVie
   const text = m?.text ?? '', first = m?.first ?? null, running = first?.running === true
   const canStart = runnable((all.previews ?? []).find((p) => p.id === repo.id))
   const start = () => go(async () => { setErr(''); await api(`repos/${repo.id}/first-map`, {}).catch((e: Error) => setErr(errText(e))) })
-  return <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4" onPointerDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
+  return <Backdrop onClose={onClose} z="z-[80]">
     <div role="dialog" aria-modal="true" aria-label={`Feature map of ${repo.name}`}
       className="flex max-h-[90vh] w-[620px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-300 shadow-xl">
       <div className="break-words text-sm font-medium text-zinc-100">Feature map of {repo.name}</div>
@@ -54,5 +54,5 @@ function MapDialog({ all, repo, m, onClose }: { all: State; repo: any; m: MapVie
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex justify-end"><button className="btn btn-primary" autoFocus onClick={onClose}>Close</button></div>
     </div>
-  </div>
+  </Backdrop>
 }

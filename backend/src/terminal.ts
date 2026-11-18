@@ -4,6 +4,7 @@ import { getSetting } from './db.ts'
 import { DEFAULTS } from './config.ts'
 import { getAgent, update } from './agents.ts'
 import { emit } from './events.ts'
+import { socket } from './tmux.ts'
 
 export type Term = { write: (data: string, typed: boolean) => void; resize: (cols: number, rows: number) => void; kill: () => void }
 // tmux client pids of HQ's own terminal views. Their attach isn't a take-over; only someone in a real terminal is.
@@ -12,7 +13,7 @@ export const isBridgePid = (pid: number): boolean => bridgePids.has(pid)
 /** A tmux client for one session, streamed to the UI. `readOnly` (`attach -r`): tmux ignores its keys but still answers the
  *  terminal's own queries. */
 function attach(session: string, cols: number, rows: number, onData: (d: string) => void, onExit: () => void, readOnly = false): IPty {
-  const p = pty.spawn('tmux', ['attach-session', ...(readOnly ? ['-r'] : []), '-t', session], { name: 'xterm-256color', cols: Math.max(20, cols), rows: Math.max(5, rows), cwd: process.env.HOME, env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string> })
+  const p = pty.spawn('tmux', ['-S', socket(), 'attach-session', ...(readOnly ? ['-r'] : []), '-t', session], { name: 'xterm-256color', cols: Math.max(20, cols), rows: Math.max(5, rows), cwd: process.env.HOME, env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string> })
   bridgePids.add(p.pid)
   p.onData(onData); p.onExit(() => { bridgePids.delete(p.pid); onExit() })
   return p

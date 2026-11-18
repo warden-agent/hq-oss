@@ -16,7 +16,7 @@ import { git } from './reposync.ts'
 import { ensureFresh } from './repos.ts'
 import { mergeBase } from './conflicts.ts'
 import { excludeHqFolders, listWorktrees, seedPackages } from './worktrees.ts'
-import { checkRecipe, commandRecipe, detectCommand, PREVIEW_PORTS, sameCommands, strayPorts, testPorts, type Recipe } from './apprun.ts'
+import { checkRecipe, commandRecipe, detectCommand, PREVIEW_PORTS, refusedWords, sameCommands, strayPorts, testPorts, type Recipe, type Refusal } from './apprun.ts'
 import { helperPorts, helperPortsHeld, PortTaken, previewSession, previewView, row, save, serial, startPreview, stopPreview } from './preview.ts'
 import { killUnder, listenersUnder, pgidOf } from './procs.ts'
 import { sendMessage } from './delivery.ts'
@@ -49,12 +49,12 @@ export const portsText = (ports: number[]): string => `Ports for your test runs:
   + 'servers ("auto" parts): another port may belong to another app on this machine, and HQ stops a test server it finds on one.'
 
 function prompt(repo: Repo, why: 'first' | 'fix', saved: Recipe | null, output: string, ports: number[], tk?: Ticket & { worktree_path: string },
-  reason: string | null = null): string {
+  reason: Refusal | null = null): string {
   const lines = [`Project: ${repo.name}. Work out how to start its app and save it with save_launch.`, '', portsText(ports)]
   if (tk) lines.push('', `Your worktree has ticket ${tk.key}'s version ("${tk.title}"), which the user wants to try before it's merged. `
     + `Work out the steps from it; once it's merged, ${repo.default_branch} uses the same steps.`)
   if (why === 'fix') {
-    lines.push('', reason ? `HQ won't run its start steps any more: ${reason}. They were:` : 'The start steps HQ had stopped working. They were:', JSON.stringify(saved, null, 1))
+    lines.push('', reason ? `HQ won't run its start steps any more: ${reason.why}. They were:` : 'The start steps HQ had stopped working. They were:', JSON.stringify(saved, null, 1))
     if (output.trim()) lines.push('', 'The app\'s last output:', output.trim())
     lines.push('', 'Find out why and save fixed steps.')
   }
@@ -68,10 +68,10 @@ function prompt(repo: Repo, why: 'first' | 'fix', saved: Recipe | null, output: 
  *  the helper already on it (Bug 41: two helpers started 2 s apart, and the untracked one's test server held the app's port).
  *  `ticket`: Try it on a repo with no steps yet (Bug 46). A new project's main is empty until its first merge, so the helper
  *  works from that finished ticket's branch, and its first run tries the ticket. Fixing steps while a ticket is tried does too. */
-export function startHelper(repoId: string, why: 'first' | 'fix', ticket: string | null = null, reason: string | null = null): Promise<ReturnType<typeof previewView>> {
+export function startHelper(repoId: string, why: 'first' | 'fix', ticket: string | null = null, reason: Refusal | null = null): Promise<ReturnType<typeof previewView>> {
   return serial(repoId, () => startOne(repoId, why, ticket, reason))
 }
-async function startOne(repoId: string, why: 'first' | 'fix', ticket: string | null, reason: string | null): Promise<ReturnType<typeof previewView>> {
+async function startOne(repoId: string, why: 'first' | 'fix', ticket: string | null, reason: Refusal | null): Promise<ReturnType<typeof previewView>> {
   const repo0 = getRepo(repoId); if (!repo0) throw new Error('unknown repo')
   notClearing(repoId)
   const cur = row(repoId)
@@ -100,7 +100,7 @@ const NO_PORTS = 'Claude needs a free port in HQ\'s preview ports'
 /** Ports given to a helper that is still starting (not in its preview row yet). */
 const picking = new Set<number>()
 async function withPorts(repo: Repo, why: 'first' | 'fix', cur: ReturnType<typeof row>, output: string, tk: (Ticket & { worktree_path: string }) | undefined,
-  reason: string | null, ports: number[]): Promise<ReturnType<typeof previewView>> {
+  reason: Refusal | null, ports: number[]): Promise<ReturnType<typeof previewView>> {
   const repoId = repo.id
   const name = `launch-${Date.now().toString(36)}`, wt = path.join(repo.path, '.claude', 'worktrees', name)
   await git(repo.path, ['worktree', 'add', '-q', '-b', `hq-launch/${name}`, wt, tk?.branch ?? mergeBase(repo).name])
@@ -113,7 +113,7 @@ async function withPorts(repo: Repo, why: 'first' | 'fix', cur: ReturnType<typeo
       launchPrompt: prompt(repo, why, parse(cur?.recipe ?? null) ?? (cur?.command ? commandRecipe(cur.command, repo.path) : null), output, ports, tk, reason),
       repoAllowlist: j<string[]>(repo.network_allowlist, []), extraEnv: { PORT: String(ports[0]), HQ_TRY_PORTS: ports.join(' ') } })
   } catch (e) { await removeWorktree(repo.path, wt); throw e }
-  const note = reason ? 'HQ didn\'t run the start steps you OK\'d: they would write a package-lock.json into the project, or not follow the one it has.' : null // Bug 156
+  const note = reason ? `HQ didn't run the start steps you OK'd: they ${refusedWords(reason.lock)}.` : null // Bugs 156, 238
   save(repoId, { helper_agent_id: a.id, helper_worktree: wt, helper_state: 'working', helper_note: note, helper_saves: 0, draft_recipe: null, helper_ticket_id: tk?.id ?? null,
     helper_ports: JSON.stringify(ports),
     ...(note || row(repoId)?.detail?.startsWith(NO_PORTS) ? { detail: null } : {}) }) // the note says it now; the refusal's "start it again" is done
@@ -124,7 +124,7 @@ async function withPorts(repo: Repo, why: 'first' | 'fix', cur: ReturnType<typeo
 
 /** Launch (or Try it, with `ticket`) with nothing to run: steps waiting for the user's OK (after "Not now") are shown, and their
  *  first run tries that ticket; else a helper starts. `outdated`: HQ refused the OK'd steps (Bug 156), so the helper fixes them. */
-export async function launchWithoutRecipe(repoId: string, ticket: string | null = null, outdated: string | null = null): Promise<ReturnType<typeof previewView>> {
+export async function launchWithoutRecipe(repoId: string, ticket: string | null = null, outdated: Refusal | null = null): Promise<ReturnType<typeof previewView>> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
   const p = row(repoId)
   if (p?.draft_recipe && p.helper_state === 'needs_ok') { save(repoId, { helper_ticket_id: triedTicket(repoId, ticket)?.id ?? null }); return previewView(repo) }

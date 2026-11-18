@@ -350,3 +350,36 @@ test('Bug 156: npm steps that would write a package-lock.json are refused, and O
   p = await preview(repo.id); assert.equal(p.helper_state, 'needs_ok')
   assert.equal((await hq.api(`previews/${repo.id}/dismiss`, {})).status, 200)
 })
+
+test('Bugs 238, 239: refused uv steps name uv.lock, and a lockless project\'s installs must not write one', async () => {
+  const dir = hq.repo('uvapp'); const repo = (await hq.api('repos', { path: dir })).json
+  fs.mkdirSync(path.join(dir, 'server')); fs.mkdirSync(path.join(dir, 'admin'))
+  fs.writeFileSync(path.join(dir, 'server', 'pyproject.toml'), '[project]\nname = "api"\nversion = "0.1.0"\n'); fs.writeFileSync(path.join(dir, 'server', 'uv.lock'), 'version = 1\n')
+  fs.writeFileSync(path.join(dir, 'admin', 'package.json'), JSON.stringify({ name: 'admin', private: true, dependencies: { ms: '2.1.3' } })) // packages, no lockfile
+  sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'a uv server and a pnpm admin page')
+  const steps = (install?: string, when = 'server/uv.lock') => ({ parts: [{ name: 'app', dir: '.', ...(install ? { install, install_when: when } : {}), run: 'node server.js',
+    port: 'auto' }], show: 'app', worktree_files: [], notes: '' })
+  const h = (await hq.api(`previews/${repo.id}/start`, {})).json.helper_agent_id
+  await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching'))
+  const bad = await hq.mcp(h, 'save_launch', steps('cd admin && pnpm install', 'admin/package.json')); assert.ok(bad.isError)
+  assert.match(bad.text, /`pnpm install` runs in admin: there is no pnpm-lock.yaml, and `pnpm install` would write one into the user's project: use `pnpm install --no-lockfile`/) // Bug 239
+  assert.equal((await hq.mcp(h, 'save_launch', steps())).isError, false); assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  await waitFor('the app', async () => (await preview(repo.id)).status === 'running', 20_000)
+  assert.equal((await hq.mcp(h, 'launch_ok')).isError, false)
+  await waitFor('the helper to go', async () => (await preview(repo.id)).helper_agent_id === null)
+
+  // the entry's case: OK'd steps `cd server && uv sync` with server/uv.lock, Launch pressed
+  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'))
+  db.prepare('UPDATE previews SET recipe = ? WHERE id = ?').run(JSON.stringify(steps('cd server && uv sync')), repo.id); db.close()
+  assert.equal((await hq.api(`previews/${repo.id}/command`, { command: null })).status, 409)
+  const p = await preview(repo.id); assert.match(p.detail, /saved start steps would write a uv\.lock into the project, or not follow the one it has\. Start it again/)
+  assert.doesNotMatch(p.detail, /package-lock/)
+  const r = await hq.api(`previews/${repo.id}/start`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.equal(r.json.helper_note, 'HQ didn\'t run the start steps you OK\'d: they would write a uv.lock into the project, or not follow the one it has.')
+  const h2 = r.json.helper_agent_id; assert.ok(h2 && h2 !== h)
+  await waitFor('the fixing helper', async () => (await hq.state()).agents.find((a: any) => a.id === h2 && a.status !== 'launching'))
+  assert.match(await nextBatch(h2), /HQ won't run its start steps any more: app: `uv sync` runs in server: use `uv sync --locked` \(there is a uv.lock\)\./)
+  assert.equal((await hq.mcp(h2, 'save_launch', steps('cd server && uv sync --locked'))).isError, false)
+  assert.equal((await hq.api(`previews/${repo.id}/dismiss`, {})).status, 200)
+  assert.equal(sh(dir, 'status', '--porcelain'), '') // nothing written into the project
+})

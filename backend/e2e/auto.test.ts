@@ -478,6 +478,40 @@ test('Bug 62: a TPM that has gone can\'t stop the project again on Resume with i
   assert.equal((await repoNow(p)).auto_stopped_why, null)
 })
 
+// Bug 246: while auto mode is stopped the user starts and merges tickets from the board until Resume (Bug 193), so that is what HQ tells the TPM, the engineer
+// and the user. Then Resume: HQ starts and merges again, and says so.
+test('Bug 246: while auto mode is stopped, a finished ticket and a merge are told as the user\'s to move on; after Resume, HQ\'s again', async () => {
+  const p = await project('stopwords'), t1 = await ticket(p, 'One'), t2 = await ticket(p, 'Two', ['T-01']), t3 = await ticket(p, 'Three', ['T-02'])
+  await turnEnds(p); const e1 = await engineer(t1)
+  await hq.hook(p.tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' })
+  await waitFor('the stop', async () => (await repoNow(p)).auto_stopped_why)
+  const toTpm = async (): Promise<string[]> => (await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === p.tpm.id).map((m: any) => m.body) // newest first
+  const before = (await toTpm()).length
+  assert.equal((await hq.hook(e1.id, exitPlanMode('Plan for T-01'))).hookSpecificOutput.decision.behavior, 'allow', 'plans are still approved while stopped')
+  fs.writeFileSync(path.join(wt(p, t1), 'one.txt'), '1\n'); sh(wt(p, t1), 'add', '.'); sh(wt(p, t1), 'commit', '-qm', 'one')
+  await ranTests(e1); await hq.mcp(e1.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
+  const r = await hq.mcp(e1.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone\n\n## Tests left out\nNothing', feature_map_unchanged: true })
+  const branch = (await tk(t1)).branch
+  assert.equal(r.text, `Done. The user merges ${branch} into main from HQ. You're done: stop now.`)
+  assert.equal((await toTpm())[0], `HQ: T-01 is finished (${branch}). The user merges it into main from HQ; you'll be told when it merges.`)
+  assert.equal((await hq.api(`tickets/${t1.id}/merge`, {})).status, 200) // the board's Merge into main, while stopped
+  await until(t1, 'merged')
+  const merged = await waitFor('the TPM told of the merge', async () => (await toTpm()).find((b) => b.startsWith('HQ: T-01 merged.')))
+  assert.equal(merged, 'HQ: T-01 merged. The user merged it with Merge, which runs no tests: HQ did not test it as it merged. Ready now: T-02. The user starts them from HQ.')
+  const notice = async () => (await hq.state()).attention.find((a: any) => a.kind === 'merged' && a.ticket_id === t1.id && !a.resolved_at)
+  assert.match((await notice())?.detail ?? '', /Ready now: T-02\. Start them with "Start ready"\./, 'the user hears it too, as on the board')
+  const stopped = (await toTpm()).slice(0, (await toTpm()).length - before)
+  assert.ok(!stopped.some((b) => /HQ (tests|starts|merges)/.test(b)), stopped.join('\n'))
+  // Resume: the dialog is seen to, and HQ starts T-02 by itself; its merge is HQ's, and the TPM hears that HQ starts what is ready next
+  for (const a of (await hq.state()).attention.filter((x: any) => x.kind === 'dialog' && !x.resolved_at)) await hq.api(`attention/${a.id}/resolve`, {})
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto-resume`, {})).status, 200); await turnEnds(p) // its turn after the dialog ends
+  const e2 = await engineer(t2); await waitFor('the "Start ready" notice to go', async () => !(await notice()))
+  await work(p, t2, e2, { 'two.txt': '2\n' })
+  assert.equal((await toTpm()).find((b) => b.startsWith('HQ: T-02 is finished')), `HQ: T-02 is finished (${(await tk(t2)).branch}). HQ tests it on main and merges it; you'll be told when it merges.`)
+  await until(t2, 'merged', 30_000)
+  assert.match(await waitFor('the TPM told of the merge', async () => (await toTpm()).find((b) => b.startsWith('HQ: T-02 merged.'))), /Ready now: T-03\. HQ starts them\.$/)
+  await engineer(t3)
+})
 test('Bug 114: a stuck alert left on a finished ticket\'s engineer that has stopped doesn\'t get it replaced when auto goes on', async () => {
   const p = await project('stale-stuck', { auto: false }); const t = await ticket(p, 'One'); await turnEnds(p)
   await hq.api(`tickets/${t.id}/launch`, {}); const e = await engineer(t)

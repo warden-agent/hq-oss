@@ -18,7 +18,11 @@ const { getAgent } = await import('./agents.ts')
 
 run(`INSERT INTO agents(id, role, model_alias, tmux_session, cwd, token_hash, status, in_plan_mode, started_at)
   VALUES ('tpm-1', 'tpm', 'haiku', 'hq-urgenttyped-1', ?, 'x', 'idle', 0, ?)`, root, Date.now())
-const calls = (): string[][] => fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+const { socket } = await import('./tmux.ts')
+/** The calls without the socket each names first (Bug 242). */
+const calls = (): string[][] => fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).map((c: string[]) => {
+  assert.deepEqual(c.slice(0, 2), ['-S', socket()]); return c.slice(2)
+})
 
 test('an urgent message of 2,000+ characters goes in after the Escape in pieces of at most 250, whole and in order, then Enter', async () => {
   const body = `Urgent check. ${Array.from({ length: 450 }, (_, i) => `w${i} 🙂`).join(' ')} FINAL-MARKER`

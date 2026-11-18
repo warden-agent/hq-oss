@@ -5,7 +5,11 @@ import { DOCK_FOR, PHONE, rightWidth, type Device, type Prefs } from './previewP
 import { AgentTerminal } from './Terminal'
 import { ActBtn, Menu } from './ui'
 
-const DOT: Record<string, string> = { running: 'bg-emerald-400', starting: 'bg-amber-400', crashed: 'bg-rose-500', stopped: 'bg-zinc-600' }
+const DOT: Record<string, string> = { running: 'bg-emerald-400', starting: 'bg-amber-400', crashed: 'bg-rose-500', stopped: 'bg-zinc-600',
+  stopping: 'bg-amber-400', restarting: 'bg-amber-400' }
+/** Bug 235: the run's state in one word. HQ marks the row before it ends a run (Bug 215), so "stopping" comes from the row, not from a request that a
+ *  backend going away cuts short; a Stop or restart HQ was in the middle of finishes once it's back. */
+const statusWord = (p: any): string => p?.status === 'stopped' ? 'stopped' : p?.stopping === 'stop' ? 'stopping' : p?.stopping === 'restart' ? 'restarting' : p?.status ?? 'stopped'
 export const Dot = ({ status }: { status: string }) => <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${DOT[status] ?? DOT.stopped}`} />
 
 // Repos whose top-bar Launch request is still in flight: until it answers, the pane doesn't offer a second way to ask Claude
@@ -21,8 +25,8 @@ export function LaunchBtn({ all, repo, p, open, setOpen }: { all: State; repo: a
   const label = (text: string) => <span className="max-w-56 truncate">{text}</span>
   const waiting = p?.helper_state === 'needs_ok' && !!p.draft_recipe
   if (isOn(p) || helperOn(p) || waiting) return <button className={`btn flex items-center gap-1.5 ${open || waiting ? 'btn-primary' : ''}`}
-    title={`Show or hide the live preview of ${repo.name}${p ? ` (${p.status})` : ''}`} onClick={() => setOpen(waiting ? true : !open)}>
-    <Dot status={isOn(p) ? p.status : 'starting'} />{label(waiting ? 'OK start steps' : isOn(p) ? `${open ? 'Hide' : 'Show'} app` : 'Claude is setting up…')}</button>
+    title={`Show or hide the live preview of ${repo.name}${p ? ` (${statusWord(p)})` : ''}`} onClick={() => setOpen(waiting ? true : !open)}>
+    <Dot status={isOn(p) ? statusWord(p) : 'starting'} />{label(waiting ? 'OK start steps' : isOn(p) ? `${open ? 'Hide' : 'Show'} app` : 'Claude is setting up…')}</button>
   const launch = async () => {
     if (!(await stopOthers(all, repo.id, { title: `Launch ${repo.name}?`, go: 'Launch' }))) return
     setOpen(true); setLaunching(repo.id, true)
@@ -35,14 +39,16 @@ export function LaunchBtn({ all, repo, p, open, setOpen }: { all: State; repo: a
 }
 
 /** The live preview: the app HQ runs from the repo's checkout (normally main), in a frame, with its server output a tab away. */
-export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo, roomRight }: {
+export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo, roomRight, onEvents }: {
   all: State; p: any; repo: any; prefs: Prefs; setPrefs: (p: Partial<Prefs>, save?: boolean) => void; ws: WebSocket | null; feed: (id: string, cb: (d: string) => void) => () => void
-  onRepo: (id: string) => void; roomRight: boolean /* false: no room beside the graph, so the pane shows below it whatever its dock (Bug 167) */ }) {
+  onRepo: (id: string) => void; roomRight: boolean /* false: no room beside the graph, so the pane shows below it whatever its dock (Bug 167) */
+  onEvents: (agentId: string) => void /* a helper's history in the side panel's Events tab (Bug 237) */ }) {
   const [picked, setTab] = useState<'app' | 'server' | 'claude'>('app')
   const [reloads, setReloads] = useState(0)
   const can = runnable(p), helper = helperOn(p) ? p.helper_agent_id : null
   const tab = picked === 'claude' && !helper ? 'app' : picked // the Claude tab goes with the helper
   const running = p.status === 'running', stopped = p.status === 'stopped'
+  const word = statusWord(p), ending = word === 'stopping', restarting = word === 'restarting'
   const tried = p.ticket_id && !stopped ? all.tickets.find((t) => t.id === p.ticket_id) : null // Try it (Bug 22)
   // Restart keeps a tried ticket; Start (it was stopped) runs main
   const start = async () => { if (await stopOthers(all, p.id, { title: `Start ${repo.name}?`, go: 'Start' })) await api(`previews/${p.id}/start`, { ticket: stopped ? null : p.ticket_id ?? null }) }
@@ -53,11 +59,11 @@ export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo, r
     {tried && <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-amber-600/50 bg-amber-950/40 px-2 py-1 text-xs text-amber-200">
       <span className="min-w-0 grow">Trying <b>{tried.key}</b>: {tried.title}. This is its version with a copy of your data, not main. Nothing you do here changes main.</span>
       <ActBtn label="Back to main" busyLabel="Switching…" run={() => api(`previews/${p.id}/start`, { ticket: null })} /></div>}
-    <HelperBanner p={p} repo={repo} watch={() => setTab('claude')} />
-    <SetupBanner p={p} repo={repo} />
+    <HelperBanner p={p} repo={repo} watch={() => setTab('claude')} events={onEvents} />
+    <SetupBanner p={p} repo={repo} events={onEvents} />
     <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs">
-      <Dot status={p.status} />
-      <span className="shrink-0 font-medium text-zinc-300">{p.status}</span>
+      <Dot status={word} />
+      <span className="shrink-0 font-medium text-zinc-300">{word}</span>
       {!stopped && where && <span className={`shrink-0 font-mono ${offMain ? 'text-amber-300' : 'text-zinc-500'}`}
         title={tried ? `${tried.key}'s branch` : offMain ? `The checkout is on ${p.branch}, not ${p.default_branch}` : `Running ${repo.name} at ${where}`}>{where}</span>}
       {!stopped && p.port && <span className="shrink-0 text-zinc-500">· :{p.url ? new URL(p.url).port : p.port}</span>}
@@ -67,9 +73,11 @@ export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo, r
         <button key={t} className={`btn-sm rounded-none first:rounded-l-md last:rounded-r-md ${tab === t ? 'btn-primary' : ''}`}
         title={t === 'claude' ? 'What Claude is doing to work out how to start the app' : undefined} onClick={() => setTab(t)}>{{ app: 'App', server: 'Server', claude: 'Claude' }[t]}</button>)}</div>
       <button className="btn-sm" title="Reload the page" disabled={!running} onClick={() => setReloads((n) => n + 1)}>⟳</button>
-      <ActBtn label={stopped ? 'Start' : 'Restart'} busyLabel={stopped ? 'Starting…' : 'Restarting…'} primary={stopped && can} disabled={!can && !stopped}
-        title={can ? `Runs ${p.command ?? recipeSummary(p.recipe)} in ${p.path}` : 'Claude works out how to start it first'} run={start} />
-      <ActBtn label="Stop" busyLabel="Stopping…" disabled={stopped} run={() => api(`previews/${p.id}/stop`, {})} />
+      <ActBtn label={stopped ? 'Start' : restarting ? 'Restarting…' : 'Restart'} busyLabel={stopped ? 'Starting…' : 'Restarting…'} primary={stopped && can}
+        disabled={(!can && !stopped) || restarting} run={start}
+        title={can ? `Runs ${p.command ?? recipeSummary(p.recipe)} in ${p.path}` : 'Claude works out how to start it first'} />
+      <ActBtn label={ending ? 'Stopping…' : 'Stop'} busyLabel="Stopping…" disabled={stopped || ending} run={() => api(`previews/${p.id}/stop`, {})}
+        title={ending ? `HQ is stopping ${repo.name}. If HQ restarts first, it finishes the Stop when it's back.` : undefined} />
       <a className={`btn-sm ${running ? '' : 'pointer-events-none opacity-40'}`} href={p.url ?? undefined} target="_blank" rel="noreferrer" title="Open in your browser">↗</a>
       <div className="flex">{(['desktop', 'phone'] as const).map((d) => <button key={d} className={`btn-sm rounded-none first:rounded-l-md last:rounded-r-md ${prefs.device === d ? 'btn-primary' : ''}`} onClick={() => device(d)}>{d === 'desktop' ? 'Desktop' : 'Phone'}</button>)}</div>
       <button className="btn-sm" disabled={!roomRight} onClick={() => setPrefs({ dock: prefs.dock === 'bottom' ? 'right' : 'bottom' })}
@@ -137,7 +145,7 @@ function Notice({ p, repo, can, start, toServer, toClaude, onRepo }: { p: any; r
 }
 
 /** The Launch helper's state above the pane: working (watch or stop it), steps waiting for the user's OK, or why it ended. */
-function HelperBanner({ p, repo, watch }: { p: any; repo: any; watch: () => void }) {
+function HelperBanner({ p, repo, watch, events }: { p: any; repo: any; watch: () => void; events: (agentId: string) => void }) {
   const box = (tone: string, body: React.ReactNode) => <div className={`flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1 text-xs ${tone}`}>{body}</div>
   const amber = 'border-amber-600/50 bg-amber-950/40 text-amber-200', rose = 'border-rose-700/50 bg-rose-950/40 text-rose-200'
   const again = (label: string) => <ActBtn label={label} busyLabel="Asking…" run={() => api(`previews/${p.id}/setup`, { why: p.recipe || p.command ? 'fix' : 'first' })} />
@@ -147,6 +155,7 @@ function HelperBanner({ p, repo, watch }: { p: any; repo: any; watch: () => void
       ? `Running Claude's steps on ${p.helper_ticket_key ? `${p.helper_ticket_key}'s version` : 'your checkout'}; Claude checks the result.`
       : `Claude is working out how to start ${repo.name}${fromTicket(p)}.`}</span>
     <button className="btn-sm" onClick={watch}>Watch</button>
+    <EventsBtn id={p.helper_agent_id} events={events} />
     <ActBtn label="Stop Claude" busyLabel="Stopping…" run={() => api(`previews/${p.id}/dismiss`, {})} /></>)
   if (p.helper_state === 'cant_start') return box(rose, <><span className="min-w-0 grow">Claude can't start {repo.name}: {p.helper_note}</span>{again('Try again')}</>)
   if (p.helper_state === 'failed') return box(rose, <><span className="min-w-0 grow">{p.helper_note ?? 'Claude couldn\'t work out how to start it.'}</span>{again('Ask Claude again')}</>)
@@ -155,8 +164,12 @@ function HelperBanner({ p, repo, watch }: { p: any; repo: any; watch: () => void
   return null
 }
 
+/** Bug 237: helpers have no box on the graph, so their history (Events tab) opens from here. */
+const EventsBtn = ({ id, events }: { id: string; events: (agentId: string) => void }) =>
+  <button className="btn-sm" title="What Claude did here, step by step, in the panel's Events tab" onClick={() => events(id)}>Events</button>
+
 /** HQ's test setup (Tester & Checker, Part 3): its helper at work, why it ended, or a new setup the user hasn't seen yet (shown once). */
-function SetupBanner({ p, repo }: { p: any; repo: any }) {
+function SetupBanner({ p, repo, events }: { p: any; repo: any; events: (agentId: string) => void }) {
   const t = p.test_setup; if (!t) return null
   const box = (tone: string, body: React.ReactNode) => <div className={`flex flex-col gap-1 rounded-md border px-2 py-1 text-xs ${tone}`}>{body}</div>
   const amber = 'border-amber-600/50 bg-amber-950/40 text-amber-200', rose = 'border-rose-700/50 bg-rose-950/40 text-rose-200', indigo = 'border-indigo-500/60 bg-indigo-950/40 text-zinc-300'
@@ -164,6 +177,7 @@ function SetupBanner({ p, repo }: { p: any; repo: any }) {
   const go = (action?: string) => api(`previews/${p.id}/test-setup`, action ? { action } : {})
   if (t.working) return box(amber, row(<><span className="min-w-0 grow">{t.state === 'checking' ? `HQ is trying Claude's test setup for ${repo.name} in its sandbox: seed, start, reset.`
     : `Claude is working out how HQ tests ${repo.name}: a production start, a clean seed, where its data is.`}</span>
+    {t.helper_agent_id && <EventsBtn id={t.helper_agent_id} events={events} />}
     <ActBtn label="Stop Claude" busyLabel="Stopping…" run={() => go('dismiss')} /></>))
   if (t.state === 'cant_test' || t.state === 'failed') return box(rose, row(<><span className="min-w-0 grow">{t.state === 'cant_test' ? `HQ can't test ${repo.name}: ${t.note}` : t.note}</span>
     <ActBtn label="Ask Claude again" busyLabel="Asking…" run={() => go()} /><ActBtn label="Dismiss" run={() => go('dismiss')} /></>))

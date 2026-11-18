@@ -72,6 +72,11 @@ test('an edit in the worktree after the run, or a handoff before it, is refused;
 test('what it must not catch: auto mode on, no test command HQ can find, one Claude Code refuses, and a refused try', async () => {
   reset(); handoff()
   setRepo('auto_mode = 1'); assert.equal((await suiteProblem(t())), null, 'on auto HQ runs the command itself before the merge'); setRepo('auto_mode = 0')
+  setRepo('auto_mode = 1, auto_stopped_why = ?', 'a refused merge') // as Bug 246: stopped, the user merges (no tests)
+  assert.match((await suiteProblem(t())) ?? '', /HQ hasn't seen this project's test command run/, 'auto stopped: the check holds')
+  setRepo('auto_stopped_why = NULL'); run("UPDATE tickets SET auto_parked_why = 'parked' WHERE id = 't1'")
+  assert.match((await suiteProblem(t())) ?? '', /HQ hasn't seen this project's test command run/, 'a ticket auto parked: the check holds')
+  run("UPDATE tickets SET auto_parked_why = NULL WHERE id = 't1'"); setRepo('auto_mode = 0')
   pkg({ start: 'node server.js' }); assert.equal((await suiteProblem(t())), null, 'no tests HQ can find')
   setRepo('test_cmd = ?', 'node --test test/'); assert.match((await suiteProblem(t())) ?? '', /node --test test\//, 'the saved command wins')
   setRepo('test_cmd_refused = ?', JSON.stringify({ cmd: 'node --test test/', why: 'isolated', by: 'SHOP-0' })); assert.equal((await suiteProblem(t())), null)

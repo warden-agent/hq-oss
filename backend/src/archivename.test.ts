@@ -1,6 +1,7 @@
 // The archive Clear and Remove write (clear.ts archive): each feature's heading in SUMMARY.md says where it stood in the board's
 // words, not its stored status word, which stays "planning" for a finished feature (Bug 222); the folder is named in the user's
-// local time, like the summary's heading (Bug 225, it was UTC), and two archives in one second get a folder each.
+// local time, like the summary's heading (Bug 225, it was UTC), and two archives in one second get a folder each. Each feature's
+// FEATURE.md says the same in its status line (Bug 250: it said "status: planning" for a done feature).
 import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -54,4 +55,9 @@ test("each feature's heading says where it stood, as its board box did, not its 
   assert.match(sum, /^## Not planned yet \(no tickets yet\): fc-fc\/$/m)
   assert.match(sum, /^## Dropped \(cancelled\): fd-fd\/$/m)
   assert.doesNotMatch(sum, /\(planning\)/)
+})
+
+test("each feature's FEATURE.md status line says where it stood in the same words, not \"planning\" (Bug 250)", () => {
+  const dir = write(), status = (folder: string) => /^status: (.*)$/m.exec(fs.readFileSync(path.join(dir, folder, 'FEATURE.md'), 'utf8'))?.[1]
+  assert.deepEqual(['fa-fa', 'fb-fb', 'fc-fc', 'fd-fd'].map(status), ['✓ done · all 2 merged', '1/2 merged', 'no tickets yet', 'cancelled'])
 })

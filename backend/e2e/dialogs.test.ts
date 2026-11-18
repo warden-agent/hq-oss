@@ -71,6 +71,25 @@ test('Bug 216: at the plan gate the Agents menu says whom the plan waits on, not
   assert.deepEqual(await view(), ['working', 'working', 'Running: npm test', 'Running: npm test'])
 })
 
+// Bug 234: a plan sent back leaves its engineer at the gate (`plan_review`) until its next step. In that gap the menu said "plan for you" and its box
+// "waiting for your review", though nobody was asked anything. Over the state HQ really sends the page after a send-back.
+test('Bug 234: a plan sent back, its engineer not moved on yet: the menu says it is revising, not that it waits for a review', async () => {
+  const repo = (await hq.api('repos', { path: hq.repo(`p${++n}`) })).json, f = (await hq.api('features', { repoId: repo.id, title: 'Plan', request: 'Build it' })).json
+  await waitFor('the TPM', async () => (await hq.state()).agents.find((x: any) => x.id === f.tpm_agent_id && x.status === 'working'))
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Box', size: 'S', spec: 'A box.' })).json, e = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await now(e))?.status === 'working' || null)
+  const view = async () => { const s = await hq.state(), x = s.agents.find((y: any) => y.id === e.id); return [x.status, agentPill(x, s), menuActivity(x, s)] }
+  const hold = hq.hook(e.id, exitPlanMode('Plan: a box, round one'))
+  const r = await waitFor('the open review', async () => (await hq.state()).reviews.find((x: any) => x.ticket_id === t.id && x.status === 'open'))
+  await waitFor('held at the gate', async () => (await now(e)).status === 'plan_review' || null)
+  assert.deepEqual(await view(), ['plan_review', 'plan for you', 'Plan R-1 waiting for you']) // the normal manual review, as before
+  assert.equal((await hq.api(`reviews/${r.id}/answer`, { verdict: 'revise', message: 'Smaller box', by: 'user' })).json.ok, true)
+  assert.equal((await hold).hookSpecificOutput.decision.behavior, 'deny')
+  assert.deepEqual(await view(), ['plan_review', 'revising plan', 'its plan was sent back · it is revising it'])
+  await hq.hook(e.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: 'x' }, tool_use_id: 'r234' }) // its next step
+  assert.deepEqual(await view(), ['working', 'working', 'Reading x'])
+})
+
 test('Bug 62: "Claude is continuing your task" doesn\'t pause it, and ends a usage wait', async () => {
   const a = await tpm()
   await note(a, 'quota_auto_resume_stale', 'Press enter to continue')

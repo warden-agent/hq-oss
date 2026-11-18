@@ -97,3 +97,26 @@ test('Bug 219: a backend restart while the TPM writes its note still brings the 
   assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', next, 'prompt.md'), 'utf8'), /RESTART-NOTE/)
   assert.equal((await hq.state()).repos.find((x: any) => x.id === repo.id).clear_tpm_was_on, null) // done with: the next clear starts afresh
 })
+
+test('Bug 231: a plan answered during a Clear is refused, its stopped engineer stays stopped, and the clear finishes once the TPM has its note', async () => {
+  const { repo, f, tpm } = await setup('plan-clear')
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Plan', size: 'S', spec: 'Plan.' })).json
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await agent(eng.id))?.status === 'working')
+  const b = (await hq.modNext(eng.id)).batch; await hq.modEvent(eng.id, { kind: 'batch_received', id: b.id })
+  await hq.hook(eng.id, { hook_event_name: 'UserPromptSubmit', prompt: b.text })
+  void hq.hook(eng.id, exitPlanMode('Plan: write plan.txt.')).catch(() => null) // held at the gate; the fake engineer never hangs up (a real one dies with its stop)
+  const rv = await waitFor('the review', async () => (await hq.state()).reviews.find((r: any) => r.ticket_id === t.id && r.status === 'open'))
+  const r = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.deepEqual(r.json.noting, [tpm.display_name]); assert.equal(r.json.stopped.length, 1) // the engineer at plan review stops at once
+  await waitFor('the engineer stopped', async () => (await agent(eng.id))?.status === 'exited')
+  for (const body of [{ verdict: 'approve' }, { verdict: 'revise', message: 'smaller', note: 'smaller' }]) {
+    const a = await hq.api(`reviews/${rv.id}/answer`, body)
+    assert.deepEqual([a.json.ok, a.json.error], [false, "plan-clear is being cleared; wait until it's done."], body.verdict)
+  }
+  const s = await hq.state()
+  assert.equal(s.agents.find((a: any) => a.id === eng.id).status, 'exited'); assert.equal(s.tickets.find((x: any) => x.id === t.id).status, 'plan_review')
+  assert.equal((await hq.mcp(tpm.id, 'write_handoff_note', { text: '## What the user wants\n- a plan (PLAN-NOTE)' })).isError, false)
+  await waitFor('the board gone', async () => !(await hq.state()).features.some((x: any) => x.repo_id === repo.id), 30_000)
+  assert.equal((await hq.state()).repos.find((x: any) => x.id === repo.id).clearing_at, null)
+})

@@ -101,6 +101,17 @@ test('Bug 94: two background helpers: the agent is idle only when both are done;
   assert.equal(await status(tpm.id), 'idle')
 })
 
+test('Bug 232: helpers the screen check forgot (idle prompt) stay forgotten after a restart', async () => {
+  const tpm = await tpmOf('forgot-helper')
+  await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'hi' })
+  await startHelper(tpm.id, 'hf1', 'Read the code') // and neither its stop nor the Stop arrives
+  await waitFor('the screen check to set it idle', async () => (await status(tpm.id)) === 'idle', 20_000)
+  await hq.restart()
+  await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'next' })
+  await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' })
+  const a = await agentOf(tpm.id); assert.equal(a.status, 'idle', 'the forgotten helper keeps nothing working'); assert.equal(a.activity, null)
+})
+
 test('Bug 94: a helper run in the foreground, or one that never started, keeps nothing working', async () => {
   const tpm = await tpmOf('foreground-helper')
   await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'hi' })

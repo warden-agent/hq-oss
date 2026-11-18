@@ -16,7 +16,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { one, run as sql } from './db.ts'
 import type { Agent } from './agents.ts'
-import { autoOn, getFeature, getRepo, repoOfAgent, ticketForAgent, type Repo, type Ticket } from './records.ts'
+import { getFeature, getRepo, hqMoves, repoOfAgent, ticketForAgent, type Repo, type Ticket } from './records.ts'
 import { afterTestCmd, bare, isRefusal, ranTestCmd, refusedTestCmd } from './refused.ts'
 import { detectTests } from './testrun.ts'
 import { j } from './util.ts'
@@ -114,7 +114,7 @@ export function keepState(agent: Agent, eventId: number, command = '', use = '')
 const EDITS = "('hook.PostToolUse:Edit', 'hook.PostToolUse:Write', 'hook.PostToolUse:MultiEdit', 'hook.PostToolUse:NotebookEdit')"
 /** open_pr's check. Null: it may go on. Otherwise why not, in words the engineer can act on. */
 export async function suiteProblem(t: Ticket): Promise<string | null> {
-  const repo = getRepo(getFeature(t.feature_id)?.repo_id ?? ''); if (!repo || autoOn(repo.id)) return null // on auto, HQ runs the command itself before the merge
+  const repo = getRepo(getFeature(t.feature_id)?.repo_id ?? ''); if (!repo || hqMoves(repo, t)) return null // HQ runs it itself before its merge (not while auto is stopped or parked)
   const cmd = suiteCmd(repo, t.worktree_path); if (!cmd) return null
   if (j<{ cmd?: string } | null>(repo.test_cmd_refused, null)?.cmd === repo.test_cmd) return null // Claude Code refuses it for engineers: HQ already says so
   const last = (where: string, ...args: string[]): number => one<{ id: number | null }>(`SELECT MAX(e.id) AS id FROM events e JOIN agents a ON a.id = e.agent_id

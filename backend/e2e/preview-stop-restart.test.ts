@@ -93,3 +93,26 @@ test('a plain Stop with HQ up all along leaves no mark behind', async () => {
   const p = await preview(id); assert.equal(p.status, 'stopped'); assert.equal(p.detail, null); assert.equal(p.stopping, null)
   const e = (await events('preview.stopped')).find((x) => x.repo === name); assert.ok(e); assert.equal(e.after_restart, undefined)
 })
+
+// Bug 236: a restart that fails after HQ ended the old run (here its run.sh can't be written) left the row "running" with nothing running, and its
+// `stopping` mark had the next backend start the app again on its own.
+test('a restart that fails after the old run ended says stopped and why, and stays stopped over a backend restart', async () => {
+  const { id, n } = await launch('slow')
+  const script = path.join(hq.hqHome, 'previews', id, 'run.sh')
+  fs.rmSync(script); fs.mkdirSync(script) // a file HQ can't write: the start fails after the old run is gone
+  const r = await hq.api(`previews/${id}/start`, {})
+  assert.notEqual(r.status, 200, JSON.stringify(r.json))
+  const p = await preview(id)
+  assert.equal(p.status, 'stopped', JSON.stringify(p)); assert.equal(p.stopping, null); assert.equal(p.url, null)
+  assert.match(p.detail ?? '', /^HQ couldn't start cut-\d+: .*run\.sh/, p.detail)
+  assert.equal(supervisor(id), null, 'the old run is gone')
+  await waitFor('the old run\'s helper to be gone', () => !helpers(n).length, 15_000)
+  await hq.down(); await hq.up()
+  const after = await preview(id)
+  assert.equal(after.status, 'stopped', JSON.stringify(after)); assert.equal(after.stopping, null)
+  assert.equal(supervisor(id), null, 'not started again by the next backend')
+  fs.rmdirSync(script)
+  assert.equal((await hq.api(`previews/${id}/start`, {})).status, 200, 'Start works again once the file can be written')
+  await waitFor('the app', async () => (await preview(id)).status === 'running', 20_000)
+  assert.equal((await hq.api(`previews/${id}/stop`, {})).status, 200)
+})

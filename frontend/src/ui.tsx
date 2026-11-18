@@ -3,6 +3,8 @@ import { onAsk, useBusy, type StopAsk } from './board'
 import { api, askUntilAnswered, errBody, errText, onError } from './api'
 import { projectSlug } from '../../backend/src/projectname.ts'
 import { clock } from './testruns.ts'
+import { mdBlocks, mdInline } from './md.ts'
+import { backdropCloses } from './backdrop.ts'
 
 const statusColor: Record<string, string> = { working: 'bg-emerald-500/20 text-emerald-300', idle: 'bg-zinc-700/50 text-zinc-300', plan_review: 'bg-amber-500/20 text-amber-300', blocked: 'bg-rose-500/20 text-rose-300', paused: 'bg-rose-500/20 text-rose-300', launching: 'bg-sky-500/20 text-sky-300', exited: 'bg-zinc-800 text-zinc-500',
   planning: 'bg-sky-500/20 text-sky-300', implementing: 'bg-emerald-500/20 text-emerald-300', awaiting_answer: 'bg-amber-500/20 text-amber-300', pr_ready: 'bg-indigo-500/20 text-indigo-300', pr_open: 'bg-indigo-500/20 text-indigo-300', resolving: 'bg-amber-500/20 text-amber-300', merged: 'bg-emerald-500/30 text-emerald-200' }
@@ -17,12 +19,15 @@ export function Elapsed({ since }: { since: number }) {
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t) }, [])
   return <span className="tabular-nums">{clock(now - since)}</span>
 }
-/** An agent's message as it means it: **bold** and `code` shown as such, and "## Heading" lines in bold (not raw markdown). */
+/** An agent's message as it means it: **bold** and `code` shown as such, "## Heading" lines in bold and ``` fences as code blocks (Bug 256),
+ *  not raw markdown. A code block wraps its long lines, so nothing in it is hidden off to the side and the page never scrolls sideways. */
 export function Md({ text }: { text: string }) {
-  const inline = (line: string) => line.split(/(\*\*[^*]+\*\*|`[^`]+`)/).map((p, i) => p.startsWith('**') && p.endsWith('**') && p.length > 4 ? <strong key={i}>{p.slice(2, -2)}</strong>
-    : p.startsWith('`') && p.endsWith('`') && p.length > 2 ? <code key={i} className="rounded bg-zinc-950/60 px-0.5 text-[0.95em]">{p.slice(1, -1)}</code> : p)
-  return <div className="whitespace-pre-wrap break-words">{String(text).split('\n').map((l, i) => { const h = /^#{1,4}\s+(.*)$/.exec(l)
-    return <div key={i} className={h ? 'font-semibold' : ''}>{h ? inline(h[1]!) : l ? inline(l) : '\u00a0'}</div> })}</div>
+  const inline = (line: string) => mdInline(line).map((p, i) => p.kind === 'bold' ? <strong key={i}>{p.text}</strong>
+    : p.kind === 'code' ? <code key={i} className="rounded bg-zinc-950/60 px-0.5 text-[0.95em]">{p.text}</code> : p.text)
+  return <div className="whitespace-pre-wrap break-words">{mdBlocks(text).map((b, i) => b.kind === 'code'
+    ? <pre key={i} className="my-0.5 whitespace-pre-wrap rounded border border-zinc-700/70 bg-zinc-950/60 px-1.5 py-1 font-mono text-[0.95em] [overflow-wrap:anywhere]">
+      {b.lines.join('\n') || '\u00a0'}</pre>
+    : <div key={i} className={b.head ? 'font-semibold' : ''}>{b.text ? inline(b.text) : '\u00a0'}</div>)}</div>
 }
 /** Text with its URLs turned into short links (attention items carry "Create PR" links that are too long to show). */
 export const Linked = ({ text }: { text: string }) => <>{String(text).split(/(https?:\/\/\S+)/).map((p, i) => /^https?:\/\//.test(p) ? <a key={i} className="text-indigo-300 underline" href={p} target="_blank" rel="noreferrer">open ↗</a> : p)}</>
@@ -67,6 +72,15 @@ export function ErrorBar() {
     <div key={m.id} className="flex items-start gap-2 rounded-md border border-rose-500/50 bg-rose-950 px-3 py-2 text-xs text-rose-200 shadow-xl">
       <span className="min-w-0 grow whitespace-pre-wrap break-words">{m.text}</span><button className="btn-sm shrink-0" title="Dismiss" onClick={() => setMsgs((x) => x.filter((y) => y.id !== m.id))}>×</button></div>)}</div>
 }
+/** The dark backdrop behind each of HQ's dialogs. A press on it (not on the box) closes the dialog, but not one in the first half second: that is the second
+ *  click of a double click on the button that opened it (Bug 252). `wrap-anywhere`: a long word with no spaces (a project name, a path) wraps inside the box
+ *  instead of running past its edge (Bug 253). `canClose` false: the dialog is busy and stays. */
+export function Backdrop({ onClose, canClose = true, z = 'z-[90]', children }: { onClose: () => void; canClose?: boolean; z?: string; children: React.ReactNode }) {
+  const opened = useRef(Infinity) // Infinity until it's on screen: no press closes it before then
+  useEffect(() => { opened.current = performance.now() }, [])
+  return <div className={`fixed inset-0 ${z} flex items-center justify-center bg-black/50 p-4 wrap-anywhere`}
+    onPointerDown={(e) => { if (e.target === e.currentTarget && canClose && backdropCloses(opened.current, performance.now())) onClose() }}>{children}</div>
+}
 /** HQ's dialog (stopOthers, freshConfirm and clearConfirm in board.ts): what a switch or start stops, which agents save a handoff
  *  note and stop (and which stay, and why), or a plain question. Enter confirms, Escape or a click outside cancels; on a `danger`
  *  question (Clear project) Cancel has the focus, so only a click on the red button goes ahead. */
@@ -81,7 +95,7 @@ export function StopDialog() {
   })
   if (!q) return null
   const list = (xs: string[]) => <ul className="ml-4 list-disc break-words text-zinc-300">{xs.map((x) => <li key={x}>{x}</li>)}</ul>
-  return <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 p-4" onPointerDown={(e) => { if (e.target === e.currentTarget) done(false) }}>
+  return <Backdrop onClose={() => done(false)}>
     <div role="dialog" aria-modal="true" aria-label={q.title}
       className="flex max-h-[90vh] w-[480px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-400 shadow-xl">
       <div className="break-words text-sm font-medium text-zinc-100">{q.title}</div>
@@ -94,7 +108,7 @@ export function StopDialog() {
       <div className="flex flex-wrap justify-end gap-1.5"><button className="btn" autoFocus={!!q.danger} onClick={() => done(false)}>Cancel</button>
         <button className={`btn ${q.danger ? 'border-rose-500/60! bg-rose-950/40! text-rose-200!' : 'btn-primary'}`} autoFocus={!q.danger} onClick={() => done(true)}>{q.go}</button></div>
     </div>
-  </div>
+  </Backdrop>
 }
 
 /** New project…: a name, where it goes, and GitHub or not. HQ makes the folder and repo itself (backend newproject.ts). */
@@ -129,7 +143,7 @@ export function NewProjectDialog({ onClose, onMade }: { onClose: () => void; onM
   const opt = (on: boolean, label: string, off = false) => <label className={`flex items-start gap-2 ${off ? 'text-zinc-600' : 'cursor-pointer text-zinc-200'}`}>
     <input type="radio" name="np-where" className="mt-0.5" checked={github === on} disabled={off || working} onChange={() => setGithub(on)} />
     <span className="min-w-0 break-words">{label}</span></label>
-  return <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 p-4" onPointerDown={(e) => { if (e.target === e.currentTarget && !working) onClose() }}>
+  return <Backdrop onClose={onClose} canClose={!working}>
     <form role="dialog" aria-modal="true" aria-label="New project" onSubmit={(e) => { e.preventDefault(); if (offer) addIt(); else make() }}
       className="flex max-h-[90vh] w-[480px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-400 shadow-xl">
       <div className="text-sm font-medium text-zinc-100">New project</div>
@@ -150,5 +164,5 @@ export function NewProjectDialog({ onClose, onMade }: { onClose: () => void; onM
           {busy === 'add' ? 'Adding…' : offer.repoId ? `Open ${offer.name}` : `Add ${offer.name} to HQ`}</button>
           : <button type="submit" className="btn btn-primary" disabled={!ok}>{busy === 'make' ? (github ? 'Making it on GitHub…' : 'Making it…') : 'Create'}</button>}</div>
     </form>
-  </div>
+  </Backdrop>
 }

@@ -12,7 +12,7 @@ import { conflictsWith, mergeIntoMain, names } from './localmerge.ts'
 import { clearConflict, clearStalled, fixButton, fixWords, forTests, mergeBase, setConflict, stalledKind, whoMergedFirst } from './conflicts.ts'
 import { getAgent, stopAgent, type Agent } from './agents.ts'
 import { sendMessage } from './delivery.ts'
-import { autoOn, getFeature, getRepo, getTicket, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type MergeTest, type Repo, type Ticket, liveTpm,
+import { autoGoing, getFeature, getRepo, getTicket, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type MergeTest, type Repo, type Ticket, liveTpm,
   closedWhy, hqMoves } from './records.ts'
 import { countWords, took } from './testcounts.ts'
 import { ghOpts, git, syncRepo } from './repos.ts'
@@ -74,7 +74,8 @@ export async function finishTicket(agent: Agent, title: string, body: string, na
   const tests = fixed && forTests(t.fixing) // it went back for its tests, not conflicts (Bug 84)
   const fixedWhat = t.fixing === 'look' ? 'what went wrong when HQ opened the app' : t.fixing === 'review' ? 'what a fresh reader of its changes found' : 'its tests'
   const changed = fixed && t.fixing === 'changes' // or for a spec the TPM changed after it was finished
-  const auto = autoOn(repo.id)
+  // Bug 246: HQ tests and merges it only while auto mode is going: stopped, or with the ticket parked, the user does until Resume (as the board says)
+  let auto = hqMoves(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t)
   clearConflict(t.id); clearStalled(t.id)
   run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
     `ticket:${t.id}`, 'pr', `# ${title}\n\n${body}`, now())
@@ -95,6 +96,7 @@ export async function finishTicket(agent: Agent, title: string, body: string, na
     attention('push_failed', `${t.key}: ${(e as Error).message}`, { agentId: agent.id, ticketId: t.id })
     throw new Error(`HQ could not push ${t.branch}: ${(e as Error).message}. The user has been told; stop and wait for a message.`)
   }
+  auto = hqMoves(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t) // read after the push: auto may have stopped, gone off or come back meanwhile
   const hasPr = !!t.pr_number && t.pr_state === 'open' // fixed after a conflict: the push updated its open PR
   setTicket(t.id, hasPr ? { status: 'pr_open', prior_status: null, fixing: null } : { status: 'pr_ready', pr_url: null, pr_state: 'waiting', prior_status: null, fixing: null })
   emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: true, waiting: !hasPr, fixed } })
@@ -148,7 +150,7 @@ export async function makePr(ticketId: string): Promise<Ticket> {
   if (!slug || t.pr_state === 'local') throw new Error(`${repo.name} isn't on GitHub: merge ${t.key} from HQ.`)
   if (t.status !== 'pr_ready' || !t.branch) throw new Error(t.status === 'pr_open' ? `${t.key} already has PR #${t.pr_number}.` : `${t.key} isn't finished yet (${t.status}).`)
   const { title, body } = prText(t), pr = await openTicketPr(t, repo, slug, title, body)
-  if (!pr) throw new Error(`GitHub wouldn't open the PR for ${t.key}; the link on its box opens GitHub's own form.`)
+  if (!pr) throw new Error(`GitHub wouldn't open the PR for ${t.key}. Create PR ↗ on its box opens GitHub's own form, filled in.`) // the button board.ts mergeActs gives a refused one (Bug 244)
   return getTicket(t.id)!
 }
 
@@ -185,7 +187,9 @@ async function checkOnce(): Promise<void> {
       }
     }
     else if (await branchMerged(repo.path, t.branch, `refs/remotes/origin/${repo.default_branch}`)) { markMerged(t, null); continue } // merged without a PR
-    else if (prs && t.status === 'pr_ready' && t.pr_state === 'not_opened') { const p = prText(t); await openTicketPr(t, repo, slug, p.title, p.body) } // retry; 'waiting' waits for the user
+    else if (prs && t.status === 'pr_ready' && t.pr_state === 'not_opened' && !hqMoves(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t)) { // retry; 'waiting' waits for the user
+      const p = prText(t); await openTicketPr(t, repo, slug, p.title, p.body) // on auto HQ opens it as it merges (Bug 247): two tries at once would clash
+    }
     await checkConflict(t, repo, pr?.state === 'OPEN' ? pr : undefined)
   }
 }
@@ -253,7 +257,7 @@ function markMerged(t: Ticket, pr: Pr | null, o: { byUser?: boolean; tested?: Te
   writeFeatureMd(f) // "Built so far" in PROJECT.md grows (Bug 52)
   const ready = readyDependents(t.key, tickets(f.id), j<string[]>(f.merge_order, [])).map((x) => x.key)
   const what = `${t.key} merged${pr ? ` (PR #${pr.number})` : ''}.${ready.length ? ` Ready now: ${ready.join(', ')}.` : ''}`
-  const auto = autoOn(f.repo_id) // auto mode starts what's ready and sums the run up at the end
+  const cur = getRepo(f.repo_id), auto = !!cur && autoGoing(cur) // auto mode starts what's ready and sums the run up at the end; stopped, the user does (Bug 246)
   if (!auto && (ready.length || !o.byUser)) attention('merged', ready.length ? `${what} Start them with "Start ready".` : what, { agentId: t.assignee_agent_id, ticketId: t.id })
   const tested = `${t.key} merged${pr ? ` (PR #${pr.number})` : ''}. ${testedWords(m, getRepo(f.repo_id)?.default_branch ?? 'main')}` // what HQ ran on it first (Bug 126)
   tellTpm(f, `HQ: ${tested}${ready.length ? ` Ready now: ${ready.join(', ')}.${auto ? ' HQ starts them.' : ' The user starts them from HQ.'}` : ''}`)

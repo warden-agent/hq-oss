@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { ReactFlow, ReactFlowProvider, Background, Controls, ControlButton, useReactFlow, useStore, useStoreApi, type Edge, type Node } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { FeatureNode, TicketNode, TpmNode } from './Nodes'
-import { placeView, type Box } from './fit'
+import { LOWEST, placeView, type Box } from './fit'
 const nodeTypes = { tpm: TpmNode, feature: FeatureNode, ticket: TicketNode }
 /** A request to bring a box into view (Show in the ⚠ menu, Read plan); `n` makes a repeat request for the same box count. */
 export type Focus = { node: string; n: number } | null
@@ -48,7 +48,7 @@ function Flow({ nodes, edges, fits, focus, onSelect, onPane }: Props) {
   }, [focus, rf, store])
   const fitBtn = useMemo(() => <ControlButton className="react-flow__controls-fitview" title="Fit view" aria-label="Fit view"
     onClick={() => { moved.current = false; place() }}><FitIcon /></ControlButton>, [place])
-  return <div className="h-full w-full"><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} minZoom={0.25}
+  return <div className="h-full w-full"><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} minZoom={LOWEST}
     nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} deleteKeyCode={null} zoomOnDoubleClick={false}
     onNodeClick={(e, n) => { if (!ownClick(e.target)) onSelect(n.id) }} onPaneClick={onPane} onMove={(e) => { if (e) moved.current = true }}
     proOptions={{ hideAttribution: true }} colorMode="dark">

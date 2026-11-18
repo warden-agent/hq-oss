@@ -36,6 +36,8 @@ test('Bug 162: only its own test file ran, so open_pr is refused until the proje
   let r = await hq.mcp(e.id, 'open_pr', BODY)
   assert.equal(r.isError, true); assert.match(r.text, /HQ hasn't seen this project's test command run on .*: npm test\./)
   const was = (await tk(t)).status; assert.ok(!['pr_ready', 'pr_open', 'merged'].includes(was), was)
+  const refusals = async () => ((await hq.api(`agents/${e.id}/events`)).json.events as any[]).map((x) => x.text).filter((x: string) => x.includes('as finished (open pr)'))
+  assert.deepEqual(await refusals(), [`HQ didn't take ${t.key} as finished (open pr): ${r.text}`]) // Bug 248: on its Events tab, not only in its terminal
 
   await bash(e, `cd ${JSON.stringify(wt)} && npm test 2>&1 | tail -20`, 'Exit code 1') // it ran, and failed in the other file
   await hq.hook(e.id, { hook_event_name: 'PostToolUse', tool_name: 'Edit', tool_input: { file_path: path.join(wt, 'list.js'), old_string: '0', new_string: '1' } })
@@ -46,6 +48,7 @@ test('Bug 162: only its own test file ran, so open_pr is refused until the proje
 
   assert.equal((await handoff(e)).isError, false)
   r = await hq.mcp(e.id, 'open_pr', BODY); assert.equal(r.isError, false, r.text)
+  assert.equal((await refusals()).length, 3) // one line per refusal above; the call that went through adds none
   await waitFor(`${t.key} finished`, async () => ['pr_ready', 'pr_open', 'merged'].includes((await tk(t)).status))
 })
 

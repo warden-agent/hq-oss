@@ -1,24 +1,44 @@
 // Worker slots (each running engineer's ports and DB name) and engineers' worktrees once they're gone.
 import fs from 'node:fs'
 import { q, run } from './db.ts'
+import { PORTS } from './config.ts'
+import { PREVIEW_PORTS, portBusy } from './apprun.ts'
+import { freeBase, SLOT_SIZE, slotBases, slotWindow } from './slotports.ts'
 import { emit } from './events.ts'
-import { sleep } from './util.ts'
+import { j, sleep } from './util.ts'
 import { sweepNow } from './leftovers.ts'
 import { claudeLockPid, listWorktrees, removeMerged, unlockStale } from './worktrees.ts'
 import { getAgent } from './agents.ts'
 import { getFeature, getRepo, getTicket, repos, type Ticket, removing } from './records.ts'
 
-/** A worker slot's env: slot n owns ports 3100+10n … 3100+10n+9, and PORT is the first of them. */
-export const slotEnv = (idx: number): Record<string, string> => ({ HQ_WORKER: String(idx), PORT: String(3100 + idx * 10), HQ_PORT_BASE: String(3100 + idx * 10), DB_NAME: `hq_w${idx}` })
-/** The lowest free slot. A slot is taken by a launch under way (`pending-…`) or an agent that hasn't exited; one still naming
- *  an exited or unknown agent is free (its release was missed). */
-export function nextWorkerSlot(agentId: string): { idx: number; env: Record<string, string> } {
-  const taken = q<{ idx: number }>(`SELECT s.idx FROM worker_slots s LEFT JOIN agents a ON a.id = s.agent_id
+/** A worker slot's env: the engineer owns ports `base` … `base`+9 (PORT is the first) and a database name no other HQ's engineer has. */
+export const slotEnv = (idx: number, base: number): Record<string, string> =>
+  ({ HQ_WORKER: String(idx), PORT: String(base), HQ_PORT_BASE: String(base), DB_NAME: `hq_w${idx}_${base}` })
+/** This HQ's engineer port blocks (Bug 259): from its own window, never a block holding one of HQ's own or preview ports. Worked out on
+ *  first use, not at import, so a bad HQ_SLOT_PORTS stops HQ at start-up with its one line (index.ts), not a stack trace. */
+let bases: number[] | null = null
+export function slotBasesNow(): number[] {
+  if (bases) return bases
+  const w = slotWindow(PORTS.ui, process.env.HQ_SLOT_PORTS), got = slotBases(w, [...PREVIEW_PORTS, PORTS.ui, PORTS.hooks, PORTS.mcp])
+  if (!got.length) throw new Error(`HQ_SLOT_PORTS ${w[0]}-${w[1]} has no block of ${SLOT_SIZE} ports left for engineers once HQ's own and preview ports are taken out`)
+  return (bases = got)
+}
+/** Slots taken: by a launch under way (`pending-…`) or an agent that hasn't exited; one still naming an exited or unknown agent is free
+ *  (its release was missed). */
+const takenSlots = () => q<{ idx: number; env: string }>(`SELECT s.idx, s.env FROM worker_slots s LEFT JOIN agents a ON a.id = s.agent_id
     WHERE s.agent_id LIKE 'pending-%' OR (a.id IS NOT NULL AND a.status != 'exited')`)
-  const used = new Set(taken.map((r) => r.idx))
-  let idx = 1; while (used.has(idx)) idx++
-  const env = slotEnv(idx)
-  run('INSERT OR REPLACE INTO worker_slots(idx, agent_id, env) VALUES (?,?,?)', idx, agentId, JSON.stringify(env)); return { idx, env }
+/** The lowest free slot, with the lowest block of ports no running engineer of this HQ holds and nothing on the machine listens on. The
+ *  ports stay the engineer's for its whole run (they're in its launch script). Throws when every block is in use. */
+export async function nextWorkerSlot(agentId: string, busy: (port: number) => Promise<boolean> = portBusy, bases = slotBasesNow()):
+  Promise<{ idx: number; env: Record<string, string> }> {
+  const held = () => new Set(takenSlots().map((r) => Number(j<Record<string, string>>(r.env, {}).HQ_PORT_BASE)))
+  const got = await freeBase(bases, held, busy, (base) => { // no await from here to the INSERT: another launch can't take the same slot
+    const used = new Set(takenSlots().map((r) => r.idx)); let idx = 1; while (used.has(idx)) idx++
+    const env = slotEnv(idx, base)
+    run('INSERT OR REPLACE INTO worker_slots(idx, agent_id, env) VALUES (?,?,?)', idx, agentId, JSON.stringify(env)); return { idx, env }
+  })
+  if (!got) throw new Error(`No free ports for another engineer: HQ's engineer ports ${bases[0]}–${bases.at(-1)! + SLOT_SIZE - 1} are all in use (by its engineers or other programs).`)
+  return got
 }
 export function releaseSlot(agentId: string): void { run('UPDATE worker_slots SET agent_id = NULL WHERE agent_id = ?', agentId) }
 

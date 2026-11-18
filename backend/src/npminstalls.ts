@@ -108,30 +108,44 @@ export function npmInstalls(cmd: string): NpmInstall[] {
 }
 
 /** A uv, yarn or pnpm install found in a command (Bug 211). `lock`: the lockfile it would rewrite; `frozen`: it follows
- *  that lockfile instead (`--locked`, `--frozen-lockfile`, ...); `fix`: the command to use instead. `dir` as in NpmInstall. */
-export type LockedInstall = { text: string; dir: string | null; lock: string; frozen: boolean; fix: string }
+ *  that lockfile instead (`--locked`, `--frozen-lockfile`, ...); `fix`: the command to use instead. `dir` as in NpmInstall.
+ *  `noLock`: it writes no lockfile (`--pure-lockfile`, `--no-lockfile`, `uv run --no-sync`); `bare`: what to use instead when
+ *  there is no lockfile, where a plain install would write one (Bug 239). `run`: a `uv run`, which installs (and writes a
+ *  uv.lock where there is none) before it runs, but follows one that's there. */
+export type LockedInstall = { text: string; dir: string | null; tool: 'uv' | 'yarn' | 'pnpm'; lock: string; frozen: boolean; noLock: boolean; run: boolean
+  fix: string; bare: string }
 
 const truthy = (env: Word[], names: string[]) => env.some((w) => { const [k, v] = w.text.split(/=(.*)/s); return names.includes(k!) && /^(1|true|yes)$/i.test(v ?? '') })
+/** uv's way to install with no uv.lock and write none (checked on uv 0.12.9: `uv sync` has no option for it, and `uv sync
+ *  --locked` fails without one). */
+const UV_BARE = '`uv venv --allow-existing && uv pip install -r pyproject.toml` with install_when `pyproject.toml`, and `uv run --no-sync` to run it'
+const UV = { tool: 'uv' as const, lock: 'uv.lock', frozen: ['--locked', '--frozen'], env: ['UV_LOCKED', 'UV_FROZEN'],
+  dir: ['--directory', '--project'], valued: ['--cache-dir', '--python', '-p', '--color', '--config-file', '--index-url', '--extra-index-url'] }
 /** Each tool: its lockfile, its install subcommands (null: no subcommand, `yarn` on its own), the options that follow the
- *  lockfile, the options that move it to another folder, and the options that take the next word as their value. */
+ *  lockfile, the options that write none, the options that move it to another folder, and the options that take the next
+ *  word as their value. */
 const TOOLS = [
-  { tool: 'uv', lock: 'uv.lock', subs: ['sync'], frozen: ['--locked', '--frozen'], env: ['UV_LOCKED', 'UV_FROZEN'], fix: '`uv sync --locked`',
-    dir: ['--directory', '--project'], valued: ['--cache-dir', '--python', '-p', '--color', '--config-file', '--index-url', '--extra-index-url'] },
-  { tool: 'yarn', lock: 'yarn.lock', subs: [null, 'install'], frozen: ['--frozen-lockfile', '--immutable'], env: ['YARN_ENABLE_IMMUTABLE_INSTALLS'],
-    fix: '`yarn install --frozen-lockfile` (or --immutable)', dir: ['--cwd'],
+  { ...UV, subs: ['sync'], noLock: [], noLockEnv: [], fix: '`uv sync --locked`', bare: UV_BARE, run: false },
+  { ...UV, subs: ['run'], noLock: ['--no-sync', '--no-project'], noLockEnv: ['UV_NO_SYNC'], fix: '`uv run --locked`', bare: '`uv run --no-sync` (install with '
+    + '`uv venv --allow-existing && uv pip install -r pyproject.toml`)', run: true },
+  { tool: 'yarn' as const, lock: 'yarn.lock', subs: [null, 'install'], frozen: ['--frozen-lockfile', '--immutable'], env: ['YARN_ENABLE_IMMUTABLE_INSTALLS'],
+    noLock: ['--pure-lockfile', '--no-lockfile'], noLockEnv: [], fix: '`yarn install --frozen-lockfile` (or --immutable)',
+    bare: '`yarn install --pure-lockfile` with install_when `package.json` (Yarn 1; Yarn 2 and later always write one)', run: false, dir: ['--cwd'],
     valued: ['--cache-folder', '--modules-folder', '--mutex', '--network-timeout', '--network-concurrency', '--registry', '--global-folder', '--link-folder', '--use-yarnrc'] },
-  { tool: 'pnpm', lock: 'pnpm-lock.yaml', subs: ['install', 'i'], frozen: ['--frozen-lockfile'], env: [], fix: '`pnpm install --frozen-lockfile`',
+  { tool: 'pnpm' as const, lock: 'pnpm-lock.yaml', subs: ['install', 'i'], frozen: ['--frozen-lockfile'], env: [], noLock: ['--no-lockfile', '--lockfile=false',
+    '--config.lockfile=false'], noLockEnv: [], fix: '`pnpm install --frozen-lockfile`', bare: '`pnpm install --no-lockfile` with install_when `package.json`', run: false,
     dir: ['-C', '--dir'], valued: ['--filter', '-F', '--loglevel', '--reporter', '--store-dir', '--virtual-store-dir'] },
 ].map((t) => ({ ...t, dir: new Set(t.dir), valued: new Set(t.valued) }))
 /** `yarn --version` and the like: no subcommand, but not an install. */
 const NOT_INSTALL = new Set(['--version', '-v', '-V', '--help', '-h'])
 
-/** Every uv, yarn or pnpm install in `cmd`, in order, with the folder it runs in: `cd server && uv sync` too. */
+/** Every uv, yarn or pnpm install in `cmd`, in order, with the folder it runs in: `cd server && uv sync` too, and `uv run`. */
 export function lockedInstalls(cmd: string): LockedInstall[] {
   return commands(cmd).flatMap((c) => TOOLS.flatMap((t) => {
     const r = read(c, t.tool, t.dir, t.valued)
-    if (!r || !t.subs.includes(r.sub) || (r.sub === null && r.args.some((a) => NOT_INSTALL.has(a.text)))) return []
+    if (!r || !(t.subs as (string | null)[]).includes(r.sub) || (r.sub === null && r.args.some((a) => NOT_INSTALL.has(a.text)))) return []
     const frozen = r.args.some((a) => t.frozen.includes(a.text)) || truthy(c.env, t.env)
-    return [{ text: r.text, dir: r.dir, lock: t.lock, frozen, fix: t.fix }]
+    const noLock = r.args.some((a) => t.noLock.includes(a.text)) || truthy(c.env, t.noLockEnv)
+    return [{ text: r.text, dir: r.dir, tool: t.tool, lock: t.lock, frozen, noLock, run: t.run, fix: t.fix, bare: t.bare }]
   }))
 }

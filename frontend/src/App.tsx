@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { agentPill, agentPlanWait, api, connectWs, endedLine, errText, jsonList, menuActivity, nextHoldEnd, onDialog, showError, waitLine, FINISHED, type Agent, type State, type WsMsg } from './api'
+import { agentPill, agentPlanWait, api, connectWs, endedLine, errText, jsonList, menuActivity, nextHoldEnd, onDialog, showError, shownStatus, waitLine, FINISHED,
+  type Agent, type State, type WsMsg } from './api'
 import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
 import { AttentionList, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
@@ -18,7 +19,7 @@ import { fitsRight, mainWidth, panelWidth, rightWidthIn, PANEL_DEFAULT } from '.
 import { openDone, useOpenDone } from './donefold'
 import { useAlerts } from './alerts'
 import { AlertsLine } from './AlertsLine'
-import { askedWho, claudeLine, goodNews, hqAnswersPlan, keysText, splitNeeds, ticketQuestion, turnQuestionText, uncountedQuestions, yourTurn, type Need } from './needs.ts'
+import { askedWho, claudeLine, clearingPlan, goodNews, hqAnswersPlan, keysText, splitNeeds, ticketQuestion, turnQuestionText, uncountedQuestions, yourTurn, type Need } from './needs.ts'
 import { AutoBanner, AutoDialog, AutoSwitch, DoRestBtn, LastRunBtn } from './Auto'
 import { Events } from './Events'
 import { MapBtn } from './FeatureMap'
@@ -169,6 +170,8 @@ export default function App() {
     else if (id.startsWith('t:')) { const t = state.tickets.find((x) => x.id === id.slice(2)); if (!t) return; const eng = liveEngineer(t, state); setSel({ node: id, agentId: eng?.id ?? t.assignee_agent_id ?? null, ticketId: t.id }); showPanel(true, eng ? 'agent' : 'ticket') }
   }
   const pickAgent = (a: Agent) => { setSel({ node: board.agentNode(a.id), agentId: a.id, ticketId: a.ticket_id ?? null }); showPanel(true, 'agent') }
+  /** Bug 237: a helper with no box (Launch, test setup): its history in the Events tab, from the banner where it works. */
+  const helperEvents = (id: string) => { setSel({ node: null, agentId: id, ticketId: null }); showPanel(true, 'events') }
   // Bug 167: the graph and the app pane share what the side panel leaves; with too little room the pane shows below the graph
   const panelPx = panelWidth(panelW, win.w), room = mainWidth(win.w, panel.open ? panelPx : null), roomRight = fitsRight(room)
   const pvOpen = !!repo && !!pv && prefs.open, pvBelow = prefs.dock === 'bottom' || !roomRight, pvW = rightWidthIn(prefs.w, room)
@@ -206,7 +209,7 @@ export default function App() {
           <div className="min-h-0 min-w-0"><Graph nodes={board.nodes} edges={board.edges} fits={board.fits} focus={focusReq} onSelect={selectNode} onPane={() => setPop(null)} /></div>
           {pvOpen && <><Splitter dir={pvBelow ? 'row' : 'col'} label="Resize preview" size={pvBelow ? clampH(prefs.h) : pvW} def={pvBelow ? Math.round(window.innerHeight * 0.45) : rightWidth(prefs.device)}
             set={(n) => { const c = pvBelow ? clampH(n) : rightWidthIn(n, room); setPrefs(pvBelow ? { h: c } : { w: c }, false); return c }} save={(n) => setPrefs(pvBelow ? { h: n } : { w: n })} />
-            <PreviewPane all={all!} p={pv} repo={repo} prefs={prefs} setPrefs={setPrefs} ws={ws} feed={feed} onRepo={switchRepo} roomRight={roomRight} /></>}
+            <PreviewPane all={all!} p={pv} repo={repo} prefs={prefs} setPrefs={setPrefs} ws={ws} feed={feed} onRepo={switchRepo} roomRight={roomRight} onEvents={helperEvents} /></>}
         </main>
         {panel.open && <><Splitter dir="col" label="Resize panel" size={panelPx} def={PANEL_DEFAULT} set={(w) => { const c = panelWidth(w, win.w); setPanelW(c); return c }} save={(w) => { try { localStorage.setItem(PANEL_KEY, String(w)) } catch { /* private window: width just isn't remembered */ } }} />
           <aside className="flex min-h-0 min-w-0 flex-col gap-2 p-2">
@@ -349,11 +352,12 @@ function AgentsMenu({ state, selected, onPick }: { state: State; selected: strin
     {!state.agents.length && <div className="p-1 text-xs text-zinc-500">No agents yet.</div>}
     {state.agents.map((a) => { const w = waitLine(a, state); return <button key={a.id} onClick={() => { onPick(a); close() }} className={`card w-full p-2! text-left text-xs ${selected === a.id ? 'border-indigo-500/60!' : ''}`}>
       <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate font-medium" title={a.display_name ?? a.id}>{a.display_name ?? a.id}</span>
-        <Pill s={a.status} label={agentPill(a, state)} /></div>
+        <Pill s={shownStatus(a, state)} label={agentPill(a, state)} /></div>
       <div className="mt-1 text-zinc-500">{a.role} · {a.model_live ?? a.model_alias}{a.in_plan_mode ? ' · plan' : ''}{a.steps_total ? ` · step ${a.steps_done}/${a.steps_total}` : ''}</div>
       {a.status === 'exited' ? (() => { const e = endedLine(a, state); return e && <div className="mt-1 break-words text-zinc-500">{e}</div> })()
-        : (() => { const line = menuActivity(a, state), tone = onDialog(a) ? 'text-rose-300' : a.status !== 'plan_review' ? 'text-zinc-400'
-          : agentPlanWait(a, state).hq ? 'text-sky-300' : 'text-amber-300' // whom its plan waits on: you (amber), or HQ's check (sky), as on its box
+        : (() => { const line = menuActivity(a, state), gate = a.status === 'plan_review' ? agentPlanWait(a, state) : null
+          // whom its plan waits on: you (amber), or HQ's check (sky), as on its box; nobody once its review has closed (Bug 234)
+          const tone = onDialog(a) ? 'text-rose-300' : !gate || gate.closed ? 'text-zinc-400' : gate.hq ? 'text-sky-300' : 'text-amber-300'
           return line && <div className={`mt-1 truncate ${tone}`} title={line}>{line}</div> })()}
       {w && <div className={`mt-1 ${w.held ? 'text-amber-300' : 'text-zinc-400'}`}>{w.text}</div>}
     </button> })}</div>}</Menu>
@@ -377,7 +381,8 @@ function Elsewhere({ all, repo, needs, onRepo }: { all: State; repo: any | null;
  *  `count` is what the tab title counts for this project (Bug 63), so plain information in the list doesn't light it up. */
 function Bell({ state, board, count }: { state: State; board: Board; count: number }) {
   const b = useBoard()
-  const reviews = state.reviews.filter((r) => r.status === 'open' && !hqAnswersPlan(state, r)).sort((x, y) => (y.opened_at ?? 0) - (x.opened_at ?? 0)) // on auto: HQ's to answer
+  const reviews = state.reviews.filter((r) => r.status === 'open' && !hqAnswersPlan(state, r) && !clearingPlan(state, r)) // on auto: HQ's to answer; during a Clear: nobody's
+    .sort((x, y) => (y.opened_at ?? 0) - (x.opened_at ?? 0))
   const base = (t: any) => { const f = state.features.find((x) => x.id === t.feature_id); return { cancelled: f?.status === 'cancelled', branch: state.repos.find((r) => r.id === f?.repo_id)?.default_branch ?? 'main' } }
   const onAuto = !!b.repo?.auto_mode && !b.repo.auto_stopped_why
   const merges = state.tickets.flatMap((t) => { const f = base(t), acts = f.cancelled || (onAuto && !t.auto_parked_why) ? [] : mergeActs(t, f.branch, liveEngineer(t, state));
@@ -429,7 +434,7 @@ function TicketInfo({ t, state }: { t: any | null; state: State }) {
   // break-words: a long run with no spaces (a path in a stack trace) wraps instead of making the tab scroll sideways (Bug 144)
   return <div className="h-full overflow-y-auto break-words pr-1 text-xs">
     <div className="flex items-center gap-2"><span className="font-semibold">{t.key}</span><span className="text-zinc-500">{t.size}</span>
-      <Pill s={t.status} label={ticketLabel(t, state.reviews.some((r) => r.ticket_id === t.id && r.status === 'open' && hqAnswersPlan(state, r)))} /></div>
+      <Pill s={t.status} label={ticketLabel(t, state.reviews.some((r) => r.ticket_id === t.id && r.status === 'open' && hqAnswersPlan(state, r)), clearingPlan(state, { ticket_id: t.id }))} /></div>
     <div className="mt-1 text-sm text-zinc-200">{t.title}</div>
     <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1 text-zinc-400">
       {ask && <><dt>Question</dt><dd className="break-words text-amber-200">asked {askedWho(ask, state.agents)}: {ask.body}</dd></>}
@@ -503,7 +508,7 @@ function AgentPane({ a, ws, feed }: { a: any; ws: WebSocket | null; feed: (id: s
     api(`agents/${a.id}/message`, { body, ...how }).catch((x) => { setText((t) => t || body); showError(errText(x)) }) }
   return <div className="flex h-full flex-col gap-2">
     <div className="flex flex-wrap items-center gap-2 text-xs"><span className="shrink-0 whitespace-nowrap font-semibold">{a.display_name ?? a.id}</span>
-      <Pill s={a.status} label={agentPill(a, state)} />
+      <Pill s={shownStatus(a, state)} label={agentPill(a, state)} />
       <span className="grow" /><FreshBtn a={a} label="Fresh start" />{stop && <button className="btn" onClick={() => api(`agents/${a.id}/stop`, {})}>Stop</button>}
       <span className="basis-full text-zinc-500">{who}{usage.map((u) => <span key={u.key}>{'\u00a0· '}{/* a wrap never starts a line with the dot */}
         <span className="cursor-help whitespace-nowrap" title={u.tip}>{u.text}</span></span>)}</span></div>

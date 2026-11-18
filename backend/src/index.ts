@@ -4,14 +4,14 @@ import { PATHS, PORTS, uiToken } from './config.ts'
 import { migrate } from './db.ts'
 import { recoverAgents, liveAgents } from './agents.ts'
 import { tellIfHqWasAway } from './delivery.ts'
-import { startHooksServer } from './hooks.ts'
+import { rebuildHelpers, startHooksServer } from './hooks.ts'
 import { startMcpServer } from './mcp.ts'
 import { startUiServer } from './ui.ts'
 import { startStuckLoop } from './stuck.ts'
 import { lookAtStart } from './dialogclear.ts'
 import { startBgRuns } from './bgruns.ts'
 import { startMergeWatcher } from './mergewatch.ts'
-import { sweepWorktrees } from './slots.ts'
+import { slotBasesNow, sweepWorktrees } from './slots.ts'
 import { startListeners } from './listeners.ts'
 import { recoverPreviews, resumeRestarts } from './preview.ts'
 import { recoverHelpers } from './launchhelper.ts'
@@ -33,6 +33,7 @@ import { readBackCommands, startLeftoverSweeps, sweepAgentTmp, sweepNow } from '
 import { checkClaude, claudeInfo, ensureClaude, startClaudeCheck } from './claudecheck.ts'
 import { saveTestCmds } from './heavy.ts'
 import { listeningOrStop, stopIfPortsTaken } from './ports.ts'
+import { prepareSocket, socket } from './tmux.ts'
 
 /** The repo's role prompts and mod are what agents get: copied into HQ's home on every start when they differ (new agents
  *  pick them up; running ones keep what they started with). Extra files already in the plugin folder are left alone. */
@@ -53,6 +54,8 @@ function ensureAssets(): void {
 }
 async function main(): Promise<void> {
   await stopIfPortsTaken() // Bug 118: a port taken stops HQ here, before it touches the database, agents or leftovers
+  try { prepareSocket() } catch (e) { console.error((e as Error).message); process.exit(1) } // Bug 242: never the default tmux server by mistake
+  try { slotBasesNow() } catch (e) { console.error(`HQ can't start: ${(e as Error).message}`); process.exit(1) } // Bug 259: engineers' port window
   migrate(); ensureAssets()
   plugIn(realParts) // the findings loop reads the real recordings, test setup and UI tester run: before the auto loop can end a run
   forgetChecking() // a plan check under way when the backend last stopped went with it
@@ -74,6 +77,7 @@ async function main(): Promise<void> {
   await recoverHelpers(repos()).catch((e) => console.error('launch helper recovery failed', e))
   await recoverSetupHelpers(repos()).catch((e) => console.error('test setup helper recovery failed', e))
   startBgRuns() // before the first sweep and any hook: it reads back what agents wait on in the background (Bug 96)
+  rebuildHelpers() // and the helpers they started in the background, after it: a helper's line comes first (Bug 232)
   readBackCommands() // what agents' commands are still running, so the sweep spares what they started (Bug 145)
   await sweepNow() // what agents' commands left running while HQ was down (Bug 75)
   await sweepAgentTmp() // and the temp folders of agents that ended meanwhile (Bug 81)
@@ -83,8 +87,9 @@ async function main(): Promise<void> {
   startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
   startLeftoverSweeps()
   startClaudeCheck()
-  emit({ agentId: null, source: 'system', kind: 'backend.started', payload: { ports: PORTS, claude: claudeInfo() } })
+  emit({ agentId: null, source: 'system', kind: 'backend.started', payload: { ports: PORTS, claude: claudeInfo(), tmux: socket() } })
   console.log(`HQ backend up. UI: http://127.0.0.1:${PORTS.ui}/?token=${uiToken()}  hooks :${PORTS.hooks}  mcp :${PORTS.mcp}  state ${PATHS.home}`)
+  console.log(`tmux socket ${socket()}`)
 }
 // HQ keeps running (nothing would restart it), but the user sees that something went wrong: one ⚠ item until they tick it off.
 const crashed = (what: string) => (e: unknown) => {

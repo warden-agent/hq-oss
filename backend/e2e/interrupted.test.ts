@@ -49,7 +49,8 @@ test('Bug 148: Escape ends the turn at once: idle, no activity line; a later tur
   await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'Build a big thing' })
   await hq.hook(tpm.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/r/.git/HEAD' } })
   assert.deepEqual(await seen(tpm.id), ['working', 'Reading .git/HEAD', false])
-  // what must NOT move it: a helper's interrupted turn, and the agent's own turn ending normally (its Stop hook says that)
+  // what must NOT move it: a helper's interrupted turn, and a turn.complete that isn't aborted for a turn the mod never said started (Bug 254 needs its
+  // turn.start; a turn that ends normally sends its Stop hook first)
   await turnComplete(tpm.id, true, 'a73f17425d78f0183')
   assert.deepEqual(await seen(tpm.id), ['working', 'Reading .git/HEAD', false])
   await turnComplete(tpm.id, false)

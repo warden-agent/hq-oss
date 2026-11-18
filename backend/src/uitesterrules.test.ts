@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { cantTry, costOf, keepPlan, keepReport, knownCriterion, numbered, onPage, stepOf, stepsOf, stepWords, uiTestLines, whatsNew, type Scenario, type UiTest } from './uitesterrules.ts'
+import { cantTry, costOf, keepPlan, keepReport, knownCriterion, numbered, onPage, PLAN_SCHEMA, stepOf, stepsOf, stepWords, uiTestLines, whatsNew, type Scenario, type UiTest } from './uitesterrules.ts'
 
 const O = 'http://localhost:4321'
 test('steps come from the code the browser ran, in a form a script can replay: role and name, label, text, the value typed, the path opened', () => {
@@ -70,6 +70,21 @@ test('the plan HQ keeps: at most n scenarios of the three kinds, none twice, eac
   assert.deepEqual(plan.map((s) => [s.id, s.kind, s.title, s.criteria ?? null]), [['s-01', 'retry', 'Again: no message', null], ['s-02', 'basic', 'Add Dune', ['T-01 A1']],
     ['s-03', 'weird', 'Empty name', null]])
   assert.deepEqual(keepPlan('nonsense', 30, []), []); assert.deepEqual(keepPlan({ scenarios: 'x' }, 30, []), [])
+})
+
+test('Bug 257: a scenario\'s criteria come from its about list, or from [id]s in its goal; pass checks and button names are not criteria', () => {
+  const ids = ['GREET-1 A1', 'GREET-1 A2', 'GREET-1 A3']
+  const raw = { scenarios: [ // what Haiku answered: its own pass checks in `criteria`, the ids only in the goal
+    { kind: 'basic', title: 'Empty name', criteria: ['Leave the name field empty and press Add', 'No new entry appears in the list'],
+      goal: 'Press [Add] with nothing typed and be told a name is needed. [GREET-1 A3]' },
+    { kind: 'weird', title: 'Across noon', goal: 'Reload the page after noon and see the greeting change. [GREET-1 A1] [GREET-1 A2]' },
+    { kind: 'basic', title: 'Greeting', goal: 'Open the page and see the greeting for the time of day.', about: ['GREET-1 A1', 'A2', 'Z9', 'GREET-1 A1'] },
+    { kind: 'complex', title: 'Both', goal: 'Add a name, then reload and see the greeting and the name.', about: ['GREET-1 A3; GREET-1 A2'] },
+    { kind: 'weird', title: 'Nothing new', goal: 'Press the back button twice from the start page.', about: [] },
+    { kind: 'weird', title: 'Bracketed words', goal: 'Type [hello], press [Add] and see it listed.', criteria: ['The page says "hello"'] }] }
+  assert.deepEqual(keepPlan(raw, 30, ids).map((s) => s.criteria ?? null), [['GREET-1 A3'], ['GREET-1 A1', 'GREET-1 A2'], ['GREET-1 A1', 'GREET-1 A2'],
+    ['GREET-1 A3', 'GREET-1 A2'], null, null])
+  assert.ok(JSON.parse(PLAN_SCHEMA).properties.scenarios.items.required.includes('about'))
 })
 
 const S: Scenario = { id: 's-04', kind: 'weird', title: 'Empty name', goal: 'Press Add with no name.' }

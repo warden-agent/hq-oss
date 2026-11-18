@@ -9,7 +9,7 @@ import { z } from 'zod'
 import { shq } from './util.ts'
 import { lockedInstalls, npmInstalls, type LockedInstall, type NpmInstall } from './npminstalls.ts'
 
-/** The ports HQ hands out to previews, from HQ_PREVIEW_PORTS ("3090-3099", the default; engineers' slots use 3101+ and 3110+).
+/** The ports HQ hands out to previews, from HQ_PREVIEW_PORTS ("3090-3099", the default; engineers get ports of their own, slotports.ts).
  *  A test HQ gets a range of its own (Bug 44): two HQs that share one can both pick the same free port before either app is up. */
 export function portRange(spec: string | undefined): number[] {
   const m = /^\s*(\d+)\s*-\s*(\d+)\s*$/.exec(spec ?? '3090-3099'), lo = Number(m?.[1]), hi = Number(m?.[2])
@@ -89,27 +89,57 @@ function lists(ws: string, member: string): boolean {
   const rel = path.relative(ws, member).split(path.sep).join('/')
   return globs.some((g) => typeof g === 'string' && !g.startsWith('!') && path.matchesGlob(rel, g.replace(/^\.\//, '').replace(/\/+$/, '')))
 }
-/** The package-lock.json an npm install in `dirPath` follows (Bug 156): its project's own (the nearest folder with a
- *  package.json, up to the repo root), else, for a workspace member, the workspace root's, as npm does. Null: none applies,
- *  and an `npm install` would write one. */
-export function npmLock(dirPath: string, root: string): string | null {
-  const up = upTo(dirPath, root), i = Math.max(0, up.findIndex((d) => fs.existsSync(path.join(d, 'package.json'))))
-  const lock = (d: string) => ['package-lock.json', 'npm-shrinkwrap.json'].map((f) => path.join(d, f)).find((f) => fs.existsSync(f)) ?? null
-  const own = lock(up[i]!); if (own) return own
-  const ws = up.slice(i + 1).find((d) => lists(d, up[i]!))
-  return ws ? lock(ws) : null
+/** Does the uv workspace root `ws` (its pyproject.toml's [tool.uv.workspace]) have `member` as one of its members, and not in
+ *  its `exclude`? A light reading of the TOML: the two lists of quoted globs. Checked on uv 0.12.9: a member follows the root's
+ *  uv.lock; an excluded or unlisted project inside it gets its own. */
+function uvLists(ws: string, member: string): boolean {
+  let toml: string
+  try { toml = fs.readFileSync(path.join(ws, 'pyproject.toml'), 'utf8') } catch { return false }
+  const at = /^\[tool\.uv\.workspace\][ \t]*$/m.exec(toml); if (!at) return false
+  const table = toml.slice(at.index + at[0].length).split(/^\[/m)[0]!
+  const globs = (key: string) => [...(new RegExp(`^\\s*${key}\\s*=\\s*\\[([^\\]]*)\\]`, 'm').exec(table)?.[1] ?? '').matchAll(/"([^"]*)"|'([^']*)'/g)]
+    .map((m) => (m[1] ?? m[2]!).replace(/^\.\//, '').replace(/\/+$/, ''))
+  const rel = path.relative(ws, member).split(path.sep).join('/'), hit = (g: string) => path.matchesGlob(rel, g)
+  return globs('members').some(hit) && !globs('exclude').some(hit)
 }
+/** Each install tool: the file that makes a folder its project, its lockfiles, and whether a folder above is the workspace
+ *  root whose lockfile a project follows (npm and yarn: listed in the root package.json's workspaces; pnpm: any folder with a
+ *  pnpm-workspace.yaml, as pnpm does; uv: a member of its [tool.uv.workspace]). */
+const LOCKS = {
+  npm: { manifest: 'package.json', files: ['package-lock.json', 'npm-shrinkwrap.json'], root: lists },
+  yarn: { manifest: 'package.json', files: ['yarn.lock'], root: lists },
+  pnpm: { manifest: 'package.json', files: ['pnpm-lock.yaml'], root: (ws: string) => fs.existsSync(path.join(ws, 'pnpm-workspace.yaml')) },
+  uv: { manifest: 'pyproject.toml', files: ['uv.lock'], root: uvLists },
+}
+/** The lockfile an install of `tool` in `dirPath` follows (Bugs 156, 240): its project's own (the nearest folder with the tool's
+ *  manifest, up to the repo root), else its workspace root's, as the tool does. `lock` null: none applies, and a plain install
+ *  would write one. `project` null: no manifest anywhere up to the root. */
+function lockOf(tool: keyof typeof LOCKS, dirPath: string, root: string): { lock: string | null; project: string | null } {
+  const k = LOCKS[tool], up = upTo(dirPath, root), i = up.findIndex((d) => fs.existsSync(path.join(d, k.manifest))), project = up[Math.max(0, i)]!
+  const lock = (d: string) => k.files.map((f) => path.join(d, f)).find((f) => fs.existsSync(f)) ?? null
+  const own = lock(project); if (own) return { lock: own, project: i < 0 ? null : project }
+  const ws = up.slice(Math.max(0, i) + 1).find((d) => k.root(d, project))
+  return { lock: ws ? lock(ws) : null, project: i < 0 ? null : project }
+}
+/** The package-lock.json an npm install in `dirPath` follows (Bug 156). Null: none applies, and an `npm install` would write one. */
+export const npmLock = (dirPath: string, root: string): string | null => lockOf('npm', dirPath, root).lock
 /** An install that would rewrite the lockfile instead of following it, which would leave changes behind in a worktree (Try
- *  it) and drift from what the repo pins, or that would write a package-lock.json into a project that has none (Bug 156).
+ *  it) and drift from what the repo pins, or that would write a lockfile into a project that has none (Bugs 156, 239).
  *  `dirPath`: the part's folder in the checkout `root`. Null when fine. */
 export function lockfileProblem(install: string, dirPath: string, root: string = dirPath, installWhen?: string): string | null {
   return installProblem(install, dirPath, root, installWhen)?.why ?? null
 }
+/** Why HQ refused a recipe's steps, and the lockfile the refused install would write or not follow (Bug 238: the user's words name it). */
+export type Refusal = { why: string; lock: string }
+/** What the user reads about refused steps: they'd write `lock` into the project, or not follow the one it has. */
+export const refusedWords = (lock: string): string => `would write a ${lock} into the project, or not follow the one it has`
 /** The first install in `cmd` that the lockfile check refuses, and why. Each is found anywhere in the command and checked in the
- *  folder it runs in: `cd web && npm install` (Bug 191), `cd server && uv sync` (Bug 211). */
-function installProblem(cmd: string, dirPath: string, root: string, installWhen?: string): { text: string; why: string } | null {
-  for (const n of npmInstalls(cmd)) { const why = npmProblem(n, dirPath, root, installWhen); if (why) return { text: n.text, why } }
-  for (const n of lockedInstalls(cmd)) { const why = lockedProblem(n, dirPath, root); if (why) return { text: n.text, why } }
+ *  folder it runs in: `cd web && npm install` (Bug 191), `cd server && uv sync` (Bug 211). `run`: a `uv run`, not an install. */
+function installProblem(cmd: string, dirPath: string, root: string, installWhen?: string): Refusal & { text: string; run: boolean } | null {
+  for (const n of npmInstalls(cmd)) {
+    const why = npmProblem(n, dirPath, root, installWhen); if (why) return { text: n.text, why, lock: 'package-lock.json', run: false }
+  }
+  for (const n of lockedInstalls(cmd)) { const why = lockedProblem(n, dirPath, root, installWhen); if (why) return { text: n.text, why, lock: n.lock, run: n.run } }
   return null
 }
 /** Where an install runs: its folder, whether that's inside the checkout, and the words that name it when it isn't the part's own. */
@@ -117,13 +147,22 @@ function placed(n: { text: string; dir: string | null }, dirPath: string, root: 
   const at = n.dir === null ? null : path.resolve(dirPath, n.dir), inRepo = at !== null && !path.relative(path.resolve(root), at).startsWith('..')
   return { at: inRepo ? at : null, where: n.dir && at ? `\`${n.text}\` runs in ${path.relative(root, at) || '.'}: ` : '' }
 }
-/** A uv, yarn or pnpm install that would rewrite the lockfile of the folder it runs in instead of following it. */
-function lockedProblem(n: LockedInstall, dirPath: string, root: string): string | null {
-  if (n.frozen) return null // follows the lockfile wherever it runs
+/** ` at uv.lock, which this folder follows` when the lockfile is its workspace root's, not the folder's own (Bugs 156, 240). */
+const above = (lock: string, at: string, root: string) => path.dirname(lock) !== at ? ` at ${path.relative(root, lock)}, which this folder follows` : ''
+/** A uv, yarn or pnpm install that would rewrite the lockfile it follows (its own, or its workspace root's, Bug 240), or write
+ *  one where there is none (Bug 239). */
+function lockedProblem(n: LockedInstall, dirPath: string, root: string, installWhen?: string): string | null {
   const { at, where } = placed(n, dirPath, root)
-  if (!at) return `HQ can't tell which folder of the repo \`${n.text}\` runs in: use ${n.fix}, or give the part that folder as its dir`
+  if (!at) return n.frozen || n.noLock || n.run ? null // writes nothing wherever it runs, or a run HQ can't follow
+    : `HQ can't tell which folder of the repo \`${n.text}\` runs in: use ${n.fix}, or give the part that folder as its dir`
   if (!fs.existsSync(at)) return `${where}that folder doesn't exist`
-  return fs.existsSync(path.join(at, n.lock)) ? `${where}use ${n.fix} (there is a ${n.lock})` : null
+  const { lock, project } = lockOf(n.tool, at, root)
+  if (lock) return n.frozen || n.noLock || n.run ? null : `${where}use ${n.fix} (there is a ${n.lock}${above(lock, at, root)})`
+  if (n.tool === 'uv' && !project) return null // no pyproject.toml: uv makes no project and no uv.lock (a plain script)
+  if (!n.noLock) return `${where}there is no ${n.lock}`
+    + `${n.frozen ? ` for \`${n.text}\` to follow` : `, and \`${n.text}\` would write one into the user's project`}: use ${n.bare}`
+  return n.run || installWhen === undefined || path.basename(installWhen) === LOCKS[n.tool].manifest ? null
+    : `${where}install_when must be a \`${LOCKS[n.tool].manifest}\` with \`${n.text}\` (there is no lockfile to watch)`
 }
 /** One npm install of a part's command, checked in the folder it runs in (the part's, or where its `cd`/`--prefix` takes it). */
 function npmProblem(n: NpmInstall, dirPath: string, root: string, installWhen?: string): string | null {
@@ -132,8 +171,7 @@ function npmProblem(n: NpmInstall, dirPath: string, root: string, installWhen?: 
   if (!fs.existsSync(at)) return `${where}that folder doesn't exist`
   const lock = npmLock(at, root)
   if (lock) { // npm ci follows it; --no-package-lock writes nothing (a git-ignored lockfile may be in one checkout only)
-    const above = path.dirname(lock) !== at ? ` at ${path.relative(root, lock)}, which this folder follows` : ''
-    return n.ci || n.noLock ? null : `${where}use \`npm ci\` (there is a ${path.basename(lock)}${above})`
+    return n.ci || n.noLock ? null : `${where}use \`npm ci\` (there is a ${path.basename(lock)}${above(lock, at, root)})`
   }
   if (!n.noLock) return `${where}use \`${NO_LOCK_INSTALL}\` with install_when \`package.json\` (there is no package-lock.json`
     + `${n.ci ? ' for `npm ci` to follow' : ', and `npm install` would write one into the user\'s project'})`
@@ -142,15 +180,20 @@ function npmProblem(n: NpmInstall, dirPath: string, root: string, installWhen?: 
 }
 /** The first part of a saved recipe whose install (or run) the lockfile check refuses in this checkout, and why (Bug 156: recipes saved
  *  before the check, or a lockfile added or removed since). Null when every part is fine. */
-export function recipeProblem(r: Recipe, root: string): string | null {
-  for (const p of r.parts) { const bad = partProblem(p, path.join(root, p.dir), root); if (bad) return `${p.name}: ${bad}` }
+export function recipeProblem(r: Recipe, root: string): Refusal | null {
+  for (const p of r.parts) { const bad = partProblem(p, path.join(root, p.dir), root); if (bad) return { why: `${p.name}: ${bad.why}`, lock: bad.lock } }
   return null
 }
-/** A part's install, and any install in its run command (it would run on every start, Bugs 191, 211), checked in this checkout. */
-function partProblem(p: RecipePart, dir: string, root: string): string | null {
-  const bad = p.install ? lockfileProblem(p.install, dir, root, p.install_when) : null; if (bad) return bad
-  const run = installProblem(p.run, dir, root)
-  return run && `run has an install that would run on every start (\`${run.text}\`; put installs in install): ${run.why}`
+/** A part's install, and any install in its run command (it would run on every start, Bugs 191, 211), checked in this checkout.
+ *  A `uv run` is checked as itself: it writes a uv.lock where there is none (Bug 239). */
+function partProblem(p: RecipePart, dir: string, root: string): Refusal | null {
+  const bad = p.install ? installProblem(p.install, dir, root, p.install_when) : null; if (bad) return bad
+  if (p.install && /\buv\s+pip\s+install\b/.test(p.install) && p.install_when && path.basename(p.install_when) !== 'pyproject.toml'
+    && !lockOf('uv', dir, root).lock) { // Bug 239's no-lockfile uv route: a missing install_when means it never installs again
+    return { why: `install_when must be a \`pyproject.toml\` with \`uv pip install\` (there is no uv.lock to watch)`, lock: 'uv.lock' }
+  }
+  const run = installProblem(p.run, dir, root); if (!run || run.run) return run
+  return { why: `run has an install that would run on every start (\`${run.text}\`; put installs in install): ${run.why}`, lock: run.lock }
 }
 
 /** The recipe if it's one HQ can run in `root` (a checkout), else what's wrong, in words the helper can act on. */
@@ -167,7 +210,7 @@ export function checkRecipe(input: unknown, root: string): { recipe: Recipe } | 
     const dir = path.join(root, p.dir)
     if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return { error: `${p.name}: folder ${p.dir} doesn't exist` }
     if (p.install && !p.install_when) return { error: `${p.name}: install_when is required with install (the lockfile, so HQ installs again only when it changes)` }
-    const bad = partProblem(p, dir, root); if (bad) return { error: `${p.name}: ${bad}` }
+    const bad = partProblem(p, dir, root); if (bad) return { error: `${p.name}: ${bad.why}` }
   }
   return { recipe }
 }

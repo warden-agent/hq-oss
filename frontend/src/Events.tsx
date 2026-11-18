@@ -22,7 +22,7 @@ export function Events({ log, agent, ticketKey, ws }: { log: EventLog; agent: Ag
     return () => { gone = true }
   }, [id, ws])
   if (!agent) return <div className="p-4 text-sm text-zinc-500">{ticketKey ? `No engineer has worked on ${ticketKey} yet. Its events show here once one starts.`
-    : "Click the TPM's box or a ticket's box on the graph to see what its agent did here."}</div>
+    : "Click the TPM's box or a ticket's box on the graph to see what its agent did here. Agents with no box (Launch and test setup helpers too) are in the Agents menu."}</div>
   const mine = hist?.agentId === agent.id ? hist : null, seen = new Set<number>()
   const lines = [...log.lines(agent.id), ...(mine?.lines ?? [])].sort((a, b) => b.id - a.id).filter((e) => !seen.has(e.id) && !!seen.add(e.id)).slice(0, KEEP)
   const note = !mine ? 'Loading its history…' : mine.error ? `Couldn't load its history: ${mine.error}` : !lines.length ? 'Nothing recorded for it yet.' : null

@@ -7,7 +7,7 @@ import { bus, emit, patch } from './events.ts'
 import { id, short } from './util.ts'
 import { update, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
-import { autoOn, getFeature, getTicket, setTicket } from './records.ts'
+import { autoOn, closedWhy, getFeature, getTicket, setTicket } from './records.ts'
 import { tellTpm } from './mergewatch.ts'
 
 export type PlanRevision = {
@@ -138,6 +138,10 @@ const sendsBack = (v: Verdict) => v === 'revise' || v === 'user_architect'
 /** `note`: the user's own words when they send a plan back; the TPM hears them too, so it knows what they asked for (Bug 35). */
 export function answerReview(reviewId: string, verdict: Verdict, opts: { plan?: string; message?: string; note?: string; by: string }): { ok: boolean; held: boolean; error?: string } {
   const review = getReview(reviewId); if (!review || review.status !== 'open') return { ok: false, held: false, error: 'review not open' }
+  // Bug 231: a project being cleared or removed takes no answer (the UI's, HQ's plan check's): an approve would move its stopped engineer back to
+  // "working", and the clear waits for it forever
+  const tk0 = getTicket(review.ticket_id), closed = tk0 ? closedWhy(getFeature(tk0.feature_id)?.repo_id ?? '') : null
+  if (closed) return { ok: false, held: held.has(reviewId), error: closed }
   const rev = getRevision(review.plan_revision_id)!; const t = now()
   if (sendsBack(verdict) && revisesUsed(review.ticket_id) >= revisionCap()) {
     return { ok: false, held: held.has(reviewId), error: `revision cap reached (sent back ${revisionCap()} times): approve it or cancel the ticket` }
@@ -153,7 +157,9 @@ export function answerReview(reviewId: string, verdict: Verdict, opts: { plan?: 
       verdict, opts.plan ?? null, opts.by, t, opts.message ?? null, rev.id)
     run('UPDATE review_requests SET status = ?, answered_at = ?, closed_reason = ? WHERE id = ?', 'answered', t, verdict, reviewId)
     setTicket(review.ticket_id, { status: ticketStatus })
-    if (approve) update(rev.agent_id, { last_gate_allow_at: t, in_plan_mode: 0, status: 'working' })
+    // A stopped engineer stays stopped (Bug 231): its ticket shows Resume, and nothing waits for an agent that isn't there
+    const gone = one<{ status: string }>('SELECT status FROM agents WHERE id = ?', rev.agent_id)?.status === 'exited'
+    if (approve) update(rev.agent_id, { last_gate_allow_at: t, in_plan_mode: 0, ...gone ? {} : { status: 'working' } })
   })
   patch('review', reviewId, { status: 'answered', closed_reason: verdict, answered_at: t })
   if (approve) resolveKind('cap_reached', rev.agent_id) // the escalation it raised is settled

@@ -12,14 +12,14 @@ import { readInbox, sendMessage, resolveRecipient, dmAllowed, displayName, patch
 import { attention } from './attention.ts'
 import { addFeature, changeFinished, createTicket, finishedAndStopped, hqOpened, launchEngineer, liveEngineerOf, setDependencies, waitingOn, withTpmText }
   from './tickets.ts'
-import { writeFeatureMd, writeProjectMd } from './projectmd.ts'
+import { featureDone, writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { proposeTestCommand } from './auto.ts'
 import { LEFT_OUT_ASK, leftOutSection } from './leftout.ts'
 import { autoOn, features, featureByHandle, tickets, getFeature, getRepo, setTicket, ticketForAgent, ticketInRepo, type Feature } from './records.ts'
 import { finishTicket } from './mergewatch.ts'
 import { id, j, readJson, TooLarge } from './util.ts'
 import { noteProblem, saveNote } from './notes.ts'
-import { completeFreshStart, featureDone } from './freshstart.ts'
+import { completeFreshStart } from './freshstart.ts'
 import { cantStart, launchOk, saveLaunch } from './launchhelper.ts'
 import { cantTest, proposeSetupChange, saveTestSetup } from './testsetup.ts'
 import { setupShape } from './testsetupstore.ts'
@@ -321,7 +321,9 @@ function registerTools(s: McpServer, agent: Agent): void {
       return text(`Kept with ${t.key}: HQ puts it in the map when ${t.key} merges. The map will then read:\n\n${r.map}`)
     })
     s.registerTool('open_pr', {
-      description: 'You are finished: HQ pushes your branch; the user tries it and merges it (or opens a PR) from HQ. Commit your work first. Requires a current before_pr '
+      // Bug 245: Claude Code keeps the list it got when the session started, and auto can go on or off after that: words true either way; the answer says which
+      description: `You are finished: hand your branch to HQ (it pushes it if the project is on GitHub). It is then merged into ${main}: by HQ after its own tests `
+        + 'when auto mode is on, otherwise by the user from HQ; the answer says which. Commit your work first. Requires a current before_pr '
         + 'handoff; the body needs a "## Deviations from approved plan" section. A ticket with acceptance criteria also needs `tests`: HQ checks them with git, and '
         + 'refuses the call until each criterion has a test on your branch or a reason it can\'t be tested.',
       inputSchema: { title: z.string(), body: z.string(), tests: TESTS.optional().describe('One entry per acceptance criterion (get_ticket lists them). The test that proves '
@@ -330,11 +332,15 @@ function registerTools(s: McpServer, agent: Agent): void {
         feature_map_unchanged: z.boolean().optional().describe('true when nothing a user sees changed, so the feature map stays as it is (else call update_feature_map first)') },
     }, async (a) => {
       logCall('open_pr', { title: a.title, tests: a.tests }); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound')
-      if (!/## Deviations from approved plan/.test(a.body)) return fail('PR body must contain a "## Deviations from approved plan" section.')
-      if (t.repairs_main && !leftOutSection(a.body)) return fail(`This is HQ's repair ticket, so ${LEFT_OUT_ASK.replace('its body', 'the PR body')} Then call open_pr again.`) // Bug 142
-      if (!t.handoff_updated_at) return fail('Call update_handoff(kind: before_pr) first.')
-      const suite = await suiteProblem(t); if (suite) return fail(suite) // Bug 162: with auto off, the project's test command ran since the last edit
-      try { return text(await finishTicket(agent, a.title, a.body, a.tests, a.feature_map_unchanged === true)) } catch (e) { return fail((e as Error).message) }
+      // Bug 248: mcp.* calls are left out of the Events tab, so a refusal gets a line of its own there; else only the engineer's terminal says why
+      const refused = (why: string): ToolResult => {
+        emit({ agentId: agent.id, source: 'mcp', kind: 'ticket.pr_refused', payload: { ticket: t.id, key: t.key, why: why.slice(0, 1000) } }); return fail(why)
+      }
+      if (!/## Deviations from approved plan/.test(a.body)) return refused('PR body must contain a "## Deviations from approved plan" section.')
+      if (t.repairs_main && !leftOutSection(a.body)) return refused(`This is HQ's repair ticket, so ${LEFT_OUT_ASK.replace('its body', 'the PR body')} Then call open_pr again.`) // Bug 142
+      if (!t.handoff_updated_at) return refused('Call update_handoff(kind: before_pr) first.')
+      const suite = await suiteProblem(t); if (suite) return refused(suite) // Bug 162: with auto off, the project's test command ran since the last edit
+      try { return text(await finishTicket(agent, a.title, a.body, a.tests, a.feature_map_unchanged === true)) } catch (e) { return refused((e as Error).message) }
     })
   }
 }

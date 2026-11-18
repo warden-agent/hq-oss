@@ -15,6 +15,7 @@ import { mergeTestOf, mergeTestWords } from './testruns.ts'
 import { DoRestBtn } from './Auto'
 import type { Agent } from './api'
 import { ActBtn, Elapsed, Linked, LiveDot, Md, Pill } from './ui'
+import { useAtEnd } from './atend.ts'
 import { placePop } from './fit'
 import { openDone } from './donefold'
 import { byKind, criteriaOf, KIND_HEADING } from '../../backend/src/criteria.ts'
@@ -159,7 +160,8 @@ function splitPlan(text: string): { plain: string; rest: string } {
  *  its note box and buttons always show; the plan between them scrolls (Bug 120). */
 export function ReviewPanel({ r, label, onDone }: { r: any; label: string; onDone?: () => void }) {
   const [msg, setMsg] = useState(''); const [busy, run] = useBusy(); const cap = useRevisionCap(); const b = useBoard()
-  const repoId = b.state.features.find((f) => f.id === b.state.tickets.find((t) => t.id === r.ticket_id)?.feature_id)?.repo_id, autoIsOn = !!b.state.repos.find((x) => x.id === repoId)?.auto_mode
+  const repoId = b.state.features.find((f) => f.id === b.state.tickets.find((t) => t.id === r.ticket_id)?.feature_id)?.repo_id, repo = b.state.repos.find((x) => x.id === repoId)
+  const autoIsOn = !!repo?.auto_mode
   const answer = (verdict: 'approve' | 'revise') => run(() => answerReview(r, verdict, msg).then(() => onDone?.()))
   const capped = (r.revises_used ?? 0) >= cap
   const { plain, rest } = splitPlan(String(r.plan_text ?? ''))
@@ -172,11 +174,13 @@ export function ReviewPanel({ r, label, onDone }: { r: any; label: string; onDon
         <div className="mt-1 whitespace-pre-wrap break-words rounded-md bg-zinc-800/60 p-2 text-[13px] leading-5 text-zinc-100">{plain}</div></div>}
       <details className="mt-2" open={!plain}><summary className="cursor-pointer text-zinc-400">{plain ? 'Technical details' : 'The plan'}</summary>
         <pre className="mt-1 whitespace-pre-wrap break-words rounded-md border border-zinc-800 bg-zinc-950 p-2 text-[11px] text-zinc-300">{rest}</pre></details></div>
-    {capped ? <div className="mt-2 text-xs text-rose-300">Sent back {r.revises_used} times already, the limit. Approve it, or cancel the ticket with ✕.</div>
+    {repo?.clearing_at ? <div className="mt-2 shrink-0 break-words text-xs text-zinc-400">{repo.name} is being cleared: its engineer was stopped, and this plan can't be approved
+      or sent back now.</div> /* Bug 231: HQ refuses an answer, so no buttons */
+      : <>{capped ? <div className="mt-2 text-xs text-rose-300">Sent back {r.revises_used} times already, the limit. Approve it, or cancel the ticket with ✕.</div>
       : <textarea className="input mt-2 h-16 shrink-0 text-xs!" placeholder="What should change? In your own words, e.g. 'keep the old colours' (needed for Revise)" value={msg} onChange={(e) => setMsg(e.target.value)} />}
     <div className="mt-2 flex shrink-0 flex-wrap gap-1"><button className="btn btn-primary" disabled={busy} onClick={() => answer('approve')}>Approve</button>
       <button className="btn" disabled={busy || capped || !msg.trim()} title={reviseTitle} onClick={() => answer('revise')}>Revise</button>
-      {repoId && !autoIsOn && <DoRestBtn repoId={repoId} />}</div>
+      {repoId && !autoIsOn && <DoRestBtn repoId={repoId} />}</div></>}
   </div>
 }
 
@@ -243,20 +247,23 @@ function DoneLine({ v }: { v: FeatureView }) {
       {v.collapsed ? 'show tickets' : 'hide tickets'}</button></div>
 }
 /** You and the project's TPM: its replies (taken from the end of each of its turns) and what you sent it, newest last, across its
- *  sessions. Write in the TPM box; its terminal (click the box) has everything else. */
+ *  sessions. Write in the TPM box; its terminal (click the box) has everything else. It opens at the newest (Bug 255) and stays there
+ *  as replies come in, unless you scrolled up to read: then it stays where you are and says a new reply is below. */
 function TalkPanel({ v, onDone }: { v: TpmView; onDone: () => void }) {
   const b = useBoard(); const tpms = new Set(v.tpmIds)
   const talk = b.state.messages.filter((m) => (m.from_id === 'user' && tpms.has(m.to_id)) || (tpms.has(m.from_id) && m.to_id === 'user'))
     .sort((x, y) => x.created_at - y.created_at).slice(-12)
+  const last = talk.at(-1), { ref, onScroll, unseen, toEnd } = useAtEnd(last?.id, last?.from_id === 'user')
   return <div className="hq-pop flex max-h-[var(--pop-h,80vh)] w-full flex-col gap-2">
     <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium">You and the TPM · {v.repo?.name}</span>
       <button className="btn" title="Close (Esc)" onClick={onDone}>×</button></div>
-    <div className="flex max-h-[50vh] min-h-0 flex-col gap-2 overflow-y-auto">
+    <div ref={ref} onScroll={onScroll} className="flex max-h-[50vh] min-h-0 flex-col gap-2 overflow-y-auto">
       {!talk.length && <div className="text-zinc-500">Nothing yet. Write to the TPM in its box; its answers show up here.</div>}
       {talk.map((m) => <div key={m.id} className={`rounded-md p-2 ${m.from_id === 'user' ? 'ml-8 bg-indigo-950/60 text-indigo-100' : 'mr-8 bg-zinc-800/70 text-zinc-200'}`}>
         <div className="mb-0.5 text-[10px] text-zinc-500">{m.from_id === 'user' ? 'You' : 'TPM'} · {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
         <Md text={m.body} /></div>)}
     </div>
+    {unseen && <button className="btn-sm self-center" onClick={toEnd}>New reply below ↓</button>}
   </div>
 }
 
@@ -288,7 +295,7 @@ export function TicketNode({ id, data }: NodeProps<Node<{ view: TicketView }>>) 
     <div className="flex h-4 items-center gap-1"><span className="min-w-0 truncate font-semibold" title={t.key}>{t.key}</span><span className="shrink-0 text-zinc-500">{t.size}</span><span className="grow" />
       <AttChip id={id} items={v.att} /><FreshBtn a={v.eng} />
       {t.status !== 'merged' && t.status !== 'cancelled' && <CancelBtn tip={`Remove ${t.key}…`} title={`Remove ${t.key}?`} go="Remove" path={`tickets/${t.id}/cancel`}
-        body={removeText(t, v.eng, waitingOn(b.state, t))} />}<Pill s={t.status} label={ticketLabel(t, v.hqPlan)} className="py-0! text-[10px]! leading-4!" /></div>
+        body={removeText(t, v.eng, waitingOn(b.state, t))} />}<Pill s={t.status} label={ticketLabel(t, v.hqPlan, v.clearing)} className="py-0! text-[10px]! leading-4!" /></div>
     <div className={v.titleRows === 2 ? 'line-clamp-2 h-8 break-words' : 'h-4 truncate'} title={t.title}>{t.title}</div>
     {v.crit && <button className="nopan block h-4 max-w-full truncate text-left text-indigo-300 hover:underline" title={`${v.crit}. Click to read them: they say what "done" means for ${t.key}.`}
       onClick={() => pop === 'criteria' ? b.setPop(null) : b.focus(id, 'criteria')}>{v.crit} ›</button>}

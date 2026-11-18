@@ -13,10 +13,10 @@ import { rememberGone, sweepNow } from './leftovers.ts'
 import { attention, resolveKind } from './attention.ts'
 import { agentDir, liveAgents, stopAgent, update, type Agent } from './agents.ts'
 import { features, getRepo, repoOfAgent, setTicket, tickets, type Feature, type Repo, type Ticket } from './records.ts'
-import { fallbackNote, featureState, freshStart, freshStartBlocker, inRepo } from './freshstart.ts'
+import { fallbackNote, freshStart, freshStartBlocker, inRepo } from './freshstart.ts'
 import { agentNote, noteScope, readNote, saveNote } from './notes.ts'
 import { launching } from './tickets.ts'
-import { builtLines, dropFeatureMd, keepBuilt, tpmWorkspace, writeFeatureMd, writeProjectMd } from './projectmd.ts'
+import { builtLines, dropFeatureMd, featureState, keepBuilt, tpmWorkspace, writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { restartTpm, tpmStarting } from './tpm.ts'
 import { stopPreview } from './preview.ts'
 import { stopFirstMap } from './firstmap.ts'
@@ -88,6 +88,8 @@ export async function maybeFinishClear(repoId: string): Promise<boolean> {
 }
 
 type Saved = { key: string; branch: string | null; head: string | null; wip: boolean; failed: string | null }
+/** What a finished clear tells the user (Bug 251): it worked; it worked but left worktrees; its TPM didn't start again. The next clear ends them all. */
+const CLEAR_NOTICES = ['repo_cleared', 'repo_cleared_left', 'repo_clear_tpm']
 async function finishClear(repo: Repo): Promise<void> {
   const fs0 = features().filter((f) => f.repo_id === repo.id), F = fs0.map((f) => f.id)
   const tks = tickets().filter((t) => F.includes(t.feature_id)), T = tks.map((t) => t.id)
@@ -102,13 +104,15 @@ async function finishClear(repo: Repo): Promise<void> {
   writeProjectMd(repo.id)
   const failed = [...saved.values()].filter((s) => s.failed).map((s) => `${s.key}: ${s.failed}`)
   emit({ agentId: null, source: 'system', kind: 'repo.cleared', payload: { repo: repo.id, archive: dir, features: F.length, tickets: T.length, agents: A.length, failed } })
-  for (const kind of ['repo_cleared', 'auto_finished', 'auto_stopped', 'test_cmd_proposed', 'test_cmd_refused']) resolveKind(`${kind}:${repo.id}`, null) // the runs they're about are gone
-  attention(`repo_cleared:${repo.id}`, `Cleared ${repo.name}: ${F.length} feature${F.length === 1 ? '' : 's'} and ${T.length} ticket${T.length === 1 ? '' : 's'}. `
+  for (const kind of [...CLEAR_NOTICES, 'auto_finished', 'auto_stopped', 'test_cmd_proposed', 'test_cmd_refused']) resolveKind(`${kind}:${repo.id}`, null) // the runs they're about are gone
+  // Bug 251: a clean clear is good news (green in the notices); one that left worktrees, or whose TPM didn't start again, is not, so each has its own kind
+  const told = failed.length ? 'repo_cleared_left' : 'repo_cleared'
+  attention(`${told}:${repo.id}`, `Cleared ${repo.name}: ${F.length} feature${F.length === 1 ? '' : 's'} and ${T.length} ticket${T.length === 1 ? '' : 's'}. `
     + `Notes and a summary are in ${dir.replace(process.env.HOME ?? '\0', '~')}.`
     + (failed.length ? ` These worktrees couldn't be removed (their code is safe on its branch): ${failed.join('; ')}.` : ''))
   bus.emit('resnapshot') // the UI drops everything at once (ui.ts)
   if (repo.clear_tpm_was_on) { // it was running: a new session, from its note and what has been built, without the old tickets
-    void restartTpm(repo.id, { cleared: true }).catch((e) => attention(`repo_cleared:${repo.id}`, `Cleared ${repo.name}, but its TPM didn't start again: `
+    void restartTpm(repo.id, { cleared: true }).catch((e) => attention(`repo_clear_tpm:${repo.id}`, `Cleared ${repo.name}, but its TPM didn't start again: `
       + `${(e as Error).message} Send it a message to start it.`))
   }
 }

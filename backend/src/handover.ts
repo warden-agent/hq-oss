@@ -1,5 +1,7 @@
 // The briefings HQ writes for new sessions: the project's TPM (Bug 52) and an engineer taking over a ticket, from HQ's records.
-import { fixWords } from './conflicts.ts'
+import { conflictFiles, fixWords } from './conflicts.ts'
+import { names } from './localmerge.ts'
+import { j } from './util.ts'
 import { unmergedDeps } from './readiness.ts'
 import type { Message } from './delivery.ts'
 import { hqMoves, type Feature, type Repo, type Ticket } from './records.ts'
@@ -9,7 +11,7 @@ import { criteriaBlock, criteriaOf } from './criteria.ts'
  *  so. Not a parked ticket, and nothing starts or merges while auto mode is stopped (plans are still checked): the user does, as the board's buttons say. */
 function standing(t: Ticket, all: Ticket[], repo: Repo): string {
   const on = !!repo.auto_mode && !t.auto_parked_why, hq = hqMoves(repo, t), main = repo.default_branch // Bug 210: the project's own, say master
-  const waits = unmergedDeps(t, all)
+  const waits = unmergedDeps(t, all), clash = conflictLine(t, hq, main)
   const now = ((): string => {
     switch (t.status) {
       case 'queued': return waits.length ? `waits for ${waits.join(', ')} to merge` : t.go_ahead ? 'started: HQ starts an engineer on it when a slot frees up (Bug 127)'
@@ -19,14 +21,24 @@ function standing(t: Ticket, all: Ticket[], repo: Repo): string {
       case 'implementing': return 'an engineer is building it'
       case 'awaiting_answer': return 'its engineer waits for an answer'
       case 'escalated': return 'escalated to the user'
-      case 'pr_ready': return t.pr_state === 'local' ? `finished; ${hq ? `HQ tests it on ${main} and merges it` : 'waits for the user to merge it'}`
+      case 'pr_ready': if (clash) return `finished${t.pr_state === 'local' ? '' : ' and pushed'}, but it ${clash}`
+        return t.pr_state === 'local' ? `finished; ${hq ? `HQ tests it on ${main} and merges it` : 'waits for the user to merge it'}`
         : `finished and pushed; ${hq ? `HQ tests it on ${main}, opens its PR and merges it` : 'its PR still needs opening'}`
-      case 'pr_open': return hq ? `finished; HQ tests PR #${t.pr_number} on ${main} and merges it` : `finished; PR #${t.pr_number} waits for the user's merge`
+      case 'pr_open': if (clash) return `finished, but PR #${t.pr_number} ${clash}`
+        return hq ? `finished; HQ tests PR #${t.pr_number} on ${main} and merges it` : `finished; PR #${t.pr_number} waits for the user's merge`
       case 'resolving': return `its engineer is ${fixWords(t.fixing, main).ing}`
       default: return t.status
     }
   })()
   return repo.auto_mode && t.auto_parked_why ? `${now} (auto mode parked it: ${t.auto_parked_why.replace(/\.$/, '')})` : now
+}
+/** Bug 243: a finished ticket that conflicts with the default branch, in the board's words (which files, who merged first), and who moves next: on auto
+ *  HQ sends it back to its engineer (auto.ts), else the user presses Fix conflicts on its box. null when it merges cleanly. */
+function conflictLine(t: Ticket, hq: boolean, main: string): string | null {
+  if (t.conflict_files == null) return null
+  const files = conflictFiles(t), first = j<string[]>(t.conflict_with, [])
+  return `conflicts with ${main}${files.length ? ` in ${names(files)}` : ''}${first.length ? ` (${first.join(', ')} merged first)` : ''}; `
+    + (hq ? `HQ has its engineer merge ${main} in and fix them` : `the user presses Fix conflicts in HQ, and its engineer merges ${main} in`)
 }
 /** What each mode means, for the TPM: its launch prompt (Bug 163) and HQ's notice when the user switches auto mode (auto.ts setAuto). `base`: the
  *  project's default branch, which HQ tests on and merges into (Bug 210: not always main). */

@@ -11,7 +11,7 @@ import { execFile } from 'node:child_process'
 import { agentTmpDir, DEFAULTS } from './config.ts'
 import { getSetting, now, one, q } from './db.ts'
 import { bus, emit, patch, type HqEvent } from './events.ts'
-import { beingStopped, getAgent, liveAgents, type Agent } from './agents.ts'
+import { beingStopped, getAgent, liveAgents, update, type Agent } from './agents.ts'
 import { resolveKind } from './attention.ts'
 import { sendMessage } from './delivery.ts'
 import { heavyKind } from './heavy.ts'
@@ -68,7 +68,7 @@ export function rebuildRuns(): void {
 /** Bug 203: the box's "Waiting on" line lives in memory only (ui.ts extras), so a restart says it again for an agent whose turn had ended with a run still
  *  going (hooks.ts Stop, or an Escape's turn.complete: working, by stillOn). Its run's notice is the next hook it sends, maybe many minutes away. Not for one
  *  still in its turn: it may be doing something else, and its next hook shows that. */
-function turnHadEnded(a: Agent, since: number): boolean {
+export function turnHadEnded(a: Agent, since: number): boolean {
   if (a.status !== 'working') return false
   const last = one<{ kind: string }>(`SELECT kind FROM events WHERE agent_id = ? AND id > ? AND (kind IN ('hook.UserPromptSubmit', 'hook.Stop')
     OR (kind = 'mod.turn.complete' AND COALESCE(json_extract(payload, '$.agentId'), '') = '')) ORDER BY id DESC LIMIT 1`, a.id, since)
@@ -123,14 +123,29 @@ export async function lookAtRuns(a: Agent, rows?: PsRow[]): Promise<{ run: BgRun
   const rs = runsOf(a.id); if (!rs.length) return []
   const pane = await tmux.panePid(a.tmux_session); if (!pane) return []
   const all = rows ?? await ps(), t = now(), frozen: { run: BgRun; quietMin: number }[] = []
+  const gone: string[] = []
   for (const r of rs) {
     const g = groupOf(all, pane, r)
-    if (!g) { if (++r.missed >= 2) endRuns(a.id, [r.task], 'gone'); continue }
+    if (!g) { if (++r.missed >= 2) gone.push(r.task); continue }
     r.missed = 0
     const quiet = judge(r, { cpu: g.cpu, bytes: outputBytes(a, r.task) }, t)
     if (quiet >= stallMs()) frozen.push({ run: r, quietMin: Math.round(quiet / 60_000) })
   }
+  if (gone.length) dropGone(a.id, gone)
   return frozen
+}
+/** What each agent's box line says now (patches), so a run that ends without its notice knows whether the line is its own. */
+const lines = new Map<string, unknown>()
+bus.on('patch', (p: { entity: string; id: string; patch: Record<string, unknown> | null }) => { if (p.entity === 'agent' && p.patch && 'activity' in p.patch) lines.set(p.id, p.patch.activity) })
+/** Bug 233: runs whose process is gone and whose notice never came. A line that named them (the agent's turn had ended: hooks.ts stillOn) names what is left; with
+ *  nothing left the agent waits on nothing, so a working one is idle, as at the end of a turn. A line of anything else (a turn under way, a helper) is left alone. */
+function dropGone(agentId: string, tasks: string[]): void {
+  const said = waitingText(agentId); endRuns(agentId, tasks, 'gone')
+  if (said === null || lines.get(agentId) !== said) return
+  const left = waitingText(agentId), a = getAgent(agentId)
+  if (left) patch('agent', agentId, { activity: left })
+  else if (a?.status === 'working' && !beingStopped(agentId)) update(agentId, { status: 'idle' }, { activity: null })
+  else patch('agent', agentId, { activity: null }) // on a dialog, say: what it is held by shows without the line
 }
 /** Stops the agent's frozen runs and tells it. Claude Code then sends the agent its "failed" notice, which wakes it, and HQ's message follows as the next
  *  turn. The Stop it button, and auto mode. Never a group of HQ's own, of the agent's Claude Code, or 1. */
@@ -178,6 +193,6 @@ export function startBgRuns(): void {
   bus.on('event:hook.PostToolUse:Bash', (e: HqEvent) => { if (!e.payload.bg) began.delete(`${e.agentId}:${String(e.payload.use ?? '')}`) })
   bus.on('event:hook.PostToolUseFailure:Bash', (e: HqEvent) => began.delete(`${e.agentId}:${String(e.payload.use ?? '')}`))
   for (const k of ['agent.stopped', 'agent.lost']) bus.on(`event:${k}`, (e: HqEvent) => {
-    if (!e.agentId) return; endRuns(e.agentId, 'all', k); resolveKind('bg_stalled', e.agentId); resolveKind('engineer_idle', e.agentId)
+    if (!e.agentId) return; endRuns(e.agentId, 'all', k); lines.delete(e.agentId); resolveKind('bg_stalled', e.agentId); resolveKind('engineer_idle', e.agentId)
   })
 }

@@ -15,11 +15,20 @@ const featureFile = (f: Feature): string => path.join(tpmWorkspace(f.repo_id), '
 /** "F-2 dark mode", or the title alone for a feature without a handle. */
 export const featureName = (f: Pick<Feature, 'handle' | 'title'>): string => f.handle ? `${f.handle} ${f.title}` : f.title
 
+/** Every ticket of the feature (at least one, not counting cancelled ones) is merged: its TPM has nothing left to coordinate. */
+export const featureDone = (fid: string): boolean => { const all = tickets(fid).filter((t) => t.status !== 'cancelled'); return all.length > 0 && all.every((t) => t.status === 'merged') }
+/** Where a feature stands, in its board box's words (frontend/src/board.ts featureView), not its stored status word: that stays
+ *  "planning" until it's cancelled, done or not (Bug 222). FEATURE.md and the Clear archive's SUMMARY.md say this (Bug 250). */
+export const featureState = (f: Feature): string => {
+  const all = tickets(f.id).filter((t) => t.status !== 'cancelled'), merged = all.filter((t) => t.status === 'merged').length
+  if (f.status === 'cancelled') return merged ? `cancelled · ${merged} merged before that` : 'cancelled' // not "done": nothing more goes in (Bug 250)
+  return featureDone(f.id) ? `✓ done · all ${all.length} merged` : all.length ? `${merged}/${all.length} merged` : 'no tickets yet'
+}
 /** One feature's file: the request, its tickets, the decisions recorded with write_feature, and every ticket's spec. Also
  *  brings PROJECT.md up to date. Returns the file. */
 export function writeFeatureMd(f: Feature): string {
   const tk = tickets(f.id), decisions = q<{ key: string; text: string }>('SELECT key, text FROM docs WHERE scope = ? ORDER BY updated_at', `feature:${f.id}`)
-  const md = `---\nfeature: ${f.handle ?? ''} ${f.slug}\nrepo: ${getRepo(f.repo_id)?.name}\nstatus: ${f.status}\nmerge_order: ${f.merge_order}\n---\n`
+  const md = `---\nfeature: ${f.handle ?? ''} ${f.slug}\nrepo: ${getRepo(f.repo_id)?.name}\nstatus: ${featureState(f)}\nmerge_order: ${f.merge_order}\n---\n`
     + `## Request (verbatim)\n\n${f.request_text}\n\n## Tickets\n\n| Key | Size | Status | Depends on | Expected files | Title |\n|---|---|---|---|---|---|\n`
     + `${tk.map((x) => `| ${x.key} | ${x.size} | ${x.status} | ${x.deps} | ${x.expected_files} | ${x.title} |`).join('\n')}\n`
     + (decisions.length ? `\n## Decisions\n\n${decisions.map((d) => `### ${d.key}\n${d.text}`).join('\n\n')}\n` : '')

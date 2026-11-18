@@ -9,6 +9,7 @@ import path from 'node:path'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
+import { WebSocket } from 'ws'
 import { startHq, waitFor, exitPlanMode, pendingAfter, lockOf, leftoverGroups, type Hq } from './harness.ts'
 import { pidsUnder } from '../src/procs.ts'
 import { PORT_TAKEN_EXIT } from '../src/ports.ts'
@@ -37,10 +38,11 @@ test('fake agents report in, hooks and MCP work as the agent, the plan gate hold
   const answer = await held
   assert.equal(answer.hookSpecificOutput.decision.behavior, 'allow'); assert.equal(answer.hookSpecificOutput.decision.updatedInput.plan, 'Plan: add b.txt')
 
-  // Isolation: the agents live on the harness's own tmux server, and HQ's trust entries went to the harness's home only.
+  // Isolation: the agents live on the harness's own tmux server, and HQ's trust entries went to the harness's home only. Bug 241: shown on that server
+  // alone (its pane is that server's child); a look at the default server for comparison was a call on the user's live one.
   assert.match(hq.tmux('ls'), new RegExp(`hq-${eng.id}`))
-  const live = (() => { const e = { ...process.env }; delete e.TMUX_TMPDIR; delete e.TMUX; try { return execFileSync('tmux', ['ls'], { env: e, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) } catch { return '' } })()
-  assert.doesNotMatch(live, new RegExp(`hq-${eng.id}`))
+  const [server, pane] = hq.tmux('display-message', '-p', '-t', `hq-${eng.id}`, '#{pid} #{pane_pid}').trim().split(' ').map(Number)
+  assert.ok(server! > 0 && pane! > 0); assert.equal(Number(execFileSync('ps', ['-o', 'ppid=', '-p', String(pane)], { encoding: 'utf8' }).trim()), server)
   const trusted = (file: string) => fs.existsSync(file) ? Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')).projects ?? {}) : []
   assert.ok(trusted(path.join(hq.home, '.claude.json')).some((p) => p.startsWith(path.dirname(hq.home))))
   assert.ok(!trusted(path.join(os.homedir(), '.claude.json')).some((p) => p.startsWith(path.dirname(hq.home))))
@@ -87,6 +89,34 @@ test('stopping a test HQ twice never reaches a tmux server outside its own folde
   fs.rmSync(bin, { recursive: true, force: true })
 })
 
+
+test('Bug 242: every tmux call the backend makes names its own socket: launching, the terminal view, a restart finding its agent again', async () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-socktmux-')), calls = path.join(bin, 'calls')
+  const real = execFileSync('sh', ['-c', 'command -v tmux'], { encoding: 'utf8' }).trim()
+  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh\necho "$*" >> '${calls}'\nexec '${real}' "$@"\n`, { mode: 0o755 }) // writes each call down
+  const own = await startHq({ env: { PATH: `${bin}:${process.env.PATH}` } }); let ws: WebSocket | null = null
+  try {
+    const repo = (await own.api('repos', { path: own.repo('sock') })).json, a = (await own.api(`repos/${repo.id}/message`, { body: 'hello' })).json.agent
+    const tpm = await waitFor('the TPM', async () => (await own.state()).agents.find((x: any) => x.id === a.id && x.status === 'working'))
+    await own.screen(tpm, 'SCREEN-242 on its own server')
+    const token = fs.readFileSync(path.join(own.hqHome, 'ui-token'), 'utf8').trim(), seen: any[] = []
+    const w = new WebSocket(`ws://127.0.0.1:${own.ports.ui}/ws`, { headers: { authorization: `Bearer ${token}` } }); ws = w
+    w.on('message', (raw) => seen.push(JSON.parse(String(raw))))
+    await new Promise<void>((ok, no) => { w.once('open', () => ok()); w.once('error', no) })
+    w.send(JSON.stringify({ type: 'term.open', agentId: tpm.id, cols: 120, rows: 30 })) // the Agent tab's terminal
+    const drawn = () => seen.filter((m) => m.type === 'term' && m.agentId === tpm.id).map((m) => m.data).join('')
+    await waitFor('the terminal view to show its screen', () => drawn().includes('SCREEN-242') || null)
+    assert.equal(seen.some((m) => m.type === 'term.exit'), false, drawn())
+    await own.restart() // a new backend finds the agent on the same server
+    await waitFor('the TPM after the restart', async () => (await own.state()).agents.find((x: any) => x.id === tpm.id && x.status === 'working'))
+    assert.match(own.tmux('ls'), new RegExp(`hq-${tpm.id}`))
+  } finally { ws?.close(); await own.stop() }
+  const lines = fs.readFileSync(calls, 'utf8').trim().split('\n'), socks = new Set(lines.map((l) => l.split(' ').slice(0, 2).join(' ')))
+  for (const verb of ['new-session', 'set-hook', 'attach-session', 'has-session', 'display-message']) assert.ok(lines.some((l) => l.split(' ').includes(verb)), verb)
+  const short = (process.env.HQ_SHORT_TMPDIR ?? '/tmp').replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  assert.equal(socks.size, 1, [...socks].join('\n')); assert.match([...socks][0]!, new RegExp(`^-S ${short}/hq-e2e-\\S+/tmux-\\d+/default$`))
+  fs.rmSync(bin, { recursive: true, force: true })
+})
 
 // Bug 199: a test HQ's teardown kills the process groups that name its folder or work in it. A group with a process older than the
 // test HQ is someone else's (a shell that cd'd into the folder, a terminal's job), and it's left alone; what the test HQ started isn't.

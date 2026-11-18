@@ -1,7 +1,7 @@
 // Where the board's view goes (Bug 119, frontend/src/fit.ts): everything while it's readable, else less, and never cut on both sides.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { fitSets, placePop, placeView, POP_EDGE, POP_FLOOR, READABLE, type Box } from '../../frontend/src/fit.ts'
+import { fitSets, floorAt, LOWEST, NARROW, placePop, placeView, POP_EDGE, POP_FLOOR, READABLE, type Box } from '../../frontend/src/fit.ts'
 
 /** Which boxes a view shows whole in a w×h pane. */
 const whole = (boxes: Box[], v: { x: number; y: number; zoom: number }, w: number, h: number) => boxes.filter((b) =>
@@ -96,7 +96,7 @@ const greetSets = (bs: Box[]) => fitSets(bs.map((b) => b.id), [{ ids: ['f1'], do
 test('Bug 227: no box cut at the board\'s edge at 1440/1100/820 px, panel open or closed; readable; the ticket waiting on you whole', () => {
   for (const bs of [greet(), shot()]) for (const [w, h] of [[914, 831], [574, 831], [414, 831], [1440, 831], [1100, 831], [820, 831], [574, 800], [300, 500]]) {
     const v = placeView(bs, greetSets(bs), w!, h!)!, at = `${bs[4]!.w} wide ticket, ${w}x${h}`
-    assert.ok(v.zoom >= READABLE, `${at}: zoom ${v.zoom}`)
+    assert.ok(v.zoom >= floorAt(w!), `${at}: zoom ${v.zoom}`) // READABLE from NARROW px up (Bug 258)
     assert.deepEqual(cut(bs, v, w!, h!), [], at)
     for (const id of ['f3', 't3']) assert.ok(whole(bs, v, w!, h!).includes(id), `${at}: ${id}`)
   }
@@ -132,6 +132,33 @@ test('Bug 227, what it must not change: everything that fits with PAD is centred
   assert.deepEqual(placeView(greet(), greetSets(greet()), 1440, 831), placeViewOld(greet(), 1440, 831))
   const bs: Box[] = [{ id: 'a', x: 0, y: 0, w: 300, h: 100 }, { id: 'far', x: -150, y: 2000, w: 300, h: 100 }] // far below the view
   assert.deepEqual(placeView(bs, [['a', 'far'], ['a']], 400, 300), { x: 50, y: 100, zoom: 1 }) // centred, though far crosses the left edge's line
+})
+// Bug 258: under ~400 px (an app pane docked right, a small window) Bug 119's two-column F-4 couldn't fit at READABLE: its far
+// column (or the feature box over both) was cut at the right edge.
+test('Bug 258: every board width under NARROW, at several heights: nothing cut, the work whole, zoomed out no more than it takes', () => {
+  for (let w = 180; w < NARROW; w += 3) for (const h of [500, 650, 831]) {
+    for (const [bs, sets, keep] of [[board(), fitSets(all(), groups(true), false), F4], [greet(), greetSets(greet()), ['f3', 't3']],
+      [shot(), greetSets(shot()), ['f3', 't3']]] as const) {
+      const v = placeView(bs, sets, w, h)!, at = `${keep[0]} board, ${w}x${h}`
+      assert.ok(v.zoom >= floorAt(w) && v.zoom >= LOWEST, `${at}: zoom ${v.zoom}`); assert.deepEqual(cut(bs, v, w, h), [], at)
+      for (const id of keep) assert.ok(whole(bs, v, w, h).includes(id), `${at}: ${id}`)
+      const shown = bs.filter((b) => whole([b], v, w, h).length), gap = Math.min(...shown.map((b) => v.x + b.x * v.zoom),
+        ...shown.map((b) => w - v.x - (b.x + b.w) * v.zoom), ...shown.map((b) => v.y + b.y * v.zoom), ...shown.map((b) => h - v.y - (b.y + b.h) * v.zoom))
+      assert.ok(v.zoom >= READABLE - 1e-9 || gap <= 8.01, `${at}: zoom ${v.zoom}, ${gap} px spare`) // under READABLE only to fit
+    }
+  }
+})
+test('Bug 258: the bug (F-4 in a 360 px pane) shows all of F-4; what fits at NARROW px fits narrower, just smaller', () => {
+  const v = placeView(board(), fitSets(all(), groups(true), false), 360, 831)!
+  assert.deepEqual(whole(board(), v, 360, 831).filter((id) => F4.includes(id)), F4); assert.deepEqual(cut(board(), v, 360, 831), [])
+  assert.ok(v.zoom < READABLE && v.zoom > 0.5, `zoom ${v.zoom}`) // the old view: 0.6, F-4's box cut at 252..480 px
+  assert.equal(floorAt(NARROW), READABLE); assert.equal(floorAt(1440), READABLE); assert.equal(floorAt(50), LOWEST)
+})
+test('Bug 258, what it must not change: from NARROW px up the floor is READABLE; a wide feature still starts at its left edge', () => {
+  const wide: Box[] = [0, 1, 2, 3].map((i) => ({ id: `c${i}`, x: 1000 + i * 268, y: 500, w: 220, h: 100 }))
+  for (const w of [NARROW, 500, 574]) assert.equal(placeView(wide, [wide.map((b) => b.id)], w, 830)!.zoom, READABLE)
+  const v = placeView(wide, [wide.map((b) => b.id)], 300, 830)! // narrower: the floor gives way in step, so still its start edge
+  assert.equal(v.zoom, floorAt(300)); assert.deepEqual(cut(wide, v, 300, 830), []); assert.ok(whole(wide, v, 300, 830).includes('c0'))
 })
 /** Bug 119's centred view of everything with PAD around it, which must not change when everything fits that way. */
 function placeViewOld(bs: Box[], w: number, h: number) {

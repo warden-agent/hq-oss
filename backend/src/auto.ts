@@ -130,8 +130,10 @@ async function retry(t: Ticket, why: string, act: () => Promise<unknown>): Promi
 }
 
 /** Notices that mean something for this project on auto. `dialog`: an engineer waits for a person, and none is coming. A stuck or
- *  errored engineer gets a fresh one first: going quiet for a while isn't the ticket's fault. */
-const STOP_KINDS = ['push_failed', 'pr_failed'], PARK_KINDS = ['blocked', 'dialog'], REPLACE_KINDS = ['stuck', 'api_error']
+ *  errored engineer gets a fresh one first: going quiet for a while isn't the ticket's fault. Not `pr_failed` (Bug 247): that is the user's Make PR, or the
+ *  watcher's retry of it, and on auto HQ opens the PR itself as it merges (mergeOnGithub), stopping with GitHub's reason if it's refused. Stopping on the
+ *  notice stopped auto again at every Resume, with nothing tried, until the PR was opened, and even once the user had opened it by hand. */
+const STOP_KINDS = ['push_failed'], PARK_KINDS = ['blocked', 'dialog'], REPLACE_KINDS = ['stuck', 'api_error']
 export async function readNotices(repo: Repo, all: Ticket[]): Promise<void> {
   const mine = new Map(all.map((t) => [t.id, t]))
   for (const seen of openAttention() as Attention[]) {

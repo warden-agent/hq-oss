@@ -32,11 +32,19 @@ test('Bug 197: during a Clear on auto the ticket box says HQ won\'t check the pl
   assert.deepEqual(box(state({ auto: true, clearing: true })).acts.map((a: any) => a.kind), ['read-plan']) // still opens the plan; no Approve HQ would race
 })
 
-test('what it must not catch: outside a Clear, and in manual mode during one, the box says what it said before', () => {
+test('what it must not catch: outside a Clear the box says what it said before', () => {
   assert.equal(first(state({ auto: true })), "its plan waits for HQ's check")
   assert.equal(first(state({ auto: true, check: { state: 'checking', since: 1 } })), 'HQ is checking its plan against its criteria')
-  assert.equal(first(state({ auto: false, clearing: true })), 'Plan R-1 waiting for you')
   assert.equal(first(state({ auto: false })), 'Plan R-1 waiting for you')
+})
+
+test('Bug 231: during a Clear in manual mode the box says its plan stays unanswered and offers no Approve or auto mode (HQ refuses both); outside it, both are back', async () => {
+  assert.equal(first(state({ auto: false, clearing: true })), 'its plan stays unanswered: the project is being cleared')
+  const { ticketLabel } = await import(BOARD) as { ticketLabel: (t: any, hqPlan?: boolean, clearing?: boolean) => string }
+  for (const auto of [false, true]) assert.equal(ticketLabel(state({ auto }).tickets[0], auto, true), 'plan unanswered') // not "plan for you" / "plan check"
+  assert.equal(ticketLabel(state({ auto: false }).tickets[0]), 'plan for you'); assert.equal(box(state({ auto: false, clearing: true })).clearing, true)
+  assert.deepEqual(box(state({ auto: false, clearing: true })).acts.map((a: any) => a.kind), ['read-plan'])
+  assert.deepEqual(box(state({ auto: false })).acts.map((a: any) => a.kind), ['read-plan', 'approve', 'do-rest'])
 })
 
 test('Bug 220: on auto, Clear\'s dialog and Fresh start say the plan waits for HQ\'s plan check, not for the user', () => {

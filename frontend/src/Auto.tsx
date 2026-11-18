@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { api, askUntilAnswered, errText, type State } from './api'
 import { DO_REST, OPEN_AUTO, OPEN_SUMMARY, openAuto, openSummary, undoConfirm, useBusy } from './board'
-import { Md } from './ui'
+import { Backdrop, Md } from './ui'
 import { yourTurn } from './needs.ts'
 import { Findings } from './Findings'
 
@@ -76,7 +76,7 @@ export function AutoDialog({ all }: { all: State }) {
       await api(`repos/${repo.id}/auto`, { on: true }); close()
     } catch (e) { setErr(errText(e as Error)) } finally { setBusy(false) }
   }
-  return <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 p-4" onPointerDown={(e) => { if (e.target === e.currentTarget && !busy) close() }}>
+  return <Backdrop onClose={close} canClose={!busy}>
     <form role="dialog" aria-modal="true" aria-label="Turn on auto mode" onSubmit={(e) => { e.preventDefault(); void go() }}
       className="flex max-h-[90vh] w-[480px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-400 shadow-xl">
       <div className="break-words text-sm font-medium text-zinc-100">{repo.auto_mode ? `How HQ tests ${repo.name}` : `Turn on auto mode for ${repo.name}?`}</div>
@@ -102,7 +102,7 @@ export function AutoDialog({ all }: { all: State }) {
       <div className="flex flex-wrap justify-end gap-1.5"><button type="button" className="btn" onClick={close} disabled={busy}>Cancel</button>
         <button type="submit" className="btn btn-primary" autoFocus disabled={busy || !check || !!refused}>{busy ? 'Saving…' : repo.auto_mode ? 'Save' : 'Turn on auto'}</button></div>
     </form>
-  </div>
+  </Backdrop>
 }
 
 function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; onClose: () => void; all: State }) {
@@ -113,8 +113,7 @@ function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; on
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onClose() }
     document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
   })
-  return <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4" onPointerDown={(e) =>
-    { if (e.target === e.currentTarget && !busy) onClose() }}>{/* under HQ's dialog: Undo's are-you-sure opens on top */}
+  return <Backdrop onClose={onClose} canClose={!busy} z="z-[80]">{/* under HQ's dialog: Undo's are-you-sure opens on top */}
     <div role="dialog" aria-modal="true" aria-label={`What auto mode did in ${name}`}
       className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-300 shadow-xl">
       <div className="break-words text-sm font-medium text-zinc-100">What auto mode did in {name}</div>
@@ -125,7 +124,7 @@ function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; on
         && <button className="btn" disabled={busy} title={`Put ${base} back where this run started. The work stays on its branches.`} onClick={undo}>{busy ? 'Undoing…' : 'Undo this run'}</button>}
         <button className="btn btn-primary" autoFocus disabled={busy} onClick={onClose}>Close</button></div>
     </div>
-  </div>
+  </Backdrop>
 }
 /** Under the top bar, when auto mode has something to say: stopped (and why), waiting, or finished. */
 export function AutoBanner({ all, repo }: { all: State; repo: any }) {

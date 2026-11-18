@@ -85,8 +85,11 @@ test('an engineer\'s change waits for its ticket\'s merge, is checked then, and 
   const after = readSetup(R)
   assert.equal(after.setup!.endpoints.length, 2, 'T1 passed and applied'); assert.equal(after.by, 'T1'); assert.equal(after.checked!.ok, true)
   assert.equal(after.setup!.seed, seed, 'T2 failed: the setup it had is kept'); assert.equal(after.seen, false, 'shown to the user once')
-  const notes = q<{ detail: string }>('SELECT detail FROM needs_attention WHERE kind = ?', `repo_testsetup:${R}`).map((x) => x.detail)
-  assert.ok(notes.some((x) => /T1 changed how HQ tests the app; HQ checked it/.test(x)) && notes.some((x) => /T2 changed .* check of it failed .* kept the setup it had/.test(x)), notes.join(' | '))
+  const notes = (kind: string) => q<{ detail: string }>('SELECT detail FROM needs_attention WHERE kind = ?', `${kind}:${R}`).map((x) => x.detail)
+  assert.ok(notes('repo_testsetup_ok').some((x) => /T1 changed how HQ tests the app; HQ checked it/.test(x)), notes('repo_testsetup_ok').join(' | ')) // good news (Bug 251)
+  assert.ok(notes('repo_testsetup').some((x) => /T2 changed .* check of it failed .* kept the setup it had/.test(x)), notes('repo_testsetup').join(' | '))
+  const open = q<{ kind: string }>('SELECT kind FROM needs_attention WHERE kind LIKE ? AND resolved_at IS NULL', `repo_testsetup%:${R}`).map((x) => x.kind)
+  assert.deepEqual(open, [`repo_testsetup:${R}`], 'one notice at a time: the newer problem ends the good news before it')
   assert.deepEqual(Object.keys(after.pending), [])
   // a cancelled ticket takes its change with it
   proposeSetupChange(getAgent('eng-t3')!, { endpoints: [] }); assert.deepEqual(Object.keys(readSetup(R).pending), ['t3'])

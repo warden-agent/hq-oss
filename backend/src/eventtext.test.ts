@@ -197,3 +197,14 @@ test('Bug 226: HQ stopping a Launch helper\'s test server on a port it wasn\'t g
   assert.equal(eventLine('launch.test_port', { repo: 'porty', ports: [3180], given: [4087, 4088, 4089] }),
     'HQ stopped its test server on port 3180: not one HQ gave it for tests (4087, 4088, 4089), so it could clash with another app. Its save was refused')
 })
+
+test('Bug 248: a refused open_pr shows on its engineer\'s Events in plain words, with HQ\'s reason; the mcp call itself stays left out', () => {
+  const why = "HQ hasn't seen this project's test command run on PAY-1. Run the project's test command, the whole suite and not only your own test files: npm test."
+  emit({ agentId: 'eng-1', source: 'mcp', kind: 'mcp.open_pr', payload: { args: { title: 'Totals' } } })
+  emit({ agentId: 'eng-1', source: 'mcp', kind: 'ticket.pr_refused', payload: { ticket: 'tkt-1', key: 'PAY-1', why } })
+  const lines = agentEvents('eng-1', 2).map((e) => e.text)
+  assert.equal(lines[0], `HQ didn't take PAY-1 as finished (open pr): ${why}`)
+  assert.ok(!lines.some((l) => l.startsWith('mcp.')), lines.join(' | '))
+  assert.equal(eventLine('mcp.open_pr', { args: {} }), null) // what it must not change: HQ's other mcp calls stay out
+  assert.equal(agentEvents('eng-2', 300).some((e) => /as finished/.test(e.text)), false) // only its own engineer's tab
+})

@@ -69,10 +69,13 @@ Write scenarios: each one thing a person wants to get done, in their words. Mix 
 - basic: the everyday tasks, one per screen or control the map names, and one for each item in what's new.
 - weird: what people really do: empty input, the same thing twice, double clicks, very long text, the back button, changing their mind halfway.
 - complex: a few steps across screens that depend on each other.
-A goal says what the person wants and how they'd know it worked, never how the app is built. Name the what's-new items a scenario is about by their [id].`
+A goal says what the person wants and how they'd know it worked, never how the app is built. Put the ids of the what's-new items a scenario is about in
+its "about" list, as written between the brackets (for example "T-03 A2"), and nothing else there.`
+// Bug 257: the list was called `criteria` with no description, and Haiku filled it with pass checks of its own and put the [id]s in the goal instead
 export const PLAN_SCHEMA = JSON.stringify({ type: 'object', required: ['scenarios'], properties: { scenarios: { type: 'array', items: { type: 'object',
-  required: ['kind', 'title', 'goal'], properties: { kind: { enum: ['basic', 'weird', 'complex'] }, title: { type: 'string' }, goal: { type: 'string' },
-  criteria: { type: 'array', items: { type: 'string' } } } } } } })
+  required: ['kind', 'title', 'goal', 'about'], properties: { kind: { enum: ['basic', 'weird', 'complex'] }, title: { type: 'string' }, goal: { type: 'string' },
+  about: { type: 'array', items: { type: 'string' }, description: 'The ids of the what\'s-new items this scenario is about (for example "T-03 A2"); empty if none.' },
+} } } } })
 export function planPrompt(map: string, news: string[], n: number): string {
   return `## Feature map\n${map.trim() || '(There is no map yet: plan from what\'s new, and include scenarios that find their way around the app from its start page.)'}\n\n`
     + `## What's new\n${news.join('\n') || '(Nothing listed: test the app as a whole.)'}\n\nWrite about ${n} scenarios: about half basic, a third weird, the rest complex.\n`
@@ -86,6 +89,13 @@ export function knownCriterion(c: unknown, ids: string[]): string | null {
   const full = ids.find((id) => squash(id) === k); if (full) return full
   const same = ids.filter((id) => squash(id.split(' ').at(-1) ?? '') === k); return same.length === 1 ? same[0]! : null
 }
+/** What a planned scenario names as its criteria: its `about` list (`criteria` too, as older answers called it), and any [id] in its title, goal or those
+ *  lists, where a model also writes them (Bug 257). Only names knownCriterion knows are kept, so a pass check written in place of an id is dropped. */
+function namedIn(s: Record<string, unknown>): unknown[] {
+  const listed = [s.about, s.criteria].flatMap((l) => Array.isArray(l) ? l : [])
+  const tags = [s.title, s.goal, ...listed].flatMap((t) => [...String(t ?? '').matchAll(/\[([^\[\]]{1,80})\]/g)].map((m) => m[1]!))
+  return [...listed, ...tags].flatMap((c) => String(c ?? '').split(/[,;]/)) // "T-03 A1, T-03 A2" names two
+}
 /** The scenarios HQ keeps of a planning answer: at most `n`, each with a kind, a title and a goal, none the same as another; then numbered. `retry` scenarios
  *  (from findings to try again) go first, as HQ wrote them. */
 export function keepPlan(raw: unknown, n: number, ids: string[], retry: Omit<Scenario, 'id' | 'kind'>[] = []): Scenario[] {
@@ -96,7 +106,7 @@ export function keepPlan(raw: unknown, n: number, ids: string[], retry: Omit<Sce
     if (!['basic', 'weird', 'complex'].includes(kind) || title.length < 3 || goal.length < 10 || seen.has(squash(goal))) continue
     if (out.length >= n + retry.length) break
     seen.add(squash(goal))
-    const crit = [...new Set((Array.isArray(s.criteria) ? s.criteria : []).map((c) => knownCriterion(c, ids)).filter((c): c is string => !!c))]
+    const crit = [...new Set(namedIn(s).map((c) => knownCriterion(c, ids)).filter((c): c is string => !!c))]
     out.push({ kind: kind as ScenarioKind, title, goal, ...(crit.length ? { criteria: crit } : {}) })
   }
   return out.map((s, i) => ({ id: `s-${String(i + 1).padStart(2, '0')}`, ...s }))

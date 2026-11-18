@@ -86,6 +86,27 @@ test('a busy run is never frozen; once its process ends unheard, the engineer go
   process.kill(-pid, 'SIGKILL') // and its notice never arrives
   await waitFor('the agent idle', async () => (await agentOf(eng.id)).status === 'idle', 20_000)
   assert.ok((await events('bg.ended')).some((e: any) => e.agent_id === eng.id && JSON.parse(e.payload).why === 'gone'))
+  assert.equal((await agentOf(eng.id)).activity ?? null, null, 'and its box no longer says it waits')
+})
+
+test("Bug 233: a run whose process ends unheard leaves the box's line; with another run left, the line names that one", async () => {
+  const { eng } = await engineer('gone-line')
+  await hq.api('settings', { key: 'heavy_at_once', value: 2 }) // a run in the background keeps its turn (Bug 96 gap 3): the build would wait for it
+  const tests = await runTimesOut(eng.id, BUSY)
+  // runs are matched to their process by start time, in ps's whole seconds (bgruns.ts groupOf): the two start well apart
+  await new Promise((r) => setTimeout(r, 4000))
+  const build = await runTimesOut(eng.id, BUSY, 'npm run build').finally(() => hq.api('settings', { key: 'heavy_at_once', value: 1 }))
+  assert.equal((await agentOf(eng.id)).activity, 'Waiting on: npm run build (+1 more)')
+  process.kill(-build.pid, 'SIGKILL') // and its notice never arrives
+  await waitFor('the line to name the run left', async () => (await agentOf(eng.id)).activity === 'Waiting on: npm run test-backend', 20_000)
+  assert.equal((await agentOf(eng.id)).status, 'working', 'it still waits on the test run')
+  assert.ok((await events('bg.ended')).some((e: any) => e.agent_id === eng.id && JSON.parse(e.payload).task === build.task && JSON.parse(e.payload).why === 'gone'))
+  // one in its turn: its line is what it does now, and a run that goes leaves it alone
+  await hq.hook(eng.id, { hook_event_name: 'UserPromptSubmit', prompt: 'look at the code meanwhile' })
+  await hq.hook(eng.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_use_id: 'toolu_read233', tool_input: { file_path: '/r/src/app.ts' } })
+  process.kill(-tests.pid, 'SIGKILL')
+  await waitFor('the run to be dropped', async () => (await events('bg.ended')).some((e: any) => e.agent_id === eng.id && JSON.parse(e.payload).task === tests.task), 20_000)
+  const a = await agentOf(eng.id); assert.equal(a.activity, 'Reading src/app.ts'); assert.equal(a.status, 'working')
 })
 
 test('a server started in the background on purpose is never watched, however quiet', async () => {

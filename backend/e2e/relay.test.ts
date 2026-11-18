@@ -27,8 +27,11 @@ test('Bug 78: an agent keeps HQ\'s tools while the backend is away, and a call m
   relay.stderr!.on('data', (d) => { stderr += d })
   await client.connect(relay)
   try {
-    const tools = (await client.listTools()).tools.map((x) => x.name)
+    const listed = (await client.listTools()).tools, tools = listed.map((x) => x.name)
     assert.ok(tools.includes('open_pr') && tools.includes('get_ticket') && !tools.includes('create_ticket'), tools.join(' ')) // the engineer's own tools
+    const openPr = listed.find((x) => x.name === 'open_pr')?.description ?? '' // Bug 245: kept for the whole session, so true with auto on or off
+    assert.match(openPr, /merged into main: by HQ after its own tests when auto mode is on, otherwise by the user from HQ; the answer says which/)
+    assert.doesNotMatch(openPr, /the user tries it and merges it/)
     assert.match(said(await client.callTool({ name: 'get_ticket', arguments: {} })), /\(S\): One/)
 
     await hq.down()

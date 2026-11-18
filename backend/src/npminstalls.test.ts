@@ -74,9 +74,26 @@ test('uv, yarn and pnpm installs anywhere in a command, in the folder they run i
 })
 
 test('what is not a uv, yarn or pnpm install is left alone', () => {
-  for (const c of ['uv run app.py', 'uv pip install -r requirements.txt', 'uv lock', 'uvx ruff', 'uv --project server run app', 'yarn dev',
+  for (const c of ['uv pip install -r requirements.txt', 'uv lock', 'uvx ruff', 'uv tool run ruff', 'yarn dev',
     'yarn run build', 'yarn --version', 'yarn -v', 'yarn --cwd web dev', 'yarn -s start', 'pnpm dev', 'pnpm run install', 'pnpm --filter web dev',
     'pnpm -C web build', 'pnpm', 'echo uv sync', 'echo "cd server && uv sync"', "sh -c 'uv sync'", 'npx pnpm install', 'npm install',
     'cd yarn && make', './yarn-install.sh', '"uv sync"', 'yarn install-peers', 'pnpm installs', ''])
     assert.deepEqual(locked(c), [], c)
+})
+
+const kinds = (cmd: string) => lockedInstalls(cmd).map((n) => [n.tool, n.dir, n.frozen, n.noLock, n.run])
+
+test('installs that write no lockfile, and `uv run`, which installs before it runs (Bug 239)', () => {
+  assert.deepEqual(kinds('uv run app.py'), [['uv', '', false, false, true]])
+  assert.deepEqual(kinds('uv --project server run app'), [['uv', 'server', false, false, true]])
+  assert.deepEqual(kinds('cd server && uv run --no-sync uvicorn app:app'), [['uv', 'server', false, true, true]])
+  assert.deepEqual(kinds('uv run --no-project script.py'), [['uv', '', false, true, true]])
+  assert.deepEqual(kinds('UV_NO_SYNC=1 uv run app.py'), [['uv', '', false, true, true]])
+  assert.deepEqual(kinds('uv run --locked app.py'), [['uv', '', true, false, true]])
+  assert.deepEqual(kinds('uv sync --no-sync'), [['uv', '', false, false, false]]) // not an option of uv sync: still writes one
+  assert.deepEqual(kinds('cd web && yarn install --pure-lockfile'), [['yarn', 'web', false, true, false]])
+  assert.deepEqual(kinds('yarn --no-lockfile'), [['yarn', '', false, true, false]])
+  for (const c of ['pnpm i --no-lockfile', 'pnpm install --lockfile=false', 'pnpm install --config.lockfile=false'])
+    assert.deepEqual(kinds(c), [['pnpm', '', false, true, false]], c)
+  assert.deepEqual(kinds('pnpm install --lockfile-only'), [['pnpm', '', false, false, false]]) // writes only the lockfile
 })

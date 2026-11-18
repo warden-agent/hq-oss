@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { EPHEMERAL_FROM, strayPorts, testPorts } from './apprun.ts'
 import { assignPorts, portRange, checkRecipe, commandRecipe, detectCommand, frameBlocked, installMark, installStep, lockfileProblem, needsInstall, NO_LOCK_INSTALL, npmLock, parseRunMark, printedPorts,
-  recipeProblem, runMark, runScript, RUN_MARK, sameCommands, supervisorSpec, type Recipe } from './apprun.ts'
+  recipeProblem, refusedWords, runMark, runScript, RUN_MARK, sameCommands, supervisorSpec, type Recipe } from './apprun.ts'
 
 const repo = (files: Record<string, string>): string => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-apprun-'))
@@ -175,10 +175,10 @@ test('installs (Bug 156): a member\'s install_when is the root lockfile, so a ch
 test('saved recipes (Bug 156): checked again in the checkout they run in', () => {
   const root = repo({ 'package.json': deps }), ok = { parts: [{ ...member, dir: '.', install: NO_LOCK_INSTALL, install_when: 'package.json' }], show: 'web', worktree_files: [], notes: '' }
   assert.equal(recipeProblem(ok, root), null)
-  assert.match(recipeProblem({ ...ok, parts: [{ ...ok.parts[0]!, install: 'npm install' }] }, root) ?? '', /^web: use `npm install --no-package-lock`/)
+  assert.match(recipeProblem({ ...ok, parts: [{ ...ok.parts[0]!, install: 'npm install' }] }, root)?.why ?? '', /^web: use `npm install --no-package-lock`/)
   assert.equal(recipeProblem({ ...ok, parts: [{ ...ok.parts[0]!, install: undefined }] }, root), null)
   assert.equal(recipeProblem({ ...ok, parts: [member] }, workspace()), null)
-  assert.match(recipeProblem({ ...ok, parts: [{ ...member, install: 'npm i' }] }, workspace()) ?? '', /use `npm ci`/)
+  assert.match(recipeProblem({ ...ok, parts: [{ ...member, install: 'npm i' }] }, workspace())?.why ?? '', /use `npm ci`/)
 })
 
 test('recipe: the OK covers commands and files, not the notes', () => {
@@ -299,12 +299,13 @@ test('recipe (Bug 191): an npm install anywhere in the command is checked in the
   fs.rmSync(path.join(root, 'web', 'package-lock.json'))
   const part = { name: 'app', dir: '.', install: 'cd web && npm install', install_when: 'web/package.json', run: 'cd web && npm start', port: 'auto' as const }
   const saved: Recipe = { parts: [part], show: 'app', worktree_files: [], notes: '' }
-  assert.match(recipeProblem(saved, root) ?? '', /^app: `npm install` runs in web: use `npm install --no-package-lock`/)
+  assert.match(recipeProblem(saved, root)?.why ?? '', /^app: `npm install` runs in web: use `npm install --no-package-lock`/)
 })
 
 test('recipe (Bug 191): what is not an npm install is not caught', () => {
   const root = repo({ 'web/package.json': deps, 'npm/Makefile': '' }) // no lockfile: any npm install would be refused
-  for (const c of ['pnpm install', 'yarn install', 'bun install', 'echo npm install', 'cd npm && make', './npm-install.sh', 'npm run build', 'npm --prefix web run build',
+  for (const c of ['pnpm install', 'yarn install']) assert.doesNotMatch(lockfileProblem(c, root, root) ?? '', /package-lock|`npm /, c) // their own check (Bug 239)
+  for (const c of ['bun install', 'echo npm install', 'cd npm && make', './npm-install.sh', 'npm run build', 'npm --prefix web run build',
     'cd web && npm start', 'npx npm-check-updates', 'pip install -r requirements.txt'])
     assert.equal(lockfileProblem(c, root, root), null, c)
 })
@@ -324,10 +325,10 @@ test('recipe (Bug 211): a uv, yarn or pnpm install anywhere in the command is ch
   assert.match(err('cd $SRV && uv sync'), /HQ can't tell which folder of the repo `uv sync` runs in: use `uv sync --locked`, or give the part that folder as its dir/)
   assert.match(err('cd ../.. && yarn'), /HQ can't tell which folder/) // outside the repo
   assert.match(err('cd srever && uv sync'), /`uv sync` runs in srever: that folder doesn't exist/)
-  // what it must not catch: following the lockfile, a folder with no such lockfile, commands that aren't installs
+  // what it must not catch: following the lockfile, a folder with no uv project, commands that aren't installs (no lockfile: Bug 239's test)
   for (const ok of ['cd server && uv sync --locked', 'cd server && uv sync --frozen', 'UV_LOCKED=1 uv sync --directory server', 'cd $SRV && uv sync --locked',
-    'cd web && yarn install --frozen-lockfile', 'yarn --cwd web install --immutable', 'pnpm -C admin install --frozen-lockfile', 'uv sync', 'cd admin && yarn',
-    'cd web && pnpm install', 'cd server && uv run app.py', 'cd web && yarn build', "sh -c 'cd server && uv sync'", 'echo cd server && echo uv sync'])
+    'cd web && yarn install --frozen-lockfile', 'yarn --cwd web install --immutable', 'pnpm -C admin install --frozen-lockfile', 'uv sync',
+    'cd server && uv run app.py', 'cd web && yarn build', "sh -c 'cd server && uv sync'", 'echo cd server && echo uv sync'])
     assert.ok('recipe' in app(ok), ok)
   // its own folder, as before: no folder named in the words
   assert.match(lockfileProblem('uv sync', path.join(root, 'server'), root) ?? '', /^use `uv sync --locked`/)
@@ -337,7 +338,81 @@ test('recipe (Bug 211): a uv, yarn or pnpm install anywhere in the command is ch
     /^app: run has an install that would run on every start \(`uv sync`; put installs in install\): `uv sync` runs in server: use `uv sync --locked`/)
   assert.ok('recipe' in app('cd server && uv sync --locked', 'cd server && uv run app.py'))
   const part = { name: 'app', dir: '.', install: 'cd web && yarn', install_when: 'web/yarn.lock', run: 'cd web && yarn dev', port: 'auto' as const }
-  assert.match(recipeProblem({ parts: [part], show: 'app', worktree_files: [], notes: '' }, root) ?? '', /^app: `yarn` runs in web: use `yarn install --frozen-lockfile`/)
+  assert.match(recipeProblem({ parts: [part], show: 'app', worktree_files: [], notes: '' }, root)?.why ?? '', /^app: `yarn` runs in web: use `yarn install --frozen-lockfile`/)
+})
+
+test('recipe (Bug 239): with no lockfile, uv, yarn and pnpm installs must not write one', () => {
+  const root = repo({ 'server/pyproject.toml': '[project]\nname = "api"\n', 'web/package.json': deps, 'admin/package.json': deps, 'scripts/x.py': '' })
+  const app = (install: string, when: string, run = 'node x') => checkRecipe({ parts: [{ name: 'app', dir: '.', install, install_when: when, run, port: 'auto' }], show: 'app' }, root)
+  const err = (install: string, when = 'server/pyproject.toml', run?: string) => { const x = app(install, when, run); return 'error' in x ? x.error : '(accepted)' }
+  const uvBare = '`uv venv --allow-existing && uv pip install -r pyproject.toml` with install_when `pyproject.toml`, and `uv run --no-sync` to run it'
+  assert.equal(err('cd server && uv sync'), `app: \`uv sync\` runs in server: there is no uv.lock, and \`uv sync\` would write one into the user's project: use ${uvBare}`)
+  assert.match(err('cd server && uv sync --locked'), /there is no uv.lock for `uv sync --locked` to follow: use `uv venv --allow-existing /) // uv fails there
+  const uvInstall = 'cd server && uv venv --allow-existing && uv pip install -r pyproject.toml'
+  assert.equal(err(uvInstall, 'server/pyproject.toml', 'cd server && uv run app.py'), // a run writes one too: said as itself, not as an install on every start
+    'app: `uv run app.py` runs in server: there is no uv.lock, and `uv run app.py` would write one into the user\'s project: '
+    + 'use `uv run --no-sync` (install with `uv venv --allow-existing && uv pip install -r pyproject.toml`)')
+  assert.match(err(uvInstall, 'server/pyproject.toml', 'uv run --directory server app.py'), /^app: `uv run --directory server app.py` runs in server: there is no uv.lock.*: use `uv run --no-sync`/)
+  for (const run of ['cd server && uv run --no-sync app.py', 'cd server && UV_NO_SYNC=1 uv run app.py', 'cd server && uv run --no-project app.py',
+    'uv run scripts/x.py', 'cd scripts && uv run x.py', 'cd $SRV && uv run app.py', 'cd server && .venv/bin/python app.py'])
+    assert.ok('recipe' in app(uvInstall, 'server/pyproject.toml', run), run) // no project there (no pyproject.toml), or a run that writes nothing
+  assert.match(err(uvInstall, 'server/uv.lock', 'cd server && uv run --no-sync app.py'), // a file that isn't there: it would never install again
+    /^app: install_when must be a `pyproject.toml` with `uv pip install` \(there is no uv.lock to watch\)$/)
+  assert.match(err('cd web && yarn', 'web/package.json'),
+    /^app: `yarn` runs in web: there is no yarn.lock, and `yarn` would write one into the user's project: use `yarn install --pure-lockfile` with install_when `package.json` \(Yarn 1; /)
+  assert.match(err('cd web && yarn install --frozen-lockfile', 'web/package.json'), /there is no yarn.lock for `yarn install --frozen-lockfile` to follow: use `yarn install --pure-lockfile`/)
+  assert.match(err('cd admin && pnpm install', 'admin/package.json'),
+    /^app: `pnpm install` runs in admin: there is no pnpm-lock.yaml, and `pnpm install` would write one into the user's project: use `pnpm install --no-lockfile` with install_when `package.json`$/)
+  assert.match(err('pnpm -C admin i --frozen-lockfile', 'admin/package.json'), /no pnpm-lock.yaml for `pnpm -C admin i --frozen-lockfile` to follow/)
+  for (const [ok, when] of [['cd web && yarn install --pure-lockfile', 'web/package.json'], ['yarn --cwd web --no-lockfile', 'web/package.json'],
+    ['cd admin && pnpm install --no-lockfile', 'admin/package.json'], ['pnpm -C admin i --lockfile=false', 'admin/package.json']] as const)
+    assert.ok('recipe' in app(ok, when), ok)
+  assert.match(err('cd web && yarn install --pure-lockfile', 'web/yarn.lock'),
+    /runs in web: install_when must be a `package.json` with `yarn install --pure-lockfile` \(there is no lockfile to watch\)/)
+  assert.match(err('cd web && yarn && yarn dev', 'web/package.json'), /`yarn` runs in web: there is no yarn.lock.*: use `yarn install --pure-lockfile`/) // the first, not the run after it
+  // saved steps refused when they run, naming the lockfile they'd write (Bug 238)
+  const saved = (install: string): Recipe =>
+    ({ parts: [{ name: 'app', dir: 'server', install, install_when: 'uv.lock', run: 'uv run app.py', port: 'auto' }], show: 'app', worktree_files: [], notes: '' })
+  assert.deepEqual(recipeProblem(saved('uv sync'), root), { why: `app: there is no uv.lock, and \`uv sync\` would write one into the user's project: use ${uvBare}`, lock: 'uv.lock' })
+  assert.equal(recipeProblem(saved('uv venv --allow-existing && uv pip install -r pyproject.toml'), root)?.lock, 'uv.lock') // its run
+  assert.equal(recipeProblem({ ...saved(''), parts: [{ name: 'web', dir: 'web', install: 'yarn', install_when: 'package.json', run: 'yarn dev', port: 'auto' }] }, root)?.lock, 'yarn.lock')
+  assert.equal(recipeProblem({ ...saved(''), parts: [{ name: 'web', dir: 'web', install: 'npm i', install_when: 'package.json', run: 'npm start', port: 'auto' }] }, root)?.lock, 'package-lock.json')
+  assert.equal(refusedWords('uv.lock'), 'would write a uv.lock into the project, or not follow the one it has')
+  fs.writeFileSync(path.join(root, 'server', 'uv.lock'), 'x') // a lockfile now: the old advice, and `uv run` follows it
+  assert.equal(recipeProblem(saved('uv sync --locked'), root), null)
+  assert.match(recipeProblem(saved('uv sync'), root)?.why ?? '', /^app: use `uv sync --locked` \(there is a uv.lock\)$/)
+})
+
+test('recipe (Bug 240): uv, yarn and pnpm workspace members follow the lockfile at the workspace root', () => {
+  const toml = '[project]\nname = "root"\n\n[tool.uv.workspace]\nmembers = [\n  "packages/*",\n  \'libs/core/\',\n]\nexclude = ["packages/skip"]\n\n[tool.ruff]\nexclude = ["tools/*"]\n'
+  const root = repo({ 'pyproject.toml': toml,
+    'uv.lock': 'x', 'packages/api/pyproject.toml': '[project]\nname = "api"\n', 'packages/skip/pyproject.toml': '', 'libs/core/pyproject.toml': '', 'tools/x/pyproject.toml': '' })
+  const at = (d: string) => path.join(root, d)
+  for (const d of ['packages/api', 'packages/api/src', 'libs/core', '.']) {
+    if (!fs.existsSync(at(d))) fs.mkdirSync(at(d))
+    assert.match(lockfileProblem('uv sync', at(d), root) ?? '',
+      d === '.' ? /^use `uv sync --locked` \(there is a uv.lock\)$/ : /^use `uv sync --locked` \(there is a uv.lock at uv.lock, which this folder follows\)$/, d)
+    assert.equal(lockfileProblem('uv sync --locked', at(d), root), null, d); assert.equal(lockfileProblem('uv run app.py', at(d), root), null, d)
+  }
+  for (const d of ['packages/skip', 'tools/x']) // excluded, or not listed (another table's `exclude` doesn't count): a project of its own (uv 0.12.9 writes its own uv.lock)
+    assert.match(lockfileProblem('uv sync', at(d), root) ?? '', /there is no uv.lock, and `uv sync` would write one/, d)
+  assert.match(lockfileProblem('cd packages/api && uv sync', root, root) ?? '', /^`uv sync` runs in packages\/api: use `uv sync --locked` \(there is a uv.lock at uv.lock/) // the entry's case
+  assert.match(lockfileProblem('uv sync', at('packages/api'), at('packages')) ?? '', /there is no uv.lock/) // never above the checkout it's given
+
+  const yarn = repo({ 'package.json': JSON.stringify({ private: true, workspaces: ['packages/*'] }), 'yarn.lock': '', 'packages/a/package.json': deps, 'tools/x/package.json': deps })
+  assert.match(lockfileProblem('yarn', path.join(yarn, 'packages/a'), yarn) ?? '',
+    /^use `yarn install --frozen-lockfile` \(or --immutable\) \(there is a yarn.lock at yarn.lock, which this folder follows\)$/)
+  assert.equal(lockfileProblem('yarn install --frozen-lockfile', path.join(yarn, 'packages/a'), yarn), null)
+  assert.match(lockfileProblem('yarn', path.join(yarn, 'tools/x'), yarn) ?? '', /use `yarn install --pure-lockfile`/) // not a workspace: yarn 1 writes tools/x/yarn.lock
+
+  const pnpm = repo({ 'package.json': deps, 'pnpm-workspace.yaml': "packages:\n  - 'packages/*'\n", 'pnpm-lock.yaml': '', 'packages/a/package.json': deps, 'tools/x/package.json': deps })
+  for (const d of ['packages/a', 'tools/x']) { // pnpm takes the nearest pnpm-workspace.yaml as its workspace, listed or not (pnpm 9.15.9)
+    assert.match(lockfileProblem('pnpm install', path.join(pnpm, d), pnpm) ?? '',
+      /^use `pnpm install --frozen-lockfile` \(there is a pnpm-lock.yaml at pnpm-lock.yaml, which this folder follows\)$/, d)
+    assert.equal(lockfileProblem('pnpm install --frozen-lockfile', path.join(pnpm, d), pnpm), null, d)
+  }
+  const own = repo({ 'pnpm-workspace.yaml': '', 'pnpm-lock.yaml': '', 'packages/a/package.json': deps, 'packages/a/pnpm-lock.yaml': '' }) // its own (shared-workspace-lockfile=false)
+  assert.match(lockfileProblem('pnpm i', path.join(own, 'packages/a'), own) ?? '', /\(there is a pnpm-lock.yaml\)$/)
 })
 
 test('recipe (Bug 191): an npm install in the run command runs on every start, so it is checked too', () => {
@@ -350,7 +425,7 @@ test('recipe (Bug 191): an npm install in the run command runs on every start, s
   for (const ok of ['cd web && npm start', 'npm --prefix web run dev -- --port $PORT', 'cd web && npm install --no-package-lock && npm start', 'echo npm install; node web/server.js'])
     assert.ok('recipe' in app(ok), ok)
   const saved: Recipe = { parts: [{ name: 'app', dir: '.', run: 'cd web && npm i && npm start', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
-  assert.match(recipeProblem(saved, root) ?? '', /^app: run has an install/) // saved before this check: refused when it runs
+  assert.match(recipeProblem(saved, root)?.why ?? '', /^app: run has an install/) // saved before this check: refused when it runs
   fs.writeFileSync(path.join(root, 'web', 'package-lock.json'), '{}')
   assert.ok('recipe' in app('cd web && npm ci && npm start')) // follows the lockfile: slow on every start, but nothing written
   assert.match(err('cd web && npm install && npm start'), /`npm install` runs in web: use `npm ci`/)

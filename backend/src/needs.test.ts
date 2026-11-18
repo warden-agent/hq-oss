@@ -75,8 +75,9 @@ test('Bug 107: a test command engineers can\'t run counts for its project, shows
 })
 
 test('goodNews (Bug 61): finished and merged are green; anything that may need the user is not', () => {
-  for (const k of ['merged', 'conflicts_fixed', 'auto_finished:r1']) assert.equal(goodNews(k), true, k)
-  for (const k of ['auto_stopped:r1', 'auto_parked', 'message_for_user', 'blocked', 'dialog', 'repo_cleared:r1', 'backend_error']) assert.equal(goodNews(k), false, k)
+  for (const k of ['merged', 'conflicts_fixed', 'auto_finished:r1', 'repo_cleared:r1', 'repo_testsetup_ok:r1']) assert.equal(goodNews(k), true, k) // Bug 251
+  for (const k of ['auto_stopped:r1', 'auto_parked', 'message_for_user', 'blocked', 'dialog', 'backend_error',
+    'repo_cleared_left:r1', 'repo_clear_tpm:r1', 'repo_clear_failed:r1', 'repo_sync:r1', 'repo_testsetup:r1', 'repo_launch:r1']) assert.equal(goodNews(k), false, k)
 })
 
 test('newNeeds: nothing pops up on the first look (page load, reconnect); later only what is new', () => {
@@ -187,4 +188,13 @@ test('a plan on a project on auto waits for HQ\'s plan check, not for you: nothi
   assert.equal(hqAnswersPlan(on, { ticket_id: 'gone' }), false)
   const keys = (s: ReturnType<typeof state>) => needsYou(s, () => null).map((n) => n.key)
   assert.ok(keys(state()).includes('review:R-1')); assert.ok(!keys(on).includes('review:R-1'))
+})
+
+test('Bug 231: a plan on a project being cleared is nobody\'s turn (HQ refuses an answer); another project\'s plan still is', async () => {
+  const { clearingPlan } = await import('../../frontend/src/needs.ts')
+  const s = state(); s.repos[0] = { ...s.repos[0]!, clearing_at: 5 } as never; s.reviews.push({ id: 'R-9', ticket_id: 't3', status: 'open' })
+  assert.equal(clearingPlan(s, s.reviews[0]!), true); assert.equal(clearingPlan(s, { ticket_id: 't3' }), false); assert.equal(clearingPlan(s, { ticket_id: 'gone' }), false)
+  const keys = needsYou(s, () => null).map((n) => n.key)
+  assert.ok(!keys.includes('review:R-1')); assert.ok(keys.includes('review:R-9'))
+  assert.ok(needsYou(state(), () => null).some((n) => n.key === 'review:R-1')) // the same plan outside a Clear
 })

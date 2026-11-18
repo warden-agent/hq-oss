@@ -92,6 +92,53 @@ test('Bug 188, what it must not catch: a dialog still open stays, whatever hooks
   for (const x of [helper, other]) { assert.ok(await open(x), x.id); assert.equal((await events(x, 'dialog.still_open')).length + (await events(x, 'agent.dialog_cleared')).length, 0, x.id) }
 })
 
+// Bug 254: Escape or No on a dialog in its first ~6 s, before Claude Code's permission_prompt notification: no dialog notice is open, and the turn ends with no
+// Stop hook and a turn.complete that says isAborted false (real 2.1.322). The mod's turn.start says which turn it was, so HQ knows no Stop or prompt came since.
+const start = (a: any, turnId: string, helper: string | null = null) => hq.modEvent(a.id, { kind: 'turn.start', turnId, agentId: helper })
+const complete = (a: any, turnId: string, helper: string | null = null) =>
+  hq.modEvent(a.id, { kind: 'turn.complete', turnId, agentId: helper, isAborted: false, durationMs: 1500, answer: '' })
+const ask = (a: any, prompt: string) => hq.hook(a.id, { hook_event_name: 'UserPromptSubmit', prompt })
+const run = (a: any, command: string) => hq.hook(a.id, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, tool_use_id: `u${++n}` })
+
+test('Bug 254: Escape or No on a dialog before its notice: idle at once, no activity line; what it must not catch', async () => {
+  const esc = await tpm(), helper = await tpm(), raced = await tpm(), normal = await tpm(), older = await tpm()
+  for (const x of [esc, helper, raced, normal, older]) { await ask(x, 'go on'); await start(x, 'T1'); await run(x, 'touch one.txt') }
+  assert.deepEqual(await seen(esc), ['working', 'Running: touch one.txt', false])
+  await complete(esc, 'T1')
+  assert.deepEqual(await seen(esc), ['idle', null, false])
+  assert.equal(await open(esc), undefined, 'no notice was ever raised')
+  // a helper's turn starting and ending is not the agent's own: it stays working until its own turn ends
+  await start(helper, 'H1', 'a254'); await complete(helper, 'H1', 'a254'); await complete(helper, 'T1', 'a254')
+  assert.deepEqual(await seen(helper), ['working', 'Running: touch one.txt', false])
+  await complete(helper, 'T1'); assert.deepEqual(await seen(helper), ['idle', null, false])
+  // the message the mod had waiting goes in the moment the agent is idle, and its prompt can reach HQ before the turn.complete (same 0.1 s on 2.1.322)
+  await ask(raced, 'HQ message batch b-1:\nhello'); await complete(raced, 'T1')
+  assert.deepEqual(await seen(raced), ['working', 'Thinking', false])
+  await start(raced, 'T2'); await hq.hook(raced.id, { hook_event_name: 'Stop', last_assistant_message: 'hi' }); await complete(raced, 'T2')
+  assert.deepEqual(await seen(raced), ['idle', null, false])
+  // a turn that ends normally: its Stop comes first; the next turn's prompt may beat that turn's turn.complete too
+  await hq.hook(normal.id, { hook_event_name: 'Stop', last_assistant_message: 'done' }); await ask(normal, 'and one more thing'); await complete(normal, 'T1')
+  assert.deepEqual(await seen(normal), ['working', 'Thinking', false])
+  // the turn.complete of a turn that is no longer the latest one the mod said started
+  await start(older, 'T2'); await complete(older, 'T1')
+  assert.deepEqual(await seen(older), ['working', 'Running: touch one.txt', false])
+  // none known (the turn started before a restart, or the mod's turn.start was lost): as before, the screen check covers it
+  const unknown = await tpm(); await ask(unknown, 'go on'); await run(unknown, 'touch two.txt'); await complete(unknown, 'T9')
+  assert.deepEqual(await seen(unknown), ['working', 'Running: touch two.txt', false])
+})
+
+test('Bug 254: a helper of its own still running keeps it working after a quick Escape; a dialog notice already open is Bug 188\'s way', async () => {
+  const helped = await tpm(), d = 'Map the code'
+  await ask(helped, 'go on'); await start(helped, 'T1')
+  await hq.hook(helped.id, { hook_event_name: 'PostToolUse', tool_name: 'Agent', tool_input: { description: d }, tool_response: { isAsync: true, agentId: 'h254', description: d } })
+  await run(helped, 'touch one.txt'); await complete(helped, 'T1')
+  assert.deepEqual(await seen(helped), ['working', `Subagent: ${d}`, false])
+  await hq.hook(helped.id, { hook_event_name: 'SubagentStop', agent_id: 'h254' }); assert.deepEqual(await seen(helped), ['idle', null, false])
+  // after the notice: still blocked until HQ has seen the dialog gone, then idle (Bug 188)
+  const late = await tpm(); await atDialog(late); await start(late, 'T1'); await hq.session(late.id, 'idle'); await complete(late, 'T1')
+  await cleared(late); assert.deepEqual(await seen(late), ['idle', null, false])
+})
+
 // Bug 217: Escape (or an answer) on a dialog while the backend is down: the mod's turn.complete and the hooks go to no one, so HQ looks once at start-up at
 // every agent with a dialog notice open. The sweep is held off (HQ_STUCK_TICK_S), so only that look can clear one.
 test('Bug 217: a dialog that ended while HQ was down clears within seconds of the start; one still open stays', async () => {

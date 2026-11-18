@@ -131,15 +131,17 @@ test('GitHub on auto: a PR HQ opens for a finished ticket is told to the TPM as 
   assert.ok(!onAuto.some((b) => /The user (merges|opens|tries)/.test(b)), onAuto.join('\n'))
 })
 
-// What the fix must not catch: auto mode stopped (here at GitHub's refusal of the PR) leaves the merge to the user until Resume, as the board does (Bug 193).
+// What the fix must not catch: auto mode stopped (here at GitHub's refusal of the PR HQ opens to merge it) leaves the merge to the user until Resume, as the board does (Bug 193).
 test('GitHub on auto, stopped: the PR the watcher opens after a refusal is the user\'s to merge until Resume', async () => {
   const { repo, t, toTpm, tk } = await finishedByHand('ags')
   gh.write({ ...gh.read(), refuseCreate: 'Resource not accessible by integration' })
-  assert.equal((await hq.api(`tickets/${t.id}/make-pr`, {})).status, 409); assert.equal((await tk()).pr_state, 'not_opened')
+  const refused = await hq.api(`tickets/${t.id}/make-pr`, {}); assert.equal(refused.status, 409); assert.equal((await tk()).pr_state, 'not_opened')
+  assert.match(refused.json.error, /Create PR ↗ on its box opens GitHub's own form/) // the link the box now has (Bug 244)
+  assert.match((await tk()).pr_url, /compare/)
   assert.equal((await hq.api(`repos/${repo.id}/test-cmd`, { cmd: 'true' })).status, 200)
   assert.equal((await hq.api(`repos/${repo.id}/auto`, { on: true })).status, 200)
   const why = await waitFor('the stop', async () => (await hq.state()).repos.find((r: any) => r.id === repo.id).auto_stopped_why, 15_000)
-  assert.match(why, /couldn't open the PR/)
+  assert.match(why, /^HQ couldn't open a PR to merge/) // HQ's own try as it merges, not the refused Make PR's notice (Bug 247)
   gh.write({ ...gh.read(), refuseCreate: undefined })
   await hq.api(`repos/${repo.id}/sync`, {}) // repo.synced: the watcher tries the PR again
   const x = await waitFor('the PR', async () => { const y = await tk(); return y?.status === 'pr_open' && y }, 15_000)
@@ -148,4 +150,39 @@ test('GitHub on auto, stopped: the PR the watcher opens after a refusal is the u
   assert.equal((await hq.api(`repos/${repo.id}/auto-resume`, {})).status, 200)
   await waitFor('the merge after Resume', async () => (await tk())?.status === 'merged', 20_000)
   assert.deepEqual(gh.read().merged, [x.pr_number])
+})
+
+// Bug 247: a Make PR GitHub refused left its notice open, and auto mode stopped on that notice at once, again after every Resume, until the PR was opened: HQ never
+// looked again. On auto HQ opens the PR itself as it merges, so the old notice stops nothing: HQ's own try does, with GitHub's reason, and each Resume tries again.
+test('Bug 247: a refused Make PR doesn\'t stop auto mode by itself; HQ\'s own try does, and Resume tries again', async () => {
+  const { repo, t, tk } = await finishedByHand('agq')
+  gh.write({ ...gh.read(), refuseCreate: 'Resource not accessible by integration' })
+  assert.equal((await hq.api(`tickets/${t.id}/make-pr`, {})).status, 409); assert.equal((await tk()).pr_state, 'not_opened')
+  const tries = () => fs.readFileSync(`${state}.log`, 'utf8').split('\n').filter((l) => l.includes('"POST"') && l.includes('/pulls"')).length, made = tries()
+  const stopped = () => waitFor('the stop', async () => (await hq.state()).repos.find((r: any) => r.id === repo.id).auto_stopped_why, 20_000)
+  assert.equal((await hq.api(`repos/${repo.id}/test-cmd`, { cmd: 'true' })).status, 200)
+  assert.equal((await hq.api(`repos/${repo.id}/auto`, { on: true })).status, 200)
+  assert.match(await stopped(), new RegExp(`^HQ couldn't open a PR to merge ${t.key}: .*can't open PRs on e2e/agq`), 'HQ tried, and says GitHub\'s reason')
+  assert.equal(tries(), made + 1, 'HQ itself asked GitHub for the PR')
+  assert.equal((await hq.api(`repos/${repo.id}/auto-resume`, {})).status, 200) // GitHub still refuses: HQ looks again, and stops again
+  await waitFor('a second try', async () => tries() === made + 2, 20_000); assert.match(await stopped(), /can't open PRs/)
+  gh.write({ ...gh.read(), refuseCreate: undefined })
+  assert.equal((await hq.api(`repos/${repo.id}/auto-resume`, {})).status, 200) // at once, before the watcher's next look
+  await waitFor('the merge after Resume', async () => (await tk())?.status === 'merged', 20_000)
+  assert.equal(gh.read().merged.length, 1)
+  assert.ok(!(await hq.state()).attention.some((a: any) => a.ticket_id === t.id && a.kind === 'pr_failed' && !a.resolved_at), 'the old notice went with the merge')
+})
+// What the notice tells the user to do: open the PR by hand with its link. HQ's own tries are still refused; Resume merges the PR the user opened.
+test('Bug 247: a PR the user opened by hand after a refused Make PR is merged after Resume, though GitHub still refuses HQ\'s own', async () => {
+  const { repo, t, tk } = await finishedByHand('agh2')
+  gh.write({ ...gh.read(), refuseCreate: 'Resource not accessible by integration' })
+  assert.equal((await hq.api(`tickets/${t.id}/make-pr`, {})).status, 409)
+  assert.equal((await hq.api(`repos/${repo.id}/test-cmd`, { cmd: 'true' })).status, 200)
+  assert.equal((await hq.api(`repos/${repo.id}/auto`, { on: true })).status, 200)
+  await waitFor('the stop', async () => (await hq.state()).repos.find((r: any) => r.id === repo.id).auto_stopped_why, 20_000)
+  const s = gh.read(), branch = (await tk()).branch
+  gh.write({ ...s, prs: { ...s.prs, [branch]: [{ number: 41, url: 'https://github.com/e2e/agh2/pull/41', state: 'OPEN', mergeable: 'MERGEABLE' }] } })
+  assert.equal((await hq.api(`repos/${repo.id}/auto-resume`, {})).status, 200)
+  await waitFor('the merge after Resume', async () => (await tk())?.status === 'merged', 20_000)
+  assert.deepEqual([(await tk()).pr_number, gh.read().merged], [41, [41]], 'HQ merged the PR the user opened')
 })

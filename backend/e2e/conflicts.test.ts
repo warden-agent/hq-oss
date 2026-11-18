@@ -171,3 +171,22 @@ test('Bug 9: fixed by hand before the click starts nothing; cancelling a resolvi
   assert.equal((await hq.state()).attention.filter((a: any) => a.ticket_id === t3.id).length, 0)
   assert.equal((await fix(t3)).status, 409) // nothing to fix on a cancelled ticket
 })
+
+test("Bug 243: a TPM started after the conflict reads it on its board: which files, who merged first, and the user's Fix conflicts", async () => {
+  const { dir, f } = await setup('c4')
+  await hq.api('settings', { key: 'concurrency_cap', value: 10 })
+  const t1 = await ticket(f, 'Orders'), t2 = await ticket(f, 'Invoices')
+  await launch(t1); await launch(t2); const e1 = await liveEngineer(t1), e2 = await liveEngineer(t2)
+  await finish(e1, wtOf(dir, t1), 'v1\norders\n'); await finish(e2, wtOf(dir, t2), 'v1\ninvoices\n')
+  assert.equal((await merge(t1)).status, 200)
+  await waitFor('T-02 flagged', async () => (await tk(t2)).conflict_files === '["version.txt"]')
+  const repoId = (await hq.state()).features.find((x: any) => x.id === f.id).repo_id, tpm = f.tpm_agent_id
+  const st = async (id: string) => (await hq.state()).agents.find((a: any) => a.id === id)?.status
+  await hq.api(`agents/${tpm}/stop`, {}); await waitFor('the TPM to stop', async () => (await st(tpm)) === 'exited')
+  const back = await hq.api(`repos/${repoId}/message`, { body: 'where are we?' }); assert.equal(back.status, 200, JSON.stringify(back.json))
+  const p = prompt(back.json.agent.id)
+  assert.match(p, /- T-02 \(S\) Invoices: finished, but it conflicts with main in version\.txt \(T-01 merged first\); the user presses Fix conflicts in HQ, and its engineer/)
+  assert.doesNotMatch(p, /T-02 [^\n]*waits for the user to merge it/)
+  assert.equal((await hq.api(`tickets/${t2.id}/fix-conflicts`, {})).status, 200) // what the words point to works
+  await waitFor('T-02 back with its engineer', async () => (await tk(t2)).status === 'resolving')
+})

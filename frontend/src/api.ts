@@ -79,17 +79,27 @@ export const onDialog = (a: Agent): boolean => a.status === 'paused' || (a.statu
 /** What an agent is doing, in words. */
 /** Bug 148: idle because its turn was stopped by Escape in its terminal (no turn has ended normally since): the backend's `interrupted_at`. */
 export const interrupted = (a: Agent): boolean => a.status === 'idle' && !!a.interrupted_at
-export const agentWord = (a: Agent): string => apiErrored(a) ? 'stopped by an API error' : interrupted(a) ? 'interrupted' : ({ working: 'working', idle: 'idle', plan_review: 'waiting for your review',
+export const agentWord = (a: Agent): string => apiErrored(a) ? 'stopped by an API error' : interrupted(a) ? 'interrupted' : ({ working: 'working', idle: 'idle', plan_review: 'at the plan gate',
   blocked: 'waiting on a dialog', paused: 'paused', launching: 'starting', exited: 'stopped' } as Record<string, string>)[a.status] ?? a.status
 /** Bug 179: the hooks' activity line ("Thinking", "Running: …") while it means something. On a dialog, a usage pause or at the plan gate (Bug 216) it is
  *  what the agent did before that came, so it is not shown; it is kept, and comes back once the agent works again (the dialog answered, the next hook). */
 export const liveActivity = (a: Agent): string | null => !onDialog(a) && a.status !== 'plan_review' && a.activity ? String(a.activity) : null
 type PlanState = Pick<State, 'repos' | 'features' | 'tickets' | 'reviews'>
+/** Bug 234: an engineer still at the plan gate whose review has closed. Its status moves on at its next step (a plan sent back leaves it at the gate
+ *  until then), so nobody is waited on: it says what the newest review's answer was, on auto and in manual alike. */
+const SENT_BACK = ['revise', 'user_architect']
+export function planAnswered(s: Pick<State, 'reviews'>, ticketId: string): { text: string; pill: string } {
+  const last = s.reviews.filter((r) => r.ticket_id === ticketId).reduce((a: any, r: any) => (!a || r.round > a.round ? r : a), null)
+  return SENT_BACK.includes(last?.closed_reason) ? { text: 'its plan was sent back · it is revising it', pill: 'revising plan' }
+    : { text: 'its plan was answered · it carries on', pill: 'plan answered' }
+}
 /** Bug 216: whom a plan held at the gate waits on, in its ticket box's words. On auto HQ's plan check answers it (`hq`; `since`: the check is reading it now).
- *  `review`: the ticket's open review; none (closed while the agent's status hasn't caught up) still says whom. */
-export function planWait(s: PlanState, ticketId: string, review: { round: number; plan_check?: unknown } | null): { text: string; hq: boolean; since: number | null } {
-  if (!hqAnswersPlan(s, { ticket_id: ticketId })) return { text: review ? `Plan R-${review.round} waiting for you` : 'its plan waits for your review', hq: false, since: null }
-  const c = review ? planCheckOf(review.plan_check) : null
+ *  `review`: the ticket's open review; none means it closed while the agent's status hasn't caught up (`closed`: it waits on nobody, Bug 234). */
+export function planWait(s: PlanState, ticketId: string, review: { round: number; plan_check?: unknown } | null)
+  : { text: string; hq: boolean; since: number | null; closed?: boolean } {
+  if (!review) return { text: planAnswered(s, ticketId).text, hq: false, since: null, closed: true }
+  if (!hqAnswersPlan(s, { ticket_id: ticketId })) return { text: `Plan R-${review.round} waiting for you`, hq: false, since: null }
+  const c = planCheckOf(review.plan_check)
   return c?.state === 'checking' ? { text: 'HQ is checking its plan against its criteria', hq: true, since: c.since } : { text: "its plan waits for HQ's check", hq: true, since: null }
 }
 /** planWait for an agent at the plan gate: its ticket's open review. */
@@ -98,9 +108,13 @@ export const agentPlanWait = (a: Agent, s: PlanState) => planWait(s, String(a.ti
  *  (Bug 216); else its activity line. A usage pause says nothing here: its pill says "paused". */
 export const menuActivity = (a: Agent, s: PlanState): string | null => a.status === 'blocked' && onDialog(a) ? `${agentWord(a)} in its terminal`
   : a.status === 'plan_review' ? agentPlanWait(a, s).text : liveActivity(a)
+/** Bug 234: the status an agent's pill and box border are coloured by. At the gate with its review closed it is at work on the answer, not waiting on
+ *  anyone: coloured as working, not in the plan gate's amber ("for you"). */
+export const shownStatus = (a: Agent, s: PlanState): string => a.status === 'plan_review' && agentPlanWait(a, s).closed ? 'working' : a.status
+const gatePill = (a: Agent, s: PlanState): string => { const w = agentPlanWait(a, s); return w.closed ? planAnswered(s, String(a.ticket_id ?? '')).pill : w.hq ? 'plan check' : 'plan for you' }
 /** Bug 216: an agent's status pill, in words (the status itself is the pill's colour): never a raw status word such as `plan_review`. At the plan gate it reads
  *  as its ticket's pill does. */
-export const agentPill = (a: Agent, s: PlanState): string => apiErrored(a) ? 'API error' : a.status === 'plan_review' ? (agentPlanWait(a, s).hq ? 'plan check' : 'plan for you')
+export const agentPill = (a: Agent, s: PlanState): string => apiErrored(a) ? 'API error' : a.status === 'plan_review' ? gatePill(a, s)
   : ({ blocked: 'on a dialog', launching: 'starting' } as Record<string, string>)[a.status] ?? a.status
 /** A newer agent has its place: the same ticket's engineer, or the same project's TPM. */
 const replaced = (a: Agent, s: Pick<State, 'agents'>): boolean => s.agents.some((x) => x.id !== a.id && x.role === a.role && (x.started_at ?? 0) > (a.started_at ?? 0)

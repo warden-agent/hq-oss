@@ -12,14 +12,15 @@ import type { TicketStatus } from './readiness.ts'
 import { getAgent, launchAgent, liveAgents, stopAgent, type Agent } from './agents.ts'
 import { pendingFor, sendMessage, type Message } from './delivery.ts'
 import { modelFor } from './roles.ts'
-import { autoOn, closedWhy, features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTicket, sweepNotices, ticketInRepo, tickets, type Feature, type Fixing, type Ticket }
+import { autoGoing, closedWhy, features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTicket, sweepNotices, ticketInRepo, tickets, type Feature, type Fixing, type Ticket }
   from './records.ts'
 import { ensureFresh, git } from './repos.ts'
 import { nextWorkerSlot, releaseSlot } from './slots.ts'
+import { portsNote } from './slotports.ts'
 import { mergedPart, tellTpm } from './mergewatch.ts'
 import { engineerResumePrompt, type LateCommits } from './handover.ts'
 import { handOver, keepFirstRequest, messageTpm, tpmStarting } from './tpm.ts'
-import { writeFeatureMd, writeProjectMd } from './projectmd.ts'
+import { writeFeatureMd } from './projectmd.ts'
 import { gitFacts, readNote } from './notes.ts'
 import { changeText, clearConflict, clearStalled, fixConflictsText, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, testsFailed, whoMergedFirst }
   from './conflicts.ts'
@@ -158,10 +159,11 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolea
   const prompt = opts.fix ? opts.fix(wtPath) : opts.resume ? await opts.resume.prompt(wtPath)
     : `Ticket ${t.key} (${t.size}): ${t.title}\nFeature: ${f.title}\nBranch: ${branch} (your worktree: ${wtPath})\nExpected files: ${t.expected_files}\nDepends on: ${t.deps}\n\n`
       + `## Spec\n${spec}\n${criteriaBlock(criteriaOf(cur))}\nStart by calling get_ticket, explore the code, write your plan, and call ExitPlanMode.`
-  const slot = nextWorkerSlot(`pending-${t.id}`) // a fix runs on the S model below: no plan, so no opusplan plan→exec switch
+  const slot = await nextWorkerSlot(`pending-${t.id}`) // a fix runs on the S model below: no plan, so no opusplan plan→exec switch
   const tests = repo.test_cmd && !t.repairs_main ? `\n\n${testCmdNote(repo.test_cmd)}` : '' // a repair's spec has the command: it's the one that failed
+  const ports = `\n\n${portsNote(slot.env)}` // Bug 259: its own, not another HQ's
   const a = await launchAgent({
-    role: 'engineer', repoId: f.repo_id, featureId: f.id, ticketId: t.id, model: modelFor('engineer', opts.fix || opts.resume?.status === 'resolving' ? 'S' : t.size), cwd: repo.path, displayName: `eng ${t.key}`, launchPrompt: prompt + tests,
+    role: 'engineer', repoId: f.repo_id, featureId: f.id, ticketId: t.id, model: modelFor('engineer', opts.fix || opts.resume?.status === 'resolving' ? 'S' : t.size), cwd: repo.path, displayName: `eng ${t.key}`, launchPrompt: prompt + tests + ports,
     worktreeName: wtName, size: t.size, repoAllowlist: j<string[]>(repo.network_allowlist, []), editOverrides: j<string[]>(t.edit_overrides, []), extraEnv: slot.env,
     permissionMode: opts.fix ? 'acceptEdits' : opts.resume?.mode ?? 'plan',
   }).catch((e) => { releaseSlot(`pending-${t.id}`); throw e })
@@ -433,7 +435,7 @@ export async function cancelFeature(featureId: string): Promise<{ tickets: strin
     const r = await cancelTicket(t.id, { tell: false }); done.push(r.key); if (r.stopped) stopped.push(r.stopped)
   }
   run("UPDATE features SET status = 'cancelled', updated_at = ? WHERE id = ?", now(), f.id); patch('feature', f.id, { status: 'cancelled' }); closeAsks(f.id)
-  writeProjectMd(f.repo_id); sweepNotices()
+  writeFeatureMd(getFeature(f.id)!); sweepNotices() // its file says "cancelled" now, and PROJECT.md drops it (Bug 250)
   tellTpm(f, `HQ: The user cancelled feature ${f.handle ?? ''} "${f.title}"${done.length ? `: ${listKeys(done)} ${done.length === 1 ? 'is' : 'are'} cancelled` : ''}. Don't add to it.`)
   emit({ agentId: null, source: 'ui', kind: 'feature.cancelled', payload: { feature: f.id, tickets: done, stopped } })
   return { tickets: done, stopped }
@@ -483,7 +485,7 @@ function tellStarted(repoId: string, started: Started[]): void {
   const head = one1 ? `HQ: engineer ${one1.id} started on ${one1.t.key} (branch ${one1.t.branch}). Address messages for this ticket to id ${one1.id}.`
     : `HQ: ${rows.length} engineers started, one per ticket: ${rows.map((r) => `${r.id} on ${r.t.key} (branch ${r.t.branch})`).join(', ')}. `
       + 'Address messages for a ticket to its engineer\'s id.'
-  const many = waiting.length > 1, auto = autoOn(repoId)
+  const r = getRepo(repoId), many = waiting.length > 1, auto = !!r && autoGoing(r) // stopped, the go-ahead came from the user's Start (Bug 246)
   const how = `${many ? 'have' : 'has'} ${auto ? 'the go-ahead' : 'the user\'s go-ahead'} too and `
     + (many ? 'start by themselves as engineer slots free' : 'starts by itself when an engineer slot frees')
   const rest = waiting.length ? ` ${listKeys(waiting)} ${how} up${auto ? '.' : ': there is nothing for the user to click.'}` : ''

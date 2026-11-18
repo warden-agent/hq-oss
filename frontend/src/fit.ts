@@ -19,28 +19,36 @@ const bounds = (bs: Box[]) => {
 
 /** How far, in pane pixels, a box the view is moved to show whole keeps from the board's edge. */
 const EDGE = 8
+/** Bug 258: a board pane narrower than this (820 px with the panel open, the narrowest of the 1440/1100/820 sweep; less with an app
+ *  pane docked right or a smaller window) can't show a two-column feature at READABLE without cutting its far column. There the floor
+ *  gives way in step with the pane, so what fits this wide fits in any narrower pane, just smaller (pinch or + zooms in to read). */
+export const NARROW = 414
+/** The board's own zoom limit (ReactFlow's minZoom): the floor never gives way below it. */
+export const LOWEST = 0.25
+/** The lowest zoom the view zooms out to in a `w` px wide pane: READABLE, less below NARROW px (Bug 258). */
+export const floorAt = (w: number) => w >= NARROW ? READABLE : Math.max(LOWEST, (READABLE * (w - 2 * EDGE)) / (NARROW - 2 * EDGE))
 
 /** The view for a `w`×`h` pane. `sets` lists which boxes to show, widest first (everything, then less; buildBoard makes it).
- *  The first set that fits at a readable zoom is shown whole and centred (with less room around it than PAD if that's what keeps it
- *  readable, down to EDGE). When none does, the last one is shown at READABLE:
+ *  The first set that fits at a readable zoom (floorAt: READABLE, less in a pane under NARROW px) is shown whole and centred (with less
+ *  room around it than PAD if that's what keeps it readable, down to EDGE). When none does, the last one is shown at that floor:
  *  centred along a side where it fits, else from its left or top edge (the rest is a pan away), never cut on both sides.
  *  Then (Bug 227) the view is moved, as little as it takes and never so far that the set stops being whole (or its start leaves
  *  the view), so that no box is cut by the board's edge: a box left out sits whole inside or wholly past the edge, a pan away.
  *  Null while the pane has no size yet or no set names a box on the board. */
 export function placeView(boxes: Box[], sets: string[][], w: number, h: number): View | null {
   if (!(w > 0 && h > 0)) return null
-  const byId = new Map(boxes.map((b) => [b.id, b])), room = { w: w / (1 + PAD), h: h / (1 + PAD) }
+  const byId = new Map(boxes.map((b) => [b.id, b])), room = { w: w / (1 + PAD), h: h / (1 + PAD) }, floor = floorAt(w)
   let last: ReturnType<typeof bounds> | null = null, view: View | null = null
   for (const set of sets) {
     const bs = set.flatMap((id) => byId.get(id) ?? []); if (!bs.length) continue
     last = bounds(bs)
     // The PAD margin, unless that makes it unreadable when a thinner one (EDGE) wouldn't (Bug 227: then the margin gives way, not the set)
     const zPad = Math.min(MAX_ZOOM, room.w / last.w, room.h / last.h), zEdge = Math.min(MAX_ZOOM, (w - 2 * EDGE) / last.w, (h - 2 * EDGE) / last.h)
-    const zoom = Math.min(zEdge, Math.max(zPad, READABLE))
-    if (zoom >= READABLE) { view = { x: w / 2 - (last.x + last.w / 2) * zoom, y: h / 2 - (last.y + last.h / 2) * zoom, zoom }; break }
+    const zoom = Math.min(zEdge, Math.max(zPad, READABLE)) // in a narrow pane it can be under READABLE, down to the floor (Bug 258)
+    if (zoom >= floor) { view = { x: w / 2 - (last.x + last.w / 2) * zoom, y: h / 2 - (last.y + last.h / 2) * zoom, zoom }; break }
   }
   if (!last) return null
-  const z = view?.zoom ?? READABLE, b = last
+  const z = view?.zoom ?? floor, b = last
   const along = (pane: number, space: number, start: number, size: number) => // pane and space in pixels, start and size on the board
     size * z <= space ? pane / 2 - (start + size / 2) * z : (pane - space) / 2 - start * z // fits: centred; else its start edge at the margin
   view ??= { x: along(w, room.w, b.x, b.w), y: along(h, room.h, b.y, b.h), zoom: z }
@@ -59,7 +67,7 @@ const crosses = (start: number, size: number, at: number, pane: number, z: numbe
  *  Where every place cuts a box, the fewest cut at the start edge win, then at the far edge; then the place showing the most
  *  boxes whole; then the one nearest `at`. */
 function clear(at: number, pane: number, z: number, start: number, size: number, spans: (readonly [number, number, boolean])[]): number {
-  const e = EDGE, fits = size * z <= pane - 2 * e
+  const e = EDGE, fits = size * z <= pane - 2 * e + 0.01 // a set zoomed to fit exactly (Bug 258) fits, float error or not
   const ok = (p: number) => p === at || (fits ? p + start * z >= e - 0.01 && p + (start + size) * z <= pane - e + 0.01
     : p + start * z >= e - 0.01 && p + start * z <= pane / 2)
   const tries = [at, ...spans.flatMap(([a, c]) => [e - a * z, -c * z, pane - e - c * z, pane - a * z])].filter(ok)
