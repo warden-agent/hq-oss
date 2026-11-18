@@ -167,6 +167,17 @@ CREATE INDEX auto_runs_repo ON auto_runs(repo_id, started_at);`,
 // Bug 122: why an agent ended, in HQ's words: the reason HQ stopped it (stopAgent's `reason`: 'fresh_start', 'finished', 'user', …), 'lost' when its process
 // went without HQ stopping it, or 'session:<Claude Code's reason>' when its session ended by itself. The Agents menu says it beside the time it ended.
 `ALTER TABLE agents ADD COLUMN ended_why TEXT;`,
+// Acceptance criteria as a list HQ can check (JSON, criteria.ts Criterion[]; '[]' on tickets from before, and on HQ's own repairs), and a finished ticket's
+// record: the test its open_pr named for each one, what git flagged, and how each named test did in HQ's own run (JSON, criteria.ts Proof).
+`ALTER TABLE tickets ADD COLUMN criteria TEXT NOT NULL DEFAULT '[]'; ALTER TABLE tickets ADD COLUMN proof TEXT;`,
+// Auto mode's two readers (checker.ts). How the check of a plan went, kept with the plan (JSON, plancheck.ts PlanCheck), and how the check of a finished
+// ticket's changes went, kept with the ticket (JSON, diffcheck.ts DiffCheck). NULL: never checked.
+`ALTER TABLE plan_revisions ADD COLUMN check_result TEXT; ALTER TABLE tickets ADD COLUMN diff_check TEXT;`,
+// What the tester tried in a browser as an auto run ended, and what it found (JSON, testerrules.ts Tried[]). NULL: nothing was tried.
+`ALTER TABLE auto_runs ADD COLUMN tried TEXT;`,
+// The UI tester at the end of an auto run (uitester.ts): what it did and found (JSON, uitesterrules.ts UiTest; NULL: not yet), and a project's own switch
+// for it ('off'; NULL follows HQ's setting).
+`ALTER TABLE auto_runs ADD COLUMN ui_test TEXT; ALTER TABLE repos ADD COLUMN ui_test TEXT;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

@@ -56,6 +56,11 @@ test('Bug 84: an engineer taking over a ticket sent back says what it was fixing
     board: [{ f: { title: 'Totals', handle: 'F-1' } as never, tickets: [t(fixing)] }] })
   assert.match(board(null), /UI-3 \(S\) Totals: its engineer is fixing its conflicts with main/)
   assert.match(board('tests'), /UI-3 \(S\) Totals: its engineer is fixing its tests on main/)
+  // what HQ saw when it opened the app is not a test failure, to the next engineer or to the TPM
+  assert.match(brief('look'), /It was fixing what went wrong when HQ opened the app with it on main;/); assert.doesNotMatch(brief('look'), /conflict|its tests/)
+  assert.match(board('look'), /UI-3 \(S\) Totals: its engineer is fixing what went wrong when HQ opened the app with it on main/)
+  assert.match(brief('review'), /It was fixing what a fresh reader of its changes found;/); assert.doesNotMatch(brief('review'), /conflict|its tests/)
+  assert.match(board('review'), /UI-3 \(S\) Totals: its engineer is fixing what a fresh reader of its changes found/)
   assert.match(board('changes'), /UI-3 \(S\) Totals: its engineer is building the change to its spec/)
 })
 

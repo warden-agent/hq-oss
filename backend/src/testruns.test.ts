@@ -56,3 +56,17 @@ test('Bug 126: a finished feature, its tickets folded away, says what HQ ran on 
   assert.equal(line(null, null), null, 'no record of any: nothing said')
   assert.match(featureTestsLine([{ key: 'T-10', merge_test: null }, { key: 'T-9', merge_test: null }, { key: 'T-2', merge_test: pass }])!.tip, /^T-2: .*\nT-9: .*\nT-10: /, 'in key order, as numbers')
 })
+
+test('HQ\'s look at the app is the same run a step on: the box and the bar say it is opening the app, with the ticket or on main without it', () => {
+  const words = (what: 'look' | 'look_main', state: 'running' | 'waiting', key: string | null = 'SHOP-2') => runWords({ what, state }, key, 'main')
+  assert.deepEqual(words('look', 'running'), { box: 'tests passed · HQ is opening the app', bar: 'HQ is opening the app with SHOP-2 merged in' })
+  assert.deepEqual(words('look', 'waiting'), { box: "HQ's look at the app is waiting its turn", bar: "HQ's look at the app with SHOP-2 is waiting its turn" })
+  assert.deepEqual(words('look_main', 'running'), { box: 'HQ is opening the app on main without it', bar: 'HQ is opening the app on main without SHOP-2' })
+  assert.deepEqual(words('look_main', 'waiting', null), { box: "HQ's look at main without it is waiting its turn", bar: "HQ's look at main is waiting its turn" })
+  for (const w of [words('look', 'running'), words('look_main', 'running')]) assert.doesNotMatch(`${w.box} ${w.bar}`, /testing|tests failed/) // its tests passed
+  assert.deepEqual(runWords({ what: 'review', state: 'running' }, 'SHOP-2', 'main'), { box: 'tests passed · a fresh reader has its changes', bar: "A fresh reader has SHOP-2's changes" })
+  assert.equal(runWords({ what: 'review', state: 'running' }, null, 'main').bar, "A fresh reader has a ticket's changes")
+  // the tester has no ticket: the whole run's work, as it ends
+  assert.equal(runWords({ what: 'tester', state: 'running' }, null, 'main').bar, "HQ's tester is using the app in a browser, as a person would")
+  assert.equal(runWords({ what: 'tester', state: 'waiting' }, null, 'main').bar, "HQ's tester is waiting its turn")
+})

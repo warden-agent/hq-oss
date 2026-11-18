@@ -11,6 +11,7 @@ import { agentDir, liveAgents, stopAgent, update } from './agents.ts'
 import { autoSettled } from './auto.ts'
 import { archive, deleteRepoRows, deleteRows, inList, startingNow, startingWhy, unfinished } from './clear.ts'
 import { fallbackNote } from './freshstart.ts'
+import { stopFirstMap } from './firstmap.ts'
 import { finish, sweepStrays } from './launchhelper.ts'
 import { inMergeQueue } from './mergewatch.ts'
 import { noteScope, readNote, saveNote } from './notes.ts'
@@ -51,6 +52,7 @@ export async function removeRepo(repoId: string, landing: string | null = null):
     })
     patch('repo', repoId, { auto_mode: 0, auto_stopped_why: null, auto_waiting: null })
     await stopPreview(repoId).catch(() => {}) // also waits for a start or stop already under way
+    stopFirstMap(repoId) // its checkout goes with the test worktrees below
     const p = row(repoId); if (p?.helper_agent_id || p?.helper_worktree) await finish(repoId, null, null).catch(() => {}) // only HQ's own scratch worktree goes
     await sweepStrays(repo).catch(() => {})
     await sweepTestWorktrees(repo.path).catch(() => {})

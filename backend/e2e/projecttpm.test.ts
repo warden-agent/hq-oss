@@ -21,7 +21,11 @@ async function merged(dir: string, t: any) {
   const e = (await hq.api(`tickets/${t.id}/launch`, {})).json
   await waitFor('the engineer', async () => (await status(e.id)) === 'working')
   const wt = path.join(dir, '.claude', 'worktrees', t.key); fs.writeFileSync(path.join(wt, `${t.key}.txt`), 'x'); sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', t.title)
-  await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: t.title }); await hq.mcp(e.id, 'open_pr', { title: t.title, body: `${t.title}\n\n## Deviations from approved plan\nNone` })
+  await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: t.title })
+  // the TPM gave it criteria (create_ticket insists), so open_pr wants something for each: this engineer writes no tests, and says so
+  const tests = JSON.parse(t.criteria).map((c: any) => ({ criterion: c.id, cant_test: 'This page is one line of text: there is nothing here to run a test with.' }))
+  const done = await hq.mcp(e.id, 'open_pr', { title: t.title, body: `${t.title}\n\n## Deviations from approved plan\nNone`, tests, feature_map_unchanged: true })
+  assert.equal(done.isError, false, done.text)
   assert.equal((await hq.api(`tickets/${t.id}/merge`, {})).status, 200)
 }
 
@@ -39,8 +43,9 @@ test('Bug 52: the TPM box starts the project\'s TPM; it makes features itself, s
   // The TPM makes the feature and its tickets
   const sf = await hq.mcp(tpm, 'start_feature', { title: 'Hello page', request: 'I want a page that says hello' })
   assert.equal(sf.text, 'Started F-1 "Hello page". Add its tickets with create_ticket(feature: "F-1").')
-  assert.equal((await hq.mcp(tpm, 'create_ticket', { title: 'Say hello', size: 'S', spec: 'hello' })).text, 'Created T-01 in F-1: Say hello') // the only open feature
-  assert.match((await hq.mcp(tpm, 'create_ticket', { feature: 'F-9', title: 'x', size: 'S', spec: 'x' })).text, /There's no feature F-9/)
+  const C = { criteria: [{ kind: 'ui', text: 'The page says hello.' }] }
+  assert.equal((await hq.mcp(tpm, 'create_ticket', { title: 'Say hello', size: 'S', spec: 'hello', ...C })).text, 'Created T-01 in F-1: Say hello (criteria A1)') // the only open feature
+  assert.match((await hq.mcp(tpm, 'create_ticket', { feature: 'F-9', title: 'x', size: 'S', spec: 'x', ...C })).text, /There's no feature F-9/)
   const t1 = (await state()).tickets.find((t: any) => t.key === 'T-01')
   await merged(dir, t1)
   await hq.hook(tpm, { hook_event_name: 'Stop', last_assistant_message: 'All set.' })
@@ -52,8 +57,8 @@ test('Bug 52: the TPM box starts the project\'s TPM; it makes features itself, s
   const next = await hq.api(`repos/${repo.id}/message`, { body: 'now add a dark mode switch' })
   assert.equal(next.json.agent.id, tpm); assert.equal(next.json.message.delivered_at, null) // the mod delivers it
   assert.equal((await hq.mcp(tpm, 'start_feature', { title: 'Dark mode', request: 'now add a dark mode switch' })).text.slice(0, 10), 'Started F-')
-  assert.equal((await hq.mcp(tpm, 'create_ticket', { feature: 'F-2', title: 'Switch', size: 'S', spec: 'x' })).text, 'Created T-02 in F-2: Switch')
-  assert.match((await hq.mcp(tpm, 'create_ticket', { title: 'Which?', size: 'S', spec: 'x' })).text, /Created T-03 in F-2/) // F-1 is done: F-2 is the only open one
+  assert.equal((await hq.mcp(tpm, 'create_ticket', { feature: 'F-2', title: 'Switch', size: 'S', spec: 'x', ...C })).text, 'Created T-02 in F-2: Switch (criteria A1)')
+  assert.match((await hq.mcp(tpm, 'create_ticket', { title: 'Which?', size: 'S', spec: 'x', ...C })).text, /Created T-03 in F-2/) // F-1 is done: F-2 is the only open one
   const listed = JSON.parse((await hq.mcp(tpm, 'list_tickets', {})).text)
   assert.deepEqual(listed.map((f: any) => [f.feature, f.done, f.tickets.map((t: any) => t.key)]), [['F-1', true, ['T-01']], ['F-2', false, ['T-02', 'T-03']]])
 

@@ -8,6 +8,7 @@ import { j } from './util.ts'
 import { parseGithubRemote } from './reposync.ts'
 import type { Agent } from './agents.ts'
 import type { Counts } from './testcounts.ts'
+import type { Look } from './smokerules.ts'
 
 export type Repo = {
   id: string; name: string; path: string; remote: string | null; default_branch: string; context_doc_path: string | null
@@ -20,6 +21,8 @@ export type Repo = {
   auto_mode: number; auto_stopped_why: string | null; auto_waiting: string | null; test_cmd: string | null; test_cmd_proposed: string | null
   /** Bug 107: the saved test command Claude Code refused in an engineer's session, as JSON (auto.ts Refused). It goes when the command changes. */
   test_cmd_refused: string | null
+  /** The UI tester at the end of an auto run (uitester.ts): 'off' turns it off for this project; null follows HQ's setting. */
+  ui_test: string | null
 }
 /** One request the project's TPM is working on: a branch of the board. `handle` (F-1…) is how the TPM names it. `tpm_agent_id`
  *  and `tpm_parked_at` are from when every feature had its own TPM (before Bug 52); nothing reads them any more. */
@@ -28,8 +31,9 @@ export type Feature = {
   merge_order: string; stacked_branches: number; created_at: number; updated_at: number; tpm_parked_at: number | null; handle: string | null
 }
 /** Why a finished ticket went back to its engineer: null, its conflicts with main; 'tests', auto mode's test of it on main failed; 'tests_hung',
- *  that test never finished; 'changes', the TPM changed its spec after it was finished. */
-export type Fixing = 'tests' | 'tests_hung' | 'changes' | null
+ *  that test never finished; 'look', the tests passed and the app had problems when HQ opened it with the ticket merged in (smoke.ts); 'review', the tests
+ *  passed and a fresh reader of its changes found problems (diffcheck.ts); 'changes', the TPM changed its spec after it was finished. */
+export type Fixing = 'tests' | 'tests_hung' | 'look' | 'review' | 'changes' | null
 export type Ticket = {
   id: string; feature_id: string; key: string; slug: string; title: string; size: string; status: TicketStatus; prior_status: TicketStatus | null
   assignee_agent_id: string | null; expected_files: string; deps: string; edit_overrides: string; branch: string | null; worktree_path: string | null
@@ -39,14 +43,18 @@ export type Ticket = {
   repairs_cmd: string | null // Bug 107: on a repair ticket, the test command it is fixing because Claude Code refuses it for engineers. Null: main's tests fail
   fixing: Fixing // what it went back to its engineer for, while `resolving` (Bug 84)
   merge_test: string | null // Bug 126: JSON MergeTest, set when it merges; null on tickets merged before HQ kept a record
+  criteria: string // JSON criteria.ts Criterion[]: what the finished ticket must do, as a list HQ can check; '[]' for a ticket with none
+  proof: string | null // JSON criteria.ts Proof, set at open_pr: the test named for each criterion and what git flagged; null until it's finished once
+  diff_check: string | null // JSON diffcheck.ts DiffCheck: how auto mode's reader of its changes answered before the merge; null when nothing read them
   parked_at: number | null; created_at: number; updated_at: number
 }
 
 /** Bug 126: what HQ ran on a ticket before it merged. `pass`: auto mode's test of it on `on` (main with this ticket merged in) passed: the command, the counts
  *  its summary gave (null when HQ couldn't read them), how long the test step took. `none`: HQ did not test it as it merged
  *  (it may have tested an earlier version): the user pressed Merge (`user`), or it was merged
- *  outside HQ, on GitHub or by hand (`outside`). Frontend testruns.ts has the same type and says it in words. */
-export type MergeTest = { ran: 'pass'; test: string; counts: Counts | null; ms: number; on: string; at: number } | { ran: 'none'; by: 'user' | 'outside'; at: number }
+ *  outside HQ, on GitHub or by hand (`outside`). `look`: how HQ's look at the app ended, right after those tests (smokerules.ts); none on a merge from before HQ
+ *  looked. Frontend testruns.ts has the same type and says it in words. */
+export type MergeTest = { ran: 'pass'; test: string; counts: Counts | null; ms: number; on: string; at: number; look?: Look } | { ran: 'none'; by: 'user' | 'outside'; at: number }
 
 /** Whether finished work goes to GitHub (push + PR) or stays local (Merge into main): a GitHub repo HQ can't push to (an
  *  open-source repo, say) is worked on locally. can_push null (GitHub couldn't be asked) keeps the GitHub way. */

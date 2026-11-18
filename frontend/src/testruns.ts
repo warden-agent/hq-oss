@@ -3,8 +3,16 @@
 // Pure and self-contained, so the backend's test runner unit-tests it (src/testruns.test.ts).
 
 /** `what`: a ticket merged into main; main alone (as an auto run starts, with no ticket, or after a ticket failed: was main already broken?); a repair's try of a
- *  test command. `state`: in line for its turn (builds and test runs take turns, Bug 76) or running. `since`: when that began. */
-export type TestRun = { id: string; repo_id: string; ticket_id: string | null; what: 'ticket' | 'main' | 'command'; state: 'waiting' | 'running'; since: number }
+ *  test command; `look`: the tests passed and HQ is opening the app with the ticket merged in (the same run, a step on); `look_main`: that look showed something
+ *  wrong, and HQ is opening the app on main alone to see whether it was already like that; `review`: everything else passed and a fresh reader (one
+ *  headless call, diffcheck.ts) has the ticket's changes before it merges; `tester`: the run's tickets are merged and an agent is trying what they built in
+ *  a browser (tester.ts), with no ticket of its own; `map`: a one-time session clicks through the app to write its first feature map (firstmap.ts);
+ *  `scenario`: HQ runs a scripted scenario against the app (scenario.ts); `setup_check`: HQ tries a test setup for real (testsetup.ts).
+ *  `checker`: a fresh reader (backendcheck.ts) has the tester's recordings and judges them against the backend criteria; `replay`: HQ replays the
+ *  steps of a finding whose fix merged (replay.ts).
+ *  `state`: in line for its turn (builds and test runs take turns, Bug 76) or running. `since`: when that began. */
+export type TestRun = { id: string; repo_id: string; ticket_id: string | null; what: 'ticket' | 'main' | 'command' | 'look' | 'look_main' | 'review' | 'tester' | 'map'
+  | 'scenario' | 'setup_check' | 'checker' | 'replay'; state: 'waiting' | 'running'; since: number }
 
 /** How long something has been going: 0:42, 12:05, 1:02:03. A clock that is a little behind HQ's reads 0:00, never a minus. */
 export function clock(ms: number): string {
@@ -18,6 +26,22 @@ export function runWords(r: Pick<TestRun, 'what' | 'state'>, key: string | null,
   if (r.what === 'command') { const tryIt = go ? 'HQ is trying' : 'HQ is waiting its turn to try'
     return { box: `${tryIt} its new test command`, bar: `${tryIt} ${key ? `${key}'s` : 'a'} new test command` } }
   // short enough for one row of the narrowest box, like the line they take the place of: the box keeps its height as a run waits, starts and ends
+  if (r.what === 'tester') return go ? { box: 'HQ\'s tester is using the app', bar: 'HQ\'s tester is using the app in a browser, as a person would' }
+    : { box: `HQ's tester ${turn}`, bar: `HQ's tester ${turn}` }
+  if (r.what === 'map') return go ? { box: 'HQ is writing the first feature map', bar: 'HQ is clicking through the app to write its first feature map' }
+    : { box: `HQ's first-map session ${turn}`, bar: `HQ's first-map session ${turn}` }
+  if (r.what === 'scenario') return go ? { box: 'HQ is running a scenario on the app', bar: 'HQ is running a scenario on the app' } : { box: `HQ's scenario ${turn}`, bar: `HQ's scenario ${turn}` }
+  if (r.what === 'setup_check') return go ? { box: 'HQ is checking its test setup', bar: 'HQ is trying its test setup for real: seed, start, reset' }
+    : { box: `HQ's check of its test setup ${turn}`, bar: `HQ's check of its test setup ${turn}` }
+  if (r.what === 'checker') return go ? { box: 'HQ\'s checker is reading what the tester did', bar: 'HQ\'s checker is reading what the tester did, against the criteria' }
+    : { box: `HQ's checker ${turn}`, bar: `HQ's checker ${turn}` }
+  if (r.what === 'replay') return go ? { box: 'HQ is replaying a fixed finding', bar: 'HQ is replaying the findings whose fixes merged' }
+    : { box: `HQ's replay ${turn}`, bar: `HQ's replay of fixed findings ${turn}` }
+  if (r.what === 'review') return { box: 'tests passed · a fresh reader has its changes', bar: `A fresh reader has ${key ? `${key}'s` : "a ticket's"} changes` }
+  if (r.what === 'look') return go ? { box: 'tests passed · HQ is opening the app', bar: `HQ is opening the app with ${key ?? 'a ticket'} merged in` }
+    : { box: `HQ's look at the app ${turn}`, bar: `HQ's look at the app with ${key ?? 'a ticket'} ${turn}` }
+  if (r.what === 'look_main') return go ? { box: `HQ is opening the app on ${base} without it`, bar: `HQ is opening the app on ${key ? `${base} without ${key}` : base}` }
+    : { box: `HQ's look at ${base} without it ${turn}`, bar: `HQ's look at ${key ? `${base} without ${key}` : base} ${turn}` }
   if (r.what === 'ticket') return go ? { box: `HQ is testing it on ${base}`, bar: `HQ is testing ${key ?? 'a ticket'} on ${base}` }
     : { box: `HQ's test ${turn}`, bar: `HQ's test of ${key ?? 'a ticket'} ${turn}` }
   const alone = key ? `${base} without ${key}` : base
@@ -25,10 +49,11 @@ export function runWords(r: Pick<TestRun, 'what' | 'state'>, key: string | null,
     : { box: `its tests failed · HQ's test of ${base} without it ${turn}`, bar: `HQ's test of ${alone} ${turn}` }
 }
 
+import type { Look } from '../../backend/src/smokerules.ts'
 // Bug 126: what HQ ran on a ticket before it merged, once it has. Nothing on the board showed it, and a TPM told the user "HQ ran the tests before each merge"
 // after six merges HQ never tested. The backend saves it on the ticket as it merges (records.ts MergeTest, the same type).
 export type Counts = { passed: number; failed: number; skipped: number }
-export type MergeTest = { ran: 'pass'; test: string; counts: Counts | null; ms: number; on: string; at: number } | { ran: 'none'; by: 'user' | 'outside'; at: number }
+export type MergeTest = { ran: 'pass'; test: string; counts: Counts | null; ms: number; on: string; at: number; look?: Look } | { ran: 'none'; by: 'user' | 'outside'; at: number }
 /** The ticket's `merge_test`, or null: merged before HQ kept a record, or not merged. Bad JSON is no record. */
 export function mergeTestOf(t: { merge_test?: string | null }): MergeTest | null {
   try { const m = t.merge_test ? JSON.parse(t.merge_test) as MergeTest : null; return m && (m.ran === 'pass' || m.ran === 'none') ? m : null } catch { return null }

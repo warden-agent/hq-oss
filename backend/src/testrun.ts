@@ -18,6 +18,9 @@ import { git } from './reposync.ts'
 import { id, real } from './util.ts'
 import { seedPackages } from './worktrees.ts'
 import { summaryLines, testCounts, type Counts } from './testcounts.ts'
+import { nameWatch, type Watched } from './criteria.ts'
+import { lookIn, type LookPlan } from './smoke.ts'
+import type { Seen } from './smokerules.ts'
 
 export type TestPlan = { install: string | null; test: string }
 const has = (root: string, ...p: string[]) => fs.existsSync(path.join(root, ...p))
@@ -76,6 +79,18 @@ export function sandboxProfile(wt: string, o: { network: boolean }): string {
       : ['(deny network-outbound)', `(allow network-outbound (remote ip "localhost:*") (remote unix-socket (subpath ${q(wt)})))`, '(allow network-bind (local ip "localhost:*"))']),
   ].join('\n')
 }
+/** macOS's sandbox for the UI tester's browser (uitester.ts): it writes only in `dir` (its own temp folder) and reaches only the app, on localhost `port`.
+ *  It can't read the project (`project`: the user's checkout, and with it every throwaway checkout under it) nor anything a test run can't. Playwright MCP
+ *  blocks file:// pages itself; this holds whatever gets past that. Spike 2026-11-17: HQ's own page on another port answers net::ERR_ACCESS_DENIED. */
+export function browserProfile(dir: string, port: number, project: string): string {
+  const hidden = [...hiddenPaths(), real(project)].map((p) => `(subpath ${q(p)})`).join(' '), d = q(real(dir))
+  return ['(version 1)', '(allow default)', '(deny file-write*)',
+    `(allow file-write* (subpath ${d}) (literal "/dev/null") (literal "/dev/zero") (literal "/dev/stdout") (literal "/dev/stderr") (regex #"^/dev/fd/"))`,
+    `(deny file-read* ${hidden})`,
+    '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd" "com.apple.coreservices.quarantine-resolver") (global-name-prefix "com.apple.lsd"))',
+    '(deny network-outbound)', `(allow network-outbound (remote ip "localhost:${port}") (remote unix-socket (subpath ${d})))`, '(allow network-bind (local ip "localhost:*"))',
+  ].join('\n')
+}
 /** Linux's sandbox for a test run, the same rules with bubblewrap: the whole machine read-only, then what's writable, then what's hidden.
  *  /tmp and /run are the run's own, which takes tmux's, Docker's and ssh-agent's sockets out of reach; a read-only mount alone doesn't. */
 export function bwrapArgs(wt: string, o: { network: boolean }): string[] {
@@ -111,7 +126,7 @@ export async function sandboxProblem(): Promise<string | null> {
 }
 /** `output`: the last TAIL characters. `earlier`: the lines before those that named a failure or an error, '' when none did (Bug 82). `summary`: the test runners'
  *  summary lines from anywhere in the output, null when there were too many to keep (testcounts.ts, Bug 126). */
-export type RunResult = { code: number | null; output: string; earlier: string; timedOut: boolean; sandboxFailed: boolean; summary?: string[] | null }
+export type RunResult = { code: number | null; output: string; earlier: string; timedOut: boolean; sandboxFailed: boolean; summary?: string[] | null; names?: Watched }
 const TAIL = 8000, EARLIER = 4000
 /** How long a run past its time limit gets after Ctrl+C before it's killed: node's test runner names the tests still running when it
  *  gets one, and prints nothing when it's killed outright (Bug 82: one engineer got 3,000 characters of passing tests). Seen on
@@ -167,16 +182,16 @@ export function sweepRunTmp(): string[] {
 }
 /** Runs `cmd` in `cwd` in the sandbox with a clean environment: no tokens, no agent ids, nothing of the backend's but PATH and HOME.
  *  With no sandbox nothing runs: HQ never runs this code bare. */
-export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal }): Promise<RunResult> {
+export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; watch?: string[] }): Promise<RunResult> {
   return new Promise((resolve) => {
     if (o.signal?.aborted) return resolve({ code: null, output: '', earlier: '', timedOut: false, sandboxFailed: false }) // stopped before it began: nothing runs
     const tmp = process.platform === 'darwin' ? runTmp() : null
-    const env = { HOME: os.homedir(), PATH: process.env.PATH ?? '/usr/bin:/bin', TMPDIR: tmp ?? '/tmp', LANG: process.env.LANG ?? 'en_US.UTF-8',
-      CI: '1', ...cacheEnv(), ...(process.env.RUSTUP_HOME ? { RUSTUP_HOME: process.env.RUSTUP_HOME } : {}) } // rustup's toolchains, if they aren't in ~/.rustup
+    const env = cleanEnv(tmp)
     const { bin, args } = sandboxCommand(cwd, cmd, o)
     const p = spawn(bin, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); if (p.pid) running.set(p.pid, cwd)
     let output = '', total = 0, timedOut = false, hard: NodeJS.Timeout | undefined
-    const fails = failureLines(), sums = summaryLines(), take = (s: string) => { total += s.length; output = (output + s).slice(-TAIL); fails.take(s); sums.take(s) }
+    const fails = failureLines(), sums = summaryLines(), names = nameWatch(o.watch ?? [])
+    const take = (s: string) => { total += s.length; output = (output + s).slice(-TAIL); fails.take(s); sums.take(s); names.take(s) }
     p.stdout.setEncoding('utf8').on('data', take); p.stderr.setEncoding('utf8').on('data', take)
     const signal = (s: NodeJS.Signals) => { try { process.kill(-p.pid!, s) } catch { /* gone */ } }, kill = () => signal('SIGKILL')
     const timer = setTimeout(() => { timedOut = true; signal('SIGINT'); hard = setTimeout(kill, GRACE_MS) }, o.timeoutMs)
@@ -187,7 +202,8 @@ export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; ti
     p.on('error', (e) => done({ code: null, output: `${bin} wouldn't start, and HQ won't run the tests without it: ${(e as Error).message}`, earlier: '', timedOut,
       sandboxFailed: true }))
     p.on('close', (code) => { kill(); running.delete(p.pid!)
-      done({ code, output: output.trim(), earlier: fails.before(total - output.length), timedOut, sandboxFailed: /^(sandbox-exec|bwrap): /m.test(output), summary: sums.lines() }) })
+      done({ code, output: output.trim(), earlier: fails.before(total - output.length), timedOut, sandboxFailed: /^(sandbox-exec|bwrap): /m.test(output), summary: sums.lines(),
+        names: names.seen() }) })
   })
 }
 
@@ -203,11 +219,16 @@ export async function sweepTestWorktrees(repoPath: string): Promise<void> {
   for (const d of fs.existsSync(dir) ? fs.readdirSync(dir) : []) if (d.startsWith('hq-test-')) await dropWorktree(repoPath, path.join(dir, d))
 }
 
-/** `hung`: it never finished, and HQ stopped it at the time limit. `output` and `earlier` are a run's (RunResult). `stopped`: auto mode went off
- *  or stopped the project during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bugs 89, 115). */
-export type TestResult = { kind: 'pass'; test: string; output: string; counts: Counts | null; ms: number }
-  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean } | { kind: 'no_tests' }
-  | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' }
+/** `hung`: it never finished, and HQ stopped it at the time limit. `unproven`: the run passed, but it skipped or never ran a test the ticket named for one of
+ *  its criteria (criteria.ts); `output` is then HQ's own list of those, not the run's. `names`: what a passing run printed about the tests it was asked to
+ *  watch for. `output` and `earlier` are a run's (RunResult). `stopped`: auto mode went off
+ *  or stopped the project during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bugs 89, 115).
+ *  `seen`: what HQ's look at the app showed, when the run was asked to look once the tests had passed (smoke.ts). `looked`: a look with no tests before it
+ *  (main alone, to tell what a ticket changed). `look` on a failure: it's HQ's look that failed, not the tests, and `output` is HQ's report of it. `review`:
+ *  likewise for what a fresh reader of the ticket's changes found (diffcheck.ts). */
+export type TestResult = { kind: 'pass'; test: string; output: string; counts: Counts | null; ms: number; names: Watched; seen?: Seen }
+  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; look?: boolean; review?: boolean } | { kind: 'no_tests' }
+  | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' } | { kind: 'looked'; seen: Seen }
 /** Auto mode's own runs under way, by project folder (Bug 89). A repair's try of a test command isn't one: with auto off its result goes to the user. */
 const autoRuns = new Map<string, Set<AbortController>>(), stops = new Map<string, number>()
 /** How many times auto mode's runs were stopped in this project. Auto reads it before it looks at anything, and a run started with an older
@@ -228,20 +249,49 @@ export type Failed = Extract<TestResult, { kind: 'fail' }>
  *  words before, during and after. `what`: a ticket merged into main; main alone (as a run starts, or after a ticket failed: was main already broken?); a repair's
  *  try of a test command. `state`: in line for its turn (heavy.ts), or running; `since`: when that began. Kept in memory, like the runs themselves: a backend that
  *  stops takes its runs with it, and the next snapshot a page gets has none. */
-export type Shown = { repoId: string; ticketId: string | null; what: 'ticket' | 'main' | 'command' }
+export type Shown = { repoId: string; ticketId: string | null; what: 'ticket' | 'main' | 'command' | 'look' | 'look_main' | 'review' | 'tester' | 'map' | 'scenario'
+  | 'setup_check' | 'checker' | 'replay' }
 export type TestRunView = { id: string; repo_id: string; ticket_id: string | null; what: Shown['what']; state: 'waiting' | 'running'; since: number }
 const views = new Map<string, TestRunView>()
 export const testRunViews = (): TestRunView[] => [...views.values()].map((v) => ({ ...v }))
 /** Puts a run on the page until `over`, however it ends. `state` moves it between waiting and running. Nothing to show: both do nothing. */
-function onPage(s: Shown | null): { state: (to: TestRunView['state']) => void; over: () => void } {
-  if (!s) return { state: () => {}, over: () => {} }
+function onPage(s: Shown | null): { state: (to: TestRunView['state']) => void; what: (to: Shown['what']) => void; over: () => void } {
+  if (!s) return { state: () => {}, what: () => {}, over: () => {} }
   const v: TestRunView = { id: id('test'), repo_id: s.repoId, ticket_id: s.ticketId, what: s.what, state: 'running', since: now() }
   views.set(v.id, v); patch('test_run', v.id, { ...v })
   return {
     state: (to) => { if (v.state === to || !views.has(v.id)) return; v.state = to; v.since = now(); patch('test_run', v.id, { state: to, since: v.since }) },
+    // the tests are over and the look has begun: the same run, saying what it's doing now
+    what: (to) => { if (v.what === to || !views.has(v.id)) return; v.what = to; v.since = now(); patch('test_run', v.id, { what: to, since: v.since }) },
     over: () => { if (views.delete(v.id)) patch('test_run', v.id, null) },
   }
 }
+/** The clean environment everything in the sandbox runs with: no tokens, no agent ids, nothing of the backend's but PATH and HOME. `tmp`: its own temp folder. */
+export const cleanEnv = (tmp: string | null): Record<string, string> => ({ HOME: os.homedir(), PATH: process.env.PATH ?? '/usr/bin:/bin', TMPDIR: tmp ?? '/tmp',
+  LANG: process.env.LANG ?? 'en_US.UTF-8', CI: '1', ...cacheEnv(), ...(process.env.RUSTUP_HOME ? { RUSTUP_HOME: process.env.RUSTUP_HOME } : {}) }) // rustup's toolchains, if they aren't in ~/.rustup
+/** A temp folder of its own for something HQ runs sandboxed on a Mac (null on Linux, where bubblewrap gives each run its own /tmp), and what removes it. */
+export function ownTmp(): { tmp: string | null; done: () => Promise<void> } {
+  const tmp = process.platform === 'darwin' ? runTmp() : null
+  return { tmp, done: () => (tmp ? fs.promises.rm(tmp, { recursive: true, force: true }) : Promise.resolve()).catch(() => {}) }
+}
+/** A throwaway checkout of `sha` for work of auto mode's that isn't a test run (the tester, tester.ts): made, handed to `fn` with the signal that auto mode
+ *  going off or stopping fires, and removed with everything still running in it, however `fn` ends. In turn with builds and test runs, and on the page
+ *  (`show`) meanwhile. `stopped`: the signal fired before `fn` began. */
+export async function inCheckout<T>(repoPath: string, sha: string, key: string, auto: number | null, show: Shown | null, fn: (wt: string, signal: AbortSignal) => Promise<T>): Promise<T | 'stopped'> {
+  const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto); let page = onPage(null)
+  try {
+    if (signal.aborted) return 'stopped'
+    await dropWorktree(repoPath, wt); fs.mkdirSync(path.dirname(wt), { recursive: true })
+    await git(repoPath, ['worktree', 'add', '--detach', '--quiet', wt, sha]); await seedPackages(repoPath, wt)
+    page = onPage(signal.aborted ? null : show)
+    return await withTurn(`HQ's tester (${key})`, 'tests', async () => { if (signal.aborted) return 'stopped' as const; page.state('running'); return fn(wt, signal) }, () => page.state('waiting'))
+  } finally { done(); await dropWorktree(repoPath, wt).finally(page.over) }
+}
+/** On the page while auto mode does something for a ticket that isn't a run of this module's: a reader on its changes (diffcheck.ts), say. */
+export const showing = (s: Shown): { over: () => void } => onPage(s)
+/** A signal that auto mode going off or stopping the project fires, for work of auto mode's that isn't a test run (Bugs 89, 115): `gen` is autoGen's count as
+ *  auto read it, and `done` gives the signal up. */
+export const autoWork = (repoPath: string, gen: number): { signal: AbortSignal; done: () => void } => ownedBy(repoPath, gen)
 // At most `max` characters of the start or the end, cut between lines
 const firstChars = (s: string, max: number): string => { if (s.length <= max) return s; const i = s.lastIndexOf('\n', max); return `${s.slice(0, i > 0 ? i : max)}\n…` }
 const lastChars = (s: string, max: number): string => s.length <= max ? s : `…\n${s.slice(s.indexOf('\n', s.length - max) + 1 || s.length - max)}`
@@ -255,15 +305,27 @@ export function failReport(r: Pick<Failed, 'output' | 'earlier'>, max: number): 
 /** The tests on commit `sha`. `custom`: the user's own command (it replaces the test step; the install step still comes from the files).
  *  `auto`: auto mode's own run, which turning it off or a stop ends: autoGen's count as auto read it. `show`: whose run the page says this is (Bug 106),
  *  from when HQ knows there are tests to run; a run stopped before that is never shown. */
-async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: number | null, show: Shown | null): Promise<TestResult> {
+/** `watch`: test names and files to look for in what the run prints (a ticket's map of its criteria's tests). `look`: once the tests pass, start the app in the
+ *  same checkout and open its pages (smoke.ts). `only`: the look alone, with no tests before it. */
+export type RunOpts = { watch?: string[]; look?: LookPlan | null; only?: 'look' }
+async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: number | null, show: Shown | null, o: RunOpts = {}): Promise<TestResult> {
   const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto), stopped = { kind: 'stopped' } as const
   let page = onPage(null)
+  /** The look, in the checkout as the tests left it: the same turn, sandbox and end as the tests (auto off, a stop, the time limit, the backend going down). */
+  const look = async (plan: LookPlan): Promise<Seen | null> => { const s = await lookIn(wt, plan, { signal, run: runSandboxed }); return s.kind === 'stopped' ? null : s }
   try {
     if (signal.aborted) return stopped
     await dropWorktree(repoPath, wt)
     fs.mkdirSync(path.dirname(wt), { recursive: true })
     await git(repoPath, ['worktree', 'add', '--detach', '--quiet', wt, sha])
     await seedPackages(repoPath, wt)
+    if (o.only === 'look' && o.look) {
+      const plan = o.look; page = onPage(signal.aborted ? null : show)
+      return await withTurn(`HQ's look at ${key}`, 'tests', async (): Promise<TestResult> => {
+        if (signal.aborted) return stopped
+        page.state('running'); const seen = await look(plan); return seen ? { kind: 'looked', seen } : stopped
+      }, () => page.state('waiting'))
+    }
     const found = detectTests(wt); const plan: TestPlan | null = custom ? { install: found?.install ?? null, test: custom } : found
     if (!plan) return { kind: 'no_tests' }
     const timeoutMs = getSetting('test_timeout_min', DEFAULTS.test_timeout_min) * 60_000
@@ -277,10 +339,16 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
         if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
         if (i.code !== 0) return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier }
       }
-      const began = Date.now(), r = await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal })
+      const began = Date.now(), r = await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal, watch: o.watch })
       if (signal.aborted) return stopped
       if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
-      if (r.code === 0) return { kind: 'pass', test: plan.test, output: r.output.replace(ANSI, ''), counts: testCounts(r.summary ?? null), ms: Date.now() - began } // Bug 126
+      if (r.code === 0) {
+        const pass: TestResult = { kind: 'pass', test: plan.test, output: r.output.replace(ANSI, ''), counts: testCounts(r.summary ?? null), ms: Date.now() - began, // Bug 126
+          names: r.names ?? { prints: false, passed: [], skipped: [] } }
+        if (!o.look) return pass
+        page.what(show?.what === 'main' ? 'look_main' : 'look'); const seen = await look(o.look) // the tests passed: now, does the app open?
+        return seen ? { ...pass, seen } : stopped
+      }
       return { kind: 'fail', test: plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so
     }, () => page.state('waiting'))
   } catch (e) { return { kind: 'error', why: (e as Error).message.split('\n')[0] ?? 'unknown error' } }
@@ -288,12 +356,15 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
 }
 /** The tests on `branch` merged into `base` (a ref): main isn't touched, and the commit tested goes away unused. */
 export async function testCombined(repoPath: string, base: string, branch: string, key: string, custom: string | null, auto: number | null = null,
-  show: Shown | null = null): Promise<TestResult> {
+  show: Shown | null = null, o: RunOpts = {}): Promise<TestResult> {
   const c = await combinedCommit(repoPath, base, branch)
   if ('conflicts' in c) return { kind: 'conflicts', files: c.conflicts }
   if ('error' in c) return { kind: 'error', why: c.error }
-  return runAt(repoPath, c.sha, key, custom, auto, show)
+  return runAt(repoPath, c.sha, key, custom, auto, show, o)
 }
+/** HQ's look at the app on `base` alone, no tests: when a ticket's look showed something wrong, was it already like that? */
+export const lookAtBase = (repoPath: string, base: string, key: string, plan: LookPlan, auto: number | null = null, show: Shown | null = null): Promise<TestResult> =>
+  runAt(repoPath, base, `${key}-main`, null, auto, show, { look: plan, only: 'look' })
 /** The tests on `base` alone: when a ticket fails, is it the ticket, or was main already broken? */
 export const testBase = (repoPath: string, base: string, key: string, custom: string | null, auto: number | null = null, show: Shown | null = null): Promise<TestResult> =>
   runAt(repoPath, base, `${key}-main`, custom, auto, show)

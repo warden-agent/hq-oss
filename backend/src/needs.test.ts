@@ -171,3 +171,13 @@ test('Bug 129: a ticket with a question says whom it asked and what; one for the
   assert.deepEqual(needsYou(hid, () => null).map((n) => [n.key, n.text, n.ref]), [['question:q2', "home: T2's engineer asked you: Colour", { ticket: 'b' }],
     ['attention:n2', 'shop: eng X1 (question): Elsewhere', { attention: 'n2' }]])
 })
+
+test('a plan on a project on auto waits for HQ\'s plan check, not for you: nothing in the count, nothing to pop up; with auto off it is yours again', async () => {
+  const { hqAnswersPlan } = await import('../../frontend/src/needs.ts')
+  const on = state(); on.repos[0] = { ...on.repos[0]!, auto_mode: 1 } as never
+  assert.equal(hqAnswersPlan(on, on.reviews[0]!), true); assert.equal(hqAnswersPlan(state(), state().reviews[0]!), false)
+  assert.equal(hqAnswersPlan(on, { ticket_id: 't3' }), false) // another project's, which isn't on auto
+  assert.equal(hqAnswersPlan(on, { ticket_id: 'gone' }), false)
+  const keys = (s: ReturnType<typeof state>) => needsYou(s, () => null).map((n) => n.key)
+  assert.ok(keys(state()).includes('review:R-1')); assert.ok(!keys(on).includes('review:R-1'))
+})

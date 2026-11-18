@@ -19,7 +19,7 @@ import { writeFeatureMd } from './projectmd.ts'
 import { parseGithubRemote } from './reposync.ts'
 import { sendMessage } from './delivery.ts'
 import { resumeRepo } from './freshstart.ts'
-import { answerReview } from './gate.ts'
+import { checkPlan, planChecks, planLine, stopPlanChecks } from './plancheck.ts'
 import { inMergeQueue, mergeNow } from './mergewatch.ts'
 import { features, getFeature, getRepo, getTicket, liveTpm, notClearing, repoOfAgent, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type Repo,
   type MergeTest, type Ticket } from './records.ts'
@@ -27,13 +27,25 @@ import { isRefusal, ranTestCmd, refusedTestCmd } from './refused.ts'
 import { readyTickets } from './readiness.ts'
 import { ensureFresh, ghOpts, git, syncRepo } from './repos.ts'
 import { canLaunch } from './scheduler.ts'
-import { autoGen, detectTests, failReport, sandboxProblem, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
+import { autoGen, autoWork, detectTests, failReport, lookAtBase, sandboxProblem, showing, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
 import { countWords, took } from './testcounts.ts'
 import { addFeature, cancelTicket, createTicket, fillSlots, fixConflicts, fixTests, resumeEngineer, testCmdNote } from './tickets.ts'
 import { restartTpm, tpmStarting } from './tpm.ts'
 import { dialogGone } from './presence.ts'
 import { idleTooLong } from './bgruns.ts'
 import { saveTestCmds } from './heavy.ts'
+import { confirm, lookLines, proofOf, unproven, watchFor } from './criteria.ts'
+import { row as previewRow, runnableRecipe } from './preview.ts'
+import { lookHow, type LookPlan } from './smoke.ts'
+import { judge, lookReport, lookWords, needsBase, type Look, type Seen } from './smokerules.ts'
+import { readDiff, readReport, whyRead } from './diffcheck.ts'
+import { diffCheckLine, diffCheckOf } from './checks.ts'
+import { criteriaOf, criteriaSummary } from './criteria.ts'
+import { undoMapChanges } from './mapstore.ts'
+import { triedLines, triedOf } from './testerrules.ts'
+import { runUiTest } from './uitester.ts'
+import { uiTestLines, uiTestOf, type UiTest } from './uitesterrules.ts'
+import { afterUiTest, beforeUiTest, findingsSection, stageDone, stageFailed, testingOn } from './findings.ts'
 
 /** Times HQ sends one ticket back (conflicts, failed tests, a lost engineer, a failed start) before parking it. */
 export const MAX_TRIES = 2
@@ -47,7 +59,9 @@ const FINISHED_NOT_MERGED = ['pr_ready', 'pr_open']
 const DONE = ['merged', 'cancelled']
 
 export type AutoRun = { id: string; repo_id: string; status: 'running' | 'finished' | 'off' | 'undone'; start_sha: string | null; end_sha: string | null; started_at: number;
-  ended_at: number | null; summary: string | null; test_change: string | null; main_checked: string | null }
+  ended_at: number | null; summary: string | null; test_change: string | null; main_checked: string | null
+  tried: string | null // what the tester of PR #130 tried in a browser as the run ended (JSON, testerrules.ts Tried[]); runs since have ui_test instead
+  ui_test: string | null } // what the UI tester did and found as the run ended (JSON, uitesterrules.ts UiTest); null: nothing yet
 type TestChange = { was: string | null; now: string; left_out: string }
 const squash = (s: string): string => s.replace(/\s+/g, ' ').trim()
 /** Bug 109: `a` is the command `b`, whatever the spacing. Putting a command in place of itself is no change. */
@@ -64,7 +78,7 @@ const openRun = (repoId: string): AutoRun | undefined => one<AutoRun>("SELECT * 
 const liveFeatures = (repoId: string): Feature[] => features().filter((f) => f.repo_id === repoId && f.status !== 'cancelled').reverse() // oldest first
 const repoTickets = (repoId: string): Ticket[] => liveFeatures(repoId).flatMap((f) => tickets(f.id))
 
-type RepoFields = Partial<Pick<Repo, 'auto_mode' | 'auto_stopped_why' | 'auto_waiting' | 'test_cmd' | 'test_cmd_proposed' | 'test_cmd_refused'>>
+type RepoFields = Partial<Pick<Repo, 'auto_mode' | 'auto_stopped_why' | 'auto_waiting' | 'test_cmd' | 'test_cmd_proposed' | 'test_cmd_refused' | 'ui_test'>>
 function setRepo(repo: Repo, fields0: RepoFields): void {
   const cur = getRepo(repo.id); if (!cur) return // removed from HQ during a test: no patch for a project that's gone
   // Bug 107: a refusal is about one command. However the command changes (the Auto box, a repair's proposal, the user's OK), what HQ knew about the old one goes
@@ -157,7 +171,7 @@ async function lostEngineers(all: Ticket[]): Promise<void> {
 }
 function approvePlans(all: Ticket[]): void {
   for (const r of q<{ id: string; ticket_id: string }>("SELECT id, ticket_id FROM review_requests WHERE status = 'open'")) {
-    if (all.some((t) => t.id === r.ticket_id)) answerReview(r.id, 'approve', { by: 'auto' })
+    if (all.some((t) => t.id === r.ticket_id)) checkPlan(r.id) // checked against its criteria first, then approved or sent back (plancheck.ts); safe to repeat
   }
 }
 /** The TPM has finished for now: its split is done, so its tickets can start (a ticket that started mid-split couldn't be rewired). */
@@ -325,6 +339,21 @@ async function checkMain(repo0: Repo, r: AutoRun): Promise<void> {
     if (b.kind === 'fail' && !openRepair(cur.id) && cur.test_cmd === repo.test_cmd && await ref(cur) === tip) await repairMain(cur, tip, b) // not if main or the command moved meanwhile
   })
 }
+type NoLook = Extract<Look, { ran: 'skipped' }>
+/** Projects whose app didn't start on main, in HQ's sandbox, during the run named: an app that needs something the sandbox hasn't got (Docker, a site on the
+ *  internet) would otherwise cost every ticket of the run two waits of a minute, to learn the same thing. For the rest of that run HQ doesn't open it; the
+ *  next run looks again. In memory only: after a restart the next ticket finds out afresh. */
+const deadApp = new Map<string, { run: string; why: string }>()
+/** What HQ starts to look at a project's app before a merge: the launch recipe its preview runs (the user's own command, or the steps they OK'd). Or why it
+ *  won't look, which is nobody's fault: `quiet`, so the summary doesn't repeat it for every ticket of a project that has no app to open. */
+/** `tester`: for the UI tester, which has its own switch: the look's setting doesn't turn it off. */
+function lookPlan(repo: Repo, o: { tester?: boolean } = {}): { plan: LookPlan } | { skip: NoLook } {
+  if (!o.tester && getSetting('app_look', DEFAULTS.app_look) === 'off') return { skip: { ran: 'skipped', why: 'opening the app before a merge is turned off in HQ\'s settings', quiet: true } }
+  const dead = deadApp.get(repo.id); if (dead && dead.run === openRun(repo.id)?.id) return { skip: { ran: 'skipped', why: dead.why, dead: true } }
+  const recipe = runnableRecipe(previewRow(repo.id), repo.path)
+  if (!recipe) return { skip: { ran: 'skipped', why: 'HQ has no start steps for this project (press Launch app once, and it looks before every merge after that)', quiet: true } }
+  return { plan: { recipe, repoPath: repo.path, how: lookHow(recipe) } }
+}
 async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
   const still = () => { const r = getRepo(repo0.id), t = getTicket(t0.id); return r?.auto_mode && !r.auto_stopped_why && !r.clearing_at && t && FINISHED_NOT_MERGED.includes(t.status) &&
     !t.auto_parked_why ? { repo: r, t } : null }
@@ -332,8 +361,11 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
     const gen = autoGen(repo0.path); if (!still()) return // read first: auto going off or stopping from here on stops the run (Bugs 89, 115)
     const repo = await ensureFresh(repo0.id).catch((e) => { stopProject(repo0, `HQ couldn't bring it up to date: ${(e as Error).message}`); return null }); if (!repo || !still()) return
     const t = getTicket(t0.id)!, base = mergeBase(repo), tip = await ref(repo), branch = `refs/heads/${t.branch}`
-    const r = await testCombined(repo.path, base.ref, branch, t.key, repo.test_cmd, gen, { repoId: repo.id, ticketId: t.id, what: 'ticket' }) // on its box meanwhile (Bug 106)
-    if (r.kind === 'stopped') return // auto went off or stopped: nothing follows, not even with it back on by now (Bugs 89, 115)
+    const proof = proofOf(t) // the tests its open_pr named for its criteria: the run is watched for them by name
+    const lp = lookPlan(repo) // and once they pass, HQ opens the app in the same checkout
+    const r = await testCombined(repo.path, base.ref, branch, t.key, repo.test_cmd, gen, { repoId: repo.id, ticketId: t.id, what: 'ticket' }, // on its box meanwhile (Bug 106)
+      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null })
+    if (r.kind === 'stopped' || r.kind === 'looked') return // auto went off or stopped: nothing follows, not even with it back on by now (Bugs 89, 115)
     emit({ agentId: null, source: 'system', kind: 'auto.tested', payload: { ticket: t.id, key: t.key, result: r.kind, test: 'test' in r ? r.test : null } })
     if (!still()) return // turned off or removed during the test: a run that was killed reads as a failure, and nothing should follow from it
     if (r.kind === 'no_tests') { noTestsAt.set(t.id, testState(t, tip)); setRepo(repo, { auto_waiting: NO_TESTS }); return }
@@ -351,15 +383,93 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
       return fix()
     }
     const cur = still(); if (!cur) return // turned off, stopped or moved on during the test: not merged
+    if (proof?.tests.length) { // a passing run that skipped or never ran a criterion's test proves nothing about it: back to its engineer, like a failure
+      const tests = proof.tests.map((e) => ({ ...e, state: confirm(e, r.names) })), missing = unproven(tests, r.test)
+      setTicket(t.id, { proof: JSON.stringify({ ...proof, tests, confirmed_at: now() }) })
+      const failed: Failed = { kind: 'fail', test: r.test, unproven: true, earlier: '', output: `The tests that didn't run:\n${missing.map((m) => `- ${m}`).join('\n')}` }
+      if (missing.length) return retry(t, `The tests named for its criteria still didn't all run after ${MAX_TRIES} fixes. ${missing[0]}`, () => fixTests(t.id, failed))
+    }
+    // HQ's look at the app with the ticket merged in (smokerules.ts). Only what the ticket changed counts: when something is wrong, HQ looks at main alone too.
+    let look: Look = 'skip' in lp ? lp.skip : { ran: 'skipped', why: 'HQ\'s look at the app didn\'t run' }
+    if ('plan' in lp && r.seen) {
+      let main: Seen | null = null
+      if (needsBase(r.seen)) {
+        const b = await lookAtBase(repo.path, base.ref, t.key, lp.plan, gen, { repoId: repo.id, ticketId: t.id, what: 'look_main' })
+        if (b.kind === 'stopped' || !still()) return
+        main = b.kind === 'looked' ? b.seen : { kind: 'skipped', why: `HQ couldn't open the app on ${base.name} to compare${b.kind === 'error' ? ` (${b.why})` : ''}` }
+      }
+      look = judge(r.seen, main, base.name)
+      const run = openRun(repo.id); if (look.ran === 'skipped' && look.dead && run) deadApp.set(repo.id, { run: run.id, why: look.why })
+      emit({ agentId: null, source: 'system', kind: 'auto.looked', payload: { ticket: t.id, key: t.key, ran: look.ran, why: 'why' in look ? look.why : null, compared: !!main } })
+      if (look.ran === 'fail') {
+        const failed: Failed = { kind: 'fail', test: lp.plan.how, look: true, earlier: '', output: lookReport(look, lp.plan.how) }
+        return retry(t, `The app still has problems with it merged in after ${MAX_TRIES} fixes. ${look.why}`, () => fixTests(t.id, failed))
+      }
+    }
+    // A fresh reader of its changes (diffcheck.ts), last, once everything that costs nothing has passed, and only for a ticket worth one: by its size, or by
+    // what git and the plan check flagged. Once per ticket: one it sent back merges on its next pass without another read.
+    const read = diffCheckOf(getTicket(t.id) ?? t), why = read && read.state !== 'unchecked' ? [] : whyRead(t, proofOf(getTicket(t.id) ?? t), planChecks(t.id))
+    if (why.length && getSetting('diff_check', DEFAULTS.diff_check) !== 'off') {
+      const work = autoWork(repo.path, gen), page = showing({ repoId: repo.id, ticketId: t.id, what: 'review' })
+      const d = await readDiff({ repoPath: repo.path, base: base.ref, branch, criteria: criteriaOf(t), why, test: r.test, output: r.output, signal: work.signal })
+        .finally(() => { work.done(); page.over() })
+      if (d === 'stopped' || !still()) return
+      setTicket(t.id, { diff_check: JSON.stringify(d) })
+      emit({ agentId: null, source: 'system', kind: 'auto.read', payload: { ticket: t.id, key: t.key, state: d.state, why, findings: d.state === 'sent_back' ? d.findings : [] } })
+      if (d.state === 'sent_back') {
+        const failed: Failed = { kind: 'fail', test: r.test, review: true, earlier: '', output: readReport(d.findings) }
+        const first = `${d.findings[0]!.about}: ${d.findings[0]!.problem}`
+        return retry(t, `A fresh reader of its changes found problems, and its ${MAX_TRIES} fixes were used up already. ${first}`, () => fixTests(t.id, failed))
+      }
+    }
     const fresh = await ensureFresh(repo.id).catch(() => repo)
     if (await ref(fresh) !== tip) return // main moved during the test: the next tick tests again
-    try { await mergeNow(t.id, fresh, { ran: 'pass', test: r.test, counts: r.counts, ms: r.ms, on: base.name, at: now(), output: r.output }) } catch (e) { // the run that let it merge (Bug 126)
+    const tested = { ran: 'pass' as const, test: r.test, counts: r.counts, ms: r.ms, on: base.name, at: now(), output: r.output, look } // the run that let it merge (Bug 126)
+    try { await mergeNow(t.id, fresh, tested) } catch (e) {
       if (getTicket(t.id)?.conflict_files != null) return // the next tick fixes it
       stopProject(repo, (e as Error).message)
     }
   })
 }
 
+const tryingNow = new Set<string>() // projects whose app the UI tester is using now: the run ends once it has
+/** Is the UI tester on for this project: HQ's setting, and the project's own switch. */
+export const uiTestOn = (repo: Repo): boolean => getSetting('tester', DEFAULTS.tester) !== 'off' && repo.ui_test !== 'off'
+/** As a run ends: should the UI tester use the app now? Once a run, never per ticket, and only on a run that merged something. */
+const wantsUiTest = (repo: Repo, r: AutoRun): boolean => uiTestOn(repo) && !r.ui_test && inRun(r).length > 0
+/** The UI tester on the whole app, on main as the run leaves it (uitester.ts). It ends tested or skipped with why, kept with the run, so a run tests once and
+ *  can't wait on it for ever. Only a stop (auto off, the project stopped) keeps nothing: that run doesn't end by itself, and one that starts later tests. */
+async function uiTestRun(repo0: Repo, r: AutoRun): Promise<void> {
+  const gen = autoGen(repo0.path) // read first: auto going off or stopping from here on stops the tester (Bugs 89, 115)
+  const still = () => { const cur = getRepo(repo0.id); return cur?.auto_mode && !cur.auto_stopped_why && !cur.clearing_at && openRun(cur.id)?.id === r.id ? cur : null }
+  const repo = still(); if (!repo) return
+  const lp = lookPlan(repo, { tester: true }), skipped = (why: string, quiet?: boolean): UiTest => ({ at: now(), state: 'skipped', why, ...(quiet ? { quiet } : {}) })
+  const tickets = inRun(r).map((t) => ({ key: t.key, title: t.title, criteria: criteriaOf(t) }))
+  const u: UiTest | 'stopped' = 'skip' in lp ? skipped(lp.skip.why, lp.skip.quiet)
+    : await runUiTest({ repoPath: repo.path, repoId: repo.id, runId: r.id, sha: await ref(repo), plan: lp.plan, gen, tickets })
+      .catch((e) => skipped(`HQ hit an error (${(e as Error).message.split('\n')[0]})`))
+  if (u === 'stopped' || !still()) return
+  const json = JSON.stringify(u)
+  run('UPDATE auto_runs SET ui_test = ? WHERE id = ?', json, r.id); patch('auto_run', r.id, { ui_test: json })
+  emit({ agentId: null, source: 'system', kind: 'auto.uitest', payload: { repo: repo.id, run: r.id, state: u.state, why: u.state === 'skipped' ? u.why : null,
+    scenarios: u.state === 'done' ? u.scenarios.length : 0, findings: u.state === 'done' ? u.findings.length : 0 } })
+}
+/** A project's own switch for the UI tester (`on`: follow HQ's setting). */
+export function setUiTest(repoId: string, on: boolean): { ui_test: string | null } {
+  const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
+  const v = on ? null : 'off'; setRepo(repo, { ui_test: v }); return { ui_test: v }
+}
+/** A run's end: the findings loop replays the findings whose fixes merged (findings.ts beforeUiTest), the UI tester uses the app (`ui`: uiTestRun), then the
+ *  loop keeps what it found and the backend checker reads it (afterUiTest). The findings whose replay broke (`retry`) aren't handed to the tester yet: its
+ *  runUiTest doesn't take them. A stop keeps nothing, so it all runs again; an error in the loop is said once in the summary and doesn't hold the run. */
+async function endStage(repo: Repo, r: AutoRun, ui: boolean): Promise<void> {
+  const gen = autoGen(repo.path)
+  let stage = testingOn(repo.id) && !stageDone(repo.id, r.id)
+  const failed = (e: unknown): void => { stageFailed(repo.id, r.id, (e as Error).message); stage = false }
+  if (stage) try { if (await beforeUiTest(repo, r.id, gen) === 'stopped') return } catch (e) { failed(e) }
+  if (ui) { await uiTestRun(repo, r); if (!openRun(repo.id)?.ui_test) return } // stopped, or auto went off: nothing kept
+  if (stage) try { await afterUiTest(repo, r.id, gen) } catch (e) { failed(e) }
+}
 const tpmGoneSince = new Map<string, number>()
 /** A project on auto with work left needs its TPM: engineers' questions go there. */
 async function keepTpm(repo: Repo, all: Ticket[]): Promise<void> {
@@ -374,7 +484,14 @@ const inRun = (r: AutoRun): Ticket[] => repoTickets(r.repo_id).filter((t) => t.s
 /** Bug 126: what HQ ran on a merged ticket, after its line in the run's summary. Nothing for one with no record. */
 const testedNote = (t: Ticket): string => {
   const m = j<MergeTest | null>(t.merge_test, null); if (!m) return ''
-  return m.ran === 'pass' ? ` (tests passed${m.counts ? `: ${countWords(m.counts)}` : ''}, ${took(m.ms)})` : ' (HQ did not test it as it merged)'
+  const app = m.ran === 'pass' && m.look?.ran === 'pass' ? `; ${lookWords(m.look)!.short}` : ''
+  return m.ran === 'pass' ? ` (tests passed${m.counts ? `: ${countWords(m.counts)}` : ''}, ${took(m.ms)}${app})` : ' (HQ did not test it as it merged)'
+}
+/** What to say in the summary about HQ's look at the app before a ticket merged: only when it couldn't look (and that isn't simply how the project is set
+ *  up), or looked without being able to judge every page. A clean look says so on the ticket's own line. */
+const appLine = (t: Ticket): string[] => {
+  const m = j<MergeTest | null>(t.merge_test, null), l = m?.ran === 'pass' ? m.look : undefined, w = lookWords(l)
+  return !l || !w || w.tone === 'ok' || (l.ran === 'skipped' && l.quiet) ? [] : [w.short]
 }
 function summary(repo: Repo, r: AutoRun, all: Ticket[]): string {
   const done = all.filter((t) => t.status === 'merged' && t.updated_at >= r.started_at), parked = all.filter((t) => t.auto_parked_why), behind = stuckBehindParked(all)
@@ -383,7 +500,19 @@ function summary(repo: Repo, r: AutoRun, all: Ticket[]): string {
   const decided = [...fs0.map((f) => [`feature:${f.id}`, 0] as const), [`repo:${repo.id}`, r.started_at] as const].flatMap(([scope, since]) =>
     q<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'Decided in auto mode' AND updated_at >= ?", scope, since).map((d) => d.text))
   const waiting = all.filter((t) => repo.auto_waiting === NO_TESTS && FINISHED_NOT_MERGED.includes(t.status)), changed = testChange(r)
+  // What nobody checked for the user on what merged: a criterion with no test, a test HQ couldn't see by name, deleted tests, files outside the plan
+  // An app HQ couldn't open is the same news for every ticket it happened to: said once, with their keys
+  const apps = new Map<string, string[]>(); for (const t of done) for (const l of appLine(t)) apps.set(l, [...apps.get(l) ?? [], t.key])
+  const look = [...done.flatMap((t) => [planLine(t.id) ?? '', diffCheckLine(diffCheckOf(t)) ?? '', ...lookLines(proofOf(t))].filter(Boolean).map((l) => `- ${t.key}: ${l}`)),
+    ...[...apps].map(([l, keys]) => `- ${keys.join(', ')}: ${l}`)]
+  // What the UI tester did and found as the run ended (uitester.ts); a run from before it has the earlier tester's lines (testerrules.ts)
+  const tried = [...triedLines(triedOf(r.tried)), ...uiTestLines(uiTestOf(r.ui_test))]
+  const had = criteriaSummary(done.map((t) => ({ key: t.key, title: t.title, criteria: criteriaOf(t) }))) // nobody reviewed them before work started: here they are
   return [`## Built\n${done.map((t) => `- ${t.key}: ${t.title}${testedNote(t)}`).join('\n') || '- Nothing was merged.'}`,
+    had.length ? `## What each one had to do\n${had.join('\n\n')}` : '',
+    tried.length ? `## Tried in a browser\n${tried.join('\n')}` : '',
+    findingsSection(repo.id, r.id),
+    look.length ? `## Worth a look\n${look.join('\n')}` : '',
     decided.length ? `## Decided for you\n${decided.join('\n')}` : '',
     parked.length ? `## Parked, needs you\n${parked.map((t) => `- ${t.key}: ${t.auto_parked_why}`).join('\n')}` : '',
     behind.size ? `## Waiting on a parked ticket\n${all.filter((t) => behind.has(t.id)).map((t) => `- ${t.key}: ${t.title}`).join('\n')}` : '',
@@ -427,6 +556,7 @@ export async function undoRun(runId: string): Promise<{ sha: string }> {
     }
     run("UPDATE auto_runs SET status = 'undone' WHERE id = ?", r.id); patch('auto_run', r.id, { status: 'undone' })
     for (const t of done) setTicket(t.id, { status: 'cancelled' }) // its work isn't in main any more, so "Built so far" drops it
+    undoMapChanges(repo.id, done) // and the feature map goes back to before their changes
     for (const fid of new Set(done.map((t) => t.feature_id))) {
       const f = getFeature(fid); if (!f) continue
       if (tickets(fid).every((t) => t.status === 'cancelled')) { run("UPDATE features SET status = 'cancelled' WHERE id = ?", fid); patch('feature', fid, { status: 'cancelled' }) }
@@ -447,7 +577,7 @@ async function tickRepo(repo0: Repo): Promise<void> {
   const left = moving(repo, repoTickets(repo.id))
   if (left.length && !openRun(repo.id)) {
     const r: AutoRun = { id: id('run'), repo_id: repo.id, status: 'running', start_sha: (await ref(repo)) || null, end_sha: null, started_at: now(), ended_at: null, summary: null,
-      test_change: null, main_checked: null }
+      test_change: null, main_checked: null, tried: null, ui_test: null }
     run('INSERT INTO auto_runs(id, repo_id, status, start_sha, started_at) VALUES (?,?,?,?,?)', r.id, r.repo_id, r.status, r.start_sha, r.started_at)
     patch('auto_run', r.id, r as unknown as Record<string, unknown>); emit({ agentId: null, source: 'system', kind: 'auto.run_started', payload: { repo: repo.id, run: r.id } })
   }
@@ -473,7 +603,15 @@ async function tickRepo(repo0: Repo): Promise<void> {
   }
   const r = openRun(repo.id), cur = getRepo(repo.id)!
   if (r && !moving(cur, repoTickets(repo.id)).length && !mergingNow.has(repo.id) && !cur.auto_stopped_why && tpmSettled(repo.id) && !openAsks().some((a) =>
-    a.repo_id === repo.id)) await closeRun(cur, r, 'finished')
+    a.repo_id === repo.id)) {
+    if (tryingNow.has(repo.id)) return // the run ends once the tester has
+    // The last thing a run does: the findings loop and the UI tester (endStage), and the summary says what they found
+    const ui = wantsUiTest(cur, r)
+    if (!ui && (!testingOn(cur.id) || stageDone(cur.id, r.id))) return closeRun(cur, r, 'finished')
+    tryingNow.add(repo.id)
+    void endStage(cur, r, ui).catch((e) => emit({ agentId: null, source: 'system', kind: 'auto.error', payload: { repo: repo.id, error: String(e) } }))
+      .finally(() => { tryingNow.delete(repo.id); autoSoon() })
+  }
 }
 
 let ticking: Promise<void> | null = null, again = false, timer: NodeJS.Timeout | null = null
@@ -514,7 +652,7 @@ const rules = 'HQ: the user turned auto mode on for this project. From now on HQ
   + 'tests finished tickets on main, merges them and fixes conflicts. Finish each split before you end your turn. '
   + 'Make product choices yourself and record each one with write_feature, section "Decided in auto mode". '
   + 'Only something hard to undo goes to ask_user, with hard_to_undo: true. '
-  + 'HQ won\'t merge without tests it can run: every ticket\'s spec names its tests, and in a project with none the first ticket adds them.'
+  + 'HQ won\'t merge without tests it can run, and it checks that each acceptance criterion of a ticket has a test: in a project with none the first ticket adds them.'
 export async function setAuto(repoId: string, on: boolean): Promise<{ on: boolean }> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
   notClearing(repoId)
@@ -527,6 +665,7 @@ export async function setAuto(repoId: string, on: boolean): Promise<{ on: boolea
   } else {
     const r = openRun(repoId); setRepo(repo, { auto_mode: 0, auto_stopped_why: null, auto_waiting: null }); clearGoAhead(repoId)
     stopAutoTests(repo.path) // its test run ends now, not at its time limit, with no result (Bug 89)
+    stopPlanChecks(repoId) // and plans waiting for HQ's check wait for the user instead
     resolveKind(`auto_stopped:${repoId}`, null) // the banner goes with auto_stopped_why; so does its ⚠ line
     if (r) await closeRun(getRepo(repoId)!, r, 'off')
     tellTpm(repoId, 'HQ: the user turned auto mode off. They start, approve and merge from HQ again, and your normal rules apply: the user decides '

@@ -8,6 +8,7 @@ import { getSetting, now, one, q, run } from './db.ts'
 import { failReport, type Failed } from './testrun.ts'
 import { j } from './util.ts'
 import { getTicket, setTicket, usesGithub, type Fixing, type Repo, type Ticket } from './records.ts'
+import { criteriaOf } from './criteria.ts'
 
 /** What a ticket's branch merges into: `main` for a local (or local-only) repo; `origin/main` for a GitHub one (HQ fetches it; engineers can't). */
 export function mergeBase(repo: Repo): { name: string; ref: string } {
@@ -53,41 +54,65 @@ export const conflictFiles = (t: Ticket): string[] => j<string[]>(t.conflict_fil
 export function fixWords(fixing: Fixing, base: string): { to: string; ing: string } {
   return fixing === 'tests_hung' ? { to: `find what never finishes in its tests on ${base}`, ing: `finding what never finishes in its tests on ${base}` }
     : fixing === 'tests' ? { to: `fix its tests on ${base}`, ing: `fixing its tests on ${base}` }
+    : fixing === 'look' ? { to: `fix what went wrong when HQ opened the app with it on ${base}`, ing: `fixing what went wrong when HQ opened the app with it on ${base}` }
+    : fixing === 'review' ? { to: 'fix what a fresh reader of its changes found', ing: 'fixing what a fresh reader of its changes found' }
     : fixing === 'changes' ? { to: 'build the change to its spec', ing: 'building the change to its spec' }
     : { to: `merge ${base} in and fix its conflicts`, ing: `fixing its conflicts with ${base}` }
 }
-/** It went back for its tests (failed, or never finished), not for its conflicts or a changed spec. */
-export const forTests = (fixing: Fixing): boolean => fixing === 'tests' || fixing === 'tests_hung'
-/** The ⚠ notice for a sent-back ticket whose engineer stopped: its kind picks the button that starts another (Fix conflicts, Fix tests, Build the change). */
-export const stalledKind = (fixing: Fixing): string => fixing === 'changes' ? 'change_stalled' : forTests(fixing) ? 'fix_stalled' : 'merge_conflict'
-/** Someone is on the ticket's tests or its change again (or it's finished): the "its engineer stopped" notices for those go. */
-export function clearStalled(ticketId: string): void { for (const k of ['fix_stalled', 'change_stalled']) resolveKindForTicket(k, ticketId) }
+/** It went back for what auto mode's check of it on main showed: its tests (failed, or never finished), HQ's look at the app, or a reader of its changes. Not
+ *  its conflicts or a changed spec. What the check showed is kept with the ticket, and whoever takes it up again gets it (keepTestsFailed). */
+export const forTests = (fixing: Fixing): boolean => fixing === 'tests' || fixing === 'tests_hung' || fixing === 'look' || fixing === 'review'
+/** The ⚠ notice for a sent-back ticket whose engineer stopped: its kind picks the button that starts another (Fix conflicts, Fix tests, Fix the app, Build the
+ *  change). */
+export const stalledKind = (fixing: Fixing): string => fixing === 'changes' ? 'change_stalled' : fixing === 'look' ? 'look_stalled' : fixing === 'review' ? 'review_stalled'
+  : forTests(fixing) ? 'fix_stalled' : 'merge_conflict'
+/** The button that starts another engineer on a sent-back ticket, by what it went back for. */
+export const fixButton = (fixing: Fixing): string => fixing === 'changes' ? 'Build the change' : fixing === 'look' ? 'Fix the app' : fixing === 'review' ? 'Fix what it found'
+  : forTests(fixing) ? 'Fix tests' : 'Fix conflicts'
+/** Someone is on the ticket's tests, its app or its change again (or it's finished): the "its engineer stopped" notices for those go. */
+export function clearStalled(ticketId: string): void { for (const k of ['fix_stalled', 'look_stalled', 'review_stalled', 'change_stalled']) resolveKindForTicket(k, ticketId) }
 /** What auto mode's failed test of a ticket printed, kept with the ticket so an engineer that takes over gets it too (Bug 84). */
 export function keepTestsFailed(t: Ticket, failed: Failed): void {
   run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
-    `ticket:${t.id}`, 'tests_failed', JSON.stringify({ test: failed.test, output: failed.output, earlier: failed.earlier, hung: !!failed.hung }), now())
+    `ticket:${t.id}`, 'tests_failed',
+    JSON.stringify({ test: failed.test, output: failed.output, earlier: failed.earlier, hung: !!failed.hung, unproven: !!failed.unproven, look: !!failed.look, review: !!failed.review }), now())
 }
 /** That kept failure; `test` (the project's command) and a note stand in for it if it's gone. */
 export function testsFailed(t: Ticket, test: string | null): Failed {
   const kept = j<Partial<Failed> | null>(one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'tests_failed'", `ticket:${t.id}`)?.text ?? null, null)
   return { kind: 'fail', test: kept?.test ?? test ?? 'the tests', output: kept?.output ?? "(HQ doesn't have what they printed any more: run them to see.)",
-    earlier: kept?.earlier ?? '', hung: kept?.hung ?? t.fixing === 'tests_hung' }
+    earlier: kept?.earlier ?? '', hung: kept?.hung ?? t.fixing === 'tests_hung', ...(kept?.unproven ? { unproven: true } : {}), ...(kept?.look ?? t.fixing === 'look' ? { look: true } : {}),
+    ...(kept?.review ?? t.fixing === 'review' ? { review: true } : {}) }
 }
 
+/** How the step that calls open_pr again ends. A ticket with acceptance criteria named a test for each when it finished: open_pr takes those again when
+ *  `tests` is left out, and checks them afresh. A ticket with none hears nothing about tests it was never asked for. */
+const again = (t: Ticket): string => criteriaOf(t).length ? ' (leave `tests` out unless a criterion\'s test moved or changed its name: HQ checks the ones you gave last time again).' : '.'
 /** HQ's instructions to the engineer when auto mode's test of its ticket on main fails: alone it passed, together it doesn't. A run
  *  that never finished is told as one: the engineer looks for what waits forever, not for a failure that wasn't printed (Bug 82). */
 export function fixTestsText(o: { t: Ticket; base: string; failed: Failed; launch?: { worktree: string } }): string {
   const { t, base, failed: r } = o
   const intro = o.launch ? `You are the engineer for ticket ${t.key} (${t.size}): ${t.title}. Its work is committed on branch ${t.branch}`
     + ` in your worktree ${o.launch.worktree}; call get_ticket for its spec and the handoff so far.\n\n` : ''
-  const what = r.hung ? `${t.branch} merged with ${base} never finished its tests: HQ stopped \`${r.test}\` after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)}`
+  const what = r.review ? `${t.branch} merged with ${base} passes its tests, but a fresh reader of your changes found problems, so HQ didn't merge it. The reader saw only the`
+    + ` ticket's acceptance criteria, your changes against ${base} and what the tests printed.`
+    : r.look ? `${t.branch} merged with ${base} passes its tests, but the app has problems when HQ opens it with your ticket merged in, so HQ didn't merge it.`
+    : r.unproven ? `${t.branch} merged with ${base} passes \`${r.test}\`, but that run didn't run every test you named for the ticket's criteria, so HQ didn't merge it.`
+    : r.hung ? `${t.branch} merged with ${base} never finished its tests: HQ stopped \`${r.test}\` after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)}`
     + " minutes, so HQ didn't merge it. Something waits forever (a test, a server or a timer that never ends), maybe only next to what another ticket merged first."
     + ' What it printed:' : `${t.branch} merged with ${base} fails its tests, so HQ didn't merge it. Another ticket may have merged first. \`${r.test}\` said:`
-  const steps = [`git merge --no-edit ${base} (merge, never rebase, never push).`, r.hung
-    ? `Run \`${r.test}\` with a time limit, find what never finishes and fix it, keeping your ticket's work and what is on ${base}.`
+  const steps = [`git merge --no-edit ${base} (merge, never rebase, never push).`, r.review
+    ? `Fix what the reader found, keeping your ticket's work and what is on ${base}. If a finding is wrong, say why in your handoff instead of changing the code: this read`
+      + ' happens once, and your next open_pr is merged on its tests. Then run the tests.'
+    : r.look
+    ? `Fix what the report above shows, keeping your ticket's work and what is on ${base}. A real browser can't start in your session: go by the report, by what the`
+      + ' app prints when you start it, and by what its server answers (curl). Then run the tests.'
+    : r.unproven
+    ? `Make each test listed above run and pass under \`${r.test}\` (HQ reads that command's output), or name a test that does. Don't drop a criterion's test.`
+    : r.hung ? `Run \`${r.test}\` with a time limit, find what never finishes and fix it, keeping your ticket's work and what is on ${base}.`
     : `Run \`${r.test}\` and fix what fails, keeping your ticket's work and what is on ${base}.`,
-  'Commit.', 'Call update_handoff(kind: before_pr) saying what was wrong.', 'Call open_pr again with the same title and body, keeping the "## Deviations from approved plan" section.']
-  return `${intro}HQ: ${what}\n\n${failReport(r, 4000)}\n\n`
+  'Commit.', 'Call update_handoff(kind: before_pr) saying what was wrong.', `Call open_pr again with the same title and body, keeping the "## Deviations from approved plan" section${again(t)}`]
+  return `${intro}HQ: ${what}\n\n${r.unproven || r.look || r.review ? r.output : failReport(r, 4000)}\n\n`
     + `Fix it now, in your worktree:\n${steps.map((x, i) => `${i + 1}. ${x}`).join('\n')}\nIf you can't fix it from this ticket, call report_blocked and say why.`
 }
 
@@ -97,9 +122,11 @@ export function changeText(o: { t: Ticket; launch?: { worktree: string } }): str
   const { t } = o
   const intro = o.launch ? `You are the engineer for ticket ${t.key} (${t.size}): ${t.title}. Its work was finished and is committed on branch ${t.branch}`
     + ` in your worktree ${o.launch.worktree}; get_ticket has the handoff so far.\n\n` : ''
-  const steps = ['Call get_ticket and read the spec as it is now.', "Build what the spec asks for that the branch doesn't do yet, and take out what it no longer asks for."
+  const crit = criteriaOf(t).length > 0, read = crit ? 'the spec and the acceptance criteria as they are now' : 'the spec as it is now'
+  const steps = [`Call get_ticket and read ${read}.`, "Build what the spec asks for that the branch doesn't do yet, and take out what it no longer asks for."
     + ' Keep the rest of the work as it is.', 'Run the tests.', 'Commit (never push).', 'Call update_handoff(kind: before_pr) saying what you changed.',
-  'Call open_pr again with a title and body that fit the ticket as it is now, keeping the "## Deviations from approved plan" section.']
+  'Call open_pr again with a title and body that fit the ticket as it is now, keeping the "## Deviations from approved plan" section'
+    + `${crit ? ', and with `tests` for the criteria as they are now' : ''}.`]
   return `${intro}HQ: the TPM changed the spec of ${t.key} after it was finished. It isn't merged yet; it waits for the change.`
     + ` Build it now, in your worktree:\n${steps.map((x, i) => `${i + 1}. ${x}`).join('\n')}\nIf you can't build it from this ticket, call report_blocked and say why.`
 }
@@ -118,7 +145,7 @@ export function fixConflictsText(o: { t: Ticket; base: string; files: string[]; 
     o.inProgress ? 'A merge is already in progress in your worktree: finish it (git status shows what is left).' : `git merge --no-edit ${base} (merge, never rebase, never push).`,
     ...(o.files.length ? ["In each conflicted file keep both sides' intent: your ticket's change and theirs."] : []),
     'Run the tests.', 'Commit the merge (if git made one already, there is nothing to commit).', 'Call update_handoff(kind: before_pr) saying what you kept.',
-    'Call open_pr again with the same title and body, keeping the "## Deviations from approved plan" section.',
+    `Call open_pr again with the same title and body, keeping the "## Deviations from approved plan" section${again(t)}`,
   ]
   return `${intro}HQ: ${what} Fix it now, in your worktree:\n${steps.map((x, i) => `${i + 1}. ${x}`).join('\n')}\nIf you can't keep both, call report_blocked and say why.`
 }

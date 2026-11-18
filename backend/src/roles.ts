@@ -5,8 +5,9 @@ import path from 'node:path'
 import { PATHS, PORTS, DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR, TURN_WAIT_S, HQ_AWAY_WAIT_S } from './config.ts'
 import { getSetting } from './db.ts'
 import { real, shq } from './util.ts'
+import { BROWSER_TOOLS } from './uitesterrules.ts'
 
-export type Role = 'tpm' | 'architect' | 'engineer' | 'launcher'
+export type Role = 'tpm' | 'architect' | 'engineer' | 'launcher' | 'tester'
 const HOME = os.homedir()
 /** Bug 87: an agent's token goes in a header, never in the hook's URL. With HQ down, Claude Code prints a failed http hook's URL on the
  *  agent's screen ("HTTP 502 from <url>"), where the model reads it; it never prints the headers. */
@@ -39,6 +40,7 @@ export function modelFor(role: Role, size?: string): string {
   if (role === 'tpm') return m.tpm
   if (role === 'architect') return m.architect
   if (role === 'launcher') return (m as Partial<typeof m>).launcher ?? m.engineer_s // saved before the helper existed: the S engineer's
+  if (role === 'tester') return (m as Partial<typeof m>).tester ?? DEFAULTS.models.tester // saved before the tester existed
   return size === 'S' ? m.engineer_s : m.engineer_ml
 }
 
@@ -65,7 +67,7 @@ function bashHook(agentDir: string, repoId: string | undefined) {
 
 function hookGroup(token: string) { return [{ hooks: [hook(token, 10)] }] }
 
-type SettingsOpts = { agentDir: string; repoId?: string; repoAllowlist?: string[]; editOverrides?: string[] }
+type SettingsOpts = { agentDir: string; repoId?: string; repoAllowlist?: string[]; editOverrides?: string[]; localOnly?: boolean }
 export function buildSettings(role: Role, token: string, opts: SettingsOpts): Record<string, unknown> {
   const gateTimeout = getSetting('gate_timeout_s', DEFAULTS.gate_timeout_s)
   const sessionStartCmd = `curl -s -m 5 -X POST -H 'Content-Type: application/json' -H @${shq(path.join(opts.agentDir, HOOK_HEADER_FILE))} --data-binary @- ${HOOK_URL()}`
@@ -114,7 +116,8 @@ export function buildSettings(role: Role, token: string, opts: SettingsOpts): Re
     env: cacheEnv(),
     sandbox: {
       enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true,
-      network: { allowedDomains: ['127.0.0.1', 'localhost', '[::1]', ...PACKAGE_REGISTRIES, ...(opts.repoAllowlist ?? [])], strictAllowlist: true, allowLocalBinding: true },
+      network: { allowedDomains: ['127.0.0.1', 'localhost', '[::1]', ...(opts.localOnly ? [] : [...PACKAGE_REGISTRIES, ...(opts.repoAllowlist ?? [])])],
+        strictAllowlist: true, allowLocalBinding: true },
       // On a Linux with no keyring, gh keeps its token in a file in GH_CONFIG_DIR. HQ's own folder by its real path: that's what the sandbox compares (Bug 59).
       filesystem: { allowWrite: [ENGINEER_CACHE], denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, real(PATHS.home), `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`,
         GH_CONFIG_DIR] },
@@ -152,5 +155,27 @@ export function roleFlags(role: Role, opts: { worktreeName?: string; model: stri
       '--disallowedTools', ...LAUNCHER_DISALLOWED, '--permission-mode', 'default', '--model', opts.model]
   }
   return ['--disallowedTools', ...PLANNER_DISALLOWED, '--permission-mode', 'default', '--model', opts.model]
+}
+/** The UI tester (uitester.ts) never sees code. Claude Code gives it a browser (Playwright MCP, as `browser`) and HQ's two scenario tools (`uitest`), and
+ *  nothing else: no Bash, Read, Edit or Write (`--tools ''`), no MCP server but those two (`--strict-mcp-config`), and of the browser's tools only what a
+ *  person does with a page. Running JavaScript in the page, uploading files, the network and console logs (HQ records those itself), other tabs: refused,
+ *  which in 2.1.322 takes them off the tester's list altogether (spike 2026-11-17). Its browser runs in HQ's sandbox, which lets it reach the app's port and
+ *  nothing else and can't read the project (testrun.ts browserProfile); it starts in an empty folder and is told only the app's address. */
+export const TESTER_TOOLS = [...BROWSER_TOOLS.map((t) => `mcp__browser__browser_${t}`), 'mcp__uitest__start_scenario', 'mcp__uitest__finish_scenario']
+export const TESTER_DENIED = ['evaluate', 'run_code_unsafe', 'file_upload', 'network_request', 'network_requests', 'console_messages', 'tabs', 'close', 'resize',
+  'emulate_media', 'drag', 'drop', 'find', 'install', 'pdf_save', 'generate_locator', 'start_tracing', 'stop_tracing'].map((t) => `mcp__browser__browser_${t}`)
+/** The tester's hooks: before and after each browser tool, Claude Code tells the tester's host (uitesthost.mjs, on `ctrl`), which stamps it on HQ's clock and
+ *  refuses a step past the scenario's budget. A command hook, since the host isn't HQ's hooks server. Claude Code waits for each answer, so a step's record
+ *  is complete before the next step begins. */
+export function testerSettings(ctrl: number): Record<string, unknown> {
+  const to = (what: string, timeout: number) => [{ matcher: '^mcp__browser__', hooks: [{ type: 'command', timeout,
+    command: `curl -s -m ${timeout - 5} -X POST --data-binary @- http://127.0.0.1:${ctrl}/${what}` }] }]
+  return { permissions: { disableBypassPermissionsMode: 'disable', disableAutoMode: 'disable', allow: TESTER_TOOLS, deny: TESTER_DENIED },
+    hooks: { PreToolUse: to('pre', 15), PostToolUse: to('post', 65), PostToolUseFailure: to('post-failed', 15) } }
+}
+/** The tester's flags (Claude Code's `-p` call, checker.ts `call`, adds its own): the lockdown above, its MCP servers, its hooks. */
+export function testerFlags(o: { model: string; mcp: Record<string, unknown>; ctrl: number }): string[] {
+  return ['--model', o.model, '--tools', '', '--strict-mcp-config', '--mcp-config', JSON.stringify({ mcpServers: o.mcp }), '--allowedTools', TESTER_TOOLS.join(','),
+    '--disallowedTools', ...TESTER_DENIED, '--settings', JSON.stringify(testerSettings(o.ctrl))]
 }
 export function rolePromptPath(role: Role): string { return path.join(PATHS.roles, `${role}.prompt.md`) }

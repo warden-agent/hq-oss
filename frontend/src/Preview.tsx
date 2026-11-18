@@ -54,6 +54,7 @@ export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo }:
       <span className="min-w-0 grow">Trying <b>{tried.key}</b>: {tried.title}. This is its version with a copy of your data, not main. Nothing you do here changes main.</span>
       <ActBtn label="Back to main" busyLabel="Switching…" run={() => api(`previews/${p.id}/start`, { ticket: null })} /></div>}
     <HelperBanner p={p} repo={repo} watch={() => setTab('claude')} />
+    <SetupBanner p={p} repo={repo} />
     <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs">
       <Dot status={p.status} />
       <span className="shrink-0 font-medium text-zinc-300">{p.status}</span>
@@ -151,6 +152,46 @@ function HelperBanner({ p, repo, watch }: { p: any; repo: any; watch: () => void
   return null
 }
 
+/** HQ's test setup (Tester & Checker, Part 3): its helper at work, why it ended, or a new setup the user hasn't seen yet (shown once). */
+function SetupBanner({ p, repo }: { p: any; repo: any }) {
+  const t = p.test_setup; if (!t) return null
+  const box = (tone: string, body: React.ReactNode) => <div className={`flex flex-col gap-1 rounded-md border px-2 py-1 text-xs ${tone}`}>{body}</div>
+  const amber = 'border-amber-600/50 bg-amber-950/40 text-amber-200', rose = 'border-rose-700/50 bg-rose-950/40 text-rose-200', indigo = 'border-indigo-500/60 bg-indigo-950/40 text-zinc-300'
+  const row = (body: React.ReactNode) => <div className="flex flex-wrap items-center gap-x-2 gap-y-1">{body}</div>
+  const go = (action?: string) => api(`previews/${p.id}/test-setup`, action ? { action } : {})
+  if (t.working) return box(amber, row(<><span className="min-w-0 grow">{t.state === 'checking' ? `HQ is trying Claude's test setup for ${repo.name} in its sandbox: seed, start, reset.`
+    : `Claude is working out how HQ tests ${repo.name}: a production start, a clean seed, where its data is.`}</span>
+    <ActBtn label="Stop Claude" busyLabel="Stopping…" run={() => go('dismiss')} /></>))
+  if (t.state === 'cant_test' || t.state === 'failed') return box(rose, row(<><span className="min-w-0 grow">{t.state === 'cant_test' ? `HQ can't test ${repo.name}: ${t.note}` : t.note}</span>
+    <ActBtn label="Ask Claude again" busyLabel="Asking…" run={() => go()} /><ActBtn label="Dismiss" run={() => go('dismiss')} /></>))
+  const who = t.by && /^[A-Z]+-\d+/.test(t.by) ? `${t.by} changed how HQ tests ${repo.name}.` : `Claude worked out how HQ tests ${repo.name}.`
+  if (t.setup && !t.seen) return box(indigo, <>{row(<><span className="min-w-0 grow text-zinc-100">{who}
+    {t.checked ? (t.checked.ok ? ' HQ tried it: it works.' : ` HQ's check failed: ${t.checked.why?.split('\n')[0]}`) : ' HQ is checking it.'}</span>
+    <ActBtn label="Got it" primary run={() => go('dismiss')} /></>)}
+    <div className="max-h-48 overflow-auto"><SetupList s={t.setup} /></div></>)
+  return null
+}
+
+/** A test setup in plain words: how each part runs for tests, the data HQ copies and resets, the seed, and the API endpoints by kind. */
+export function SetupList({ s }: { s: any }) {
+  const kinds = ['instant', 'normal', 'heavy'].map((k) => [k, s.endpoints.filter((e: any) => e.kind === k)] as const).filter(([, l]) => l.length)
+  return <div className="flex flex-col gap-1">
+    {s.start.map((x: any) => <div key={x.part} className="rounded border border-zinc-800 bg-zinc-950/60 px-2 py-1">
+      <div className="text-zinc-200"><b>{x.part}</b> for tests (a production build)</div>
+      {x.build && <div className="break-all font-mono text-zinc-400">build: {x.build}</div>}
+      <div className="break-all font-mono text-zinc-200">run: {x.run}</div>
+    </div>)}
+    <div className="text-zinc-400">Its data: <code className="break-all">{s.snapshot.join(', ')}</code>. HQ copies it after every step, and puts the seed back for a reset (stop, seed, start).</div>
+    <details className="text-zinc-400"><summary className="cursor-pointer">The seed (a clean set of test data, never yours)</summary>
+      <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px]">{s.seed}</pre></details>
+    {kinds.length > 0 && <details className="text-zinc-400">
+      <summary className="cursor-pointer">{s.endpoints.length} API endpoint{s.endpoints.length === 1 ? '' : 's'}: {kinds.map(([k, l]) => `${l.length} ${k}`).join(', ')}</summary>
+      {kinds.map(([k, l]) => <div key={k}><span className="text-zinc-300">{k}:</span>{' '}
+        <span className="break-all font-mono text-[11px]">{l.map((e: any) => `${e.method} ${e.path}`).join(' · ')}</span></div>)}</details>}
+    {s.notes && <div className="italic text-zinc-400">{s.notes}</div>}
+  </div>
+}
+
 /** A program holds a port the app needs (Bug 42): who it is, and a button that stops it and launches. HQ's own leftovers go on
  *  one click; anything else is named in HQ's dialog first. */
 function PortBox({ p, repo }: { p: any; repo: any }) {
@@ -228,5 +269,16 @@ function CommandForm({ p, close }: { p: any; close: () => void }) {
     <div className="flex items-center gap-1.5"><span className="grow" />
       <ActBtn label={p.recipe ? "Use Claude's steps" : 'Clear'} disabled={!p.command} run={() => save(null)} />
       <ActBtn label="Save" primary disabled={!text.trim() || text.trim() === p.command} run={() => save(text.trim())} /></div>
+    <div className="mt-1 border-t border-zinc-800 pt-2 text-zinc-300">How HQ tests this app</div>
+    {p.test_setup?.setup ? <><div className="text-zinc-400">{p.test_setup.by ? `Saved by ${p.test_setup.by}` : 'Saved'}{p.test_setup.checked
+      ? (p.test_setup.checked.ok ? '; HQ tried it and it works.' : `; HQ's last check failed: ${p.test_setup.checked.why?.split('\n')[0]}`) : '.'}
+      {p.test_setup.pending?.length ? ` Changes waiting on ${p.test_setup.pending.join(', ')}.` : ''}
+      {p.test_setup.checking?.length ? ` HQ is checking the changes ${p.test_setup.checking.join(', ')} made.` : ''}</div><SetupList s={p.test_setup.setup} /></>
+      : <div className="text-zinc-400">No test setup yet. Claude (Opus) works it out once from the code: a production start, a clean seed, where the data lives. HQ runs it
+        in its sandbox, with no internet and none of your files, and uses it for every test after.</div>}
+    <div className="flex items-center gap-1.5">
+      <ActBtn label={p.test_setup?.setup ? 'Ask Claude to work it out again' : 'Set up testing'} busyLabel="Asking…" disabled={!!p.test_setup?.working || (!p.recipe && !p.command)}
+        title={!p.recipe && !p.command ? 'Launch the app once first: testing starts it the same way' : undefined} run={() => api(`previews/${p.id}/test-setup`, {}).then(close)} />
+    </div>
   </form>
 }

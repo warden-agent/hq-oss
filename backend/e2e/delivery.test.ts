@@ -355,7 +355,7 @@ test('Bug 33: the TPM can retitle a ticket after a change of mind; the engineer 
   assert.deepEqual([(await ticketOf(t)).title, (await ticketOf(t)).spec], ['Totals line on the Home page', 'A line on the Home page.'])
   assert.equal((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Only the title' })).isError, false)
   assert.equal((await ticketOf(t)).spec, 'A line on the Home page.') // a title alone keeps the spec
-  assert.match((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key })).text, /give a new spec, a new title, or both/)
+  assert.match((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key })).text, /give a new spec, a new title, new criteria, or any of them together/)
   const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
   await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
   await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, title: 'Totals line', user_asked: true })

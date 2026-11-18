@@ -7,14 +7,18 @@ import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshB
   removeConfirm, openAuto, openSummary, boardKeeper, turnOn, useBoard, type Board, type Pop, type PopKind } from './board'
 import { ActBtn, Elapsed, ErrorBar, LiveDot, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
 import { mergeTestOf, mergeTestWords, runWords } from './testruns.ts'
+import { byKind, criteriaOf, flagLines, KIND_HEADING, proofOf, proofWords } from '../../backend/src/criteria.ts'
+import { lookWords } from '../../backend/src/smokerules.ts'
+import { diffCheckOf, diffCheckWords, planCheckOf, planCheckWords } from '../../backend/src/checks.ts'
 import { pauseAt, usageParts } from './usage.ts'
 import { LaunchBtn, PreviewPane } from './Preview'
 import { clampH, clampW, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
 import { useAlerts } from './alerts'
 import { AlertsLine } from './AlertsLine'
-import { askedWho, claudeLine, goodNews, keysText, splitNeeds, ticketQuestion, turnQuestionText, uncountedQuestions, yourTurn, type Need } from './needs.ts'
+import { askedWho, claudeLine, goodNews, hqAnswersPlan, keysText, splitNeeds, ticketQuestion, turnQuestionText, uncountedQuestions, yourTurn, type Need } from './needs.ts'
 import { AutoBanner, AutoDialog, AutoSwitch, DoRestBtn, LastRunBtn } from './Auto'
 import { Events } from './Events'
+import { MapBtn } from './FeatureMap'
 import { eventLog } from './eventlog.ts'
 
 type Tab = 'agent' | 'ticket' | 'messages' | 'events'
@@ -171,6 +175,7 @@ export default function App() {
         <TestLimit state={all!} />
         {repo && <AutoSwitch all={all!} repo={repo} />}
         {repo && <LastRunBtn all={all!} repo={repo} />}
+        {repo && <MapBtn all={all!} repo={repo} />}
         <TestingNow state={state} />
         <Sessions state={state} repo={repo} />
         <span className="grow" />
@@ -208,7 +213,7 @@ const same = (a: unknown, b: unknown): boolean => a === b || (typeof a === 'obje
 function applyPatch(s: State, m: { entity: string; id: string; patch: Record<string, any> | null }): State {
   if (m.entity === 'setting') return same(s.settings[m.id], m.patch?.value) ? s : { ...s, settings: { ...s.settings, [m.id]: m.patch?.value } }
   const key = ({ agent: 'agents', ticket: 'tickets', feature: 'features', message: 'messages', review: 'reviews', attention: 'attention', repo: 'repos', preview: 'previews',
-    ask: 'asks', question: 'questions', auto_run: 'autoRuns', test_run: 'testRuns' } as Record<string, keyof State>)[m.entity]
+    ask: 'asks', question: 'questions', auto_run: 'autoRuns', test_run: 'testRuns', map: 'maps', finding: 'findings' } as Record<string, keyof State>)[m.entity]
   if (!key) return s
   const list = (s[key] as any[]) ?? []; const i = list.findIndex((x) => x.id === m.id)
   if (m.entity === 'repo' && i < 0 && !m.patch?.name) return s // a late change to a project just removed from HQ
@@ -358,7 +363,7 @@ function Elsewhere({ all, repo, needs, onRepo }: { all: State; repo: any | null;
  *  `count` is what the tab title counts for this project (Bug 63), so plain information in the list doesn't light it up. */
 function Bell({ state, board, count }: { state: State; board: Board; count: number }) {
   const b = useBoard()
-  const reviews = state.reviews.filter((r) => r.status === 'open').sort((x, y) => (y.opened_at ?? 0) - (x.opened_at ?? 0))
+  const reviews = state.reviews.filter((r) => r.status === 'open' && !hqAnswersPlan(state, r)).sort((x, y) => (y.opened_at ?? 0) - (x.opened_at ?? 0)) // on auto: HQ's to answer
   const base = (t: any) => { const f = state.features.find((x) => x.id === t.feature_id); return { cancelled: f?.status === 'cancelled', branch: state.repos.find((r) => r.id === f?.repo_id)?.default_branch ?? 'main' } }
   const onAuto = !!b.repo?.auto_mode && !b.repo.auto_stopped_why
   const merges = state.tickets.flatMap((t) => { const f = base(t), acts = f.cancelled || (onAuto && !t.auto_parked_why) ? [] : mergeActs(t, f.branch, liveEngineer(t, state));
@@ -408,7 +413,8 @@ function TicketInfo({ t, state }: { t: any | null; state: State }) {
   if (!t) return <div className="p-4 text-sm text-zinc-500">Click a ticket box to see its details here.</div>
   const f = state.features.find((x) => x.id === t.feature_id), deps = jsonList(t.deps), files = jsonList(t.expected_files), ask = ticketQuestion(state, t)
   return <div className="h-full overflow-y-auto pr-1 text-xs">
-    <div className="flex items-center gap-2"><span className="font-semibold">{t.key}</span><span className="text-zinc-500">{t.size}</span><Pill s={t.status} label={ticketLabel(t)} /></div>
+    <div className="flex items-center gap-2"><span className="font-semibold">{t.key}</span><span className="text-zinc-500">{t.size}</span>
+      <Pill s={t.status} label={ticketLabel(t, state.reviews.some((r) => r.ticket_id === t.id && r.status === 'open' && hqAnswersPlan(state, r)))} /></div>
     <div className="mt-1 text-sm text-zinc-200">{t.title}</div>
     <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1 text-zinc-400">
       {ask && <><dt>Question</dt><dd className="break-words text-amber-200">asked {askedWho(ask, state.agents)}: {ask.body}</dd></>}
@@ -419,20 +425,51 @@ function TicketInfo({ t, state }: { t: any | null; state: State }) {
       {t.pr_url && <><dt>PR</dt><dd><a className="text-indigo-300 underline" href={t.pr_url} target="_blank" rel="noreferrer">{t.pr_number ? `#${t.pr_number}` : 'open'} ↗</a></dd></>}
     </dl>
     {t.status === 'merged' && <MergeTests key={`${t.id}:${t.merge_test}`} t={t} />}
+    <Criteria t={t} />
+    <Readers t={t} state={state} />
     <div className="mt-3 font-semibold text-zinc-400">Spec</div>
     <pre className="mt-1 whitespace-pre-wrap text-[11px] text-zinc-300">{t.spec || '—'}</pre>
     <HandoffNote scope={`resume:ticket:${t.id}`} stamp={`${t.parked_at}:${t.assignee_agent_id}`} />
   </div>
 }
+const TONE = { ok: 'text-emerald-300', look: 'text-amber-300', none: 'text-zinc-500' } as const
+/** A ticket's acceptance criteria, each with the test its engineer named for it at open_pr and how that test did in HQ's own run, then what git flagged about
+ *  the finished work (deleted tests, files outside the plan). Nothing for a ticket with neither. */
+function Criteria({ t }: { t: any }) {
+  const list = criteriaOf(t), p = proofOf(t), flags = p ? flagLines(p.flags) : []
+  if (!list.length && !flags.length) return null
+  return <>
+    {list.length > 0 && <><div className="mt-3 font-semibold text-zinc-400">Acceptance criteria</div>
+      {byKind(list).map((g) => <div key={g.kind} className="mt-1"><div className="text-zinc-500">{KIND_HEADING[g.kind]}</div>
+      <ul className="mt-0.5 space-y-1.5">{g.list.map((c) => { const named = p?.tests.filter((e) => e.criterion === c.id) ?? []
+        return <li key={c.id}><div className="break-words text-zinc-300"><span className="font-semibold">{c.id}</span> · {c.text}</div>
+          {(named.length ? named : [undefined]).map((e, i) => { const w = proofWords(e); return <div key={i} className={`break-words ${TONE[w.tone]}`}>{w.text}</div> })}</li> })}</ul></div>)}</>}
+    {flags.length > 0 && <><div className="mt-3 font-semibold text-zinc-400">Worth a look in its changes</div>
+      <ul className="mt-1 space-y-0.5 text-amber-300">{flags.map((l) => <li key={l} className="break-words">{l}</li>)}</ul></>}
+  </>
+}
+/** What auto mode's two fresh readers said about a ticket (checks.ts): its plan against the criteria before it was built, and its changes before it merged.
+ *  Nothing for a ticket neither has read. The plan check shown is the one that sent a plan back, if any did, else the newest. */
+function Readers({ t, state }: { t: any; state: State }) {
+  const plans = state.reviews.filter((r) => r.ticket_id === t.id).map((r) => planCheckOf(r.plan_check)).filter((c) => !!c)
+  const plan = planCheckWords(plans.find((c) => c.state === 'sent_back') ?? plans[0] ?? null), diff = diffCheckWords(diffCheckOf(t))
+  if (!plan && !diff) return null
+  const part = (w: NonNullable<typeof plan>, key: string) => <div key={key} className="mt-1"><div className={`break-words ${TONE[w.tone]}`}>{w.text}</div>
+    {w.findings.length > 0 && <ul className="mt-0.5 space-y-0.5 text-zinc-300">{w.findings.map((f, i) => <li key={i} className="break-words">
+      <span className="font-semibold">{f.about}</span> · {f.problem}</li>)}</ul>}</div>
+  return <><div className="mt-3 font-semibold text-zinc-400">A second reader</div>{plan && part(plan, 'plan')}{diff && part(diff, 'diff')}</>
+}
 /** Bug 126: what HQ ran on a merged ticket before it merged, and how it ended, with the run's output a click away (fetched only then: it can be 8,000 characters).
  *  Keyed by the ticket and its record, so another ticket or a new record starts closed. */
 function MergeTests({ t }: { t: any }) {
   const m = mergeTestOf(t), words = mergeTestWords(m), [out, setOut] = useState<string | null>(null), [open, setOpen] = useState(false)
+  const look = m?.ran === 'pass' ? lookWords(m.look) : null // HQ's look at the app, right after those tests
   const show = () => { setOpen(!open); if (out === null) api<any[]>(`docs?scope=${encodeURIComponent(`ticket:${t.id}`)}`).then((r) =>
     setOut(r.find((d) => d.key === 'merge_test_output')?.text ?? ''), () => setOut('')) }
   return <><div className="mt-3 font-semibold text-zinc-400">Tests before it merged</div>
     {!words ? <div className="mt-1 text-zinc-500">HQ has no record: it merged before HQ kept one.</div>
       : <div className={`mt-1 ${words.passed ? 'text-emerald-300' : 'text-amber-300'}`}>{words.long}</div>}
+    {m?.ran === 'pass' && look && <div className={`mt-1 break-words ${TONE[look.tone]}`}>{look.long}</div>}
     {m?.ran === 'pass' && <>
       <div className="mt-1 text-zinc-400">Ran: <span className="select-all break-all font-mono text-zinc-300">{m.test}</span></div>
       <button className="btn-sm mt-1" onClick={show}>{open ? 'Hide output' : 'Show output'}</button>

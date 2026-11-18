@@ -43,9 +43,12 @@ export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>, show
 }
 
 export type LaunchSpec = {
-  role: Role; repoId?: string; featureId?: string; ticketId?: string; reviewRequestId?: string; model: string; cwd: string; displayName: string
+  role: Exclude<Role, 'tester'>; // the UI tester is no agent on the board: a headless call (uitester.ts)
+  repoId?: string; featureId?: string; ticketId?: string; reviewRequestId?: string; model: string; cwd: string; displayName: string
   launchPrompt: string; worktreeName?: string; permissionMode?: 'plan' | 'acceptEdits'
   extraEnv?: Record<string, string>; extraFlags?: string[]; repoAllowlist?: string[]; editOverrides?: string[]; size?: string
+  /** Network: localhost only, not even the package registries (the test setup helper, testsetup.ts). */
+  localOnly?: boolean
 }
 
 /** The agent's own temp folder (Bug 81), private as Claude Code wants it; null when something not ours is already there (/tmp is
@@ -62,7 +65,7 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   fs.writeFileSync(path.join(dir, 'token'), token, { mode: 0o600 })
   fs.writeFileSync(path.join(dir, HOOK_HEADER_FILE), hookHeaderLine(token), { mode: 0o600 }) // what the SessionStart hook sends (Bug 87)
-  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(buildSettings(spec.role, token, { agentDir: dir, repoId: spec.repoId, repoAllowlist: spec.repoAllowlist, editOverrides: spec.editOverrides }), null, 2), { mode: 0o600 })
+  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(buildSettings(spec.role, token, { agentDir: dir, repoId: spec.repoId, repoAllowlist: spec.repoAllowlist, editOverrides: spec.editOverrides, localOnly: spec.localOnly }), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(buildMcp(path.join(dir, 'token')), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'prompt.md'), spec.launchPrompt)
   const sessionId = randomUUID(), tmp = agentTmp(agentId) // made in the same tick as the agent's row below: a sweep never sees one without the other

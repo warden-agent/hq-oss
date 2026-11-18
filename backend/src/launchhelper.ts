@@ -21,6 +21,7 @@ import { PortTaken, previewSession, previewView, row, save, serial, startPreview
 import { killUnder, pgidOf } from './procs.ts'
 import { sendMessage } from './delivery.ts'
 import { q } from './db.ts'
+import { readSetup } from './testsetupstore.ts'
 import { j, sleep } from './util.ts'
 import * as tmux from './tmux.ts'
 
@@ -248,8 +249,8 @@ export async function recoverHelpers(repos: Repo[]): Promise<void> {
 /** Helpers HQ lost track of (Bug 41): a live launcher for this repo that isn't the one in its preview row is stopped, and every
  *  launch-* worktree that isn't the row's is removed along with the test servers still running in it. */
 export async function sweepStrays(repo: Repo): Promise<void> {
-  const p = row(repo.id)
-  for (const a of liveAgents().filter((x) => x.role === 'launcher' && x.cwd === repo.path && x.id !== p?.helper_agent_id)) {
+  const p = row(repo.id), setup = readSetup(repo.id).job?.agent_id // the test setup helper has the same role, and its own job (testsetup.ts)
+  for (const a of liveAgents().filter((x) => x.role === 'launcher' && x.cwd === repo.path && x.id !== p?.helper_agent_id && x.id !== setup)) {
     await stopAgent(a.id, 'stray launch helper').catch(() => {})
   }
   for (const w of await listWorktrees(repo.path).catch(() => [])) {

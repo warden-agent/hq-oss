@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import type { ServerResponse } from 'node:http'
 import { one, q, run, now, getSetting, tx } from './db.ts'
 import { DEFAULTS } from './config.ts'
-import { emit, patch } from './events.ts'
+import { bus, emit, patch } from './events.ts'
 import { id, short } from './util.ts'
 import { update, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
@@ -36,7 +36,7 @@ export function openReviews(): ReviewRequest[] { return q<ReviewRequest>("SELECT
 /** The reviews the page gets, 50 at most. A plan's text goes only while its review is open (the page shows no other plan), and open
  *  reviews come first, so the limit never drops one. */
 export function pageReviews(): Record<string, unknown>[] {
-  return q(`SELECT r.*, CASE WHEN r.status = 'open' THEN p.plan_text END AS plan_text, p.agent_id, p.verdict, p.verdict_message,
+  return q(`SELECT r.*, CASE WHEN r.status = 'open' THEN p.plan_text END AS plan_text, p.agent_id, p.verdict, p.verdict_message, p.check_result AS plan_check,
       (SELECT COUNT(*) FROM plan_revisions x WHERE x.ticket_id = r.ticket_id AND x.verdict IN ('revise', 'user_architect')) AS revises_used
     FROM review_requests r JOIN plan_revisions p ON p.id = r.plan_revision_id ORDER BY r.status = 'open' DESC, r.opened_at DESC LIMIT 50`)
 }
@@ -103,9 +103,10 @@ export function onExitPlanMode(agent: Agent, body: Record<string, unknown>, res:
   held.set(review.id, { res, timer, agentId: agent.id })
   res.on('close', () => { const h = held.get(review!.id); if (h && h.res === res) { clearTimeout(h.timer); held.delete(review!.id) } })
   update(agent.id, { status: 'plan_review' })
-  // Auto mode: the engineer planned as usual and its plan stays on record; nobody is waited for. Only here, once the hold is set, or the allow has nowhere to go
+  // Auto mode: the engineer planned as usual and its plan stays on record; no person is waited for. HQ's plan check answers it (plancheck.ts, which listens
+  // for this: listeners.ts), at once for a ticket with nothing to check. Only here, once the hold is set, or the allow has nowhere to go
   const tk = getTicket(ticketId), repoId = tk ? getFeature(tk.feature_id)?.repo_id : null
-  if (autoOn(repoId)) answerReview(review.id, 'approve', { by: 'auto' })
+  if (autoOn(repoId)) bus.emit('plan.auto', review.id)
 }
 
 /** A changed plan replaces the ticket's open review: it closes as superseded (its plan can't be approved any more), and a

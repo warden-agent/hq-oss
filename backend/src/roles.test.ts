@@ -27,6 +27,13 @@ test('engineers\' package caches (npm, Go, Python) sit outside home; PyPI is rea
   for (const k of ['GOCACHE', 'GOMODCACHE', 'GOPATH', 'CARGO_HOME']) assert.ok(String(s.env[k]).startsWith(ENGINEER_CACHE), k)
 })
 
+test('the test setup helper (localOnly) reaches localhost and nothing else: no package registry, not the repo\'s own allowlist', () => {
+  const s = buildSettings('launcher', 'tok', { agentDir: tmp, localOnly: true, repoAllowlist: ['api.example.com'] }) as any
+  assert.deepEqual(s.sandbox.network.allowedDomains, ['127.0.0.1', 'localhost', '[::1]']); assert.equal(s.sandbox.network.strictAllowlist, true)
+  const launch = (buildSettings('launcher', 'tok', { agentDir: tmp, repoAllowlist: ['api.example.com'] }) as any).sandbox.network.allowedDomains // the Launch helper keeps them
+  assert.ok(launch.includes('registry.npmjs.org') && launch.includes('api.example.com'))
+})
+
 test('Bug 59: engineers can\'t read HQ\'s folder, by its real path, because that\'s the one the sandbox compares', () => {
   const denied: string[] = (buildSettings('engineer', 'tok', { agentDir: tmp }) as any).sandbox.filesystem.denyRead
   assert.ok(denied.includes(fs.realpathSync(path.join(tmp, 'real-hq'))), denied.join(' '))

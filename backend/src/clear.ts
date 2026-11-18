@@ -19,7 +19,9 @@ import { launching } from './tickets.ts'
 import { builtLines, dropFeatureMd, keepBuilt, tpmWorkspace, writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { restartTpm, tpmStarting } from './tpm.ts'
 import { stopPreview } from './preview.ts'
+import { stopFirstMap } from './firstmap.ts'
 import { git } from './repos.ts'
+import { dropFindings } from './findings.ts'
 
 const name = (a: Agent): string => a.display_name ?? a.id
 /** The repo's agents that a clear stops: its TPM, engineers and reviewers (not a Launch helper: it goes with the app). */
@@ -50,6 +52,7 @@ export async function clearRepo(repoId: string): Promise<{ noting: string[]; sto
   })
   patch('repo', repoId, { clearing_at: at })
   if ((one<{ status: string }>('SELECT status FROM previews WHERE id = ?', repoId)?.status ?? 'stopped') !== 'stopped') await stopPreview(repoId).catch(() => {})
+  stopFirstMap(repoId) // a first map half written goes; one already saved stays (the app is still what it was)
   const noting: string[] = [], stopped: string[] = []
   for (const a of liveAgents().filter(ofRepo(repoId))) {
     if (a.role === 'tpm') tpmWasOn.add(repoId)
@@ -210,6 +213,7 @@ export function deleteRows(repoId: string, F: string[], T: string[], A: string[]
   del('features', inList('id', F), ...F)
   run("UPDATE previews SET ticket_id = NULL, status = 'stopped', updated_at = ? WHERE id = ?", now(), repoId)
   del('auto_runs', 'repo_id = ?', repoId)
+  dropFindings(repoId) // the findings loop's: about runs and tickets that are gone
   // test_cmd_refused (Bug 107): the command stays, but its repair ticket went with the board, so the next engineer it's refused for says so afresh
   run(`UPDATE repos SET clearing_at = NULL, tpm_agent_id = NULL, tpm_parked_at = NULL, auto_mode = 0, auto_stopped_why = NULL, auto_waiting = NULL, test_cmd_proposed = NULL,
     test_cmd_refused = NULL WHERE id = ?`, repoId) // its sessions' rows went with the board
@@ -217,7 +221,7 @@ export function deleteRows(repoId: string, F: string[], T: string[], A: string[]
 /** What only goes when the repo itself does (Remove from HQ): Clear keeps all of it. */
 export function deleteRepoRows(repoId: string): void {
   run('DELETE FROM messages WHERE repo_id = ?', repoId)
-  run('DELETE FROM docs WHERE scope IN (?, ?)', `repo:${repoId}`, `resume:repo:${repoId}`)
+  run('DELETE FROM docs WHERE scope IN (?, ?, ?)', `repo:${repoId}`, `resume:repo:${repoId}`, `map:${repoId}`) // the feature map too (mapstore.ts)
   run('DELETE FROM needs_attention WHERE kind LIKE ?', `%:${repoId}`)
   run('DELETE FROM previews WHERE id = ?', repoId)
   run('DELETE FROM repos WHERE id = ?', repoId)

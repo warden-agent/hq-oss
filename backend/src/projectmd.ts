@@ -7,6 +7,7 @@ import path from 'node:path'
 import { PATHS } from './config.ts'
 import { one, q, run, now } from './db.ts'
 import { features, getFeature, getRepo, tickets, type Feature } from './records.ts'
+import { criteriaOf, criteriaMd } from './criteria.ts'
 
 /** The project TPM's workspace: its cwd, where PROJECT.md and features/ live. */
 export const tpmWorkspace = (repoId: string): string => path.join(PATHS.workspaces, `repo-${repoId}`, 'tpm')
@@ -22,11 +23,12 @@ export function writeFeatureMd(f: Feature): string {
     + `## Request (verbatim)\n\n${f.request_text}\n\n## Tickets\n\n| Key | Size | Status | Depends on | Expected files | Title |\n|---|---|---|---|---|---|\n`
     + `${tk.map((x) => `| ${x.key} | ${x.size} | ${x.status} | ${x.deps} | ${x.expected_files} | ${x.title} |`).join('\n')}\n`
     + (decisions.length ? `\n## Decisions\n\n${decisions.map((d) => `### ${d.key}\n${d.text}`).join('\n\n')}\n` : '')
-    + (tk.length ? `\n## Ticket specs\n\n${tk.map((x) => `### ${x.key}: ${x.title}\n${x.spec ?? ''}`).join('\n\n')}\n` : '')
+    + (tk.length ? `\n## Ticket specs\n\n${tk.map((x) => `### ${x.key}: ${x.title}\n${x.spec ?? ''}${criteriaNote(x)}`).join('\n\n')}\n` : '')
   const file = featureFile(f); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, md)
   writeProjectMd(f.repo_id)
   return file
 }
+const criteriaNote = (t: { criteria: string }): string => criteriaMd(criteriaOf(t))
 /** Removes a feature's file (its feature was cleared off the board). */
 export function dropFeatureMd(f: Feature): void { fs.rmSync(featureFile(f), { force: true }) }
 
@@ -62,7 +64,8 @@ export function writeProjectMd(repoId: string): string {
   }).join('\n\n')
   const md = `# ${repo.name}: project notes (kept by HQ)\n\nHQ rewrites this file whenever the board changes; don't edit it. Your own notes go in `
     + `write_feature (decisions) and, when HQ asks, write_handoff_note.\n\n`
-    + `## What this project is\n\n${ctx ? 'See CONTEXT.md: what the user asked for when the project started.' : 'No first request on record.'}\n\n`
+    + `## What this project is\n\n${ctx ? 'See CONTEXT.md: what the user asked for when the project started.' : 'No first request on record.'}`
+    + ' FEATURE-MAP.md, once there is one, says what is on each screen of the app, in a user\'s words: write screen criteria in those words.\n\n'
     + `## Built so far\n\n${built || 'Nothing merged yet.'}\n\n## On the board now\n\n${board || 'Nothing: every feature is merged or the board is empty.'}\n`
     + (decisions.length ? `\n## Project decisions\n\n${decisions.map((d) => `### ${d.key}\n${d.text}`).join('\n\n')}\n` : '')
   fs.writeFileSync(path.join(ws, 'PROJECT.md'), md)

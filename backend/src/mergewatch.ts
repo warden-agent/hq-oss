@@ -9,7 +9,7 @@ import { one, q, run, now } from './db.ts'
 import { bus, emit } from './events.ts'
 import { j } from './util.ts'
 import { conflictsWith, mergeIntoMain, names } from './localmerge.ts'
-import { clearConflict, clearStalled, fixWords, forTests, mergeBase, setConflict, stalledKind, whoMergedFirst } from './conflicts.ts'
+import { clearConflict, clearStalled, fixButton, fixWords, forTests, mergeBase, setConflict, stalledKind, whoMergedFirst } from './conflicts.ts'
 import { getAgent, stopAgent, type Agent } from './agents.ts'
 import { sendMessage } from './delivery.ts'
 import { autoOn, getFeature, getRepo, getTicket, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type MergeTest, type Repo, type Ticket, liveTpm,
@@ -18,12 +18,15 @@ import { countWords, took } from './testcounts.ts'
 import { ghOpts, git, syncRepo } from './repos.ts'
 import { releaseWorktree } from './slots.ts'
 import { writeFeatureMd } from './projectmd.ts'
+import { criteriaOf, proofOf, type ProofEntry } from './criteria.ts'
+import { checkProof } from './proof.ts'
+import { applyMapOnMerge, mapWanted, markUnchanged, pendingMapChange } from './mapstore.ts'
 
 /** open_pr: the engineer is done. GitHub repos: push its branch as the HQ account; the user tries it, then chooses Merge (HQ
  *  opens a PR and merges it, mergeTicket) or Make PR (makePr) (Bug 45; a PR it already has stays open). Local repos, and GitHub
  *  ones HQ can't push to: the ticket waits for the user's "Merge into main" (mergeTicket). Either way HQ notices the merge (checkMerges). Waiting for a merge isn't an alert: the
  *  box and the ⚠ menu show it until it's merged. */
-export async function finishTicket(agent: Agent, title: string, body: string): Promise<string> {
+export async function finishTicket(agent: Agent, title: string, body: string, named?: ProofEntry[], mapUnchanged = false): Promise<string> {
   const t = ticketForAgent(agent); if (!t || !t.branch || !t.worktree_path) throw new Error('no ticket bound')
   if (FINISHED.includes(t.status)) return `${t.key} is already ${t.status}; nothing more to do. Stop here.`
   const f = getFeature(t.feature_id)!; const repo = getRepo(f.repo_id)!
@@ -40,8 +43,20 @@ export async function finishTicket(agent: Agent, title: string, body: string): P
     throw new Error(`${t.branch} conflicts with ${base.name} in ${names(conflicts)}: main has moved on. Merge it in (git merge --no-edit ${base.name};`
       + " merge, never rebase), keep both sides' intent, run the tests, commit, then call open_pr again.")
   }
+  // The test named for each acceptance criterion, checked with git before anything changes (criteria.ts, proof.ts). Left out on a ticket that was finished
+  // before (a fix of its conflicts or tests): the ones it gave then are checked again, against the criteria and the branch as they are now.
+  const cur = getTicket(t.id) ?? t, given = named?.length ? named : proofOf(cur)?.tests.map(({ state: _, ...e }) => e) ?? null
+  const checked = await checkProof({ repoPath: repo.path, base: base.ref, branch: t.branch, criteria: criteriaOf(cur), tests: given, expected: j<string[]>(cur.expected_files, []), at: now() })
+  if ('problem' in checked) throw new Error(checked.problem)
+  if (mapWanted(cur) && !pendingMapChange(t.id)) { // the map is the tester's only picture of the app: a ticket that changes a screen says how (mapstore.ts)
+    if (!mapUnchanged) throw new Error(`${t.key} has screen criteria, so HQ needs to know what changed on the feature map (get_ticket shows it). Call `
+      + 'update_feature_map with the lines to add and remove on each screen you changed, or, if nothing a user sees changed, call open_pr again with feature_map_unchanged: true.')
+    markUnchanged(cur, f.repo_id)
+  }
+  setTicket(t.id, { proof: JSON.stringify(checked.proof) })
   const fixed = t.status === 'resolving' || (t.status === 'awaiting_answer' && t.prior_status === 'resolving')
   const tests = fixed && forTests(t.fixing) // it went back for its tests, not conflicts (Bug 84)
+  const fixedWhat = t.fixing === 'look' ? 'what went wrong when HQ opened the app' : t.fixing === 'review' ? 'what a fresh reader of its changes found' : 'its tests'
   const changed = fixed && t.fixing === 'changes' // or for a spec the TPM changed after it was finished
   const auto = autoOn(repo.id)
   clearConflict(t.id); clearStalled(t.id)
@@ -52,7 +67,7 @@ export async function finishTicket(agent: Agent, title: string, body: string): P
     emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: false, fixed } })
     if (fixed && !tests && !changed && !auto) attention('conflicts_fixed', `${t.key}: conflicts fixed (${repo.default_branch} merged in). Ready to merge again.`, { agentId: agent.id, ticketId: t.id })
     tellTpm(f, auto ? `HQ: ${t.key} is finished (${t.branch}). HQ tests it on ${repo.default_branch} and merges it; you'll be told when it merges.`
-      : tests ? `HQ: ${t.key}'s engineer fixed its tests on ${repo.default_branch}. The user merges it from HQ; you'll be told when it merges.`
+      : tests ? `HQ: ${t.key}'s engineer fixed ${fixedWhat} on ${repo.default_branch}. The user merges it from HQ; you'll be told when it merges.`
       : changed ? `HQ: ${t.key}'s engineer built the change to its spec (${t.branch}). The user merges it from HQ; you'll be told when it merges.`
       : fixed ? `HQ: ${t.key}'s conflicts with ${repo.default_branch} are fixed. The user merges it from HQ; you'll be told when it merges.`
       : `HQ: ${t.key} is finished (${t.branch}). The user merges it into ${repo.default_branch} from HQ; you'll be told when it merges.`)
@@ -69,7 +84,7 @@ export async function finishTicket(agent: Agent, title: string, body: string): P
   emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: true, waiting: !hasPr, fixed } })
   if (fixed && !tests && !changed && !auto) attention('conflicts_fixed', `${t.key}: conflicts fixed (${base.name} merged in). Ready to merge again.`, { agentId: agent.id, ticketId: t.id })
   tellTpm(f, auto ? `HQ: ${t.key} is finished (${t.branch}, pushed). HQ tests it on ${base.name} and merges it; you'll be told when it merges.`
-    : tests ? `HQ: ${t.key}'s engineer fixed its tests on ${base.name}. The user merges it from HQ; you'll be told when it merges.`
+    : tests ? `HQ: ${t.key}'s engineer fixed ${fixedWhat} on ${base.name}. The user merges it from HQ; you'll be told when it merges.`
     : changed ? `HQ: ${t.key}'s engineer built the change to its spec (${t.branch}, pushed). The user merges it from HQ; you'll be told when it merges.`
     : fixed ? `HQ: ${t.key}'s conflicts with ${base.name} are fixed. The user merges it from HQ; you'll be told when it merges.`
     : `HQ: ${t.key} is finished (${t.branch}, pushed). The user tries it, then merges it or makes a PR from HQ; you'll be told when it merges.`)
@@ -165,8 +180,7 @@ async function checkConflict(t0: Ticket, repo: Repo, pr?: Pr): Promise<void> {
   const t = getTicket(t0.id); if (!t?.branch || !['pr_ready', 'pr_open', 'resolving'].includes(t.status)) return
   if (t.status === 'resolving') {
     const eng = t.assignee_agent_id ? getAgent(t.assignee_agent_id) : undefined
-    const why = t.fixing ? `${t.key}: its engineer stopped while ${fixWords(t.fixing, mergeBase(repo).name).ing}.`
-      + ` Press ${t.fixing === 'changes' ? 'Build the change' : 'Fix tests'} to start another.`
+    const why = t.fixing ? `${t.key}: its engineer stopped while ${fixWords(t.fixing, mergeBase(repo).name).ing}. Press ${fixButton(t.fixing)} to start another.`
       : `${t.key}: its engineer stopped before the conflicts with ${mergeBase(repo).name} were fixed. Press Fix conflicts to start another.`
     if ((!eng || eng.status === 'exited') && !toldStopped.has(t.assignee_agent_id ?? t.id)) {
       toldStopped.add(t.assignee_agent_id ?? t.id); attention(stalledKind(t.fixing), why, { agentId: t.assignee_agent_id, ticketId: t.id })
@@ -217,7 +231,8 @@ function markMerged(t: Ticket, pr: Pr | null, o: { byUser?: boolean; tested?: Te
   resolveForTicket(t.id) // its work is in main: older notices about it (exited, stuck, blocked…) are moot
   if (a && a.status !== 'exited') void stopAgent(a.id, 'merged') // its work is in main now; once it's gone its worktree goes too
   else void releaseWorktree(t).catch(() => {})
-  const f = getFeature(t.feature_id)!; writeFeatureMd(f) // "Built so far" in PROJECT.md grows (Bug 52)
+  const f = getFeature(t.feature_id)!; applyMapOnMerge(t, f.repo_id) // its change to the feature map goes in with its work (mapstore.ts)
+  writeFeatureMd(f) // "Built so far" in PROJECT.md grows (Bug 52)
   const ready = readyDependents(t.key, tickets(f.id), j<string[]>(f.merge_order, [])).map((x) => x.key)
   const what = `${t.key} merged${pr ? ` (PR #${pr.number})` : ''}.${ready.length ? ` Ready now: ${ready.join(', ')}.` : ''}`
   const auto = autoOn(f.repo_id) // auto mode starts what's ready and sums the run up at the end

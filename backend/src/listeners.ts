@@ -1,13 +1,15 @@
 // What HQ does when something happens elsewhere. Registered once by index.ts at startup, never as a side effect of an import.
 import { bus, type HqEvent } from './events.ts'
-import { getTicket, setTicket } from './records.ts'
+import { getFeature, getTicket, setTicket } from './records.ts'
 import { releaseFor, releaseSlot } from './slots.ts'
 import { checkMerges } from './mergewatch.ts'
 import { fillSlots, stopFinished, FINISHED_STOP_MS } from './tickets.ts'
 import { onTicketMerged } from './preview.ts'
 import { onAgentGone } from './launchhelper.ts'
+import { dropSetupChange, onMergedSetup, onSetupAgentGone } from './testsetup.ts'
 import { autoSoon } from './auto.ts'
 import { startTurns } from './heavy.ts'
+import { checkPlan, onRetry } from './plancheck.ts'
 
 const FINISHED_TICK_MS = Number(process.env.HQ_FINISHED_TICK_S ?? 60) * 1000 // the backstop for stopping finished engineers
 
@@ -16,12 +18,13 @@ export function startListeners(): void {
   if (started) return
   started = true
   const freed = (agentId: string | null) => { if (agentId) releaseSlot(agentId); void fillSlots().catch(() => {}) }
-  bus.on('event:agent.stopped', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId) })
-  bus.on('event:agent.lost', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId) })
+  bus.on('event:agent.stopped', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onSetupAgentGone(e.agentId) })
+  bus.on('event:agent.lost', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId); onSetupAgentGone(e.agentId) })
   bus.on('event:hook.SessionEnd', (e: HqEvent) => {
     if (e.payload.reason === 'clear') return
     freed(e.agentId); setTimeout(() => releaseFor(e.agentId), 5000) // Claude Code may still be exiting
     onAgentGone(e.agentId) // a Launch helper that quit by itself
+    onSetupAgentGone(e.agentId) // or a test setup helper
   })
   /** An engineer's question was answered: its ticket goes back to what it was doing. */
   bus.on('event:question.answered', (e: HqEvent) => {
@@ -36,8 +39,12 @@ export function startListeners(): void {
   for (const kind of ['hook.Stop', 'hook.SubagentStop', 'ticket.pr_ready', 'ticket.pr_open', 'agent.idle_fixed']) bus.on(`event:${kind}`, leave)
   setInterval(stopFinished, FINISHED_TICK_MS).unref()
   bus.on('event:ticket.merged', onTicketMerged)
+  bus.on('event:ticket.merged', onMergedSetup) // an engineer's change to the test setup applies with its ticket
+  bus.on('event:ticket.cancelled', (e: HqEvent) => { const t = getTicket(String(e.payload.ticket ?? '')), f = t ? getFeature(t.feature_id) : undefined; if (t && f) dropSetupChange(f.repo_id, t.id) })
   bus.on('event:ticket.merged', () => { void checkMerges().catch(() => {}) }) // main moved: do the tickets still waiting merge cleanly?
   bus.on('slot.freed', () => { void fillSlots().catch(() => {}) }) // a finished engineer no longer counts against the limit
   bus.on('repo.synced', () => { void checkMerges().catch(() => {}) }) // a fresh fetch may show a merge
+  bus.on('plan.auto', (reviewId: string) => checkPlan(reviewId)) // a plan arrived on a project on auto: HQ's plan check answers it
+  onRetry(autoSoon) // a check that failed is asked once more at auto mode's next look
   startTurns()
 }

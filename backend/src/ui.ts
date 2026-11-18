@@ -11,6 +11,7 @@ import { allAgents, getAgent, pageAgent, stopAgent, update, type Agent } from '.
 import type { Term } from './terminal.ts'
 import { termMessage } from './termws.ts'
 import { createFeature, createTicket, launchEngineer, resumeEngineer, startReady, startReadyRepo, fillSlots, cancelTicket, cancelFeature, fixConflicts } from './tickets.ts'
+import { readCriteria } from './criteria.ts'
 import { messageTpm, restartTpm } from './tpm.ts'
 import { freshStart, freshStartAll, parkRepo, resumeRepo } from './freshstart.ts'
 import { clearRepo } from './clear.ts'
@@ -29,8 +30,13 @@ import * as tmux from './tmux.ts'
 import { answerAsk, answerOpenAsks, openAsks } from './asks.ts'
 import { freePort, NeedsSetup, previews, setPreviewCommand, startPreview, stopPreview } from './preview.ts'
 import { approve, dismiss, launchWithoutRecipe, startHelper } from './launchhelper.ts'
+import { dismissSetup, startSetupHelper } from './testsetup.ts'
+import { runScenario, type Step } from './scenario.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
-import { answerTestCommand, autoCheck, autoResume, autoRetry, autoRuns, setAuto, setTestCmd, undoRun } from './auto.ts'
+import { startFirstMap } from './firstmap.ts'
+import { mapViews } from './mapstore.ts'
+import { allFindings, decideFinding, sendFindings } from './findings.ts'
+import { answerTestCommand, autoCheck, autoResume, autoRetry, autoRuns, setAuto, setTestCmd, setUiTest, undoRun } from './auto.ts'
 import { claudeInfo } from './claudecheck.ts'
 import { testRunViews } from './testrun.ts'
 import { pageFeed } from './pagefeed.ts'
@@ -70,7 +76,8 @@ function snapshot() {
   return { autoRuns: autoRuns(), repos: repos(), features: features(), tickets: tickets(), agents: agents.map(agentView), messages: messagesForFeature(null, 300), reviews: pageReviews(),
     attention: openAttention(), asks: openAsks(), questions: openQuestions(), settings: Object.fromEntries(q<{ key: string; value: string }>('SELECT key, value FROM settings').map((r) => [r.key,
       JSON.parse(r.value)])), defaults: { ...DEFAULTS, github_account: GITHUB_ACCOUNT, choices: CHOICES, engineer_limit: ENGINEER_LIMIT, note_cap: NOTE_CAP }, held: heldCount(),
-        ports: PORTS, previews: previews(), build: build(), claude: claudeInfo(), testRuns: testRunViews() }
+        ports: PORTS, previews: previews(), build: build(), claude: claudeInfo(), testRuns: testRunViews(), maps: mapViews(repos().map((r) => r.id)),
+        findings: allFindings() }
 }
 const json = (res: http.ServerResponse, code: number, obj: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)) }
 const cookieToken = (req: http.IncomingMessage): string | null => { const m = /(?:^|;\s*)hq=([^;]+)/.exec(req.headers.cookie ?? ''); return m ? decodeURIComponent(m[1]!) : null }
@@ -112,6 +119,8 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
       { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 && r2 === 'around' && req.method === 'POST') { try { return json(res, 200, { around: await repoAroundProject(r1) }) }
       catch (e) { return json(res, 400, { error: (e as Error).message }) } }
+    if (r0 === 'repos' && r1 && r2 === 'ui-test' && req.method === 'POST') { try { return json(res, 200, setUiTest(r1, !!body.on)) }
+      catch (e) { return json(res, 400, { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 && r2 === 'auto-check' && req.method === 'POST') { try { return json(res, 200, await autoCheck(r1)) }
       catch (e) { return json(res, 400, { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 && r2 === 'auto-resume' && req.method === 'POST') { try { return json(res, 200, await autoResume(r1)) }
@@ -121,12 +130,24 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     }
     if (r0 === 'repos' && r1 && r2 === 'test-cmd' && req.method === 'POST') { try { return json(res, 200, setTestCmd(r1, String(body.cmd ?? ''))) } catch (e) { return json(res,
       400, { error: (e as Error).message }) } }
+    if (r0 === 'repos' && r1 && r2 === 'first-map' && req.method === 'POST') { try { return json(res, 200, startFirstMap(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
+    // The findings loop (findings.ts): the user's decision on one finding, and Send
+    if (r0 === 'repos' && r1 && r2 === 'findings' && parts[3] && req.method === 'POST') {
+      try { return json(res, 200, decideFinding(r1, parts[3], { decision: body.decision as never, wording: body.wording as string | undefined, rule: body.rule as string | undefined })) }
+      catch (e) { return json(res, 409, { error: (e as Error).message }) }
+    }
+    if (r0 === 'repos' && r1 && r2 === 'findings-send' && req.method === 'POST') { try { return json(res, 200, await sendFindings(r1)) } catch (e) { return json(res, 409,
+      { error: (e as Error).message }) } }
     if (r0 === 'auto-runs' && r1 && r2 === 'undo' && req.method === 'POST') { try { return json(res, 200, await undoRun(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'auto-retry' && req.method === 'POST') { try { return json(res, 200, autoRetry(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 && r2 === 'start-ready' && req.method === 'POST') { try { return json(res, 200, await startReadyRepo(r1)) } catch (e) { return json(res, 400, { error: (e as Error).message }) } }
     if (r0 === 'features' && r1 && r2 === 'cancel' && req.method === 'POST') { try { return json(res, 200, await cancelFeature(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'features' && req.method === 'POST') return json(res, 200, await createFeature(String(body.repoId), String(body.title), String(body.request)))
-    if (r0 === 'tickets' && !r1 && req.method === 'POST') return json(res, 200, createTicket(String(body.featureId), { title: String(body.title), size: String(body.size ?? 'M'), spec: String(body.spec ?? ''), expected_files: (body.expected_files as string[]) ?? [], depends_on: (body.depends_on as string[]) ?? [] }))
+    if (r0 === 'tickets' && !r1 && req.method === 'POST') { // scripts and tests; the TPM's create_ticket insists on criteria, this takes a ticket with none
+      const c = readCriteria(body.criteria ?? []); if ('error' in c) return json(res, 400, { error: c.error })
+      return json(res, 200, createTicket(String(body.featureId), { title: String(body.title), size: String(body.size ?? 'M'), spec: String(body.spec ?? ''),
+        expected_files: (body.expected_files as string[]) ?? [], depends_on: (body.depends_on as string[]) ?? [], criteria: c.list }))
+    }
     if (r0 === 'tickets' && r1 && r2 === 'cancel') { try { return json(res, 200, await cancelTicket(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'fix-conflicts') { try { return json(res, 200, await fixConflicts(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'make-pr') { try { return json(res, 200, await makePr(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
@@ -173,6 +194,16 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
         setup: () => startHelper(r1, body.why === 'fix' ? 'fix' : 'first'), approve: () => approve(r1), dismiss: () => dismiss(r1),
         'free-port': () => freePort(r1, Array.isArray(body.pids) ? body.pids.map(Number).filter((n: number) => Number.isInteger(n) && n > 1) : []) }[r2 as 'start']
       try { return json(res, 200, await act()) } catch (e) { return json(res, 409, { error: e instanceof Error ? e.message : String(e) }) }
+    }
+    if (r0 === 'previews' && r1 && r2 === 'test-setup' && req.method === 'POST') { // Tester & Checker, Part 3
+      const act = body.action === 'dismiss' ? () => dismissSetup(r1) : () => startSetupHelper(r1)
+      try { await act(); return json(res, 200, { ok: true }) } catch (e) { return json(res, 409, { error: e instanceof Error ? e.message : String(e) }) }
+    }
+    if (r0 === 'previews' && r1 && r2 === 'scenario' && req.method === 'POST') { // a scripted scenario: the app on its seed, these steps, the timeline
+      if (!Array.isArray(body.steps) || body.steps.length > 100) return json(res, 400, { error: 'steps: a list of at most 100' })
+      const r = await runScenario(r1, body.steps as Step[], { name: typeof body.name === 'string' ? body.name.slice(0, 100) : undefined, show: 'scenario' })
+      if (r === 'stopped') return json(res, 409, { error: 'stopped: the project was stopped or auto mode went off' })
+      return 'why' in r && !('id' in r) ? json(res, 409, { error: r.why }) : json(res, 200, r)
     }
     if (r0 === 'settings' && req.method === 'POST') {
       const bad = validSetting(String(body.key), body.value); if (bad) return json(res, 400, { error: bad })

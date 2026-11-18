@@ -60,7 +60,7 @@ test('cancel a feature: its engineers stop and every unmerged ticket is cancelle
 test('Bug 50: the TPM removes a ticket only on the user\'s "Remove it", then rewires the ticket that waited on it', async () => {
   const { f, tpm } = await setup('remove-ticket')
   const make = async (key: string, title: string, deps: string[] = []) => {
-    assert.equal((await hq.mcp(tpm.id, 'create_ticket', { key, title, size: 'S', spec: `${title}.`, depends_on: deps })).isError, false)
+    assert.equal((await hq.mcp(tpm.id, 'create_ticket', { key, title, size: 'S', spec: `${title}.`, depends_on: deps, criteria: [{ kind: 'backend', text: 'The page says hello.' }] })).isError, false)
     return (await hq.state()).tickets.find((t: any) => t.feature_id === f.id && t.key === key)
   }
   const counter = await make('RT-1', 'Counter'), dark = await make('RT-2', 'Dark mode', ['RT-1'])
@@ -111,7 +111,7 @@ test('Bug 50: the TPM removes a ticket only on the user\'s "Remove it", then rew
 test('Bug 50: a "Remove it" works with the TPM stopped; the user\'s own ✕ tells the TPM which tickets to rewire', async () => {
   const { f, tpm } = await setup('remove-offline')
   for (const [key, deps] of [['RO-1', []], ['RO-2', ['RO-1']], ['RO-3', ['RO-1']]] as const) {
-    assert.equal((await hq.mcp(tpm.id, 'create_ticket', { key, title: key, size: 'S', spec: 'x', depends_on: deps })).isError, false)
+    assert.equal((await hq.mcp(tpm.id, 'create_ticket', { key, title: key, size: 'S', spec: 'x', depends_on: deps, criteria: [{ kind: 'backend', text: 'The page says hello.' }] })).isError, false)
   }
   const tk = async (key: string) => (await hq.state()).tickets.find((t: any) => t.feature_id === f.id && t.key === key)
   await hq.mcp(tpm.id, 'cancel_ticket', { key: 'RO-2', why: 'Not needed.' })

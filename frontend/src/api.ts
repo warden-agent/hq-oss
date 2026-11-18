@@ -1,7 +1,11 @@
 import type { TestRun } from './testruns.ts'
 import type { Question } from './needs.ts'
 export type Agent = Record<string, any> & { id: string; role: string; status: string }
-export type State = { autoRuns?: any[]; repos: any[]; features: any[]; tickets: any[]; agents: Agent[]; messages: any[]; reviews: any[]; attention: any[]; asks: any[]; questions?: Question[];
+/** A project's feature map as the page gets it (backend mapstore.ts MapView). */
+export type MapView = { id: string; text: string; by: { at: number; by: string } | null; pending: { ticket: string; key: string; screens: string; unchanged: boolean }[]
+  first: { running: true; since: number } | { running: false; at: number; ok: boolean; why: string | null } | null }
+export type State = { autoRuns?: any[]; findings?: any[];
+  repos: any[]; features: any[]; tickets: any[]; agents: Agent[]; messages: any[]; reviews: any[]; attention: any[]; asks: any[]; questions?: Question[];
   settings: Record<string, any>; defaults: Record<string, any>; held: number; ports: Record<string, number>; previews: any[]
   /** The frontend build HQ serves now (Bug 48): a tab running another one is out of date. */
   build?: string | null
@@ -9,6 +13,8 @@ export type State = { autoRuns?: any[]; repos: any[]; features: any[]; tickets: 
   claude?: { checked: string; runs: string | null; installed: string | null }
   /** Bug 106: HQ's own test runs under way now (forRepo keeps the picked repo's). */
   testRuns?: TestRun[]
+  /** Each project's feature map (FeatureMap.tsx). */
+  maps?: MapView[]
   /** Engineers working in every repo (forRepo sets it: the parallel limit counts them all). */
   working?: number }
 export async function api<T = any>(path: string, body?: unknown): Promise<T> {

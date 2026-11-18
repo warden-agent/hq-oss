@@ -20,14 +20,28 @@ import { id, j, readJson, TooLarge } from './util.ts'
 import { noteProblem, saveNote } from './notes.ts'
 import { completeFreshStart, featureDone } from './freshstart.ts'
 import { cantStart, launchOk, saveLaunch } from './launchhelper.ts'
+import { cantTest, proposeSetupChange, saveTestSetup } from './testsetup.ts'
+import { setupShape } from './testsetupstore.ts'
 import { recipeShape } from './apprun.ts'
 import { actionOf, askUser, KEEP, openAsks, REMOVE } from './asks.ts'
+import { criteriaBlock, criteriaOf, proofOf, readCriteria } from './criteria.ts'
+import { readChange } from './featuremap.ts'
+import { mapForEngineer, recordChange } from './mapstore.ts'
+import { findingTools } from './findings.ts'
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean }
 const text = (s: string): ToolResult => ({ content: [{ type: 'text', text: s }] })
 const fail = (s: string): ToolResult => ({ content: [{ type: 'text', text: s }], isError: true })
 
 const GO_AHEAD = 'started: HQ starts an engineer on it as soon as a slot is free, nothing for the user to click'
+// `kind` and `id` are plain strings here so a wrong one gets HQ's own words (criteria.ts readCriteria), not a schema error. `type` is the same as `kind`.
+const CRITERIA = z.array(z.object({ id: z.string().optional(), kind: z.string().optional(), type: z.string().optional(), text: z.string() }))
+const CRITERIA_ABOUT = 'a list of { kind, text }, at least one, one per thing that must be true when the ticket is done, checkable from outside the code:'
+  + ' "when X happens, Y is true". kind "ui": what the user sees on the screen; "backend": stored records and how the API answers (status codes and responses'
+  + ' are fine). No file names, function names or paths ("one new book record", not "a line in data/books.json"), nothing too vague to check ("works'
+  + ' well", "is intuitive"): HQ refuses those. Cover the failure cases the ticket implies (empty input, duplicates). HQ numbers them A1, A2… (give `id`'
+  + ' on every one to keep your own).'
+const TESTS = z.array(z.object({ criterion: z.string(), file: z.string().optional(), name: z.string().optional(), cant_test: z.string().optional() }))
 function registerTools(s: McpServer, agent: Agent): void {
   const logCall = (tool: string, args: unknown) => emit({ agentId: agent.id, source: 'mcp', kind: `mcp.${tool}`, payload: { args } })
   s.registerTool('read_inbox', { description: 'Read HQ messages addressed to you that have not been delivered yet.', inputSchema: {} }, async () => { logCall('read_inbox', {}); const m = readInbox(agent); return text(m.length ? m.map((x) => `[${x.reason}] from ${displayName(x.from_id)} (${x.id}): ${x.body}`).join('\n\n') : 'No new messages.') })
@@ -76,6 +90,7 @@ function registerTools(s: McpServer, agent: Agent): void {
     // The project's TPM (Bug 52): every feature of its repo. Features are named by handle (F-2); ticket keys are unique in the project.
     const repoId = agent.repo_id ?? ''
     const byKey = (key: string) => ticketInRepo(repoId, key)
+    findingTools(s, repoId, logCall) // the findings loop: list_findings, create_fix_ticket (findings.ts)
     const open = () => features().filter((f) => f.repo_id === repoId && f.status !== 'cancelled' && !featureDone(f.id))
     /** The feature a tool call means: its handle, or the only open feature when none is given. */
     const pick = (handle?: string): Feature | string => {
@@ -100,20 +115,29 @@ function registerTools(s: McpServer, agent: Agent): void {
       try { const f = addFeature(repoId, a.title, a.request); return text(`Started ${f.handle} "${f.title}". Add its tickets with create_ticket(feature: "${f.handle}").`) } catch (e) { return fail((e as Error).message) }
     })
     s.registerTool('create_ticket', {
-      description: 'Create a ticket in a feature (its handle, F-3; it can be left out when only one feature is open).',
+      description: 'Create a ticket in a feature (its handle, F-3; it can be left out when only one feature is open). Its acceptance criteria go in `criteria`, as a'
+        + ' list, not in the spec: HQ checks each one against the engineer\'s tests before the ticket can finish.',
       inputSchema: { feature: z.string().optional(), key: z.string().optional(), title: z.string(), size: z.enum(['S', 'M', 'L']),
-        spec: z.string().describe('What, why, acceptance criteria, test expectations'), expected_files: z.array(z.string()).default([]), depends_on: z.array(z.string()).default([]) },
+        spec: z.string().describe('What and why, and anything the engineer needs to know. Not the acceptance criteria: those go in `criteria`'),
+        criteria: CRITERIA.default([]).describe(CRITERIA_ABOUT), expected_files: z.array(z.string()).default([]), depends_on: z.array(z.string()).default([]) },
     }, async (a) => {
       logCall('create_ticket', a); const f = pick(a.feature); if (typeof f === 'string') return fail(f)
-      try { const t = createTicket(f.id, a); return text(`Created ${t.key} in ${f.handle}: ${t.title}`) } catch (e) { return fail(String(e)) }
+      // a TPM session started before `criteria` existed has no schema for it and sends none: the refusal tells it how
+      if (!a.criteria.length) return fail(`Give ${a.title ? `"${a.title}"` : 'the ticket'} its acceptance criteria in \`criteria\`: ${CRITERIA_ABOUT} Nothing was created.`)
+      const c = readCriteria(a.criteria); if ('error' in c) return fail(`${c.error} Nothing was created.`)
+      try {
+        const t = createTicket(f.id, { ...a, criteria: c.list })
+        return text(`Created ${t.key} in ${f.handle}: ${t.title} (criteria ${c.list.map((x) => x.id).join(', ')})`)
+      } catch (e) { return fail(String(e)) }
     })
     // A change of mind often changes what a ticket is (no "Reports tab" any more), so the title can change with the spec (Bug 33)
     s.registerTool('update_ticket_spec', {
-      description: 'Change a ticket\'s spec and/or title (keep the title matching what will be built). Its engineer is told (with none on it now, the next one'
+      description: 'Change a ticket\'s spec, title and/or acceptance criteria (keep the title matching what will be built). Its engineer is told (with none on it now, the next one'
         + ' that starts on it). A ticket that is already finished goes back to an engineer to build the new spec, and can\'t be merged until that is done. Not for merged or cancelled tickets.'
         + ' A ticket HQ opened by itself (to repair main\'s tests) keeps HQ\'s spec and title: give only what you want to add, and HQ puts it under its own spec as "From the TPM".'
         + ' With auto mode off, the user decides what a started ticket covers: change one only when they asked for it (user_asked: true).',
       inputSchema: { key: z.string(), spec: z.string().optional(), title: z.string().optional(),
+        criteria: CRITERIA.optional().describe(`The ticket's whole list of acceptance criteria, replacing the one it has: ${CRITERIA_ABOUT} Keep the id of each one that stays.`),
         // a TPM started before this field existed has no schema for it and sends the string "true" (seen live, Bug 125)
         user_asked: z.union([z.boolean(), z.enum(['true', 'false'])]).default(false).describe('true only when the user asked for this change, in a message or an answer to ask_user') },
     }, async (a) => {
@@ -126,16 +150,20 @@ function registerTools(s: McpServer, agent: Agent): void {
       }
       // Bug 108: HQ's own ticket keeps HQ's spec and title. The TPM's text goes under the spec; a new title for it is left out, and said so.
       const hq = hqOpened(t), asked = a.title?.trim(), title = hq ? undefined : asked
-      if (!a.spec && !asked) return fail('give a new spec, a new title, or both')
+      if (!a.spec && !asked && !a.criteria) return fail('give a new spec, a new title, new criteria, or any of them together')
       if (t.status === 'merged' || t.status === 'cancelled') return fail(`${t.key} is ${t.status}; create a new ticket instead`)
+      if (hq && a.criteria) return fail(`HQ opened ${t.key} by itself: its tests are its criteria, and they stay. Give a spec with what you want to add, and HQ puts it under its own.`)
       if (hq && !a.spec?.trim()) return fail(`HQ opened ${t.key} by itself: its spec and title stay. Give a spec with what you want to add, and HQ puts it under its own.`)
+      const c = a.criteria ? readCriteria(a.criteria) : null; if (c && 'error' in c) return fail(`${c.error} Nothing was changed.`)
+      if (c && !c.list.length) return fail(`${t.key} keeps at least one acceptance criterion: give its whole list as it should be now. Nothing was changed.`)
+      const criteria = c && JSON.stringify(c.list) !== t.criteria ? JSON.stringify(c.list) : undefined // the same list again is no change
       const spec = hq && a.spec ? withTpmText(t, a.spec) : a.spec
       const ok = !hq ? 'Updated.' : `Added to ${t.key} as "From the TPM", under HQ's own spec, which stays as it is${asked ? ', and so does its title' : ''}.`
         + ' It takes the place of anything you added before.'
       const done = t.status === 'pr_ready' || t.status === 'pr_open'
-      if (done && spec && spec !== t.spec) { // already built: an engineer builds the change before anything merges
+      if (done && ((spec && spec !== t.spec) || criteria)) { // already built: an engineer builds the change before anything merges
         try {
-          const r = await changeFinished(t.id, { spec, ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
+          const r = await changeFinished(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}) }); changed(getFeature(t.feature_id)!)
           const who = r.via === 'launch' ? `HQ started an engineer (${r.engineer})` : `HQ told its engineer (${r.engineer})`
           return text(`${ok} ${t.key} was already finished, so ${who} to build the change. It can't be merged until that's done; HQ tells you when it is.`)
         } catch (e) {
@@ -143,12 +171,13 @@ function registerTools(s: McpServer, agent: Agent): void {
             + ' Nothing was changed. Try again in a minute, or create a new ticket for the change.')
         }
       }
-      setTicket(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}) }); changed(getFeature(t.feature_id)!)
-      const what = [spec && 'spec', title && `title (now "${title}")`].filter(Boolean).join(' and ')
+      const what = [spec && 'spec', criteria && 'acceptance criteria', title && `title (now "${title}")`].filter(Boolean).join(' and ')
+      if (!what) return text(`${t.key} already says that: nothing changed.`) // the criteria it has, given again
+      setTicket(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}) }); changed(getFeature(t.feature_id)!)
       if (done) return text(ok) // a finished ticket's engineer has nothing to do with a new title (and has usually stopped)
       // Bug 102: the engineer on the ticket now hears it. One that has gone never would: its notice waits, and the next engineer on the
       // ticket gets it when it starts (startEngineer hands over). HQ's notice, not the TPM's message: no DM limits (Bug 86)
-      const eng = liveEngineerOf(t), to = eng ?? t.assignee_agent_id, news = [spec && 'spec', title && 'title'].filter(Boolean).join(' and ')
+      const eng = liveEngineerOf(t), to = eng ?? t.assignee_agent_id, news = [spec && 'spec', criteria && 'acceptance criteria', title && 'title'].filter(Boolean).join(' and ')
       const body = hq ? `HQ: the TPM added to ${t.key}'s spec, under "From the TPM". HQ's own steps and rules are as they were. Call get_ticket to read it.`
         : `HQ: the TPM updated ${t.key}'s ${what}. Call get_ticket to read it.`
       if (to) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to, reason: 'fyi', body })
@@ -238,10 +267,30 @@ function registerTools(s: McpServer, agent: Agent): void {
       + 'or what about this setup stops you. HQ ends your session.'
     s.registerTool('report_cant_start', { description: cantAbout, inputSchema: { reason: z.string().min(1).max(500) } },
       async (a) => { logCall('report_cant_start', a); return done(cantStart(agent, a.reason)) })
+    // The test setup job (testsetup.ts): the same role, its own two tools
+    s.registerTool('save_test_setup', { description: 'Test setup job only. Save how HQ runs this app for its tests: production start per part, the state paths, a seed '
+      + 'command and the API endpoints with the kind of work each does. HQ checks it for real in its sandbox and messages you the result.', inputSchema: setupShape },
+      async (a) => { logCall('save_test_setup', { parts: a.start.length, snapshot: a.snapshot, endpoints: a.endpoints?.length ?? 0 }); return done(saveTestSetup(agent, a)) })
+    s.registerTool('report_cant_test', { description: 'Test setup job only. Tell the user, in one plain sentence, why HQ can\'t test this app here. HQ ends your session.',
+      inputSchema: { reason: z.string().min(1).max(500) } }, async (a) => { logCall('report_cant_test', a); return done(cantTest(agent, a.reason)) })
   }
   if (agent.role === 'engineer') {
-    s.registerTool('get_ticket', { description: 'Your ticket: spec, status, review state, handoff so far.', inputSchema: {} }, async () => { logCall('get_ticket', {}); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound'); const rv = one<{ id: string; round: number; status: string }>("SELECT id, round, status FROM review_requests WHERE ticket_id = ? AND status = 'open'", t.id); const hand = one<{ text: string }>('SELECT text FROM docs WHERE scope = ? AND key = ?', `ticket:${t.id}`, 'handoff'); return text(`# ${t.key} (${t.size}): ${t.title}\nStatus: ${t.status}${rv ? ` (review R-${rv.round} pending)` : ''}\nBranch: ${t.branch}\nExpected files: ${t.expected_files}\nDepends on: ${t.deps}\n\n## Spec\n${t.spec ?? ''}\n\n## Handoff so far\n${hand?.text ?? '(none)'}`) })
+    s.registerTool('get_ticket', { description: 'Your ticket: spec, acceptance criteria, status, review state, handoff so far.', inputSchema: {} }, async () => {
+      logCall('get_ticket', {}); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound')
+      const rv = one<{ id: string; round: number; status: string }>("SELECT id, round, status FROM review_requests WHERE ticket_id = ? AND status = 'open'", t.id)
+      const hand = one<{ text: string }>('SELECT text FROM docs WHERE scope = ? AND key = ?', `ticket:${t.id}`, 'handoff')
+      const last = proofOf(t)?.tests.map((e) => `- ${e.criterion}: ${e.cant_test ? `no test (${e.cant_test})` : `${e.file} · "${e.name}"`}`).join('\n')
+      return text(`# ${t.key} (${t.size}): ${t.title}\nStatus: ${t.status}${rv ? ` (review R-${rv.round} pending)` : ''}\nBranch: ${t.branch}\nExpected files: ${t.expected_files}\n`
+        + `Depends on: ${t.deps}\n\n## Spec\n${t.spec ?? ''}\n${criteriaBlock(criteriaOf(t))}${last ? `\n## The tests you named at your last open_pr\n${last}\n` : ''}`
+        + `${mapForEngineer(t, agent.repo_id ?? '')}\n## Handoff so far\n${hand?.text ?? '(none)'}`)
+    })
     s.registerTool('update_handoff', { description: 'Append to your handoff log. kind: after_plan | milestone | before_pr. Required before open_pr.', inputSchema: { text: z.string(), kind: z.enum(['after_plan', 'milestone', 'before_pr']) } }, async (a) => { logCall('update_handoff', { kind: a.kind, len: a.text.length }); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound'); const stamp = `### ${new Date().toISOString().slice(0, 16).replace('T', ' ')} — ${a.kind}\n${a.text}`; run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = text || char(10) || char(10) || excluded.text, updated_at = excluded.updated_at', `ticket:${t.id}`, 'handoff', stamp, now()); setTicket(t.id, { handoff_updated_at: now() }); return text('Handoff recorded.') })
+    s.registerTool('update_test_setup', {
+      description: 'When your ticket changes how the app starts, where it keeps its data, or its API endpoints: the fields of HQ\'s test setup that change '
+        + '(each given field replaces the old one; give the whole list). HQ applies it when your ticket merges. No test setup in this project: nothing to do.',
+      inputSchema: { start: setupShape.start.optional(), snapshot: setupShape.snapshot.optional(), seed: setupShape.seed.optional(),
+        endpoints: setupShape.endpoints.removeDefault().optional() },
+    }, async (a) => { logCall('update_test_setup', { fields: Object.keys(a) }); const r = proposeSetupChange(agent, a); return r.ok ? text(r.text) : fail(r.text) })
     s.registerTool('report_blocked', { description: 'Tell HQ you are blocked and why (the user is notified).', inputSchema: { reason: z.string() } }, async (a) => { logCall('report_blocked', a); attention('blocked', `${agent.display_name ?? agent.id}: ${a.reason}`, { agentId: agent.id, ticketId: agent.ticket_id }); return text('Reported. Stop and wait for a message.') })
     s.registerTool('propose_test_command', {
       description: 'Repair tickets only: a test command that works in HQ\'s sandbox and in an engineer\'s session, when the current one doesn\'t. '
@@ -249,9 +298,35 @@ function registerTools(s: McpServer, agent: Agent): void {
         + 'HQ then tries it itself on main plus your branch and messages you the result. '
         + 'left_out: exactly which tests it no longer runs, and why.', inputSchema: { command: z.string().min(1).max(2000), left_out: z.string().min(1).max(1000) },
     }, async (a) => { logCall('propose_test_command', a); try { return text(proposeTestCommand(agent, a.command, a.left_out)) } catch (e) { return fail((e as Error).message) } })
+    s.registerTool('update_feature_map', {
+      description: 'The feature map: what a user finds on each screen of the app, and what each control does, in a user\'s words (get_ticket shows it). When your '
+        + 'ticket changes what a user sees, give each screen you changed: `add` the new lines, `remove` the lines it no longer has (copied from the map exactly), or '
+        + '`gone: true` for a screen that is gone. A changed line is one remove and one add; lines you leave out stay as they are. HQ puts it in the map when your '
+        + 'ticket merges. No file names, paths or code terms: HQ refuses those, and a map over its size limit. Calling again adds to what you gave before.',
+      inputSchema: { screens: z.array(z.object({ screen: z.string().describe('The screen\'s heading, as on the map ("Reading (tab)"), or a new one'),
+        add: z.array(z.string()).optional().describe('New lines, one per control: what it is, then what it does, with labels in quotes: "Add item" box + Add: puts an item on the list'),
+        remove: z.array(z.string()).optional().describe('Lines the screen no longer has, exactly as the map has them'),
+        gone: z.boolean().optional().describe('true when the whole screen is gone') })) },
+    }, async (a) => {
+      logCall('update_feature_map', a); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound')
+      const c = readChange(a.screens); if ('error' in c) return fail(`${c.error} Nothing was kept.`)
+      const r = recordChange(t, agent.repo_id ?? '', c.edits); if ('error' in r) return fail(`${r.error}\nNothing was kept.`)
+      return text(`Kept with ${t.key}: HQ puts it in the map when ${t.key} merges. The map will then read:\n\n${r.map}`)
+    })
     s.registerTool('open_pr', {
-      description: 'You are finished: HQ pushes your branch; the user tries it and merges it (or opens a PR) from HQ. Commit your work first. Requires a current before_pr handoff; the body needs a "## Deviations from approved plan" section.', inputSchema: { title: z.string(), body: z.string() } }, async (a) => { logCall('open_pr', { title: a.title }); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound'); if (!/## Deviations from approved plan/.test(a.body)) return fail('PR body must contain a "## Deviations from approved plan" section.'); if (!t.handoff_updated_at) return fail('Call update_handoff(kind: before_pr) first.')
-      try { return text(await finishTicket(agent, a.title, a.body)) } catch (e) { return fail((e as Error).message) } })
+      description: 'You are finished: HQ pushes your branch; the user tries it and merges it (or opens a PR) from HQ. Commit your work first. Requires a current before_pr '
+        + 'handoff; the body needs a "## Deviations from approved plan" section. A ticket with acceptance criteria also needs `tests`: HQ checks them with git, and '
+        + 'refuses the call until each criterion has a test on your branch or a reason it can\'t be tested.',
+      inputSchema: { title: z.string(), body: z.string(), tests: TESTS.optional().describe('One entry per acceptance criterion (get_ticket lists them). The test that proves '
+        + 'it: { criterion: "A1", file: "test/items.test.js", name: "its name, as written in that file" }. Or, only when nothing can test it: '
+        + '{ criterion: "A2", cant_test: "the reason, for the user to judge" }. Calling open_pr again after a fix: leave `tests` out to keep the ones you gave.'),
+        feature_map_unchanged: z.boolean().optional().describe('true when nothing a user sees changed, so the feature map stays as it is (else call update_feature_map first)') },
+    }, async (a) => {
+      logCall('open_pr', { title: a.title, tests: a.tests }); const t = ticketForAgent(agent); if (!t) return fail('no ticket bound')
+      if (!/## Deviations from approved plan/.test(a.body)) return fail('PR body must contain a "## Deviations from approved plan" section.')
+      if (!t.handoff_updated_at) return fail('Call update_handoff(kind: before_pr) first.')
+      try { return text(await finishTicket(agent, a.title, a.body, a.tests, a.feature_map_unchanged === true)) } catch (e) { return fail((e as Error).message) }
+    })
   }
 }
 

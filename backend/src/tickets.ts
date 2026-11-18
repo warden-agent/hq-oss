@@ -29,6 +29,7 @@ import { excludeHqFolders, seedPackages } from './worktrees.ts'
 import type { Failed } from './testrun.ts'
 import { sweepNow } from './leftovers.ts'
 import { actionOf, closeAsks, openAsks } from './asks.ts'
+import { criteriaBlock, criteriaOf, type Criterion } from './criteria.ts'
 
 export const slugify = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'item'
 
@@ -68,7 +69,7 @@ export const launching = (id: string): boolean => starting.has(id) || fixing.has
 export const testCmdNote = (cmd: string): string => 'While you work, run only the tests for what you changed. ' // a full run while working can freeze (Bug 96)
   + `HQ tests this project with this command, so run it once, just before open_pr: use it for your full test run instead of the project's usual one: ${cmd}`
 export function createTicket(featureId: string, t: { key?: string; title: string; size: string; spec: string; expected_files?: string[]; depends_on?: string[]; repairs_main?: string
-  repairs_cmd?: string }): Ticket {
+  repairs_cmd?: string; criteria?: Criterion[] }): Ticket {
   const f = getFeature(featureId); if (!f) throw new Error('unknown feature')
   if (f.status === 'cancelled') throw new Error(`${f.handle ?? f.title} is cancelled; start a new feature for this`)
   notClearing(f.repo_id)
@@ -82,11 +83,11 @@ export function createTicket(featureId: string, t: { key?: string; title: string
     prior_status: null, assignee_agent_id: null, expected_files: JSON.stringify(t.expected_files ?? []), deps: JSON.stringify(t.depends_on ?? []),
     edit_overrides: '[]', branch: null, worktree_path: null, pr_number: null, pr_url: null, pr_state: null, plan_round: 0, handoff_updated_at: null,
     last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, repairs_main: t.repairs_main ?? null,
-    repairs_cmd: t.repairs_cmd ?? null, fixing: null, merge_test: null, parked_at: null, created_at: ts, updated_at: ts,
+    repairs_cmd: t.repairs_cmd ?? null, fixing: null, merge_test: null, criteria: JSON.stringify(t.criteria ?? []), proof: null, diff_check: null, parked_at: null, created_at: ts, updated_at: ts,
   }
-  run(`INSERT INTO tickets(id, feature_id, key, slug, title, size, status, expected_files, deps, edit_overrides, plan_round, spec, repairs_main, repairs_cmd, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec, row.repairs_main,
-    row.repairs_cmd, ts, ts)
+  run(`INSERT INTO tickets(id, feature_id, key, slug, title, size, status, expected_files, deps, edit_overrides, plan_round, spec, repairs_main, repairs_cmd, criteria, created_at,
+       updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec,
+    row.repairs_main, row.repairs_cmd, row.criteria, ts, ts)
   if (row.repairs_main) keepHqSpec(row.id, t.spec)
   patch('ticket', row.id, row as unknown as Record<string, unknown>); writeFeatureMd(f)
   return row
@@ -147,9 +148,10 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolea
   // Installed packages come from the main checkout, so the engineer can run the tests straight away (never blocks the launch)
   await seedPackages(repo.path, wtPath).then((dirs) => { if (dirs.length) emit({ agentId: null, source: 'system', kind: 'worktree.packages', payload: { path: wtPath, dirs } }) },
     (e) => emit({ agentId: null, source: 'system', kind: 'worktree.packages_failed', payload: { path: wtPath, error: String(e) } }))
-  const spec = getTicket(t.id)?.spec ?? t.spec ?? '' // the TPM may have changed it while this one was starting
+  const cur = getTicket(t.id) ?? t, spec = cur.spec ?? '' // the TPM may have changed it while this one was starting
   const prompt = opts.fix ? opts.fix(wtPath) : opts.resume ? await opts.resume.prompt(wtPath)
-    : `Ticket ${t.key} (${t.size}): ${t.title}\nFeature: ${f.title}\nBranch: ${branch} (your worktree: ${wtPath})\nExpected files: ${t.expected_files}\nDepends on: ${t.deps}\n\n## Spec\n${spec}\n\nStart by calling get_ticket, explore the code, write your plan, and call ExitPlanMode.`
+    : `Ticket ${t.key} (${t.size}): ${t.title}\nFeature: ${f.title}\nBranch: ${branch} (your worktree: ${wtPath})\nExpected files: ${t.expected_files}\nDepends on: ${t.deps}\n\n`
+      + `## Spec\n${spec}\n${criteriaBlock(criteriaOf(cur))}\nStart by calling get_ticket, explore the code, write your plan, and call ExitPlanMode.`
   const slot = nextWorkerSlot(`pending-${t.id}`) // a fix runs on the S model below: no plan, so no opusplan plan→exec switch
   const tests = repo.test_cmd && !t.repairs_main ? `\n\n${testCmdNote(repo.test_cmd)}` : '' // a repair's spec has the command: it's the one that failed
   const a = await launchAgent({
@@ -266,7 +268,7 @@ export async function fixTests(ticketId: string, failed: Failed): Promise<{ via:
     if (live && !(await tmux.hasSession(live.tmux_session))) throw new Error(`${t.key}'s engineer (${live.id}) can't be reached right now`)
     if (!live) { const cap = canLaunch({ ignoreCap: true }); if (!cap.ok) throw new Error(cap.why) }
     keepTestsFailed(t, failed); clearStalled(t.id)
-    const r = await sendBack(t, f.id, live, (launch) => fixTestsText({ t, base, failed, launch }), failed.hung ? 'tests_hung' : 'tests')
+    const r = await sendBack(t, f.id, live, (launch) => fixTestsText({ t, base, failed, launch }), failed.review ? 'review' : failed.look ? 'look' : failed.hung ? 'tests_hung' : 'tests')
     emit({ agentId: r.engineer, source: 'system', kind: 'ticket.fix_tests', payload: { ticket: t.id, key: t.key, via: r.via, test: failed.test, hung: !!failed.hung } })
     return r
   } finally { fixing.delete(t.id) }
@@ -275,7 +277,7 @@ export async function fixTests(ticketId: string, failed: Failed): Promise<{ via:
  *  to its engineer to build it, as a message when it still runs, else a fresh engineer on the same worktree and branch, even over
  *  the parallel limit. It is `resolving` until open_pr finishes it again, so the old work can't merge meanwhile. If it can't go
  *  back, nothing is saved: finished work never sits under a spec it doesn't match. */
-export async function changeFinished(ticketId: string, change: { spec: string; title?: string }): Promise<{ via: 'message' | 'launch'; engineer: string }> {
+export async function changeFinished(ticketId: string, change: { spec?: string; title?: string; criteria?: string }): Promise<{ via: 'message' | 'launch'; engineer: string }> {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
   if (!['pr_ready', 'pr_open'].includes(t.status) || !t.branch) throw new Error(`${t.key} isn't finished (${t.status})`)
   if (fixing.has(t.id) || starting.has(t.id)) throw new Error(`${t.key} is going back to its engineer for something else right now`)
@@ -289,7 +291,7 @@ export async function changeFinished(ticketId: string, change: { spec: string; t
     if (!live) { const cap = canLaunch({ ignoreCap: true }); if (!cap.ok) throw new Error(cap.why) }
     setTicket(t.id, change); const cur = getTicket(t.id)!
     const r = await sendBack(cur, f.id, live, (launch) => changeText({ t: cur, launch }), 'changes')
-      .catch((e) => { setTicket(t.id, { spec: t.spec, title: t.title, fixing: t.fixing }); throw e })
+      .catch((e) => { setTicket(t.id, { spec: t.spec, title: t.title, criteria: t.criteria, fixing: t.fixing }); throw e })
     resolveKindForTicket('conflicts_fixed', t.id) // "ready to merge again" isn't true any more
     emit({ agentId: r.engineer, source: 'mcp', kind: 'ticket.change', payload: { ticket: t.id, key: t.key, via: r.via } })
     return r

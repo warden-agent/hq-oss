@@ -5,6 +5,7 @@ import { api, askUntilAnswered, errText, type State } from './api'
 import { DO_REST, OPEN_AUTO, OPEN_SUMMARY, openAuto, openSummary, undoConfirm, useBusy } from './board'
 import { Md } from './ui'
 import { yourTurn } from './needs.ts'
+import { Findings } from './Findings'
 
 /** Bug 107: the saved test command Claude Code refused in an engineer's session, if HQ has seen that, and the ticket HQ opened to fix it. */
 const refusedCmd = (repo: any): { cmd: string; ticket?: string } | null => { try { return repo.test_cmd_refused ? JSON.parse(repo.test_cmd_refused) : null } catch { return null } }
@@ -47,10 +48,11 @@ function autoPreview(all: State, repoId: string): string[] {
 export function AutoDialog({ all }: { all: State }) {
   const [repoId, setRepoId] = useState<string | null>(null), [check, setCheck] = useState<{ custom: string | null; found: string | null; sandbox: string | null } | null>(null)
   const [cmd, setCmd] = useState(''), [busy, setBusy] = useState(false), [err, setErr] = useState(''), [away, setAway] = useState(false)
-  const repo = all.repos.find((r) => r.id === repoId)
+  const repo = all.repos.find((r) => r.id === repoId), [uiTest, setUiTest] = useState<boolean | null>(null) // null: as the project has it
+  const testing = uiTest ?? repo?.ui_test !== 'off'
   const close = () => { setRepoId(null); setCheck(null); setErr(''); setAway(false) }
   useEffect(() => {
-    const open = (e: Event) => { setRepoId((e as CustomEvent<string>).detail); setCmd(''); setCheck(null); setErr(''); setAway(false) }
+    const open = (e: Event) => { setRepoId((e as CustomEvent<string>).detail); setCmd(''); setCheck(null); setErr(''); setAway(false); setUiTest(null) }
     window.addEventListener(OPEN_AUTO, open); return () => window.removeEventListener(OPEN_AUTO, open)
   }, [])
   // Bug 64: HQ may be restarting as the box opens. Closing the box stops the asking, so a late answer can't land on the next open. What was typed meanwhile stays.
@@ -68,6 +70,7 @@ export function AutoDialog({ all }: { all: State }) {
     setBusy(true); setErr('')
     try {
       if (check && cmd.trim() !== (check.custom ?? '')) await api(`repos/${repo.id}/test-cmd`, { cmd })
+      if (testing !== (repo.ui_test !== 'off')) await api(`repos/${repo.id}/ui-test`, { on: testing })
       await api(`repos/${repo.id}/auto`, { on: true }); close()
     } catch (e) { setErr(errText(e as Error)) } finally { setBusy(false) }
   }
@@ -82,6 +85,10 @@ export function AutoDialog({ all }: { all: State }) {
         <ul className="ml-4 list-disc break-words text-zinc-300">{now.map((x) => <li key={x}>{x}</li>)}</ul></div>}
       <label className="flex flex-col gap-1">Test command
         <input className="input" value={cmd} onChange={(e) => setCmd(e.target.value)} placeholder={check ? check.found ?? 'No tests found' : 'Looking…'} aria-label="Test command" /></label>
+      <label className="flex items-start gap-2"><input type="checkbox" className="mt-0.5" checked={testing} onChange={(e) => setUiTest(e.target.checked)}
+        aria-label="Test the app in a browser at the end of each run" />
+        <span><span className="text-zinc-300">Test the app in a browser at the end of each run.</span> A tester that never sees the code tries about 30 everyday and odd
+          things, and the run's summary lists where a person would get stuck. Nothing is changed for you. About $1–2 a run.</span></label>
       {noTests && <div className="text-amber-300/80">HQ found no tests here, so it will build but not merge. The TPM can add tests, or write a command above.</div>}
       {cantRun && <div role="note" className="break-words text-amber-300/80">Claude Code refuses this command in an engineer's session, so engineers can't run the full tests.
         {bad?.ticket ? ` HQ opened ${bad.ticket} to fix it.` : ' With auto mode on, HQ opens a ticket that fixes it.'} Or write
@@ -96,7 +103,7 @@ export function AutoDialog({ all }: { all: State }) {
   </div>
 }
 
-function SummaryDialog({ run, name, onClose }: { run: any; name: string; onClose: () => void }) {
+function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; onClose: () => void; all: State }) {
   const [busy, go] = useBusy(), [err, setErr] = useState('') // shown in this box: the page's error strip is behind it
   const undo = () => go(async () => { setErr(''); if (await undoConfirm(name)) await api(`auto-runs/${run.id}/undo`, {}).then(onClose, (e: Error) => setErr(errText(e))) })
   useEffect(() => { // busy: Undo's are-you-sure is up, and its Escape is only for that
@@ -109,6 +116,7 @@ function SummaryDialog({ run, name, onClose }: { run: any; name: string; onClose
       className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-300 shadow-xl">
       <div className="break-words text-sm font-medium text-zinc-100">What auto mode did in {name}</div>
       <div className="break-words"><Md text={run.summary ?? ''} /></div>
+      <Findings all={all.findings ?? []} repoId={run.repo_id} />
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex flex-wrap justify-end gap-1.5">{(run.status === 'finished' || run.status === 'off') && run.start_sha && run.end_sha !== run.start_sha
         && <button className="btn" disabled={busy} title="Put main back where this run started. The work stays on its branches." onClick={undo}>{busy ? 'Undoing…' : 'Undo this run'}</button>}
@@ -141,6 +149,6 @@ export function AutoBanner({ all, repo }: { all: State; repo: any }) {
     {done && last && row('border-emerald-500/40 bg-emerald-950/30 text-emerald-200', `Auto mode finished in ${repo.name}.`, <>
       <button className="btn-sm" onClick={() => openSummary(repo.id)}>Read the summary</button>
       <button className="btn-sm" disabled={busy} onClick={() => run(() => api(`attention/${done.id}/resolve`, {}))}>Dismiss</button></>)}
-    {shown && <SummaryDialog run={shown} name={repo.name} onClose={closeSummary} />}
+    {shown && <SummaryDialog run={shown} name={repo.name} onClose={closeSummary} all={all} />}
   </>
 }

@@ -14,6 +14,7 @@ import { sweepWorktrees } from './slots.ts'
 import { startListeners } from './listeners.ts'
 import { recoverPreviews } from './preview.ts'
 import { recoverHelpers } from './launchhelper.ts'
+import { recoverSetupHelpers } from './testsetup.ts'
 import { repos } from './records.ts'
 import { emit } from './events.ts'
 import { attention } from './attention.ts'
@@ -22,6 +23,9 @@ import { startFreshStartLoop } from './freshstart.ts'
 import { ensureTrusted } from './trust.ts'
 import { startAutoLoop } from './auto.ts'
 import { killTestRuns, sweepRunTmp, sweepTestWorktrees } from './testrun.ts'
+import { killChecks } from './checker.ts'
+import { sweepUiTmp } from './uitester.ts'
+import { forgetChecking } from './plancheck.ts'
 import { startLeftoverSweeps, sweepAgentTmp, sweepNow } from './leftovers.ts'
 import { checkClaude, claudeInfo, ensureClaude, startClaudeCheck } from './claudecheck.ts'
 import { saveTestCmds } from './heavy.ts'
@@ -47,6 +51,7 @@ function ensureAssets(): void {
 async function main(): Promise<void> {
   await stopIfPortsTaken() // Bug 118: a port taken stops HQ here, before it touches the database, agents or leftovers
   migrate(); ensureAssets()
+  forgetChecking() // a plan check under way when the backend last stopped went with it
   saveTestCmds() // Bug 112: for commands saved before this file existed, and projects removed since it was written
   try { await ensureClaude() } catch (e) { console.error((e as Error).message); process.exit(1) } // no agent could start
   // Bug 97: which Claude Code the agents run, and whether HQ was checked on it, before the page or a launch can ask. A look that fails stops nothing
@@ -58,10 +63,11 @@ async function main(): Promise<void> {
   await sweepWorktrees().catch((e) => emit({ agentId: null, source: 'system', kind: 'worktree.sweep.error', payload: { error: String(e) } }))
   for (const r of repos()) await sweepTestWorktrees(r.path).catch(() => {}) // a test run the last backend didn't finish
   try { // and its temp files (Bug 81)
-    const tmps = sweepRunTmp(); if (tmps.length) emit({ agentId: null, source: 'system', kind: 'testrun.tmp_swept', payload: { folders: tmps } })
+    const tmps = [...sweepRunTmp(), ...sweepUiTmp()]; if (tmps.length) emit({ agentId: null, source: 'system', kind: 'testrun.tmp_swept', payload: { folders: tmps } })
   } catch { /* the next start */ }
   await recoverPreviews() // before the merge watcher: its first check can restart a preview
   await recoverHelpers(repos()).catch((e) => console.error('launch helper recovery failed', e))
+  await recoverSetupHelpers(repos()).catch((e) => console.error('test setup helper recovery failed', e))
   startBgRuns() // before the first sweep and any hook: it reads back what agents wait on in the background (Bug 96)
   await sweepNow() // what agents' commands left running while HQ was down (Bug 75)
   await sweepAgentTmp() // and the temp folders of agents that ended meanwhile (Bug 81)
@@ -84,5 +90,5 @@ const crashed = (what: string) => (e: unknown) => {
 process.on('unhandledRejection', crashed('unhandledRejection'))
 process.on('uncaughtException', crashed('uncaughtException'))
 // tmux kill-session hangs up, a test HQ's stop() sends SIGTERM, Ctrl-C SIGINT. Agents and previews run on in tmux and a restart picks them up; test runs don't (Bug 69).
-for (const [sig, code] of [['SIGTERM', 143], ['SIGHUP', 129], ['SIGINT', 130]] as const) process.once(sig, () => { killTestRuns(); process.exit(code) })
+for (const [sig, code] of [['SIGTERM', 143], ['SIGHUP', 129], ['SIGINT', 130]] as const) process.once(sig, () => { killTestRuns(); killChecks(); process.exit(code) })
 main().catch((e) => { console.error(e); process.exit(1) })

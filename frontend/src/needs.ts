@@ -6,6 +6,12 @@ import { FINISHED, readyTickets } from '../../backend/src/readiness.ts'
 type S = { repos: any[]; features: any[]; tickets: any[]; agents: any[]; reviews: any[]; attention: any[]; asks?: any[]; questions?: Question[]; settings?: Record<string, any>
   defaults?: Record<string, any>
   working?: number; testRuns?: { repo_id: string }[] }
+/** Whether an open plan review waits for HQ's plan check and not for the user: its project is on auto (also while auto is stopped: running engineers finish,
+ *  and HQ still answers their plans). Such a plan is never "your turn", and nothing pops up for it. */
+export function hqAnswersPlan(s: Pick<S, 'repos' | 'features' | 'tickets'>, review: { ticket_id: string }): boolean {
+  const t = s.tickets.find((x) => x.id === review.ticket_id), f = t && s.features.find((x) => x.id === t.feature_id)
+  return !!f && !!s.repos.find((r) => r.id === f.repo_id)?.auto_mode
+}
 /** The project a notice's kind names (repo_sync:<id>, auto_stopped:<id>, test_cmd_proposed:<id>, test_cmd_refused:<id>): those notices have no ticket or agent to go by. */
 const kindRepo = (k: string): string | null => /^[a-z_]+:(.+)$/.exec(k)?.[1] ?? null
 /** Only the picked repo's work: its features, their tickets, agents, messages and reviews, and the notices about them or about the
@@ -76,7 +82,8 @@ export type Need = { key: string; text: string; repoId: string | null; ref: { re
 /** Notices that alert: an agent is stuck, blocked, asking the user, sent back too often or stopped when it shouldn't have, or
  *  finished work can't go further. Information (merged, memory filling up, model notes) is left to the ⚠ menu. */
 export const ALERT_KINDS = new Set(['stuck', 'blocked', 'dialog', 'message_for_user', 'cap_reached', 'engineer_exited', 'agent_exited', 'launch_failed',
-  'fresh_start_failed', 'merge_conflict', 'fix_stalled', 'change_stalled', 'delivery_failed', 'dm_refused', 'tpm_away', 'unexpected_prompt', 'usage_limit', 'rate_limit', 'api_error',
+  'fresh_start_failed', 'merge_conflict', 'fix_stalled', 'look_stalled',
+  'review_stalled', 'change_stalled', 'delivery_failed', 'dm_refused', 'tpm_away', 'unexpected_prompt', 'usage_limit', 'rate_limit', 'api_error',
   'pr_failed', 'push_failed', 'auto_parked', 'leftovers_stuck', 'leftovers_cant_check', 'bg_stalled', 'engineer_idle',
   'claude_unchecked']) // Bug 97: agents on a Claude Code HQ wasn't checked on. A newer one merely installed (claude_newer) is information
 /** Good news: green, not red, because nothing is wrong (Bug 61). */
@@ -103,6 +110,7 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
   }
   for (const r of s.reviews.filter((x) => x.status === 'open')) {
     const t = s.tickets.find((x) => x.id === r.ticket_id), repo = repoOf(t)
+    if (hqAnswersPlan(s, r)) continue // on auto its plan waits for HQ's plan check, not for you
     out.push({ key: `review:${r.id}`, text: `${where(repo)}${t?.key ?? 'a ticket'}'s plan is waiting for you`, repoId: repo, ref: { review: r.id } })
   }
   for (const t of s.tickets) {
@@ -111,6 +119,8 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
     out.push({ key: `${act}:${t.id}`, repoId: f.repo_id, ref: { ticket: t.id },
       text: act === 'merge' ? `${where(f.repo_id)}${t.key} is finished and waiting for you to merge it`
         : t.status === 'resolving' && t.fixing === 'changes' ? `${where(f.repo_id)}${t.key}'s change isn't built yet and its engineer stopped: press Build the change`
+        : t.status === 'resolving' && t.fixing === 'review' ? `${where(f.repo_id)}what a reader found in ${t.key} isn't fixed yet and its engineer stopped: press Fix what it found`
+        : t.status === 'resolving' && t.fixing === 'look' ? `${where(f.repo_id)}${t.key}'s app problems aren't fixed yet and its engineer stopped: press Fix the app`
         : t.status === 'resolving' && t.fixing ? `${where(f.repo_id)}${t.key}'s tests aren't fixed yet and its engineer stopped: press Fix tests`
         : `${where(f.repo_id)}${t.key} clashes with main: press Fix conflicts` })
   }

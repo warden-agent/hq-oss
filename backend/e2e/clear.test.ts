@@ -79,5 +79,6 @@ test('Clear project: notes first, then the board goes; the code is kept on its b
   // A new request is a new branch on the same TPM, and keys go on counting
   const again = await hq.api('features', { repoId: repo.id, title: 'fresh', request: 'Start over' }); assert.equal(again.status, 200, JSON.stringify(again.json))
   assert.equal(again.json.tpm_agent_id, next); assert.equal(again.json.handle, 'F-2')
-  assert.equal((await hq.mcp(next, 'create_ticket', { feature: 'F-2', title: 'Again', size: 'S', spec: 'x' })).text, 'Created T-02 in F-2: Again')
+  assert.equal((await hq.mcp(next, 'create_ticket', { feature: 'F-2', title: 'Again', size: 'S', spec: 'x', criteria: [{ kind: 'backend', text: 'The page says hello.' }] })).text,
+    'Created T-02 in F-2: Again (criteria A1)')
 })

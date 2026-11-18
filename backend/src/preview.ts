@@ -17,6 +17,7 @@ import { getFeature, getRepo, getTicket, repos, type Repo, notClearing } from '.
 import { syncRepo } from './repos.ts'
 import { shq, sleep } from './util.ts'
 import { copyMainData, tryable } from './trydata.ts'
+import { setupView } from './testsetupstore.ts'
 import * as tmux from './tmux.ts'
 
 export type PreviewStatus = 'stopped' | 'starting' | 'running' | 'crashed'
@@ -49,14 +50,18 @@ export class NeedsSetup extends Error {}
 type PreviewView = Omit<Preview, 'recipe' | 'draft_recipe' | 'port_holders'> & {
   recipe: Recipe | null; draft_recipe: Recipe | null; port_holders: PortHolder[] | null; auto_command: string | null; default_branch: string; path: string
   /** The Launch helper's ticket (Bug 46), by key. */
-  helper_ticket_key: string | null }
+  helper_ticket_key: string | null
+  /** How HQ tests this app (testsetupstore.ts), and its helper. */
+  test_setup: ReturnType<typeof setupView> }
 const holdersOf = (json: string | null): PortHolder[] | null => { try { return json ? JSON.parse(json) as PortHolder[] : null } catch { return null } }
 export function previewView(repo: Repo): PreviewView {
   const p = row(repo.id) ?? blank(repo.id), t = p.ticket_id ? getTicket(p.ticket_id) : undefined
   return { ...p, recipe: parse(p.recipe), draft_recipe: parse(p.draft_recipe), port_holders: holdersOf(p.port_holders),
     auto_command: detectCommand(repo.path), default_branch: repo.default_branch, path: t?.worktree_path ?? repo.path,
-    helper_ticket_key: p.helper_ticket_id ? getTicket(p.helper_ticket_id)?.key ?? null : null }
+    helper_ticket_key: p.helper_ticket_id ? getTicket(p.helper_ticket_id)?.key ?? null : null, test_setup: setupView(repo.id) }
 }
+/** Sends the UI the repo's preview again: something it shows besides the row changed (the test setup). */
+export function repush(repoId: string): void { const repo = getRepo(repoId); if (repo) patch('preview', repoId, previewView(repo)) }
 export const previews = () => repos().map(previewView)
 /** Saves and sends the UI the whole row (a patch for a row the UI hasn't seen would otherwise arrive half-filled). */
 export function save(repoId: string, fields: Partial<Preview>): void {

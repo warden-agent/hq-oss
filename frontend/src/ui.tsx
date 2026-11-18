@@ -36,8 +36,14 @@ export function Menu({ label, title, className = 'btn', align = 'right', childre
   const [open, setOpen] = useState(false); const ref = useRef<HTMLDivElement>(null), pop = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => { // keep the menu inside the window: a button near the edge (a wrapped header) would push it off screen
     const el = pop.current; if (!open || !el) return
-    el.style.transform = ''; const r = el.getBoundingClientRect()
+    el.style.transform = ''; Object.assign(el.style, { top: '', bottom: '', marginBottom: '', maxHeight: '', overflowY: '' }); const r = el.getBoundingClientRect()
     const dx = r.right > innerWidth - 8 ? innerWidth - 8 - r.right : r.left < 8 ? 8 - r.left : 0; if (dx) el.style.transform = `translateX(${dx}px)`
+    // and up and down: a button low in the window (the preview pane's ⚙) opens it upwards when there's more room above, and it scrolls when it's taller than that
+    const btn = ref.current?.getBoundingClientRect(), below = innerHeight - 8 - r.top, above = (btn?.top ?? 0) - 12
+    if (r.bottom > innerHeight - 8 && btn) {
+      if (above > below) Object.assign(el.style, { top: 'auto', bottom: '100%', marginBottom: '4px' })
+      Object.assign(el.style, { maxHeight: `${Math.max(120, Math.max(above, below))}px`, overflowY: 'auto' })
+    }
   }, [open])
   useEffect(() => {
     if (!open) return

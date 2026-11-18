@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-conflicts-'))
 const { migrate, run } = await import('./db.ts')
 migrate()
-const { changeText, fixConflictsText, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, stalledKind, testsFailed, whoMergedFirst } = await import('./conflicts.ts')
+const { changeText, fixButton, fixConflictsText, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, stalledKind, testsFailed, whoMergedFirst } = await import('./conflicts.ts')
 const { getRepo, getTicket, localOnly, syncBlocks, usesGithub } = await import('./records.ts')
 
 const sh = (cwd: string, ...args: string[]): string =>
@@ -125,4 +125,52 @@ test('a finished ticket whose spec changed: its own words, notice and instructio
   assert.doesNotMatch(live, /conflict|git merge|fails its tests/)
   assert.match(fresh, /^You are the engineer for ticket invoices \(S\): invoices title\. .*committed on branch b\/INV in your worktree \/wt\/shop; get_ticket has/)
   assert.ok(fresh.endsWith(`the handoff so far.\n\n${live}`))
+})
+
+test('a ticket with acceptance criteria: going back says what to do about the tests it named; a ticket with none hears nothing about them', () => {
+  const plain = getTicket('shop')!, t = { ...plain, criteria: JSON.stringify([{ id: 'A1', kind: 'ui', text: 'The list shows dates.' }]) }
+  const again = /Call open_pr again with the same title and body, keeping the "## Deviations from approved plan" section \(leave `tests` out unless a criterion's test moved/
+  const failed = { kind: 'fail' as const, test: 'npm test', output: 'not ok 1 - join', earlier: '' }
+  for (const text of [fixTestsText({ t, base: 'main', failed }), fixConflictsText({ t, base: 'main', files: ['app.js'], merged: [], inProgress: false })]) assert.match(text, again)
+  assert.match(changeText({ t }), /1\. Call get_ticket and read the spec and the acceptance criteria as they are now\./)
+  assert.match(changeText({ t }), /section, and with `tests` for the criteria as they are now\.\n/)
+  const none = [fixTestsText({ t: plain, base: 'main', failed }), fixConflictsText({ t: plain, base: 'main', files: ['app.js'], merged: [], inProgress: false }), changeText({ t: plain })]
+  for (const text of none) assert.doesNotMatch(text, /`tests`|criteri/)
+  // HQ's run passed, but skipped a test the ticket named: its own words, the list as HQ wrote it, and it survives a takeover (Bug 84)
+  const unproven = { ...failed, unproven: true, output: "The tests that didn't run:\n- A1: \"shows dates\" in test/list.test.js was skipped, so nothing proved A1." }
+  const text = fixTestsText({ t, base: 'main', failed: unproven })
+  assert.match(text, /^HQ: b\/INV merged with main passes `npm test`, but that run didn't run every test you named for the ticket's criteria, so HQ didn't merge it\.\n\n/)
+  assert.match(text, /merge it\.\n\nThe tests that didn't run:\n- A1: "shows dates"/)
+  assert.match(text, /2\. Make each test listed above run and pass under `npm test` \(HQ reads that command's output\), or name a test that does\. Don't drop a criterion's test\./)
+  assert.doesNotMatch(text, /fails its tests|never finished/)
+  keepTestsFailed(t, unproven); assert.equal(testsFailed(t, 'npm test').unproven, true); assert.equal(testsFailed(t, 'npm test').output, unproven.output)
+  keepTestsFailed(t, failed); assert.equal(testsFailed(t, 'npm test').unproven, undefined)
+})
+
+test('a ticket sent back for what HQ saw when it opened the app: its own words, notice and button, and HQ\'s report as it wrote it', () => {
+  assert.deepEqual(fixWords('look', 'main'), { to: 'fix what went wrong when HQ opened the app with it on main', ing: 'fixing what went wrong when HQ opened the app with it on main' })
+  assert.equal(forTests('look'), true); assert.equal(stalledKind('look'), 'look_stalled')
+  assert.deepEqual([null, 'tests', 'tests_hung', 'look', 'changes'].map((f) => fixButton(f as never)), ['Fix conflicts', 'Fix tests', 'Fix tests', 'Fix the app', 'Build the change'])
+  const t = getTicket('shop')!, report = "HQ started the app the way its preview does (npm run dev) and opened its pages in a headless browser.\n- /: error in the console: boom"
+  const failed = { kind: 'fail' as const, test: 'npm run dev', output: report, earlier: '', look: true }
+  const text = fixTestsText({ t, base: 'main', failed })
+  assert.match(text, /^HQ: b\/INV merged with main passes its tests, but the app has problems when HQ opens it with your ticket merged in, so HQ didn't merge it\.\n\nHQ started the app/)
+  assert.match(text, /2\. Fix what the report above shows, .* A real browser can't start in your session: go by the report, .* Then run the tests\.\n3\. Commit\./)
+  assert.doesNotMatch(text, /fails its tests|never finished|Lines that named a failure/)
+  keepTestsFailed(t, failed); assert.equal(testsFailed(t, 'npm test').look, true); assert.equal(testsFailed(t, 'npm test').output, report)
+  keepTestsFailed(t, { ...failed, look: false }); assert.equal(testsFailed(t, 'npm test').look, undefined)
+  assert.equal(testsFailed({ ...t, id: 'nothing-kept', fixing: 'look' }, 'npm test').look, true) // what was printed is gone: the reason on the ticket still says which
+})
+
+test('a ticket sent back for what a fresh reader of its changes found: its own words, notice and button, and the findings as the reader wrote them', () => {
+  assert.deepEqual(fixWords('review', 'main'), { to: 'fix what a fresh reader of its changes found', ing: 'fixing what a fresh reader of its changes found' })
+  assert.equal(forTests('review'), true); assert.equal(stalledKind('review'), 'review_stalled'); assert.equal(fixButton('review' as never), 'Fix what it found')
+  const t = getTicket('shop')!, found = 'What the reader found:\n- A1: add() subtracts.\n- bug: add.js: add("2", 3) gives "23".'
+  const failed = { kind: 'fail' as const, test: 'npm test', output: found, earlier: '', review: true }, text = fixTestsText({ t, base: 'main', failed })
+  assert.match(text, /^HQ: b\/INV merged with main passes its tests, but a fresh reader of your changes found problems, so HQ didn't merge it\. The reader saw only the ticket's/)
+  assert.match(text, /what the tests printed\.\n\nWhat the reader found:\n- A1: add\(\) subtracts\.\n- bug: add\.js: add\("2", 3\) gives "23"\.\n\nFix it now/)
+  assert.match(text, /2\. Fix what the reader found, .* If a finding is wrong, say why in your handoff instead of changing the code: this read happens once, .* Then run the tests\.\n3\. Commit\./)
+  assert.doesNotMatch(text, /fails its tests|never finished|opens it|Lines that named a failure/)
+  keepTestsFailed(t, failed); assert.equal(testsFailed(t, 'npm test').review, true); assert.equal(testsFailed(t, 'npm test').look, undefined)
+  assert.equal(testsFailed({ ...t, id: 'nothing-kept-2', fixing: 'review' }, 'npm test').review, true)
 })

@@ -3,6 +3,7 @@ import { fixWords } from './conflicts.ts'
 import { unmergedDeps } from './readiness.ts'
 import type { Message } from './delivery.ts'
 import type { Feature, Repo, Ticket } from './records.ts'
+import { criteriaBlock, criteriaOf } from './criteria.ts'
 
 /** Where a ticket stands, in words, for a TPM taking over. */
 function standing(t: Ticket, all: Ticket[]): string {
@@ -43,8 +44,10 @@ export function tpmPrompt(repo: Repo, o: { ws: string; previous: string | null; 
     + (o.localOnly ? `\n\nHQ can't push to ${repo.name}, so nothing in it goes to GitHub: no PRs; the user merges finished tickets into the local ${repo.default_branch} from HQ.` : '')
   const note = o.note ? `\n\nThe previous TPM's handoff note (HQ's ticket list above is the truth for statuses):\n${o.note}` : ''
   const ask = o.message
-    ? `\n\nThe user's new message, verbatim:\n"""\n${o.message}\n"""\n\nAct on it. New work: start_feature, then create_ticket for each ticket (S/M/L, spec with acceptance criteria,`
+    ? `\n\nThe user's new message, verbatim:\n"""\n${o.message}\n"""\n\nAct on it. New work: start_feature, then create_ticket for each ticket (S/M/L, spec, criteria,`
       + ' expected_files, depends_on), set_merge_order, and tell the user the breakdown in a few lines; don\'t assign tickets unless they ask you to start now.'
+      + ' Write criteria as your instructions say: checkable from outside, ui or backend, no file or function names, failure cases covered.'
+      + (repo.auto_mode ? '' : ' Ask the user to read each ticket\'s criteria on its box before they start it.')
       + ' A question or a change to existing work: answer it, or update the tickets it touches.'
     : o.previous || o.note ? '\n\nFirst read PROJECT.md and call list_tickets, then tell the user in two or three lines where things stand and what happens next.' : ''
   return `${head}${files}${cleared}${extra}\n\nOn the board now:\n${board || '- nothing'}${talk ? `\n\nLast messages between the user and the TPM, oldest first:\n${talk}` : ''}`
@@ -68,7 +71,7 @@ Git is the truth for what exists: if the note and git disagree, trust git.
 
 ## Spec
 ${t.spec ?? ''}
-
+${criteriaBlock(criteriaOf(t))}
 ## The previous engineer's handoff note
 ${o.note ?? '(none)'}
 

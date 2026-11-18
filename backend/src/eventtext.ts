@@ -73,7 +73,20 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'message.typed': return 'HQ typed a message into its terminal'
     case 'ask.opened': return `Asked you: ${one(p.question)}`
     case 'gate.review_opened': return `Its plan waits for review${Number(p.round) > 1 ? ` (round ${p.round})` : ''}`
-    case 'gate.verdict': return `Plan ${VERDICT[String(p.verdict)] ?? String(p.verdict)}${p.by === 'auto' ? ' by HQ' : p.by === 'user' ? ' by you' : ''}`
+    case 'gate.verdict': { const by = p.by === 'auto' ? ' by HQ' : p.by === 'plan_check' ? ' by HQ\'s plan check' : p.by === 'user' ? ' by you' : ''
+      return `Plan ${VERDICT[String(p.verdict)] ?? String(p.verdict)}${by}` }
+    case 'auto.tried': return p.state === 'tried' ? `HQ's tester tried ${p.feature} in a browser${Number(p.problems) ? ` and found ${p.problems === 1 ? 'a problem' : `${p.problems} problems`}` : ''}`
+      : `HQ's tester didn't try ${p.feature}: ${one(p.why)}`
+    case 'auto.uitest': return p.state === 'done'
+      ? `HQ's UI tester tried ${p.scenarios} scenarios in a browser and found ${Number(p.findings) === 1 ? 'one thing' : `${p.findings} things`} worth a look`
+      : `HQ's UI tester didn't use the app: ${one(p.why)}`
+    case 'auto.read': { const n = Array.isArray(p.findings) ? p.findings.length : 0
+      return p.state === 'unchecked' ? `Nobody could read ${p.key}'s changes before it merged` : n ? `A fresh reader of ${p.key}'s changes found ${n === 1 ? 'a problem' : `${n} problems`}`
+        : `A fresh reader of ${p.key}'s changes found nothing wrong` }
+    case 'plan_check.started': return 'HQ\'s plan check is reading its plan against the ticket\'s criteria'
+    case 'plan_check.answered': { const n = Array.isArray(p.findings) ? p.findings.length : 0
+      return n ? `HQ's plan check found ${n === 1 ? 'a problem' : `${n} problems`} with its plan` : 'HQ\'s plan check found nothing wrong with its plan' }
+    case 'plan_check.failed': return `HQ's plan check couldn't run: ${one(p.why)}`
     case 'tpm.started': return "Took over as the project's TPM"
     case 'fresh_start.requested': return 'Asked to save a note and start fresh'
     case 'fresh_start.done': return 'Started fresh from its note'
