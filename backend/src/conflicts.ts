@@ -139,7 +139,8 @@ export function fixConflictsText(o: { t: Ticket; base: string; files: string[]; 
   const intro = o.launch ? `You are the engineer for ticket ${t.key} (${t.size}): ${t.title}. Its work is already finished and committed on branch ${t.branch}`
     + ` in your worktree ${o.launch.worktree}; call get_ticket for its spec and the handoff so far.\n\n` : ''
   const first = o.merged.length ? `${o.merged.join(', ')} merged first, and now` : 'Now'
-  const what = o.files.length ? `main has moved on since you finished ${t.key}. ${first} ${t.branch} conflicts with ${base} in ${list}.`
+  const branch = base.replace(/^origin\//, '') // the project's default branch (Bug 210), not always main: mergeBase names origin's copy of it on GitHub
+  const what = o.files.length ? `${branch} has moved on since you finished ${t.key}. ${first} ${t.branch} conflicts with ${base} in ${list}.`
     : `${t.branch} has to merge ${base} in to fix its conflicts, and it already merges cleanly with ${base} now (the merge may be done already).`
   const steps = [
     o.inProgress ? 'A merge is already in progress in your worktree: finish it (git status shows what is left).' : `git merge --no-edit ${base} (merge, never rebase, never push).`,

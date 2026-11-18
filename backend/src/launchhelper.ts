@@ -16,9 +16,9 @@ import { git } from './reposync.ts'
 import { ensureFresh } from './repos.ts'
 import { mergeBase } from './conflicts.ts'
 import { excludeHqFolders, listWorktrees, seedPackages } from './worktrees.ts'
-import { checkRecipe, commandRecipe, detectCommand, sameCommands, type Recipe } from './apprun.ts'
-import { PortTaken, previewSession, previewView, row, save, serial, startPreview, stopPreview } from './preview.ts'
-import { killUnder, pgidOf } from './procs.ts'
+import { checkRecipe, commandRecipe, detectCommand, PREVIEW_PORTS, sameCommands, strayPorts, testPorts, type Recipe } from './apprun.ts'
+import { helperPorts, helperPortsHeld, PortTaken, previewSession, previewView, row, save, serial, startPreview, stopPreview } from './preview.ts'
+import { killUnder, listenersUnder, pgidOf } from './procs.ts'
 import { sendMessage } from './delivery.ts'
 import { q } from './db.ts'
 import { readSetup } from './testsetupstore.ts'
@@ -43,12 +43,18 @@ function triedTicket(repoId: string, ticketId: string | null): (Ticket & { workt
   return tryable(t) && getFeature(t.feature_id)?.repo_id === repoId ? t : undefined
 }
 
-function prompt(repo: Repo, why: 'first' | 'fix', saved: Recipe | null, output: string, tk?: Ticket & { worktree_path: string }): string {
-  const lines = [`Project: ${repo.name}. Work out how to start its app and save it with save_launch.`]
+/** What the helper is told about the ports for its test runs (Bug 226). */
+export const portsText = (ports: number[]): string => `Ports for your test runs: ${ports.join(', ')}, free ports in HQ's preview range `
+  + `${PREVIEW_PORTS[0]}–${PREVIEW_PORTS.at(-1)}. $PORT is ${ports[0]} in your shell and $HQ_TRY_PORTS lists them all. Use only these for your test `
+  + 'servers ("auto" parts): another port may belong to another app on this machine, and HQ stops a test server it finds on one.'
+
+function prompt(repo: Repo, why: 'first' | 'fix', saved: Recipe | null, output: string, ports: number[], tk?: Ticket & { worktree_path: string },
+  reason: string | null = null): string {
+  const lines = [`Project: ${repo.name}. Work out how to start its app and save it with save_launch.`, '', portsText(ports)]
   if (tk) lines.push('', `Your worktree has ticket ${tk.key}'s version ("${tk.title}"), which the user wants to try before it's merged. `
     + `Work out the steps from it; once it's merged, ${repo.default_branch} uses the same steps.`)
   if (why === 'fix') {
-    lines.push('', 'The start steps HQ had stopped working. They were:', JSON.stringify(saved, null, 1))
+    lines.push('', reason ? `HQ won't run its start steps any more: ${reason}. They were:` : 'The start steps HQ had stopped working. They were:', JSON.stringify(saved, null, 1))
     if (output.trim()) lines.push('', 'The app\'s last output:', output.trim())
     lines.push('', 'Find out why and save fixed steps.')
   }
@@ -62,24 +68,40 @@ function prompt(repo: Repo, why: 'first' | 'fix', saved: Recipe | null, output: 
  *  the helper already on it (Bug 41: two helpers started 2 s apart, and the untracked one's test server held the app's port).
  *  `ticket`: Try it on a repo with no steps yet (Bug 46). A new project's main is empty until its first merge, so the helper
  *  works from that finished ticket's branch, and its first run tries the ticket. Fixing steps while a ticket is tried does too. */
-export function startHelper(repoId: string, why: 'first' | 'fix', ticket: string | null = null): Promise<ReturnType<typeof previewView>> {
-  return serial(repoId, () => startOne(repoId, why, ticket))
+export function startHelper(repoId: string, why: 'first' | 'fix', ticket: string | null = null, reason: string | null = null): Promise<ReturnType<typeof previewView>> {
+  return serial(repoId, () => startOne(repoId, why, ticket, reason))
 }
-async function startOne(repoId: string, why: 'first' | 'fix', ticket: string | null): Promise<ReturnType<typeof previewView>> {
+async function startOne(repoId: string, why: 'first' | 'fix', ticket: string | null, reason: string | null): Promise<ReturnType<typeof previewView>> {
   const repo0 = getRepo(repoId); if (!repo0) throw new Error('unknown repo')
   notClearing(repoId)
   const cur = row(repoId)
   const tk = triedTicket(repoId, ticket ?? (why === 'fix' ? cur?.ticket_id ?? null : null))
   if (live(cur?.helper_agent_id ?? null)) { if (tk) save(repoId, { helper_ticket_id: tk.id }); return previewView(repo0) } // already on it
   const repo = await ensureFresh(repoId)
-  const output = why === 'fix' ? await tmux.capturePane(previewSession(repoId), 80) : ''
+  const output = why === 'fix' && !reason ? await tmux.capturePane(previewSession(repoId), 80) : '' // refused steps never ran: no output of theirs
   if (cur?.helper_worktree) await removeWorktree(repo.path, cur.helper_worktree) // a "Not now" or a lost helper's
   if (repo.empty && !tk) { // Bug 67: a helper would spend tokens finding that out. A ticket to try has files of its own, even on an empty main (Bug 46)
     resolveKind(notice(repoId), null)
-    save(repoId, { helper_agent_id: null, helper_worktree: null, helper_state: 'empty', helper_note: null, helper_saves: 0, draft_recipe: null, helper_ticket_id: null })
+    save(repoId, { helper_agent_id: null, helper_worktree: null, helper_state: 'empty', helper_note: null, helper_saves: 0, draft_recipe: null, helper_ticket_id: null,
+      helper_ports: null })
     emit({ agentId: null, source: 'system', kind: 'launch.nothing_to_start', payload: { repo: repo.name } })
     return previewView(repo)
   }
+  // Bug 226: ports for its test runs, before anything is made. Another repo's helper starting meanwhile (its own queue) mustn't get the same ones
+  const ports = await testPorts([...helperPortsHeld(), ...picking])
+  if (!ports.length) { // the pane says why (a refused Launch's answer isn't shown anywhere else)
+    const msg = `${NO_PORTS} ${PREVIEW_PORTS[0]}–${PREVIEW_PORTS.at(-1)} to try ${repo.name}, and they are all in use. Stop a preview, then Launch again.`
+    save(repoId, { detail: msg }); throw new Error(msg)
+  }
+  for (const x of ports) picking.add(x)
+  try { return await withPorts(repo, why, cur, output, tk, reason, ports) } finally { for (const x of ports) picking.delete(x) }
+}
+const NO_PORTS = 'Claude needs a free port in HQ\'s preview ports'
+/** Ports given to a helper that is still starting (not in its preview row yet). */
+const picking = new Set<number>()
+async function withPorts(repo: Repo, why: 'first' | 'fix', cur: ReturnType<typeof row>, output: string, tk: (Ticket & { worktree_path: string }) | undefined,
+  reason: string | null, ports: number[]): Promise<ReturnType<typeof previewView>> {
+  const repoId = repo.id
   const name = `launch-${Date.now().toString(36)}`, wt = path.join(repo.path, '.claude', 'worktrees', name)
   await git(repo.path, ['worktree', 'add', '-q', '-b', `hq-launch/${name}`, wt, tk?.branch ?? mergeBase(repo).name])
   await excludeHqFolders(repo.path)
@@ -88,22 +110,25 @@ async function startOne(repoId: string, why: 'first' | 'fix', ticket: string | n
   let a: Agent
   try {
     a = await launchAgent({ role: 'launcher', repoId, model: modelFor('launcher'), cwd: repo.path, displayName: `launch ${repo.name}`, worktreeName: name,
-      launchPrompt: prompt(repo, why, parse(cur?.recipe ?? null) ?? (cur?.command ? commandRecipe(cur.command, repo.path) : null), output, tk),
-      repoAllowlist: j<string[]>(repo.network_allowlist, []) })
+      launchPrompt: prompt(repo, why, parse(cur?.recipe ?? null) ?? (cur?.command ? commandRecipe(cur.command, repo.path) : null), output, ports, tk, reason),
+      repoAllowlist: j<string[]>(repo.network_allowlist, []), extraEnv: { PORT: String(ports[0]), HQ_TRY_PORTS: ports.join(' ') } })
   } catch (e) { await removeWorktree(repo.path, wt); throw e }
-  save(repoId, { helper_agent_id: a.id, helper_worktree: wt, helper_state: 'working', helper_note: null, helper_saves: 0, draft_recipe: null, helper_ticket_id: tk?.id ?? null })
+  const note = reason ? 'HQ didn\'t run the start steps you OK\'d: they would write a package-lock.json into the project, or not follow the one it has.' : null // Bug 156
+  save(repoId, { helper_agent_id: a.id, helper_worktree: wt, helper_state: 'working', helper_note: note, helper_saves: 0, draft_recipe: null, helper_ticket_id: tk?.id ?? null,
+    helper_ports: JSON.stringify(ports),
+    ...(note || row(repoId)?.detail?.startsWith(NO_PORTS) ? { detail: null } : {}) }) // the note says it now; the refusal's "start it again" is done
   emit({ agentId: a.id, source: 'system', kind: 'launch.helper_started', payload: { repo: repo.name, why, ticket: tk?.key ?? null } })
   await sweepStrays(repo)
   return previewView(repo)
 }
 
 /** Launch (or Try it, with `ticket`) with nothing to run: steps waiting for the user's OK (after "Not now") are shown, and their
- *  first run tries that ticket; else a helper starts. */
-export async function launchWithoutRecipe(repoId: string, ticket: string | null = null): Promise<ReturnType<typeof previewView>> {
+ *  first run tries that ticket; else a helper starts. `outdated`: HQ refused the OK'd steps (Bug 156), so the helper fixes them. */
+export async function launchWithoutRecipe(repoId: string, ticket: string | null = null, outdated: string | null = null): Promise<ReturnType<typeof previewView>> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
   const p = row(repoId)
   if (p?.draft_recipe && p.helper_state === 'needs_ok') { save(repoId, { helper_ticket_id: triedTicket(repoId, ticket)?.id ?? null }); return previewView(repo) }
-  return startHelper(repoId, 'first', ticket)
+  return startHelper(repoId, outdated ? 'fix' : 'first', ticket, outdated)
 }
 
 /** The helper is done (or gone): stop it, stop its leftover test servers, delete its worktree. `state`/`note` are what the
@@ -111,7 +136,7 @@ export async function launchWithoutRecipe(repoId: string, ticket: string | null 
 export async function finish(repoId: string, state: string | null, note: string | null): Promise<void> {
   const p = row(repoId); const repo = getRepo(repoId); if (!p || !repo) return
   const ticket = state === 'needs_ok' ? {} : { helper_ticket_id: null } // steps still to OK keep their ticket
-  save(repoId, { helper_agent_id: null, helper_worktree: null, helper_state: state, helper_note: note, ...ticket })
+  save(repoId, { helper_agent_id: null, helper_worktree: null, helper_state: state, helper_note: note, helper_ports: null, ...ticket })
   if (live(p.helper_agent_id)) await stopAgent(p.helper_agent_id!, 'launch helper done').catch(() => {})
   if (p.helper_worktree) await removeWorktree(repo.path, p.helper_worktree)
   emit({ agentId: p.helper_agent_id, source: 'system', kind: 'launch.helper_done', payload: { repo: repo.name, state, note } })
@@ -129,12 +154,16 @@ async function removeWorktree(repoPath: string, wt: string): Promise<void> {
 type Result = { ok: true; text: string } | { ok: false; text: string }
 /** save_launch: check the recipe, keep it as a draft for the user's OK (or run it at once when its commands are the ones they
  *  already OK'd), and tell the helper what happens next. */
-export function saveLaunch(agent: Agent, input: unknown): Result {
-  const repoId = repoOf(agent.id), p = repoId ? row(repoId) : undefined, repo = repoId ? getRepo(repoId) : undefined
-  if (!repoId || !p || !repo) return { ok: false, text: 'HQ is not waiting for start steps from you any more. Stop here.' }
-  if (p.helper_state === 'trying') return { ok: false, text: 'HQ is still running your last steps. End your turn; its message will come.' }
-  const checked = checkRecipe(input, p.helper_worktree ?? repo.path) // the same tree as main: folders and lockfiles are checked there
+export async function saveLaunch(agent: Agent, input: unknown): Promise<Result> {
+  const gone = { ok: false, text: 'HQ is not waiting for start steps from you any more. Stop here.' } as const
+  const repoId = repoOf(agent.id), p0 = repoId ? row(repoId) : undefined, repo = repoId ? getRepo(repoId) : undefined
+  if (!repoId || !p0 || !repo) return gone
+  if (p0.helper_state === 'trying') return { ok: false, text: 'HQ is still running your last steps. End your turn; its message will come.' }
+  const checked = checkRecipe(input, p0.helper_worktree ?? repo.path) // the same tree as main: folders and lockfiles are checked there
   if ('error' in checked) return { ok: false, text: `Not saved: ${checked.error}. Fix it and call save_launch again.` }
+  const stray = await strayTest(agent, p0, checked.recipe); if (stray) return { ok: false, text: stray }
+  const p = row(repoId); if (!p || p.helper_agent_id !== agent.id || !getRepo(repoId)) return gone // stopped or removed meanwhile
+  if (p.helper_state === 'trying') return { ok: false, text: 'HQ is still running your last steps. End your turn; its message will come.' }
   const saves = p.helper_saves + 1
   if (saves > MAX_SAVES) {
     tellUser(repoId, `${repo.name}: Claude tried ${MAX_SAVES} times and couldn't get the app to start. Its last notes: ${checked.recipe.notes || '(none)'}`)
@@ -151,6 +180,22 @@ export function saveLaunch(agent: Agent, input: unknown): Result {
   save(repoId, { helper_state: 'needs_ok' })
   tellUser(repoId, `${repo.name}: Claude worked out how to start the app. Check its steps and OK them in the preview.`)
   return { ok: true, text: 'Saved. HQ is showing the user your commands for an OK. End your turn now; the result of the real run comes to you as a message.' }
+}
+
+/** Bug 226: a test server of the helper's on a port HQ didn't give it (nor one the recipe fixes) may have been another app answering, and holds a port
+ *  another app may need. HQ stops its test servers and refuses the save, which doesn't count, saying why. Null: none found (or a helper from before
+ *  ports were given). Only servers still running are seen: the prompt tells the helper not to stop them. */
+async function strayTest(agent: Agent, p: NonNullable<ReturnType<typeof row>>, recipe: Recipe): Promise<string | null> {
+  const given = helperPorts(p); if (!given.length || !p.helper_worktree) return null
+  const pane = await tmux.panePid(agent.tmux_session), group = pane ? await pgidOf(pane) : null, spare = group ? [group] : [] // the helper itself
+  const stray = strayPorts((await listenersUnder(p.helper_worktree, spare)).map((l) => l.port), given, recipe); if (!stray.length) return null
+  await killUnder(p.helper_worktree, spare)
+  emit({ agentId: agent.id, source: 'system', kind: 'launch.test_port', payload: { repo: getRepo(p.id)?.name ?? p.id, ports: stray, given } })
+  const one = stray.length === 1
+  return `Not saved: your test server${one ? '' : 's'} listened on port${one ? '' : 's'} ${stray.join(', ')}, which HQ didn't give you. Another app on this `
+    + `machine may use ${one ? 'it' : 'them'}, so what answered there may not have been yours. HQ stopped your test servers. Try the app again on your `
+    + `ports (${given.join(', ')}; $PORT is ${given[0]}, $HQ_TRY_PORTS lists them all), check it answers, then call save_launch again. This save didn't count. `
+    + 'A port the project itself hard-wires is fine: give that part that port instead of "auto".'
 }
 
 /** The user OK'd the draft: it becomes the repo's recipe and HQ runs it. A helper still on it hears how it went. */

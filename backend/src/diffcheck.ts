@@ -2,8 +2,8 @@
 // main and what the test run printed, and nothing of the engineer's plan or reasoning. It answers: is a criterion not met, and is there a concrete bug?
 // Only when triggered, so tokens go where judgment is needed: a size M or L ticket, or one that git or the plan check flagged (deleted or cut tests, files
 // outside the plan, a criterion with no test, a plan that was sent back or never checked). A small clean ticket merges on its tests and HQ's look alone.
-// The same rules as the plan check: at most three findings, each about a criterion or a concrete bug, and one send-back per ticket. A ticket is read once;
-// a read that can't be had (the call fails) never holds the merge: the summary says nobody read it.
+// The same rules as the plan check: at most three findings, each about a criterion or a concrete bug, and one send-back per ticket. A ticket is read once
+// per commit its open_pr names (readAgain); a read that can't be had (the call fails) never holds the merge: the summary says nobody read it.
 import { execFile } from 'node:child_process'
 import { now } from './db.ts'
 import { ask } from './checker.ts'
@@ -20,6 +20,11 @@ export function whyRead(t: { size: string }, proof: Proof | null, plans: PlanChe
     plans.some((c) => c.state === 'sent_back') ? 'its plan was sent back once' : plans.some((c) => c.state === 'unchecked') ? 'its plan was never checked' : '',
   ].filter(Boolean)
 }
+
+/** Bug 185: does a ticket get a reader at `head`, the commit its open_pr named, after `last`, its last read? Each commit open_pr names is read, all of its
+ *  changes against main (as the first read): a later commit can break a criterion the first one met. Tested again at the same commit (main moved meanwhile),
+ *  it isn't read again. A read that couldn't be had is tried again. A ticket sent back merges on its next pass without another read: one send-back each. */
+export const readAgain = (last: DiffCheck | null, head: string): boolean => !last || last.state === 'unchecked' || (last.state === 'ok' && last.sha !== head)
 
 export const DIFF_SYSTEM = `You are a second reader for a finished software ticket, just before it is merged. You see only the ticket's acceptance criteria, its changes
 as a diff against the main branch, and what the test run printed. You do not see the plan, the rest of the code, or the engineer's reasoning. The tests passed.

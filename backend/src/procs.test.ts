@@ -1,7 +1,11 @@
 // Finding what still runs inside a folder (the Launch helper's leftover test servers) from lsof's listing.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pidsUnder, whoAnswers, whose } from './procs.ts'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
+import { listenersUnder, listenPorts, pgidOf, pidsUnder, whoAnswers, whose } from './procs.ts'
 
 test('pidsUnder: processes working in the folder or below it, each once; a sibling with the same prefix is not inside', () => {
   const listing = ['p10', 'fcwd', 'n/repo/.claude/worktrees/launch-1', 'p11', 'fcwd', 'n/repo/.claude/worktrees/launch-1/server',
@@ -33,4 +37,26 @@ test('whoAnswers (Bug 44): the app alone is shown; another listener beside it is
   assert.deepEqual(whoAnswers([h(9, 9)], 4, 1000), { kind: 'wait' }) // the app may still be starting
   assert.deepEqual(whoAnswers([h(9, 9)], 4, 16_000), { kind: 'show' }) // a port Docker forwards
   assert.deepEqual(whoAnswers([h(9, null)], null, 0), { kind: 'wait' })
+})
+
+test('listenPorts (Bug 226): each process\'s listening ports, once each, on any address', () => {
+  const listing = ['p20', 'f5', 'n127.0.0.1:3180', 'f6', 'n[::1]:3180', 'p21', 'f7', 'n*:4087', 'f8', 'nlocalhost:4088', 'p22', 'f9', 'nweird'].join('\n')
+  assert.deepEqual([...listenPorts(listing)], [[20, [3180]], [21, [4087, 4088]]])
+  assert.deepEqual([...listenPorts('')], [])
+})
+
+test('listenersUnder (Bug 226): a server working in the folder is found with its port; one elsewhere, or in a spared group, is not', async (t) => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-listen-'))), other = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-listen-')))
+  const serve = (cwd: string) => {
+    const k = spawn(process.execPath, ['-e', "const s = require('http').createServer(); s.listen(0, '127.0.0.1', () => console.log(s.address().port))"],
+      { cwd, detached: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    return { k, port: new Promise<number>((resolve) => k.stdout!.once('data', (d) => resolve(Number(String(d).trim())))) }
+  }
+  const inside = serve(dir), outside = serve(other)
+  t.after(() => { for (const x of [inside.k, outside.k]) { try { process.kill(-x.pid!, 'SIGKILL') } catch { /* gone */ } } })
+  const port = await inside.port; await outside.port
+  const found = await listenersUnder(dir)
+  assert.deepEqual(found.map((l) => [l.pid, l.port]), [[inside.k.pid, port]])
+  assert.deepEqual(await listenersUnder(dir, [(await pgidOf(inside.k.pid!))!]), []) // the helper's own group is spared
+  assert.deepEqual(await listenersUnder(path.join(dir, 'nope')), [])
 })

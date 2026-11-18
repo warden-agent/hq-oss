@@ -87,6 +87,10 @@ If you can't keep both, call report_blocked and say why.`)
   assert.match(gh, /^You are the engineer for ticket invoices \(S\): invoices title\. Its work is already finished and committed on branch b\/INV in your worktree \/w\/invoices; call get_ticket/)
   assert.match(gh, /HQ: main has moved on since you finished invoices\. Now b\/INV conflicts with origin\/main in a\./)
   assert.match(gh, /\n1\. A merge is already in progress in your worktree: finish it/)
+  // Bug 210: a project whose default branch is master says master, locally and on GitHub
+  assert.match(fixConflictsText({ t, base: 'origin/master', files: ['a'], merged: [], inProgress: false }),
+    /HQ: master has moved on since you finished invoices\. Now b\/INV conflicts with origin\/master in a\.[\s\S]*git merge --no-edit origin\/master/)
+  assert.match(fixConflictsText({ t, base: 'master', files: ['a'], merged: [], inProgress: false }), /HQ: master has moved on since you finished invoices\./)
   const clean = fixConflictsText({ t, base: 'main', files: [], merged: [], inProgress: false })
   assert.match(clean, /it already merges cleanly with main now/); assert.doesNotMatch(clean, /conflicted file/); assert.match(clean, /\n5\. Call open_pr again/)
   const many = fixConflictsText({ t, base: 'main', files: Array.from({ length: 25 }, (_, i) => `f${i}`), merged: [], inProgress: false })

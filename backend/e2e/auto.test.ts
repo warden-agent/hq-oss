@@ -6,23 +6,28 @@ import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, sh, exitPlanMode, pendingAfter, type Hq } from './harness.ts'
 import { WebSocket } from 'ws'
+import { diffCheckWords } from '../src/checks.ts'
 
 let hq: Hq
 const prompt = (id: string) => fs.readFileSync(path.join(hq.hqHome, 'agents', id, 'prompt.md'), 'utf8') // what the agent was started with
 // HQ_LOOK_RUNNER: no browser here; HQ's look at the app (a project with start steps) runs fake-look.mjs in its place, in the same sandbox. The UI tester's
 // browser is never started either (fake-claude.mjs drives its host itself), so any program will do for it
-beforeEach(async () => { hq = await startHq({ env: { HQ_AUTO_SOON_MS: '100', HQ_AUTO_TICK_MS: '500', HQ_LOOK_RUNNER: path.join(import.meta.dirname, 'fake-look.mjs'),
-  HQ_UITEST_BROWSER_EXE: '/usr/bin/false' } }) })
+// HQ_SCENARIO_RUNNER: a finding's replay (scenario.ts) runs fake-scenario.mjs in place of the scripted browser, under the real recorder
+const ENV = { HQ_AUTO_SOON_MS: '100', HQ_AUTO_TICK_MS: '500', HQ_LOOK_RUNNER: path.join(import.meta.dirname, 'fake-look.mjs'),
+  HQ_UITEST_BROWSER_EXE: '/usr/bin/false', HQ_SCENARIO_RUNNER: path.join(import.meta.dirname, 'fake-scenario.mjs') }
+beforeEach(async () => { hq = await startHq({ env: ENV }) })
 afterEach(async () => { await hq?.stop() })
 
 const PASS = "require('node:test').test('ok',()=>{})\n"
 /** A project with `npm test` and one passing test, its TPM running and auto mode on. */
-async function project(name: string, o: { tests?: boolean; auto?: boolean } = {}) {
+async function project(name: string, o: { tests?: boolean; auto?: boolean; branch?: string } = {}) {
   const dir = hq.repo(name)
+  if (o.branch) sh(dir, 'branch', '-m', o.branch) // Bug 210: a project whose default branch isn't main
   if (o.tests !== false) {
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, private: true, scripts: { start: 'node server.js', test: 'node --test' } }))
     fs.mkdirSync(path.join(dir, 'test')); fs.writeFileSync(path.join(dir, 'test', 'ok.test.js'), PASS); sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'tests')
@@ -42,13 +47,19 @@ const runs = async (p: P) => (await hq.state()).autoRuns.filter((r: any) => r.re
 const engineer = (t: any, not?: string) => waitFor(`an engineer on ${t.key}`, async () => (await hq.state()).agents.find((a: any) => a.role === 'engineer' && a.ticket_id === t.id &&
   a.status === 'working' && a.id !== not))
 const wt = (p: P, t: any) => path.join(p.dir, '.claude', 'worktrees', t.key)
+/** Bug 206: the "came back" lines of an engineer's Events tab. */
+const cameBack = async (id: string): Promise<string[]> => ((await hq.api(`agents/${id}/events`)).json.events as any[]).map((x) => x.text).filter((x) => / came back: /.test(x))
 /** Waits for `t` to reach `status`; a time-out says where it was instead (Bug 113: a CI failure that never said which wait it was). */
 const until = async (t: any, status: string, ms = 15_000) => { let last = 'not found'
   try { return await waitFor(`${t.key} to be ${status}`, async () => { const x = await tk(t); last = x ? `${x.status}${x.auto_parked_why ? `, parked: ${x.auto_parked_why}` : ''}` : 'gone'
     return x?.status === status ? x : null }, ms) } catch (e) { throw new Error(`${(e as Error).message} (it is ${last})`) } }
-async function openPr(e: any): Promise<void> {
-  await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
-  const r = await hq.mcp(e.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true }) // the map: featuremap.test.ts
+/** Bug 162: what the engineer ran last before its handoff, as Claude Code's hook reports it. With auto off, open_pr needs the project's test command run. */
+const ranTests = (e: any) => hq.hook(e.id, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_use_id: `toolu_${e.id}_${Date.now()}` })
+/** `leftOut`: the "## Tests left out" section a repair's body needs (Bug 142); any ticket may have it. */
+async function openPr(e: any, leftOut = 'Nothing'): Promise<void> {
+  await ranTests(e); await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
+  const r = await hq.mcp(e.id, 'open_pr', { title: 'Done', body: `Done.\n\n## Deviations from approved plan\nNone\n\n## Tests left out\n${leftOut}`,
+    feature_map_unchanged: true }) // the map: featuremap.test.ts
   assert.equal(r.isError, false, r.text)
 }
 /** What an engineer does: plan (no one approves it but HQ), write `files`, commit, open_pr. */
@@ -119,6 +130,47 @@ test('Bug 89: auto off while a finished ticket is tested ends the run; the ticke
   assert.equal((await tested()).filter((e) => e.kind === 'auto.tested').length, 0, 'the stopped run said nothing')
   const now = await tk(t); assert.equal(now.status, 'pr_ready'); assert.equal(now.auto_tries, 0, 'not sent back to its engineer')
 })
+test('Bug 163: a TPM started after auto mode went off is told it\'s off, and that earlier talk of HQ testing was from auto mode', async () => {
+  const p = await project('offstart'), repo = p.repo.id
+  const fromHq = async (id: string) => (await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === id).map((m: any) => m.body).join('\n')
+  assert.match(await fromHq(p.tpm.id),
+    /HQ: the user turned auto mode on for this project\. From now on HQ starts ready tickets when your turn ends, approves plans, tests finished tickets on main, merges them/)
+  await hq.hook(p.tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'HQ ran the tests before each merge.' }) // said while auto was on
+  assert.equal((await hq.api(`repos/${repo}/auto`, { on: false })).status, 200) // a running TPM is told, in the same words as a new one
+  assert.match(await fromHq(p.tpm.id), /HQ: the user turned auto mode off\. From now on the user starts tickets, approves plans and merges from HQ, and HQ runs no tests before a merge\./)
+  assert.equal((await hq.api(`repos/${repo}/auto`, { on: true })).status, 200)
+  await hq.api(`agents/${p.tpm.id}/stop`, {}); await waitFor('the TPM to stop', async () => (await hq.state()).agents.find((a: any) => a.id === p.tpm.id)?.status === 'exited')
+  assert.equal((await hq.api(`repos/${repo}/auto`, { on: false })).status, 200) // no TPM to tell
+  const off = await hq.api(`repos/${repo}/message`, { body: 'Is auto mode on?' }); assert.equal(off.status, 200, JSON.stringify(off.json))
+  const said = prompt(off.json.agent.id)
+  assert.match(said, /- TPM: HQ ran the tests before each merge\./) // its history still says so
+  assert.match(said, /Auto mode is off for this project: the user starts tickets, approves plans and merges from HQ, and HQ runs no tests before a merge\./)
+  assert.match(said, /If earlier messages or the handoff note say HQ starts, tests or merges tickets by itself, that was while auto mode was on\./)
+  assert.doesNotMatch(said, /Auto mode is on/)
+  await hq.api(`agents/${off.json.agent.id}/stop`, {})
+  await waitFor('the second TPM to stop', async () => (await hq.state()).agents.find((a: any) => a.id === off.json.agent.id)?.status === 'exited')
+  assert.equal((await hq.api(`repos/${repo}/auto`, { on: true })).status, 200)
+  const on = await hq.api(`repos/${repo}/message`, { body: 'And now?' }); assert.equal(on.status, 200, JSON.stringify(on.json))
+  assert.match(prompt(on.json.agent.id), /Auto mode is on for this project: HQ starts ready tickets when your turn ends, approves plans, tests finished tickets on main/)
+  assert.doesNotMatch(prompt(on.json.agent.id), /Auto mode is off/)
+})
+test('Bug 210: in a project whose default branch is master, HQ tells the TPM master, when auto goes on and on a new TPM\'s board', async () => {
+  const p = await project('oldbase', { branch: 'master' }), t = await ticket(p, 'Thing')
+  assert.equal((await repoNow(p)).default_branch, 'master')
+  const fromHq = (await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === p.tpm.id).map((m: any) => m.body).join('\n')
+  assert.match(fromHq, /HQ: the user turned auto mode on for this project\. From now on HQ starts ready tickets when your turn ends, approves plans, tests finished tickets on master,/)
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: `if [ -f thing.js ]; then ${MARK}; fi` })).status, 200); await turnEnds(p)
+  await waitFor('master checked', async () => (await checks())[0]); await work(p, t, await engineer(t), { 'thing.js': '1\n' })
+  await waitFor('the ticket\'s test', () => stuckRun(), 15_000) // finished, and HQ is testing it: it stays that way while the new TPM starts
+  await hq.api(`agents/${p.tpm.id}/stop`, {}); await waitFor('the TPM to stop', async () => (await hq.state()).agents.find((a: any) => a.id === p.tpm.id)?.status === 'exited')
+  const fresh = await hq.api(`repos/${p.repo.id}/restart-tpm`, {}); assert.equal(fresh.status, 200, JSON.stringify(fresh.json))
+  const said = prompt(fresh.json.id)
+  assert.match(said, /Auto mode is on for this project: HQ starts ready tickets when your turn ends, approves plans, tests finished tickets on master, merges them/)
+  assert.match(said, new RegExp(`  - ${t.key} \\(S\\) Thing: finished; HQ tests it on master and merges it · branch `))
+  assert.doesNotMatch(said, /\bmain\b/)
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200); await waitFor('the test run to end', () => !stuckRun(), 5000)
+  await hq.api(`agents/${fresh.json.id}/stop`, {})
+})
 test('Bug 115: a project auto mode stops ends its test run at once, frees the turn an engineer waits for, and Resume tests afresh', async () => {
   const p = await project('stoprun'), t = await ticket(p, 'Thing'), t2 = await ticket(p, 'Other')
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: `if [ -f thing.js ]; then ${MARK}; fi` })).status, 200); await turnEnds(p)
@@ -147,6 +199,15 @@ test('Bug 115: a stop during the check of main ends that run with no result, and
   await hq.api(`agents/${p.tpm.id}/stop`, {}); assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: '' })).status, 200)
   assert.equal((await hq.api(`repos/${p.repo.id}/auto-resume`, {})).status, 200)
   const c = await waitFor('a new check', async () => (await checks())[0], 15_000); assert.equal(c.result, 'pass')
+})
+test('Bug 152: Clear project ends the check of main at once, while the TPM still writes its note, and nothing follows from it', async () => {
+  const p = await project('clearrun'); await ticket(p, 'One')
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: MARK })).status, 200); await turnEnds(p)
+  await waitFor('the check of main', () => stuckRun(), 15_000)
+  const r = await hq.api(`repos/${p.repo.id}/clear`, {}); assert.equal(r.status, 200); assert.equal(r.json.done, false, 'the clear waits for the TPM\'s note')
+  await waitFor('the run to end', () => !stuckRun(), 2000); await wait(500)
+  assert.deepEqual(await tested(), [], 'no result: not a failure, not a repair'); assert.deepEqual(await repairs(p), [])
+  assert.ok((await repoNow(p)).clearing_at, 'the clear is still under way: the run didn\'t wait for it to finish')
 })
 
 test('a machine that can\'t sandbox the tests says so before anything starts: no switch, no run, no tokens', async () => {
@@ -209,6 +270,31 @@ test('Bug 105: the request that asked to leave plan mode is reported after HQ ap
   await step(OPUS, ['Edit']) // building on the planning model is still an alarm
   assert.deepEqual(await alarms(), [`engineer ${e.id}: main-loop request on ${OPUS}, expected sonnet`])
 })
+test('Bug 141: an engineer set to haiku plans on Sonnet and builds on Haiku, with no model alarm, and the next engineer still starts', async () => {
+  const p = await project('cheap'), SONNET = 'claude-sonnet-5-5', HAIKU = 'claude-haiku-5-5'
+  const models = { tpm: 'opus', architect: 'opus', engineer_s: 'haiku', engineer_ml: 'opusplan', launcher: 'sonnet', tester: 'sonnet' } // S tickets on haiku
+  assert.equal((await hq.api('settings', { key: 'models', value: models })).status, 200)
+  const t = await ticket(p, 'Labels'); await turnEnds(p); const e = await engineer(t); assert.equal(e.model_alias, 'haiku')
+  const step = (model: string, tools: string[]) => hq.modEvent(e.id, { kind: 'turn.step', model, agentId: null, usageModel: model, tools })
+  const alarms = async () => (await hq.state()).attention.filter((a: any) => a.kind.startsWith('model_')).map((a: any) => a.detail)
+  // What the real 2.1.322 sent for `--model haiku --permission-mode plan` (a throwaway spike): every planning request on Sonnet,
+  // the plan allowed, then a switch to Haiku of its own (source auto) 20 ms later, and every request after that on Haiku
+  await hq.hook(e.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: {}, permission_mode: 'plan' }); await step(SONNET, ['Read'])
+  await hq.hook(e.id, { hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan: `Plan for ${t.key}` }, permission_mode: 'plan' })
+  await step(SONNET, ['ExitPlanMode'])
+  assert.equal((await hq.hook(e.id, exitPlanMode(`Plan for ${t.key}`))).hookSpecificOutput.decision.behavior, 'allow')
+  await hq.hook(e.id, { hook_event_name: 'PostModelSwitch', from_model: SONNET, to_model: HAIKU, source: 'auto', requested_model: null })
+  await hq.hook(e.id, { hook_event_name: 'PostToolUse', tool_name: 'ExitPlanMode', tool_input: {}, tool_response: { plan: 'x' }, permission_mode: 'acceptEdits' })
+  await step(HAIKU, ['Edit'])
+  const s = await hq.state(); assert.deepEqual(await alarms(), []); assert.deepEqual(s.settings.paused_roles ?? [], [])
+  assert.equal(s.agents.find((a: any) => a.id === e.id).model_live, HAIKU)
+  const t2 = await ticket(p, 'Badges'); await turnEnds(p); const e2 = await engineer(t2) // the engineer role isn't paused: the next ticket gets one
+  assert.equal(e2.model_alias, 'haiku')
+  // Any other switch Claude Code makes by itself still pauses the role: here the first engineer goes back to Sonnet while it builds
+  await hq.hook(e.id, { hook_event_name: 'PostModelSwitch', from_model: HAIKU, to_model: SONNET, source: 'auto', requested_model: null })
+  assert.deepEqual(await alarms(), [`engineer ${e.id}: model switched ${HAIKU} → ${SONNET} (source auto); role paused`])
+  assert.deepEqual((await hq.state()).settings.paused_roles, ['engineer'])
+})
 test('tickets that pass alone but fail together go back to their engineer, and the fix merges', async () => {
   const p = await project('mismatch')
   const t1 = await ticket(p, 'Server'), t2 = await ticket(p, 'Screen'); await turnEnds(p)
@@ -242,6 +328,7 @@ test('Bug 84: a ticket sent back for its tests says so, and an engineer that tak
   const e3 = await engineer(t1, e1.id)
   assert.match(prompt(e3.id), /It was fixing its tests on main; HQ's instructions for that are below\.[\s\S]*fails its tests[\s\S]*join/)
   assert.doesNotMatch(prompt(e3.id), /conflict/i); assert.equal((await tk(t1)).fixing, 'tests')
+  assert.deepEqual(await cameBack(e1.id), [`${t1.key} came back: its tests fail`]) // Bug 206
   sh(wt(p, t1), 'merge', '--no-edit', 'main'); fs.writeFileSync(path.join(wt(p, t1), 'items.js'), "exports.item=()=>({expiresOn:'2027'})\n"); sh(wt(p, t1), 'add', '.')
   sh(wt(p, t1), 'commit', '-qm', 'same name'); await openPr(e3)
   await until(t1, 'merged'); assert.equal((await tk(t1)).fixing, null)
@@ -322,6 +409,10 @@ test('Bug 108: what the TPM writes for HQ\'s repair ticket goes under HQ\'s spec
   const second = await spec(r, { spec: 'Leave the date tests alone.' }); assert.match(second.text, under); assert.match(second.text, /added before\.$/)
   const part = await tpmPart(); assert.ok(part.endsWith('\n\nLeave the date tests alone.')); assert.ok(!part.includes('offline')); assert.equal(part.split('## From the TPM').length, 2)
   await waitFor('the engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.to_id === er.id && /^HQ: the TPM added to .+ spec, under "From the TPM"/.test(m.body)))
+  // Bug 168: the same text again changes nothing, and the engineer isn't told twice
+  const toEr = async () => (await hq.state()).messages.filter((m: any) => m.to_id === er.id && /^HQ: the TPM added to/.test(m.body)).length
+  assert.equal(await toEr(), 1); assert.equal((await spec(r, { spec: ' Leave the date tests alone.\n' })).text, `${r.key} already says that: nothing changed.`)
+  assert.equal(await toEr(), 1); assert.ok((await tpmPart()).endsWith('\n\nLeave the date tests alone.'))
   const got = (await hq.mcp(er.id, 'get_ticket')).text; assert.match(got, /Reach the internet/); assert.match(got, /Leave the date tests alone\.\n\n## Handoff so far/)
   // Finished and not merged yet (auto is off by then): it goes back to its engineer for the TPM's text, HQ's spec still on top
   assert.equal((await hq.hook(er.id, exitPlanMode('Plan'))).hookSpecificOutput.decision.behavior, 'allow')
@@ -396,7 +487,7 @@ test('Bug 114: a stuck alert left on a finished ticket\'s engineer that has stop
   fs.writeFileSync(path.join(wt(p, t), 'one.txt'), '1\n'); sh(wt(p, t), 'add', '.'); sh(wt(p, t), 'commit', '-qm', 'one'); await openPr(e)
   await hq.hook(e.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' })
   await waitFor('the finished engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === e.id)?.status === 'exited', 8000)
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite')) // an alert from before the fix: HQ now clears it as the engineer stops
+  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 }) // an alert from before the fix: HQ now clears it as the engineer stops
   try {
     db.prepare("INSERT INTO needs_attention(id, agent_id, ticket_id, kind, detail, created_at) VALUES ('att-stale', ?, ?, 'stuck', 'eng: no events for 12 min', ?)").run(e.id, t.id, Date.now())
   } finally { db.close() }
@@ -501,7 +592,8 @@ test('Bug 83: a test command is taken only once Claude Code has let the repair e
 
 /** The test HQ's own database: what its events say, and state only an older HQ would have left there. */
 function sql(query: string, ...args: (string | number)[]): any[] {
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite')); try { const s = db.prepare(query); return /^select/i.test(query) ? s.all(...args) : (s.run(...args), []) } finally { db.close() }
+  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 }) // waits out HQ's write lock, as HQ's own connection does (Bug 158)
+  try { const s = db.prepare(query); return /^select/i.test(query) ? s.all(...args) : (s.run(...args), []) } finally { db.close() }
 }
 const changes = (): any[] => sql("SELECT payload FROM events WHERE kind = 'auto.test_changed' ORDER BY id").map((e) => JSON.parse(e.payload))
 
@@ -513,10 +605,12 @@ test('Bug 109: proposing the command that is already saved changes nothing: the 
   const r = await repair(p), er = await engineer(r)
   const same = await hq.mcp(er.id, 'propose_test_command', { command: ' node  --test\n', left_out: 'nothing' }) // not run first: there's nothing for HQ to try
   assert.equal(same.isError, true); assert.match(same.text, /already the test command HQ runs.*commit that and call open_pr: HQ runs the command on main plus your branch/)
+  assert.doesNotMatch(same.text, /HQ kept what you said/, '"nothing" left out: nothing to keep')
   assert.equal((await propose(er, cmd, 'nothing')).isError, true, 'having run it first makes no difference')
   await work(p, r, er, { 'test/main.test.js': PASS }); await until(r, 'merged'); await until(t1, 'merged'); await turnEnds(p) // what the command runs changed, not the command
   const run = await waitFor('the run to finish', async () => (await runs(p)).find((x: any) => x.status === 'finished'))
   assert.equal(run.test_change, null); assert.doesNotMatch(run.summary, /Test command changed/); assert.deepEqual(changes(), []); assert.equal((await repoNow(p)).test_cmd, cmd)
+  assert.doesNotMatch(run.summary, /Tests a repair left out/, 'Bug 142: "nothing", in the proposal and in the PR, is not listed')
   assert.equal((await hq.state()).messages.some((m: any) => m.to_id === er.id && /your test command/.test(m.body)), false, 'HQ tried nothing')
 })
 
@@ -543,6 +637,30 @@ test('Bug 109: with none saved, the command HQ finds is the one it runs; and a c
   assert.equal((await repoNow(p)).auto_stopped_why, null, 'not a second change')
   assert.match(run.summary, /## Test command changed\n- Was: `the one HQ found`\n- Now: `node --test test\/fine\.test\.js`\n- Left out: test\/ok\.test\.js/)
   assert.doesNotMatch(run.summary, /old record/); assert.deepEqual(changes().map((c) => [c.was, c.now]), [[null, 'node --test test/fine.test.js']])
+})
+
+test('Bug 142: a repair that keeps the command and changes what it runs: the summary names what it left out, in its proposal and its PR, after a restart too', async () => {
+  const p = await project('leftout')
+  const t1 = await ticket(p, 'One'); await turnEnds(p)
+  const e1 = await engineer(t1); breakMain(p); await work(p, t1, e1, { 'one.txt': '1\n' })
+  const r = await repair(p), er = await engineer(r); assert.equal((await hq.hook(er.id, exitPlanMode('Plan'))).hookSpecificOutput.decision.behavior, 'allow')
+  const pkg = path.join(wt(p, r), 'package.json') // npm test stops running test/main.test.js
+  fs.writeFileSync(pkg, fs.readFileSync(pkg, 'utf8').replace('"node --test"', '"node --test test/ok.test.js"'))
+  const same = await propose(er, 'npm test', 'test/main.test.js, which needs the internet')
+  assert.equal(same.isError, true); assert.match(same.text, /already the test command HQ runs.*HQ kept what you said it leaves out.*"## Tests left out"/s)
+  sh(wt(p, r), 'add', '.'); sh(wt(p, r), 'commit', '-qm', 'npm test runs what can pass here'); await hq.mcp(er.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
+  await hq.restart() // kept on the ticket, not in memory
+  const bare = await hq.mcp(er.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true })
+  assert.equal(bare.isError, true, 'a repair says what it left out'); assert.match(bare.text, /HQ's repair ticket.*"## Tests left out" section in the PR body/)
+  const empty = await hq.mcp(er.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Tests left out\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true })
+  assert.equal(empty.isError, true, 'an empty section says nothing')
+  await openPr(er, 'test/main.test.js: it calls a real website.\n\n## Notes\n- npm test lists its files now')
+  await until(r, 'merged'); await until(t1, 'merged'); await turnEnds(p)
+  const run = await waitFor('the run to finish', async () => (await runs(p)).find((x: any) => x.status === 'finished'))
+  assert.equal(run.test_change, null); assert.deepEqual(changes(), []); assert.equal((await repoNow(p)).auto_stopped_why, null)
+  const want = `## Tests a repair left out\n- ${r.key}, when it proposed \`npm test\`: test/main.test.js, which needs the internet\n`
+    + `- ${r.key}, in its PR: test/main.test.js: it calls a real website.`
+  assert.ok(run.summary.endsWith(want), run.summary); assert.doesNotMatch(run.summary, /## Notes/, 'the section ends at the next heading')
 })
 
 for (const auto of [true, false]) test(`Bug 109: the user saves the very command HQ is trying (auto ${auto ? 'on' : 'off'}): nothing to ask, record or tell twice`, async () => {
@@ -680,6 +798,49 @@ test('engineers get the project\'s test command: in their launch prompt, and as 
   const er = await engineer(await repair(p)); assert.doesNotMatch(prompt(er.id), /use it for your full test run/, 'a repair isn\'t told to use the command that failed')
 })
 
+/** HQ's notes to `e` that the test command changed (Bug 147: their own reason, so a late one can be dropped). */
+const cmdNotes = async (e: any): Promise<any[]> => (await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === e.id && m.reason === 'test_cmd')
+test('Bug 147: a repair\'s new command goes to the engineers at work, not to its own; with code on the repair\'s branch it says to merge main in first', async () => {
+  const p = await project('cmdnote')
+  const t1 = await ticket(p, 'One'), t2 = await ticket(p, 'Two'); await turnEnds(p) // Two is still at work when the command changes
+  const e1 = await engineer(t1), e2 = await engineer(t2); breakMain(p); await work(p, t1, e1, { 'one.txt': '1\n' })
+  const r = await repair(p), er = await engineer(r); assert.equal((await hq.hook(er.id, exitPlanMode('Plan'))).hookSpecificOutput.decision.behavior, 'allow')
+  fs.mkdirSync(path.join(wt(p, r), 'fixed')); fs.writeFileSync(path.join(wt(p, r), 'fixed', 'a.test.js'), PASS); sh(wt(p, r), 'add', '.'); sh(wt(p, r), 'commit', '-qm', 'new tests')
+  const cmd = 'node --test fixed/a.test.js' // that file is only on the repair's branch
+  assert.equal((await propose(er, cmd, 'test/')).isError, false)
+  const [note] = await waitFor('the note to Two', async () => { const n = await cmdNotes(e2); return n.length ? n : null }, 15_000)
+  assert.ok(note.body.endsWith(`: ${cmd}`), note.body); assert.ok(note.body.includes(`It came with ${r.key}, which isn't in main yet`), note.body)
+  assert.equal(note.feature_id, p.f.id, 'Bug 187: with its ticket\'s feature, so Messages shows it with that box picked')
+  assert.match(note.body, /just before that run, merge main into your branch \(git merge --no-edit main; merge, never rebase\)/)
+  assert.ok(note.body.includes(`${r.key} hasn't merged yet: say so under "Deviations from approved plan" and call open_pr anyway`), note.body)
+  const answer = await waitFor('the repair engineer\'s own answer', async () => (await hq.state()).messages.find((m: any) => m.to_id === er.id && /passed and is saved/.test(m.body)))
+  assert.ok(answer.feature_id && answer.feature_id === r.feature_id, 'Bug 187: HQ\'s answer is in the repair\'s feature')
+  assert.deepEqual(await cmdNotes(er), [], 'not to the engineer whose proposal it was'); assert.deepEqual(await cmdNotes(e1), [], 'nor to one already finished')
+  await openPr(er); await until(r, 'merged'); await until(t1, 'merged')
+})
+
+test('Bug 147: a note of a new command its engineer hasn\'t read by open_pr is dropped and starts no turn; an engineer still at work gets it', async () => {
+  const p = await project('latenote')
+  const t1 = await ticket(p, 'One'), t2 = await ticket(p, 'Two'); await turnEnds(p)
+  const e1 = await engineer(t1), e2 = await engineer(t2)
+  // Typed in the Auto box while both work (no mod here: what HQ sends waits, as it does for an engineer in the middle of a turn)
+  const cmd = 'node --test test/ok.test.js'; await setCmd(p, cmd)
+  const [n1] = await waitFor('the notes', async () => { const a = await cmdNotes(e1), b = await cmdNotes(e2); return a.length && b.length ? a : null })
+  assert.ok(n1.body.endsWith(`one: ${cmd}`), n1.body); assert.doesNotMatch(n1.body, /It came with|git merge/, 'no repair: nothing to merge in')
+  assert.equal((await hq.api(`agents/${e2.id}/message`, { body: 'Also keep the list short.', reason: 'fyi' })).status, 200)
+  await work(p, t1, e1, { 'one.txt': '1\n' }) // One's engineer finishes without having read it
+  const [late] = await cmdNotes(e1); assert.equal(late.delivery_method, 'dropped'); assert.equal(late.dropped_why, 'finished', 'Bug 187: and why')
+  assert.notEqual((await hq.hook(e1.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' })).decision, 'block', 'no new turn for it')
+  await waitFor('the finished engineer to be stopped', async () => (await hq.state()).agents.find((a: any) => a.id === e1.id && a.status === 'exited'))
+  // What it must not catch: an engineer still at work gets its note, and other messages are left alone. No mod here, so its Stop hook
+  // hands them out (Bug 103; hq.hook goes on until HQ lets the turn end)
+  assert.equal((await hq.hook(e2.id, { hook_event_name: 'Stop', last_assistant_message: 'Working.' })).decision, 'block')
+  const read = (await hq.state()).messages.filter((m: any) => m.to_id === e2.id).map((m: any) => `${m.reason}:${m.delivery_method}`).sort()
+  assert.deepEqual(read, ['fyi:stop_hook', 'test_cmd:stop_hook'])
+  assert.ok((await hq.state()).messages.filter((m: any) => m.to_id === e2.id).every((m: any) => m.dropped_why === null), 'Bug 187: delivered ones have no why')
+  await work(p, t2, e2, { 'two.txt': '2\n' }); await until(t1, 'merged'); await until(t2, 'merged')
+})
+
 test('tests that freeze are reported as frozen, and the repair is told so', async () => {
   const p = await project('frozen')
   assert.equal((await hq.api('settings', { key: 'test_timeout_min', value: 0.1 })).status, 200)
@@ -754,6 +915,24 @@ test('Bug 61: Clear project leaves no auto alerts behind', async () => {
   await waitFor('the stop alert', async () => (await hq.state()).attention.find((a: any) => a.kind === `auto_stopped:${p.repo.id}`))
   const r = await hq.api(`repos/${p.repo.id}/clear`, {}); assert.equal(r.status, 200); assert.equal(r.json.done, true, 'a TPM at a dialog can\'t write a note')
   assert.deepEqual((await hq.state()).attention.filter((a: any) => a.kind.startsWith('auto_')), [])
+})
+
+// Bug 221: Clear empties the board; it has nothing to do with auto mode, so auto mode stays as the user left it. The cleared project starts nothing by itself,
+// and the next request is built and merged on auto, in a run of its own.
+test('Bug 221: Clear keeps auto mode on; nothing starts on the empty board, and the next request is built and merged on auto', async () => {
+  const p = await project('keepauto')
+  const t1 = await ticket(p, 'One'); await turnEnds(p); await work(p, t1, await engineer(t1), { 'one.txt': '1\n' }); await until(t1, 'merged'); await turnEnds(p)
+  await hq.hook(p.tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' }) // no note to wait for
+  const r = await hq.api(`repos/${p.repo.id}/clear`, {}); assert.equal(r.status, 200); assert.equal(r.json.done, true)
+  const after = await repoNow(p); assert.equal(after.auto_mode, 1, 'still on'); assert.equal(after.auto_stopped_why, null); assert.equal(after.clearing_at, null)
+  await wait(1500) // a few auto ticks on the empty board
+  assert.deepEqual(await runs(p), [], 'no run on an empty board'); assert.equal((await hq.state()).agents.filter((a: any) => a.role === 'engineer' && a.status !== 'exited').length, 0)
+  const f = (await hq.api('features', { repoId: p.repo.id, title: 'Two', request: 'Build two' })).json
+  const tpm = await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
+  const t2 = (await hq.api('tickets', { featureId: f.id, title: 'Two', size: 'S', spec: 'Two.' })).json
+  await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Split done.' })
+  await work(p, t2, await engineer(t2), { 'two.txt': '2\n' }); await until(t2, 'merged')
+  assert.equal((await runs(p)).length, 1, 'a run of its own')
 })
 
 test('a conflict goes to Fix conflicts by itself', async () => {
@@ -903,6 +1082,51 @@ test('Bug 106: a ticket whose tests fail says so while HQ tests main without it,
   await onPage(p, `${t.id}:main:running`); assert.equal((await tk(t)).status, 'pr_ready', 'not sent back until HQ knows it was the ticket'); await letGo(p)
   await until(t, 'resolving'); assert.equal(await shown(p), ''); assert.ok((await tk(t)).fixing, 'sent back for its tests')
 })
+// Bug 143: HQ tested the branch as open_pr left it but merged the branch as it was when the test ended, so a commit made during the test reached main untested
+const commit = (p: P, t: any, file: string) => { fs.writeFileSync(path.join(wt(p, t), file), `${file}\n`); sh(wt(p, t), 'add', '.'); sh(wt(p, t), 'commit', '-qm', file) }
+test('Bug 143: a commit to a finished ticket\'s branch while HQ tests it is not merged; its engineer is told, and once it calls open_pr again that is tested and merged',
+  async () => {
+    const p = await project('latecommit'), t = await ticket(p, 'Thing')
+    assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: HELD })).status, 200); await turnEnds(p)
+    await onPage(p, 'no ticket:main:running'); await letGo(p); await waitFor('main checked', async () => (await checks())[0])
+    const e = await engineer(t); await work(p, t, e, { 'thing.js': '1\n' })
+    assert.equal((await tk(t)).finished_sha, sh(wt(p, t), 'rev-parse', 'HEAD'), 'open_pr keeps the commit it hands over')
+    await onPage(p, `${t.id}:ticket:running`)
+    commit(p, t, 'late.txt') // a message reached the engineer after its open_pr, and it acted on it
+    await letGo(p); await until(t, 'implementing')
+    assert.equal(fs.existsSync(path.join(p.dir, 'thing.js')), false, 'nothing merged'); assert.equal(fs.existsSync(path.join(p.dir, 'late.txt')), false)
+    const told = await waitFor('its engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === e.id &&
+      /commits from after your open_pr/.test(m.body)))
+    assert.match(told.body, /call open_pr again\.$/)
+    await wait(1200); assert.equal(await shown(p), '', 'nothing is tested until it calls open_pr again'); assert.equal((await tk(t)).status, 'implementing')
+    await openPr(e); assert.equal((await tk(t)).finished_sha, sh(wt(p, t), 'rev-parse', 'HEAD'))
+    await onPage(p, `${t.id}:ticket:running`); await letGo(p); await until(t, 'merged')
+    assert.equal(fs.readFileSync(path.join(p.dir, 'late.txt'), 'utf8'), 'late.txt\n'); assert.equal(sh(p.dir, 'log', '-1', '--format=%P', 'main').split(' ')[1], sh(wt(p, t), 'rev-parse', 'HEAD'))
+  })
+test('Bug 143: a branch that moved after open_pr, with its engineer stopped, isn\'t tested; a fresh engineer finishes it again, and open_pr again on a finished ticket counts',
+  async () => {
+    const p = await project('latestop'), t = await ticket(p, 'Thing')
+    assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: HELD })).status, 200); await turnEnds(p)
+    await onPage(p, 'no ticket:main:running') // main's check holds the next test back: the ticket finishes and its branch moves before HQ gets to it
+    const e = await engineer(t); await work(p, t, e, { 'thing.js': '1\n' })
+    await hq.hook(e.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' })
+    await waitFor('the finished engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === e.id)?.status === 'exited')
+    commit(p, t, 'late.txt') // by hand, say
+    await letGo(p); await waitFor('main checked', async () => (await checks())[0])
+    const e2 = await engineer(t, e.id); assert.equal((await tk(t)).status, 'implementing'); assert.equal(await shown(p), '', 'the moved branch was not tested')
+    assert.equal((await hq.state()).messages.some((m: any) => m.to_id === e.id && /after your open_pr/.test(m.body)), false, 'nothing sent to an engineer that has stopped')
+    await openPr(e2); await onPage(p, `${t.id}:ticket:running`)
+    commit(p, t, 'later.txt') // open_pr again on a finished ticket whose branch moved finishes it again, with the new commit
+    const again = await hq.mcp(e2.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true })
+    assert.equal(again.isError, false, again.text); assert.doesNotMatch(again.text, /already/); assert.equal((await tk(t)).finished_sha, sh(wt(p, t), 'rev-parse', 'HEAD'))
+    const same = await hq.mcp(e2.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true })
+    assert.match(same.text, /is already pr_ready; nothing more to do/)
+    await letGo(p); await waitFor('the first test to end', async () => (await tested()).filter((x) => x.kind === 'auto.tested').length === 1)
+    await onPage(p, `${t.id}:ticket:running`); assert.equal((await tk(t)).status, 'pr_ready', 'tested again, not sent back: open_pr named the new commit')
+    assert.equal(fs.existsSync(path.join(p.dir, 'thing.js')), false, 'what the first test ran is not what is there now: not merged')
+    await letGo(p); await until(t, 'merged')
+    assert.ok(['thing.js', 'late.txt', 'later.txt'].every((f) => fs.existsSync(path.join(p.dir, f))))
+  })
 test("Bug 106: a run in line behind another project's says it is waiting its turn, and running once its turn comes", async () => {
   const a = await project('ahead'); await ticket(a, 'One')
   assert.equal((await hq.api(`repos/${a.repo.id}/test-cmd`, { cmd: HELD })).status, 200); await turnEnds(a); await onPage(a, 'no ticket:main:running')
@@ -925,7 +1149,7 @@ const A1 = { criterion: 'A1', file: 'test/add.test.js', name: 'adds two numbers'
 async function build(p: P, t: any, e: any, files: Record<string, string>, o: { plan?: boolean } = {}): Promise<void> {
   if (o.plan !== false) assert.equal((await hq.hook(e.id, exitPlanMode(`Plan for ${t.key}`))).hookSpecificOutput.decision.behavior, 'allow')
   for (const [f, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(wt(p, t), f)), { recursive: true }); fs.writeFileSync(path.join(wt(p, t), f), text) }
-  sh(wt(p, t), 'add', '.'); sh(wt(p, t), 'commit', '-qm', t.title); await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
+  sh(wt(p, t), 'add', '.'); sh(wt(p, t), 'commit', '-qm', t.title); await ranTests(e); await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
 }
 const finish = (e: any, tests?: unknown) => hq.mcp(e.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', ...(tests ? { tests } : {}),
   feature_map_unchanged: true }) // the feature map has its own tests (featuremap.test.ts)
@@ -967,6 +1191,7 @@ test('a named test that HQ\'s run skipped, or never ran, sends the ticket back; 
   assert.match(told.body, /passes `npm test`, but that run didn't run every test you named for the ticket's criteria, so HQ didn't merge it\./)
   assert.match(told.body, /- A1: "adds two numbers" in test\/add\.test\.js was skipped/)
   assert.match(told.body, /- A2: "total is bold" in checks\/bold\.js never ran\. `npm test` listed other tests and not this one/)
+  assert.deepEqual(await cameBack(e.id), [`${t.key} came back: the tests named for its criteria didn't all run`]) // Bug 206
   assert.deepEqual((await proofNow(t)).tests.map((x: any) => x.state), ['skipped', 'not_run']); assert.equal(fs.existsSync(path.join(p.dir, 'add.js')), false, 'not merged')
   const w = wt(p, t); fs.writeFileSync(path.join(w, 'test', 'add.test.js'), ADD_TEST); sh(w, 'mv', 'checks/bold.js', 'test/bold.test.js'); sh(w, 'add', '-A'); sh(w, 'commit', '-qm', 'they run now')
   const same = await finish(e); assert.equal(same.isError, true) // the tests it named last time are checked again, and one has moved
@@ -1011,8 +1236,89 @@ test('the TPM gives criteria as a list: a ticket without them is refused, and cr
     /- A2 \(behind the screen\): Adding "2" and 3 is refused\.\n\n## The tests you named at your last open_pr\n- A1: test\/add\.test\.js · "adds two numbers"\n/)
   const old = await finish(e); assert.equal(old.isError, true); assert.match(old.text, /Nothing named for A2\./) // last time's tests don't cover the new criterion
   const w = wt(p, t); fs.appendFileSync(path.join(w, 'test', 'add.test.js'), "t.test('refuses text',()=>{})\n"); sh(w, 'add', '.'); sh(w, 'commit', '-qm', 'A2')
+  await ranTests(e); await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: 'done' }) // Bug 194: the test file changed since the last run
   assert.equal((await finish(e, [A1, { criterion: 'A2', file: 'test/add.test.js', name: 'refuses text' }])).isError, false); assert.equal((await tk(t)).status, 'pr_ready')
 })
+
+// Bug 184: a commit that reached the branch after HQ's last look at it and before main moved stayed behind on the branch, and the ticket read merged. A `git` in
+// front of the real one on HQ's PATH runs `before-ff` (once) as HQ moves main: the moment that commit has to land in. `late` sets it to commit `file` in t's worktree.
+async function mergeHook(run: (late: (p: P, t: any, file: string, text?: string) => void) => Promise<void>): Promise<void> {
+  await hq.stop()
+  const bin = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-e2e-git-'))), real = execFileSync('which', ['git'], { encoding: 'utf8' }).trim()
+  const hook = path.join(bin, 'before-ff'), q = JSON.stringify
+  fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\ncase " $* " in *" merge --ff-only "*) if [ -f ${q(hook)} ]; then mv ${q(hook)} ${q(`${hook}.ran`)}; `
+    + `sh ${q(`${hook}.ran`)}; fi;; esac\nexec ${q(real)} "$@"\n`, { mode: 0o755 })
+  hq = await startHq({ env: { ...ENV, PATH: `${bin}:${process.env.PATH}` } })
+  const late = (p: P, t: any, file: string, text = 'late\n') => {
+    fs.writeFileSync(path.join(bin, `${path.basename(file)}.text`), text)
+    fs.writeFileSync(hook, `cd ${q(wt(p, t))} && mkdir -p ${q(path.dirname(file))} && cp ${q(path.join(bin, `${path.basename(file)}.text`))} ${q(file)} && `
+      + `${q(real)} add ${q(file)} && ${q(real)} commit -qm ${q(`late: ${file}`)}\n`)
+  }
+  try { await run(late); assert.ok(fs.existsSync(`${hook}.ran`), 'the commit landed as HQ merged') } finally { await hq.stop(); fs.rmSync(bin, { recursive: true, force: true }) }
+}
+test('Bug 184: a commit that lands while HQ merges is not left behind: the tested commit is in main, the ticket goes back for the rest, and open_pr again merges it',
+  () => mergeHook(async (late) => {
+    const p = await project('mergemove'), t = await withCriteria(p, 'Adding', [CRIT[0]]); await turnEnds(p)
+    const e = await engineer(t); await build(p, t, e, { 'add.js': ADD, 'test/add.test.js': ADD_TEST })
+    const first = sh(wt(p, t), 'rev-parse', 'HEAD')
+    late(p, t, 'late.txt') // the engineer acts on a late message
+    assert.equal((await finish(e, [A1])).isError, false)
+    await until(t, 'implementing')
+    assert.equal(sh(p.dir, 'log', '-1', '--format=%P', 'main').split(' ')[1], first, 'main has the commit HQ tested')
+    assert.ok(fs.existsSync(path.join(p.dir, 'add.js'))); assert.equal(fs.existsSync(path.join(p.dir, 'late.txt')), false, 'and nothing after it')
+    const moved = sql("SELECT payload FROM events WHERE kind = 'auto.moved'").map((x) => JSON.parse(x.payload))
+    assert.deepEqual(moved.map((x) => [x.finished, x.merged, x.named, x.told]), [[first, true, false, e.id]])
+    assert.equal(sql("SELECT 1 FROM events WHERE kind = 'ticket.merged'").length, 0, 'not marked merged with commits left over')
+    const told = await waitFor('its engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === e.id &&
+      /the commit your open_pr handed over \(\w+\) is merged into main/.test(m.body)))
+    assert.match(told.body, /got commits after it while it merged, and those aren't in main, so T-\d+ isn't finished yet\..+call open_pr again: HQ tests and merges the rest\.$/)
+    assert.equal((await hq.state()).agents.find((a: any) => a.id === e.id).status, 'working', 'its engineer is kept on to finish it')
+    const tpm = (await hq.state()).messages.find((m: any) => m.to_id === p.tpm.id && /tested commit/.test(m.body))
+    assert.match(tpm.body, new RegExp(`^HQ: ${t.key}'s tested commit \\(${first.slice(0, 7)}\\) is merged into main, but its branch got commits while it merged that aren't in `
+      + `main: "\\w+ late: late\\.txt"\\. So ${t.key} is building again: its engineer was told to finish them and call open_pr again`))
+    // Its test is in main now, yet it is still this ticket's: open_pr again with the same test isn't refused for naming a file the branch didn't change
+    const tip = sh(wt(p, t), 'rev-parse', 'HEAD') // read now: HQ removes the ticket's worktree once it merges (on Linux before the next line runs)
+    const again = await finish(e, [A1]); assert.equal(again.isError, false, again.text)
+    await until(t, 'merged'); assert.equal(fs.readFileSync(path.join(p.dir, 'late.txt'), 'utf8'), 'late\n')
+    assert.equal(sh(p.dir, 'log', '-1', '--format=%P', 'main').split(' ')[1], tip)
+    assert.equal(JSON.parse((await tk(t)).proof).tests[0].state, 'passed')
+  }))
+test('Bug 184: a ticket that came back after a late commit and is then sent back for its tests still counts the test it added in its merged part', () =>
+  mergeHook(async (late) => {
+    const p = await project('mergeback'), t = await withCriteria(p, 'Adding', [CRIT[0]]); await turnEnds(p)
+    const e = await engineer(t); await build(p, t, e, { 'add.js': ADD, 'test/add.test.js': ADD_TEST })
+    late(p, t, 'test/late.test.js', "require('node:test').test('late',()=>{throw new Error('late is broken')})\n") // a late commit that breaks the tests
+    assert.equal((await finish(e, [A1])).isError, false); await until(t, 'implementing')
+    const back = await finish(e, [A1]); assert.equal(back.isError, false, back.text) // accepted, tested: the late test fails, main alone passes
+    await until(t, 'resolving'); assert.ok((await tk(t)).fixing, 'sent back for its tests')
+    await waitFor('HQ to tell the engineer', async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === e.id && /fails its tests/.test(m.body)))
+    sh(wt(p, t), 'merge', '--no-edit', 'main') // as HQ's instructions say, then the fix
+    fs.writeFileSync(path.join(wt(p, t), 'test', 'late.test.js'), PASS); sh(wt(p, t), 'add', '.'); sh(wt(p, t), 'commit', '-qm', 'fix late'); await ranTests(e)
+    const fixed = await finish(e); assert.equal(fixed.isError, false, fixed.text) // its earlier tests, checked again: test/add.test.js is still the ticket's
+    await until(t, 'merged'); assert.ok(fs.existsSync(path.join(p.dir, 'test', 'late.test.js')))
+  }))
+test('Bug 184: on auto its engineer has stopped by the time a late commit lands: the fresh one and the TPM are told what is merged and what is left', () =>
+  mergeHook(async (late) => {
+    const p = await project('mergegone'), t = await ticket(p, 'Thing')
+    assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: HELD })).status, 200); await turnEnds(p)
+    await onPage(p, 'no ticket:main:running'); await letGo(p); await waitFor('main checked', async () => (await checks())[0])
+    const e = await engineer(t); await work(p, t, e, { 'thing.js': '1\n' }); const first = sh(wt(p, t), 'rev-parse', 'HEAD')
+    await hq.hook(e.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' })
+    await waitFor('the finished engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === e.id)?.status === 'exited')
+    late(p, t, 'late.txt'); await onPage(p, `${t.id}:ticket:running`); await letGo(p) // by hand, say, as HQ merges
+    const e2 = await engineer(t, e.id); assert.equal((await tk(t)).status, 'implementing')
+    const lateSha = sh(wt(p, t), 'rev-parse', '--short', 'HEAD')
+    assert.match(prompt(e2.id), new RegExp(`Its plan is approved \\(below\\) and it was finished once\\. HQ already merged the commit an earlier open_pr handed over `
+      + `\\(${first.slice(0, 7)}\\) into main, as it passed HQ's tests: that part of the ticket is done, don't redo it\\. These commits came after it, while it merged, and aren't `
+      + `in main yet:\\n- ${lateSha} late: late\\.txt\\nCheck they finish what they started, run the tests, commit, then call open_pr again \\(with the same tests\\): HQ tests `
+      + 'them and merges them\\.'))
+    const toTpm = (await hq.state()).messages.filter((m: any) => m.to_id === p.tpm.id).map((m: any) => m.body)
+    assert.ok(toTpm.some((b: string) => b.startsWith(`HQ: ${t.key}'s tested commit (${first.slice(0, 7)}) is merged into main`) && /a fresh engineer will finish them/.test(b)), toTpm.join('\n'))
+    const started = toTpm.find((b: string) => b.startsWith(`HQ: engineer ${e2.id} started on ${t.key}`))
+    assert.match(started, /to take over after a fresh start \(branch/, 'no handoff note was left, and the TPM isn\'t told there was one')
+    await openPr(e2); await onPage(p, `${t.id}:ticket:running`); await letGo(p); await until(t, 'merged')
+    assert.ok(fs.existsSync(path.join(p.dir, 'late.txt')))
+  }))
 
 // HQ's look at the app before a merge (smoke.ts). The browser's part is a stand-in here (fake-look.mjs): what it "sees" is the checkout's look.json, so main
 // and a ticket's branch each say how their app looks. The real browser, in the real sandbox, is src/smoke.test.ts.
@@ -1030,11 +1336,13 @@ test('HQ opens the app before it merges: a clean look is on the merged ticket an
   await waitFor('main checked', async () => (await checks())[0]) // the tests only: the look is for a ticket about to merge
   await work(p, t, await engineer(t), { 'thing.txt': '1\n' })
   await onPage(p, `${t.id}:look:running`); await letGo(p) // the tests passed; the same run is now opening the app
-  await until(t, 'merged'); assert.equal(await shown(p), '')
+  // Bug 192: merged, the ticket is off the board. The run may already be ending, and the UI tester on the page, before or after this look
+  await until(t, 'merged'); assert.match(await shown(p), /^(no ticket:tester:(waiting|running))?$/)
   assert.deepEqual(await lookOf(t), { ran: 'pass', pages: 1, ms: 5, known: 0, offline: [] }); assert.deepEqual(looks(), [`${t.key} pass`]) // a clean app is opened once
   await turnEnds(p)
   const r = await waitFor('the run to finish', async () => (await runs(p)).find((x: any) => x.status === 'finished'))
   assert.match(r.summary, new RegExp(`- ${t.key}: Thing \\(tests passed: 1 passed, (\\d+|under 1) s; app opened, 1 page\\)`)); assert.doesNotMatch(r.summary, /Worth a look/)
+  assert.equal(await shown(p), '') // the tester, if it ran, was over before the run ended
   assert.equal(sh(p.dir, 'status', '--porcelain'), ''); assert.equal(sh(p.dir, 'worktree', 'list').split('\n').filter((l) => l.includes('hq-test')).length, 0)
 })
 
@@ -1052,6 +1360,7 @@ test('a ticket that breaks a page goes back to its engineer with what HQ saw; wh
   assert.match(told.body, /merge it\.\n\nHQ started the app the way its preview does \(node server\.js\) and opened its pages in a headless browser\.\n/)
   assert.match(told.body, /The app has 2 problems with it merged in that main doesn't have\.\n- \/: error in the console: boom from the page\n- \/list: the page is blank: /)
   assert.doesNotMatch(told.body, /old noise|fails its tests/); assert.match(told.body, /A real browser can't start in your session/)
+  assert.deepEqual(await cameBack(e2.id), [`${t2.key} came back: HQ's look at the app found something wrong`]) // Bug 206: not "tests fail"
   await hq.api(`agents/${e2.id}/stop`, {}) // gone before it fixed it: the next engineer is told the same, and the board never calls it a test failure
   const e3 = await engineer(t2, e2.id)
   assert.match(prompt(e3.id), /It was fixing what went wrong when HQ opened the app with it on main; HQ's instructions for that are below\.[\s\S]*boom from the page/)
@@ -1157,6 +1466,32 @@ test('a plan check ends with what it was for: a restart reads the plan afresh, a
   assert.deepEqual(sql("SELECT kind FROM events WHERE kind LIKE 'plan_check.%' ORDER BY id").map((x) => x.kind), ['plan_check.started', 'plan_check.started']) // neither answered or failed
 })
 
+// Bug 177: Clear and Remove end a plan check under way, as turning auto off does; nothing it would have said lands on the project, and no new reader starts.
+async function readerOnPlan(name: string) {
+  const p = await project(name), t = await withCriteria(p, 'Adding', CRIT); await turnEnds(p)
+  const e = await engineer(t); plan(e, 'Plan.\nFAKE-CHECK: hang').catch(() => {}) // the engineer is stopped below: its held call ends with it
+  await waitFor('the reader to have it', async () => (await planCheck(t))?.state === 'checking')
+  return { p, t, e, pid: readerCalls()[0].pid as number }
+}
+const gone = (pid: number) => { try { process.kill(pid, 0); return false } catch { return true } }
+const planEnds = () => sql("SELECT kind FROM events WHERE kind IN ('plan_check.answered', 'plan_check.failed', 'gate.verdict')")
+test('Bug 177: Clear project ends a plan check at once, while the TPM still writes its note, and nothing follows from it', async () => {
+  const { p, t, e, pid } = await readerOnPlan('planclear')
+  const r = await hq.api(`repos/${p.repo.id}/clear`, {}); assert.equal(r.status, 200); assert.equal(r.json.done, false, 'the clear waits for the TPM\'s note')
+  await waitFor('the reader to end', () => gone(pid), 5000)
+  plan(e, 'Plan.\nFAKE-CHECK: hang').catch(() => {}); await wait(1500) // a plan that comes late, and several auto ticks
+  assert.equal(readerCalls().length, 1, 'no new reader on a project being cleared'); assert.deepEqual(planEnds(), [], 'no answer, no verdict')
+  assert.ok((await repoNow(p)).clearing_at, 'the clear is still under way: the check didn\'t wait for it to finish')
+  assert.equal((await reviewsOf(t))[0]?.plan_check ?? null, null, 'the page doesn\'t say a reader has it')
+})
+test('Bug 177: Remove from HQ ends a plan check at once, and nothing follows from it', async () => {
+  const { p, pid } = await readerOnPlan('planremove')
+  assert.equal((await hq.api(`repos/${p.repo.id}/remove`, {})).status, 200)
+  await waitFor('the reader to end', () => gone(pid), 5000); await wait(1500)
+  assert.equal(readerCalls().length, 1); assert.deepEqual(planEnds(), [])
+  assert.equal((await hq.state()).repos.some((x: any) => x.id === p.repo.id), false)
+})
+
 // HQ's diff check (diffcheck.ts): before a ticket worth a second look merges, a fresh reader sees its criteria, its changes and the test output. The reader is
 // the fake Claude Code again: a `FAKE-CHECK:` line in a file the ticket adds is in its diff, and so is the reader's answer.
 const diffCheck = async (t: any) => JSON.parse((await tk(t)).diff_check ?? 'null')
@@ -1179,12 +1514,52 @@ test('a ticket worth a second look is read before it merges: findings send it ba
   assert.match(told.body, /passes its tests, but a fresh reader of your changes found problems, so HQ didn't merge it\./)
   assert.match(told.body, /What the reader found:\n- A1: add\(\) subtracts: it should add\.\n- bug: add\.js: add\("2", 3\) gives "23", not 5\.\n\nFix it now/)
   assert.doesNotMatch(told.body, /named function/) // not about a criterion, not a bug: never reaches the engineer
+  assert.deepEqual(await cameBack(e.id), [`${t.key} came back: a fresh reader of its changes found something to fix`]) // Bug 206: not "tests fail"
   const d = await diffCheck(t); assert.equal(d.state, 'sent_back'); assert.deepEqual(d.why, ['it is a size M ticket', 'one of its criteria has no test'])
   const w = wt(p, t); fs.writeFileSync(path.join(w, 'add.js'), `${ADD}// fixed\n`); sh(w, 'add', '.'); sh(w, 'commit', '-qm', 'fixed'); assert.equal((await finish(e)).isError, false)
   await until(t, 'merged'); assert.equal(reads().length, 1, 'one read, one send-back'); assert.equal((await tk(t)).auto_tries, 1); assert.equal((await tk(t)).fixing, null)
   await turnEnds(p)
   const r = await waitFor('the run to finish', async () => (await runs(p)).find((x: any) => x.status === 'finished'))
   assert.match(r.summary, new RegExp(`- ${t.key}: HQ's read of its changes sent it back once \\(A1: add\\(\\) subtracts: it should add\\. bug: add\\.js: [^\\n]+\\)\\n`))
+})
+
+// Bug 185: the reader read a ticket once, so a commit a second open_pr named merged unread
+test('Bug 185: a commit named by a second open_pr is read too; the same commit tested again (main moved during its test) is not read again', async () => {
+  const p = await project('diffagain'), t = await withCriteria(p, 'Adding', [CRIT[0]], { size: 'M' })
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: `${HELD}; node --test` })).status, 200); await turnEnds(p)
+  await onPage(p, 'no ticket:main:running'); await letGo(p); await waitFor('main checked', async () => (await checks())[0])
+  const e = await engineer(t); await build(p, t, e, { 'add.js': ADD, 'test/add.test.js': ADD_TEST, 'notes.txt': 'FAKE-CHECK: hold read185-go\n' })
+  assert.equal((await finish(e, [A1])).isError, false); const first = (await tk(t)).finished_sha
+  await onPage(p, `${t.id}:ticket:running`); await letGo(p); await onPage(p, `${t.id}:review:running`); await waitFor('the first read', () => reads().length === 1)
+  commit(p, t, 'late.txt'); fs.writeFileSync(path.join(hq.home, 'read185-go'), '') // a commit after its open_pr, while the reader has it (Bug 208: one during the test isn't read)
+  await until(t, 'implementing'); assert.doesNotMatch(reads()[0].prompt, /late\.txt/); assert.equal(fs.existsSync(path.join(p.dir, 'add.js')), false, 'not merged')
+  const d1 = await diffCheck(t); assert.equal(d1.state, 'ok')
+  const back = diffCheckWords(d1, await tk(t))!.text // Bug 207: read, then sent back to building: it didn't merge
+  assert.match(back, new RegExp(`read its changes at commit ${first.slice(0, 7)} `)); assert.doesNotMatch(back, /merged/)
+  await openPr(e); const second = (await tk(t)).finished_sha; assert.notEqual(second, first)
+  await onPage(p, `${t.id}:ticket:running`); onMain(p, { 'other.txt': 'other\n' }) // main moves during this test: the next tick tests the same commit again
+  await letGo(p); await waitFor('the second read', () => reads().length === 2); assert.match(reads()[1].prompt, /late\.txt/, 'it read the new commit')
+  await onPage(p, `${t.id}:ticket:running`); assert.equal((await tk(t)).status, 'pr_ready', 'tested again, not merged yet')
+  await letGo(p); await until(t, 'merged'); assert.equal(reads().length, 2, 'the same commit is not read twice')
+  const d = await diffCheck(t); assert.equal(d.state, 'ok'); assert.deepEqual([d1.sha, d.sha], [first, second], 'each read says which commit it read')
+  assert.match(diffCheckWords(d, await tk(t))!.text, /^A fresh reader read its changes before it merged /, 'merged with the commit read')
+  const lines = ((await hq.api('events?limit=500')).json as any[]).filter((x) => x.kind === 'auto.read').map((x) => JSON.parse(x.payload).again)
+  assert.deepEqual(lines.sort(), [false, true])
+})
+// Bug 208: HQ read a ticket's changes before it looked whether its branch had moved, so a commit during the test cost a read of a commit it won't merge
+test('Bug 208: a commit during the test of a ticket worth a read sends it back unread; the commit open_pr names next is read once and merges', async () => {
+  const p = await project('readmoved'), t = await withCriteria(p, 'Adding', [CRIT[0]], { size: 'M' })
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: `${HELD}; node --test` })).status, 200); await turnEnds(p)
+  await onPage(p, 'no ticket:main:running'); await letGo(p); await waitFor('main checked', async () => (await checks())[0])
+  const e = await engineer(t); await build(p, t, e, { 'add.js': ADD, 'test/add.test.js': ADD_TEST }); assert.equal((await finish(e, [A1])).isError, false)
+  await onPage(p, `${t.id}:ticket:running`); commit(p, t, 'late.txt') // a commit after its open_pr, during its test
+  await letGo(p); await until(t, 'implementing')
+  assert.equal(reads().length, 0, 'nothing read'); assert.equal(await diffCheck(t), null); assert.equal(fs.existsSync(path.join(p.dir, 'add.js')), false, 'not merged')
+  assert.equal(sql("SELECT kind FROM events WHERE kind = 'auto.read'").length, 0)
+  await waitFor('its engineer to be told', async () => (await hq.state()).messages.some((m: any) => m.to_id === e.id && /commits from after your open_pr/.test(m.body)))
+  await openPr(e); await onPage(p, `${t.id}:ticket:running`); await letGo(p); await until(t, 'merged')
+  assert.equal(reads().length, 1, 'the commit it merged is read once'); assert.match(reads()[0].prompt, /late\.txt/)
+  const d = await diffCheck(t); assert.equal(d.state, 'ok'); assert.equal(d.sha, (await tk(t)).finished_sha)
 })
 
 test('a small ticket with nothing flagged merges unread; one that deletes a test is read, and a reader with nothing to say lets it merge', async () => {
@@ -1208,7 +1583,8 @@ test('a read that can\'t be had never holds a merge, and the summary says nobody
   const e1 = await engineer(t1), e2 = await engineer(t2)
   assert.equal(verdict(await plan(e1, 'Plan.')), 'allow'); await build(p, t1, e1, { 'add.js': ADD, 'test/add.test.js': ADD_TEST, 'notes.txt': 'FAKE-CHECK: error\n' }, { plan: false })
   assert.equal((await finish(e1, [A1])).isError, false); await until(t1, 'merged')
-  assert.deepEqual({ ...await diffCheck(t1), at: 0 }, { state: 'unchecked', at: 0, why: ['it is a size L ticket'], error: "the reader couldn't be asked (API Error: Overloaded)" })
+  assert.deepEqual({ ...await diffCheck(t1), at: 0 }, { state: 'unchecked', at: 0, why: ['it is a size L ticket'], error: "the reader couldn't be asked (API Error: Overloaded)",
+    sha: (await tk(t1)).finished_sha })
   assert.equal((await hq.api('settings', { key: 'diff_check', value: 'off' })).status, 200)
   assert.equal(verdict(await plan(e2, 'Plan.')), 'allow')
   await build(p, t2, e2, { 'sub.js': SUB, 'test/sub.test.js': SUB_TEST, 'notes2.txt': `${says('send_back', ['bug', 'It would have gone back with the check on.'])}\n` }, { plan: false })
@@ -1250,7 +1626,7 @@ async function ship(p: P, t: any, files: Record<string, string>, tests: unknown)
 }
 
 test('as a run ends the UI tester uses the whole app: scenarios from what is new, each reset first, and findings with replayable steps in the summary', async () => {
-  const p = await project('uitester'); await startCmd(p)
+  const p = await project('uitester'); await startCmd(p, 'npm start') // a start that forks: each reset has to end npm's server too (Bug 170)
   assert.equal((await hq.api('settings', { key: 'app_look', value: 'off' })).status, 200) // the look before each merge has its own switch: off, the tester still runs
   const found = { 's-02': { outcome: 'problem', notes: ['Looked for an error message'], findings: [{ kind: 'no_feedback', at_step: 2, what: 'Pressing Add with no name showed nothing.',
     expected: 'A message saying a name is needed', criterion: 'A1', looked_for: { role: 'alert' } }, { kind: 'odd', at_step: 1, what: 'Not a kind HQ knows of.', expected: '' }] } }
@@ -1277,7 +1653,134 @@ test('as a run ends the UI tester uses the whole app: scenarios from what is new
   const s2 = JSON.parse(fs.readFileSync(path.join(kept, 's-02.json'), 'utf8')); assert.deepEqual(s2.log.map((e: any) => e.tool), ['navigate', 'snapshot', 'click'])
   assert.ok(s2.log.every((e: any, i: number) => !i || e.at >= s2.log[i - 1].at), 'one clock, in order'); assert.deepEqual(s2.notes, ['Looked for an error message'])
   assert.equal(sh(p.dir, 'status', '--porcelain'), ''); assert.equal(sh(p.dir, 'worktree', 'list').split('\n').filter((l) => l.includes('hq-test')).length, 0)
+  // The findings loop is connected to the real tester (Bug 171): what it found is a finding the user decides on, and the summary says why the backend
+  // checker read nothing (this project has no test setup, so the run wasn't recorded). Bug 223: in words that don't say it has no tests: it has `npm test`
+  const why = 'HQ isn\'t set up to record this app yet: Set up testing is under the preview\'s ⚙. This is separate from the project\'s own tests, `npm test`, which still run as usual'
+  assert.equal(u.unrecorded, why); assert.equal(s2.recording, null)
+  assert.deepEqual((await findingsOf(p)).map((f: any) => [f.fid, f.source, f.by, f.state, f.criterion, f.expect]),
+    [['P-1', 'ui', 'tester', 'new', `${t1.key} A1`, [{ role: 'alert', visible: true }]]]) // it was missing: once fixed it shows
+  assert.match(r.summary, new RegExp(`## Findings\\n- New P-1 \\(on the screen, ${t1.key} A1\\): Pressing Add with no name showed nothing\\.\\n`
+    + `- The backend checker had nothing to read: the tester's run wasn't recorded \\(${why.replace(/[.()]/g, '\\$&')}\\)\\n\\n1 waiting for you`))
+  assert.doesNotMatch(r.summary, /no test setup/)
+  assert.equal(backendCalls().length, 0)
 })
+
+test('Bug 223: what the tester couldn\'t try from a browser is "couldn\'t test" in the summary, never a finding waiting for Fix or Ignore', { skip: !MAC }, async () => {
+  const p = await project('uitesterclock'); await startCmd(p); assert.equal((await hq.api('settings', { key: 'app_look', value: 'off' })).status, 200)
+  // s-01 as run 2's tester wrote it: a "problem" whose finding is the clock it couldn't change. s-02 as the prompt now asks: its own outcome and words
+  const said = { 's-01': { outcome: 'problem', findings: [{ kind: 'missing', at_step: 1, what: 'I couldn\'t change the clock to see the morning greeting.', expected: 'Good morning',
+    criterion: 'A1' }] }, 's-02': { outcome: 'couldnt_test', couldnt_test: 'It needs the afternoon, and I can\'t set the computer\'s clock.', findings: [] } }
+  const t1 = await withCriteria(p, 'Greeting', [UI(`Says Good morning before noon. FAKE-UITEST: ${JSON.stringify(said)}`)]); await turnEnds(p)
+  await ship(p, t1, { 'greet.js': '1\n' }, [NO_TEST]); await turnEnds(p)
+  const r = await finished(p), u = await uiTestBy(p)
+  assert.deepEqual(u.scenarios.map((s: any) => [s.id, s.outcome, s.why]), [['s-01', 'couldnt_test', 'I couldn\'t change the clock to see the morning greeting.'],
+    ['s-02', 'couldnt_test', 'It needs the afternoon, and I can\'t set the computer\'s clock.']]); assert.deepEqual(u.findings, [])
+  assert.match(r.summary, /## Tried in a browser\n- 2 scenarios: 0 fine, 0 findings, 0 unspecified, 2 couldn't test\n- s-01 See the list: couldn't test it from a browser, so it has no /)
+  assert.deepEqual(await findingsOf(p), []); assert.doesNotMatch(r.summary, /waiting for you|New P-/)
+  // The project has `npm test`: the line about the unrecorded run says HQ's recording isn't set up, not that the project has no tests
+  assert.match(r.summary, /## Findings\n- The backend checker had nothing to read: the tester's run wasn't recorded \(HQ isn't set up to record this app yet: Set up testing is under /)
+  assert.match(r.summary, /This is separate from the project's own tests, `npm test`, which still run as usual\)/); assert.doesNotMatch(r.summary, /no test setup/)
+})
+
+test('Bug 170: when HQ can\'t reset the app for the tester, the summary says why once, not "not run" for every scenario', { skip: !MAC }, async () => {
+  const p = await project('uitesterreset') // starts once; a reset never puts installed packages back, so every start after the first stops at once
+  await startCmd(p, 'if [ -e node_modules/.hq-once ]; then echo only once >&2; exit 3; fi; mkdir -p node_modules && touch node_modules/.hq-once && npm start')
+  assert.equal((await hq.api('settings', { key: 'app_look', value: 'off' })).status, 200)
+  const t1 = await withCriteria(p, 'Label', [UI('Books near their due date say "Due soon".')]); await turnEnds(p)
+  await ship(p, t1, { 'label.js': '1\n' }, [NO_TEST]); await turnEnds(p)
+  const r = await finished(p); assert.equal(testerCalls().length, 1)
+  assert.match(r.summary, /## Tried in a browser\n- 2 scenarios, none run \(HQ couldn't reset the app: the app didn't start: its app part stopped \(3\) while the app was starting\)\n\n/)
+  const u = await uiTestBy(p); assert.deepEqual(u.scenarios.map((x: any) => x.outcome), ['not_run', 'not_run'])
+})
+
+// The parts connected (Bugs 171, 172). An app that keeps what it's given in a file; a test setup for it, as the setup helper saves one (testsetupstore.ts).
+// The tester's host runs it under HQ's real recorder, and the stand-in tester asks it for the page and POSTs to it, as a browser would.
+const STORE = `const http=require('http'),fs=require('fs'),f='data/items.json'
+const items=()=>{try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return[]}}
+http.createServer((q,s)=>{
+ if(q.method==='POST'){fs.mkdirSync('data',{recursive:true});fs.writeFileSync(f,JSON.stringify([...items(),{id:items().length+1,name:'Dune'}]));s.writeHead(201);return s.end('{}')}
+ s.end('<!doctype html><h1>Library</h1><p>'+items().length+' books</p>'+(fs.existsSync('notice.txt')?'<div role="alert">Added</div>':'')+'<button>Add</button>')
+}).listen(process.env.PORT)\n`
+const testSetup = (p: P) => {
+  const f = path.join(hq.hqHome, 'projects', p.repo.id, 'test-setup.json'); fs.mkdirSync(path.dirname(f), { recursive: true })
+  fs.writeFileSync(f, JSON.stringify({ seen: true, setup: { start: [{ part: 'app', run: 'node server.js' }], snapshot: ['data'], seed: "mkdir -p data && echo '[]' > data/items.json",
+    endpoints: [{ method: 'POST', path: '/api/add', kind: 'instant' }], notes: '' } }))
+}
+const findingsOf = async (p: P) => (await hq.state()).findings.filter((f: any) => f.repo_id === p.repo.id)
+const backendCalls = () => readerCalls().filter((c) => /^You check what a web app's backend did/.test(c.system))
+const keptFor = async (p: P, n = 0) => path.join(hq.hqHome, 'projects', p.repo.id, 'uitest', (await runs(p))[n].id)
+
+test('with a test setup the tester\'s run is recorded: each scenario\'s API calls and data changes are kept, the backend checker reads them, and what it finds is a finding',
+  { skip: !MAC }, async () => {
+    const p = await project('recorded'); onMain(p, { 'server.js': STORE }); await startCmd(p); testSetup(p)
+    const t1 = await withCriteria(p, 'Adding', [CRIT[0]])
+    const said = { scenarios: [{ scenario: 's-02', clean: false, line: 'kept twice', findings: [{ type: 'backend', criterion: `${t1.key} A1`, what: 'The add kept the book under a new id each time.',
+      expected: 'One id per book.', why: 'the data row', rows: ['POST /api/add → 201', 'a row nobody recorded'] }] }] }
+    const t2 = await withCriteria(p, 'Storing', [{ kind: 'backend', text: `A book is stored once. FAKE-BACKEND: ${JSON.stringify(said)}` }]); await turnEnds(p)
+    await ship(p, t1, { 'add.js': ADD, 'test/add.test.js': ADD_TEST }, [A1])
+    await ship(p, t2, { 'store.js': '1\n', 'test/store.test.js': "require('node:test').test('stores once',()=>{})\n" }, [{ criterion: 'A1', file: 'test/store.test.js', name: 'stores once' }])
+    await turnEnds(p); const r = await finished(p)
+    const u = await uiTestBy(p); assert.equal(u.state, 'done'); assert.equal(u.unrecorded, undefined); assert.deepEqual(u.scenarios.map((s: any) => s.outcome), ['ok', 'ok'])
+    const kept = await keptFor(p); assert.deepEqual(fs.readdirSync(kept).sort(), ['plan.json', 's-01.json', 's-01.rec', 's-02.json', 's-02.rec']) // HQ's folder, not the repo
+    assert.equal(JSON.parse(fs.readFileSync(path.join(kept, 's-02.json'), 'utf8')).recording, `${path.basename(kept)}/s-02`)
+    for (const id of ['s-01', 's-02']) { // each from a reset: one book added in each, never two
+      assert.match(fs.readFileSync(path.join(kept, `${id}.rec`, 'timeline.md'), 'utf8'), new RegExp('\\| hq \\| reset the app to its seed \\|\\n.*\\| tester \\| open / \\|\\n'
+        + '.*\\| tester \\| click button "Add" \\|\\n.*\\| api \\| POST /api/add → 201 \\(\\d+ms\\) \\|\\n.*\\| data \\| items: \\+Dune \\|\\n$'))
+    }
+    // The checker: one call for both scenarios, read tools only, the recordings' folders in reach, the timelines and the setup's endpoint labels in its prompt
+    const [bc] = backendCalls(); assert.equal(backendCalls().length, 1); assert.equal(bc.tools, 'Read,Grep,Glob'); assert.equal(bc.model, 'opus')
+    assert.deepEqual(bc.addDirs, [path.join(kept, 's-01.rec'), path.join(kept, 's-02.rec')])
+    assert.match(bc.prompt, /## Scenario s-02: Add nothing\n[\s\S]*\| api \| POST \/api\/add → 201 \(\d+ms\) \|\n.*\| data \| items: \+Dune \|/)
+    assert.match(bc.prompt, /- POST \/api\/add: instant/)
+    const [f] = await findingsOf(p); assert.equal((await findingsOf(p)).length, 1)
+    assert.deepEqual([f.fid, f.source, f.by, f.state, f.criterion], ['P-1', 'backend', 'checker', 'new', `${t1.key} A1`])
+    assert.deepEqual(f.evidence.rows, ['POST /api/add → 201']); assert.equal(f.evidence.recording, `${path.basename(kept)}/s-02`) // only a row the recording has
+    assert.deepEqual(f.steps, [{ action: 'navigate', url: '/' }, { action: 'click', role: 'button', name: 'Add' }])
+    assert.match(r.summary, new RegExp(`## Findings\\n- New P-1 \\(behind the screen, ${t1.key} A1\\): The add kept the book under a new id each time\\.\\n`
+      + '- The backend checker read what the backend did in 2 scenarios: 1 problem reported\\n\\n1 waiting for you'))
+    assert.doesNotMatch(r.summary, /no recording|nothing to read/)
+    assert.equal(sh(p.dir, 'status', '--porcelain'), ''); assert.equal(sh(p.dir, 'worktree', 'list').split('\n').filter((l) => l.includes('hq-test')).length, 0)
+  })
+
+test('a fixed finding is checked as the next run ends: HQ replays its steps where code can tell, and where a script can\'t, the tester gets it back to try by its goal',
+  { skip: !MAC }, async () => {
+    const p = await project('recheck'); onMain(p, { 'server.js': STORE }); await startCmd(p); testSetup(p)
+    const found = { 's-01': { outcome: 'problem', notes: [], findings: [{ kind: 'confusing', at_step: 1, what: 'No hint where books are added.', expected: 'A hint' }] },
+      's-02': { outcome: 'problem', notes: [], findings: [{ kind: 'no_feedback', at_step: 2, what: 'Pressing Add showed nothing.', expected: 'A message', looked_for: { role: 'alert' } }] } }
+    const t1 = await withCriteria(p, 'Label', [UI(`Books say "Due soon". FAKE-UITEST: ${JSON.stringify(found)}`)]); await turnEnds(p)
+    await ship(p, t1, { 'label.js': '1\n' }, [NO_TEST]); await turnEnds(p); await finished(p)
+    assert.deepEqual((await findingsOf(p)).map((f: any) => [f.fid, f.state, f.steps.length, f.expect]), [['P-1', 'new', 1, null], ['P-2', 'new', 2, [{ role: 'alert', visible: true }]]])
+    // The user marks both Fix and sends them; the TPM makes a fix ticket for each; both merge in the next run
+    for (const id of ['P-1', 'P-2']) assert.equal((await hq.api(`repos/${p.repo.id}/findings/${id}`, { decision: 'fix' })).status, 200)
+    assert.equal((await hq.api(`repos/${p.repo.id}/findings-send`, {})).status, 200)
+    const fix = async (finding: string, title: string, text: string) => {
+      const made = await hq.mcp(p.tpm.id, 'create_fix_ticket', { finding, title, size: 'S', spec: `${title}.`, criteria: [UI(text)] }); assert.equal(made.isError, false, made.text)
+      const key = /^Created (\S+) for/.exec(made.text)![1]; return (await hq.state()).tickets.find((t: any) => t.key === key && t.feature_id === p.f.id)
+    }
+    // (this time the tester, trying P-1 again, will find it still there)
+    const still = { 's-01': { outcome: 'problem', notes: [], findings: [{ kind: 'confusing', at_step: 1, what: 'Still no hint where books are added.', expected: 'A hint' }] } }
+    const f1 = await fix('P-1', 'Hint', `The start page says how to add a book. FAKE-UITEST: ${JSON.stringify(still)}`)
+    const f2 = await fix('P-2', 'Notice', 'Adding a book shows a message.'); await turnEnds(p)
+    await ship(p, f1, { 'hint.txt': '1\n' }, [NO_TEST]); await ship(p, f2, { 'notice.txt': '1\n' }, [NO_TEST]); await turnEnds(p) // notice.txt: the page now has its alert
+    const r = await finished(p, 2)
+    // P-1 has no element a script could look for: it went to the tester, first, as a scenario of its own, with its old steps in words and nothing else
+    assert.equal(testerCalls().length, 2); const again = testerCalls()[1].prompt
+    assert.match(again, new RegExp('### s-01 \\(retry\\): Again: No hint where books are added\\.\\nP-1: A hint\\nSeen before: No hint where books are added\\.\\n'
+      + 'The steps then, which may not fit the app any more \\(find your own way\\): open /\\n\\n### s-02 \\(basic\\): See the list\\n'))
+    assert.doesNotMatch(again, /P-2|Pressing Add showed nothing/) // that one HQ replayed itself
+    // What the tester found on its retry is P-1, still broken: back with the user after one strike, and never a second finding of its own
+    const [p1, p2] = await findingsOf(p); assert.equal((await findingsOf(p)).length, 2)
+    assert.deepEqual([p1.state, p1.strikes, p1.checks.at(-1).result, p1.checks.at(-1).how], ['new', 1, 'broken', 'retry'])
+    assert.equal(p1.checks.at(-1).why, 'the tester, trying it by its goal: Still no hint where books are added.')
+    assert.deepEqual([p2.state, p2.checks.at(-1).result, p2.checks.at(-1).how, p2.checks.at(-1).why], ['fixed', 'fixed', 'replay', 'the replay ended with the page as it should be'])
+    assert.match(r.summary, new RegExp(`## Findings\\n- ✓ P-2 fixed: Pressing Add showed nothing\\.\\n- ✗ P-1 still broken after ${f1.key}: No hint where books are added\\. `
+      + '\\(the tester, trying it by its goal: Still no hint where books are added\\.\\)\\n')); assert.doesNotMatch(r.summary, /- New /)
+    assert.match(r.summary, /\n- The backend checker read what the backend did in 3 scenarios: nothing wrong found\n/)
+    // The replay ran the finding's own steps under the recorder, in HQ's folder for the project
+    const replays = path.join(hq.hqHome, 'projects', p.repo.id, 'scenarios'), [one] = fs.readdirSync(replays); assert.equal(fs.readdirSync(replays).length, 1)
+    assert.match(fs.readFileSync(path.join(replays, one!, 'timeline.md'), 'utf8'), /\| tester \| navigate \/ \|\n.*\| tester \| click Add \|/)
+    assert.equal(sh(p.dir, 'status', '--porcelain'), ''); assert.equal(sh(p.dir, 'worktree', 'list').split('\n').filter((l) => l.includes('hq-test')).length, 0)
+  })
 
 test('what the UI tester can\'t do never keeps a run from ending: no start steps, turned off in HQ or for the project, a plan that fails', async () => {
   const p = await project('uitesternot')

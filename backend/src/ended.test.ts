@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { endedLine, type Agent } from '../../frontend/src/api.ts'
+import { alertFrom, endedLine, type Agent } from '../../frontend/src/api.ts'
 
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-ended-'))
 const { migrate, run } = await import('./db.ts')
@@ -59,4 +59,18 @@ test('every way an agent ends clears its activity line in the same patch; other 
   assert.equal(getAgent('eng-u2')!.ended_why, 'lost')
   const ended = getAgent('eng-u1')!; lost('eng-u1') // a late "gone" for an agent that had already ended keeps why and when it did
   assert.deepEqual([getAgent('eng-u1')!.ended_why, getAgent('eng-u1')!.ended_at], [ended.ended_why, ended.ended_at])
+})
+
+test('Bugs 153, 165: an alert about an agent that has ended says whose it was, so it is not read as the running one\'s', () => {
+  const tpm = (o: Record<string, unknown>) => eng({ role: 'tpm', ticket_id: null, display_name: 'TPM shop', ...o })
+  const old = tpm({ id: 'tpm-1', ended_why: 'user' }), now = tpm({ id: 'tpm-2', status: 'idle', started_at: 200, ended_at: null })
+  const from = (x: Record<string, unknown>, agents: Agent[]) => alertFrom({ kind: 'mod_missing', ...x }, { agents }, NOW)
+  assert.deepEqual(from({ agent_id: 'tpm-1' }, [old, now]), { tag: 'earlier TPM', line: `From an earlier TPM shop, which has ended (stopped by you · ${time}).` })
+  assert.deepEqual(from({ agent_id: 'tpm-1' }, [old]), { tag: 'TPM ended', line: `From TPM shop, which has ended (stopped by you · ${time}).` })
+  assert.equal(from({ agent_id: 'tpm-2' }, [old, now]), null, 'the running one\'s own alert')
+  assert.equal(from({ agent_id: null }, [old]), null); assert.equal(from({ agent_id: 'tpm-9' }, [old]), null, 'not in the list: nothing to say')
+  for (const kind of ['agent_exited', 'engineer_exited']) assert.equal(alertFrom({ agent_id: 'tpm-1', kind }, { agents: [old, now] }, NOW), null, `${kind} says so itself`)
+  const e1 = eng({ display_name: 'eng T-01', ended_why: 'replaced by auto mode' }), e2 = eng({ id: 'eng-2', status: 'working', started_at: 200, ended_at: null })
+  assert.equal(from({ agent_id: 'eng-1' }, [e1, e2])?.tag, 'earlier engineer')
+  assert.equal(from({ agent_id: 'eng-1' }, [eng({ ended_at: null })])?.line, 'From eng-1, which has ended.', 'an old row with nothing recorded')
 })

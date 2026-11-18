@@ -167,7 +167,7 @@ const retrying = new Map<string, string>() // finding → the run whose tester r
  *  marked done, so a restart doesn't pay for it twice. */
 export async function afterUiTest(repo: Repo, runId: string, gen: number): Promise<'done' | 'stopped'> {
   if (!testingOn(repo.id) || stageDone(repo.id, runId)) return 'done'
-  const ui = inputs().uiRun(repo.id, runId)
+  const ui = inputs().uiRun(repo.id, runId), answered = new Set<string>() // retry scenarios whose findings are the answer to a retry, not new findings
   for (const [key, rid] of retrying) {
     const [rp, fid] = key.split(':'); if (rp !== repo.id || rid !== runId) continue
     retrying.delete(key); const k = getFinding(repo.id, fid!); if (!k || k.state !== 'fixing') continue
@@ -177,17 +177,19 @@ export async function afterUiTest(repo: Repo, runId: string, gen: number): Promi
       if (j === 'stopped') return 'stopped'
       const now0 = getFinding(repo.id, k.id); if (now0?.state === 'fixing') put(afterCheck(now0, { run: runId, at: now(), ...j })); continue
     }
+    if (sc) answered.add(sc.scenario.id) // what the tester found retrying its own finding is that finding, still there: said on it, never kept as another
     const c: Omit<Check, 'run' | 'at'> = !sc ? { result: 'unknown', how: 'retry', why: 'the tester didn\'t retry it' }
       : sc.findings.length ? { result: 'broken', how: 'retry', why: `the tester, trying it by its goal: ${sc.findings[0]!.what}` }
       : sc.outcome === 'ok' ? { result: 'fixed', how: 'retry', why: 'the old steps no longer fit, and the tester, trying it by its goal, found nothing wrong' }
       : { result: 'unknown', how: 'retry', why: `the tester's retry didn't settle it (${sc.why ?? sc.outcome})` }
     put(afterCheck(k, { run: runId, at: now(), ...c }))
   }
-  const fresh: Fresh[] = (ui?.findings ?? []).map((f) => ({ source: 'ui' as const, by: 'tester' as const, what: f.what, expected: f.expected, criterion: f.criterion, steps: f.steps, expect: f.expect,
+  const fresh: Fresh[] = (ui?.findings ?? []).filter((f) => !answered.has(f.scenario)).map((f) => ({
+    source: 'ui' as const, by: 'tester' as const, what: f.what, expected: f.expected, criterion: f.criterion, steps: f.steps, expect: f.expect,
     evidence: { scenario: f.scenario, goal: ui?.scenarios.find((s) => s.scenario.id === f.scenario)?.scenario.goal,
       recording: ui?.scenarios.find((s) => s.scenario.id === f.scenario)?.recording ?? undefined, rows: [], flags: [] } }))
   if (ui?.scenarios.length) {
-    const c = await checkRun(repo, runId, ui.scenarios, gen); if (c === 'stopped') return 'stopped'
+    const c = await checkRun(repo, runId, ui.scenarios, gen, ui.unrecorded); if (c === 'stopped') return 'stopped'
     fresh.push(...c.findings); if (c.note) note(repo.id, runId, c.note)
   }
   keep(repo.id, runId, fresh)

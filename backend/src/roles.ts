@@ -20,8 +20,16 @@ const hook = (token: string, timeout: number, extra: Record<string, unknown> = {
 
 export const ENGINEER_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'LSP', 'ToolSearch', 'EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'Agent']
 export const ENGINEER_DISALLOWED = ['EnterWorktree', 'ExitWorktree', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'AskUserQuestion', 'Monitor', 'Skill']
-/** Where engineers may download packages from: npm and PyPI (index + files). */
-export const PACKAGE_REGISTRIES = ['registry.npmjs.org', 'registry.yarnpkg.com', 'pypi.org', 'files.pythonhosted.org']
+/** Where engineers may download packages from: npm, PyPI and crates.io (each index + files; Bug 71). */
+export const PACKAGE_REGISTRIES = ['registry.npmjs.org', 'registry.yarnpkg.com', 'pypi.org', 'files.pythonhosted.org', 'index.crates.io', 'static.crates.io']
+/** Bug 71: rustup puts `cargo` and `rustc` in ~/.cargo/bin and the toolchains in ~/.rustup, and an engineer's sandbox reads nothing in home
+ *  (blockReadsOutsideWorkingDirectories), so its `cargo` was "operation not permitted". The sandbox may read those two folders and nothing
+ *  else of home: not the rest of ~/.cargo (its credentials; crates download to the engineers' CARGO_HOME, cacheEnv). Both spellings of a
+ *  linked folder, as the sandbox compares real paths (Bug 59). None when rustup isn't installed. */
+export function rustReads(): string[] {
+  const dirs = [path.join(process.env.CARGO_HOME || path.join(HOME, '.cargo'), 'bin'), process.env.RUSTUP_HOME || path.join(HOME, '.rustup')]
+  return [...new Set(dirs.filter((d) => fs.existsSync(d)).flatMap((d) => [d, real(d)]))]
+}
 /** The Launch helper looks around and tries things in its sandbox; it never changes the project (launchhelper.ts). */
 export const LAUNCHER_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'ToolSearch']
 export const LAUNCHER_DISALLOWED = ['Edit', 'Write', 'NotebookEdit', 'Agent', ...ENGINEER_DISALLOWED]
@@ -119,8 +127,8 @@ export function buildSettings(role: Role, token: string, opts: SettingsOpts): Re
       network: { allowedDomains: ['127.0.0.1', 'localhost', '[::1]', ...(opts.localOnly ? [] : [...PACKAGE_REGISTRIES, ...(opts.repoAllowlist ?? [])])],
         strictAllowlist: true, allowLocalBinding: true },
       // On a Linux with no keyring, gh keeps its token in a file in GH_CONFIG_DIR. HQ's own folder by its real path: that's what the sandbox compares (Bug 59).
-      filesystem: { allowWrite: [ENGINEER_CACHE], denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, real(PATHS.home), `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`,
-        GH_CONFIG_DIR] },
+      filesystem: { allowWrite: [ENGINEER_CACHE], allowRead: rustReads(), // Bug 71: rustup's cargo and toolchains
+        denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, real(PATHS.home), `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`, GH_CONFIG_DIR] },
       credentials: { envVars: [{ name: 'HQ_AGENT_ID', mode: 'deny' }, { name: 'HQ_BACKEND', mode: 'deny' }, { name: 'ANTHROPIC_API_KEY', mode: 'deny' }, { name: 'GH_TOKEN', mode: 'deny' }, { name: 'GITHUB_TOKEN', mode: 'deny' }] },
     },
   }
@@ -130,7 +138,7 @@ export function buildSettings(role: Role, token: string, opts: SettingsOpts): Re
 export const cacheEnv = (): Record<string, string> => ({
   npm_config_cache: path.join(ENGINEER_CACHE, 'npm'),
   GOCACHE: path.join(ENGINEER_CACHE, 'go-build'), GOMODCACHE: path.join(ENGINEER_CACHE, 'gomod'), GOPATH: path.join(ENGINEER_CACHE, 'gopath'),
-  CARGO_HOME: path.join(ENGINEER_CACHE, 'cargo'), // where crates download to; cargo itself is still found on PATH (~/.cargo/bin), and rustup's toolchains stay put
+  CARGO_HOME: path.join(ENGINEER_CACHE, 'cargo'), // where crates download to; cargo itself is still found on PATH (~/.cargo/bin, readable: rustReads), and rustup's toolchains stay put
   UV_CACHE_DIR: path.join(ENGINEER_CACHE, 'uv'), PIP_CACHE_DIR: path.join(ENGINEER_CACHE, 'pip'),
   UV_PYTHON_INSTALL_DIR: path.join(ENGINEER_CACHE, 'python'), UV_PYTHON_DOWNLOADS: 'never',
 })

@@ -9,7 +9,8 @@ import path from 'node:path'
 import { PATHS } from './config.ts'
 import { one, q, run, now } from './db.ts'
 import { emit, patch, type HqEvent } from './events.ts'
-import { assignPorts, commandRecipe, detectCommand, frameBlocked, PREVIEW_PORTS, portBusy, printedPorts, runScript, supervisorSpec, type Recipe } from './apprun.ts'
+import { assignPorts, commandRecipe, detectCommand, frameBlocked, PREVIEW_PORTS, portBusy, printedPorts, recipeProblem, runScript, supervisorSpec,
+  type Recipe } from './apprun.ts'
 import { groupPids, pgidOf, portHolders, whoAnswers, whose, type Holder, type Whose } from './procs.ts'
 import { markFor, runOver, runStarting, sweepNow } from './leftovers.ts'
 import { git } from './reposync.ts'
@@ -25,19 +26,31 @@ export type Preview = {
   id: string; command: string | null; status: PreviewStatus; detail: string | null; port: number | null; url: string | null
   frameable: number | null; branch: string | null; head: string | null; started_at: number | null; updated_at: number; ticket_id: string | null
   recipe: string | null; draft_recipe: string | null; helper_agent_id: string | null; helper_state: string | null; helper_note: string | null; helper_saves: number
-  helper_worktree: string | null; port_holders: string | null; helper_ticket_id: string | null
+  helper_worktree: string | null; port_holders: string | null; helper_ticket_id: string | null; helper_ports: string | null
+  /** Bug 215: HQ is ending this run (kept before anything is signalled): for the user's Stop (Clear and Remove too) or to start it again. */
+  stopping: Stopping | null
 }
+export type Stopping = 'stop' | 'restart'
 /** A program on one of the recipe's fixed ports (Bug 42), and whose it is. */
 export type PortHolder = Holder & Whose & { port: number; part: string }
 const COLS = ['id', 'command', 'status', 'detail', 'port', 'url', 'frameable', 'branch', 'head', 'started_at', 'updated_at', 'ticket_id',
-  'recipe', 'draft_recipe', 'helper_agent_id', 'helper_state', 'helper_note', 'helper_saves', 'helper_worktree', 'port_holders', 'helper_ticket_id'] as const
+  'recipe', 'draft_recipe', 'helper_agent_id', 'helper_state', 'helper_note', 'helper_saves', 'helper_worktree', 'port_holders', 'helper_ticket_id', 'stopping',
+  'helper_ports'] as const
 
 export const previewSession = (repoId: string): string => `hq-preview-${repoId}`
 export const row = (repoId: string): Preview | undefined => one<Preview>('SELECT * FROM previews WHERE id = ?', repoId)
 const blank = (repoId: string): Preview => ({
   id: repoId, command: null, status: 'stopped', detail: null, port: null, url: null, frameable: null, branch: null, head: null, started_at: null, updated_at: 0,
   ticket_id: null, recipe: null, draft_recipe: null, helper_agent_id: null, helper_state: null, helper_note: null, helper_saves: 0, helper_worktree: null, port_holders: null, helper_ticket_id: null,
+  stopping: null, helper_ports: null,
 })
+/** The ports a Launch helper was given for its test runs (Bug 226); [] when it has none. */
+export function helperPorts(p: Pick<Preview, 'helper_ports'> | undefined): number[] {
+  try { const v: unknown = JSON.parse(p?.helper_ports ?? '[]'); return Array.isArray(v) ? v.filter((n): n is number => Number.isInteger(n)) : [] } catch { return [] }
+}
+/** Every live Launch helper's test ports but `repoId`'s own (its run stops that helper's test servers first). */
+export const helperPortsHeld = (repoId: string | null = null): number[] =>
+  q<Preview>('SELECT * FROM previews WHERE helper_agent_id IS NOT NULL AND helper_ports IS NOT NULL').filter((p) => p.id !== repoId).flatMap((p) => helperPorts(p))
 const parse = (json: string | null): Recipe | null => { try { return json ? JSON.parse(json) as Recipe : null } catch { return null } }
 /** What Launch runs: the user's own ⚙ command, else the recipe they OK'd; null when there's neither (the Launch helper is next). */
 export function runnableRecipe(p: Preview | undefined, cwd: string): Recipe | null {
@@ -45,10 +58,15 @@ export function runnableRecipe(p: Preview | undefined, cwd: string): Recipe | nu
 }
 /** Thrown when there's nothing to run yet: no ⚙ command and no OK'd recipe. */
 export class NeedsSetup extends Error {}
+/** Thrown when the OK'd recipe's install fails today's lockfile check in this checkout (Bug 156: saved before the check, or a
+ *  lockfile came or went since). `reason`: the check's words, for the helper that fixes the steps. */
+export class StepsOutdated extends Error { reason: string; constructor(msg: string, reason: string) { super(msg); this.reason = reason } }
 /** One repo's preview as the UI sees it: the saved row (or "stopped") with its recipes parsed, and the root npm script HQ
  *  would suggest for ⚙ (a hint only: it no longer starts anything by itself). */
-type PreviewView = Omit<Preview, 'recipe' | 'draft_recipe' | 'port_holders'> & {
+type PreviewView = Omit<Preview, 'recipe' | 'draft_recipe' | 'port_holders' | 'helper_ports'> & {
   recipe: Recipe | null; draft_recipe: Recipe | null; port_holders: PortHolder[] | null; auto_command: string | null; default_branch: string; path: string
+  /** The ports the Launch helper was given for its test runs (Bug 226); null with no helper (or one from before). */
+  helper_ports: number[] | null
   /** The Launch helper's ticket (Bug 46), by key. */
   helper_ticket_key: string | null
   /** How HQ tests this app (testsetupstore.ts), and its helper. */
@@ -56,7 +74,7 @@ type PreviewView = Omit<Preview, 'recipe' | 'draft_recipe' | 'port_holders'> & {
 const holdersOf = (json: string | null): PortHolder[] | null => { try { return json ? JSON.parse(json) as PortHolder[] : null } catch { return null } }
 export function previewView(repo: Repo): PreviewView {
   const p = row(repo.id) ?? blank(repo.id), t = p.ticket_id ? getTicket(p.ticket_id) : undefined
-  return { ...p, recipe: parse(p.recipe), draft_recipe: parse(p.draft_recipe), port_holders: holdersOf(p.port_holders),
+  return { ...p, recipe: parse(p.recipe), draft_recipe: parse(p.draft_recipe), port_holders: holdersOf(p.port_holders), helper_ports: p.helper_ports ? helperPorts(p) : null,
     auto_command: detectCommand(repo.path), default_branch: repo.default_branch, path: t?.worktree_path ?? repo.path,
     helper_ticket_key: p.helper_ticket_id ? getTicket(p.helper_ticket_id)?.key ?? null : null, test_setup: setupView(repo.id) }
 }
@@ -104,8 +122,9 @@ function watch(repoId: string, since: number, done: string | null): void {
     if (cur.ticket_id && tried?.status !== 'merged' && !tryable(tried)) { // cancelled, sent to Fix conflicts…: back to main (a merge restarts it anyway)
       unwatch(repoId); void startPreview(repoId, `back on main: ${tried?.key ?? 'the ticket'} isn't waiting to be merged any more`, { ticket: null }).catch(() => {}); return
     }
-    if (!(await tmux.hasSession(session))) { save(repoId, { status: 'stopped', detail: 'its tmux session is gone', url: null }); void sweepNow(); return unwatch(repoId) }
-    const code = await tmux.paneDeadStatus(session)
+    const has = await tmux.hasSession(session), code = has ? await tmux.paneDeadStatus(session) : null
+    if (row(repoId)?.stopping) return unwatch(repoId) // Bug 215: HQ ended it meanwhile (Stop, a restart): that end is no crash
+    if (!has) { save(repoId, { status: 'stopped', detail: 'its tmux session is gone', url: null }); void sweepNow(); return unwatch(repoId) }
     if (code !== null) {
       save(repoId, { status: 'crashed', detail: `stopped with code ${code}` })
       emit({ agentId: null, source: 'system', kind: 'preview.crashed', payload: { repo: repoId, code, ...stopReport(repoId, since) } })
@@ -137,37 +156,44 @@ function clash(repoId: string, since: number, port: number, others: Holder[]): P
     const cur = row(repoId), repo = getRepo(repoId); if (!cur || !repo || (cur.started_at ?? 0) !== since) return // restarted meanwhile
     const part = cur.command ? 'app' : parse(cur.recipe)?.show ?? 'app', all = repos()
     const held = others.map((h): PortHolder => ({ ...h, ...whose(h.cwd, all, repoId), port, part }))
-    await kill(repoId)
+    await kill(repoId, 'stop')
     const error = `Can't show ${repo.name}: ${heldText(port, part, held)} as well, so the page could be that program instead of ${repo.name}. Stop it here, then Launch.`
-    save(repoId, { status: 'stopped', detail: error, url: null, frameable: null, port_holders: JSON.stringify(held) })
+    save(repoId, { status: 'stopped', detail: error, url: null, frameable: null, port_holders: JSON.stringify(held), stopping: null })
     emit({ agentId: null, source: 'system', kind: 'preview.error', payload: { repo: repo.name, error, why: null, ticket: cur.ticket_id ? getTicket(cur.ticket_id)?.key ?? null : null } })
   })
 }
 
 /** How long the app's supervisor gets to end the app: its own grace (5 s for what was asked to stop, then it kills), with room to spare. */
 const STOP_MS = Number(process.env.HQ_PREVIEW_STOP_MS) || 8000
-/** What the supervisor wrote as this run ended (supervise.mjs): how much of the app ran outside its own process group, and what had to be killed. */
-function stopReport(repoId: string, since: number): { outside?: number; killed?: number[] } {
+/** What the supervisor wrote as this run ended (supervise.mjs): how much of the app ran outside its own process group, and what had to be killed;
+ *  `no_ps` when it couldn't run `ps` and so only told its own process group to stop (Bug 182). */
+function stopReport(repoId: string, since: number): { outside?: number; killed?: number[]; no_ps?: true } {
   try {
-    const r = JSON.parse(fs.readFileSync(path.join(PATHS.home, 'previews', repoId, 'stopped.json'), 'utf8')) as { at: number; outside: number; killed: number[] }
-    return r.at >= since ? { outside: r.outside, killed: r.killed } : {}
+    const r = JSON.parse(fs.readFileSync(path.join(PATHS.home, 'previews', repoId, 'stopped.json'), 'utf8')) as
+      { at: number; outside?: number; killed?: number[]; no_ps?: boolean }
+    return r.at >= since ? { outside: r.outside, killed: r.killed, ...(r.no_ps ? { no_ps: true as const } : {}) } : {}
   } catch { return {} }
 }
 /** Stops the app. Its supervisor is asked (SIGTERM) and ends everything the app started, whatever group or session that put itself in (supervise.mjs); if the
  *  supervisor itself doesn't go, its whole process group is killed. Then the session, and what the run had left with no parent: leftovers.ts knows those
- *  by the run's mark (Bug 77). A signal to the group alone left running whatever ignored it, was slow, or had left the group. */
-async function kill(repoId: string): Promise<void> {
-  const session = previewSession(repoId), cur = row(repoId)
-  if (await tmux.hasSession(session)) {
+ *  by the run's mark (Bug 77). A signal to the group alone left running whatever ignored it, was slow, or had left the group.
+ *  `why` is kept on the row first (Bug 215): a backend restart in the middle finishes the job (recoverPreviews), and the ended app isn't read as a crash.
+ *  The caller's next save clears it. `sweep` false: no leftover look now (at start-up, before agents' commands are read back). */
+async function kill(repoId: string, why: Stopping, sweep = true): Promise<{ forced: boolean }> {
+  const session = previewSession(repoId), cur = row(repoId), on = await tmux.hasSession(session)
+  if (on || (cur && cur.status !== 'stopped')) save(repoId, { stopping: why })
+  let forced = false // Bug 182: the supervisor didn't end within STOP_MS and HQ killed it, so it had no time to report what it stopped
+  if (on) {
     const pid = (await tmux.paneDeadStatus(session)) === null ? await tmux.panePid(session) : null
     if (pid) {
       try { process.kill(pid, 'SIGTERM') } catch {}
-      if (!(await waitFor(async () => (await tmux.paneDeadStatus(session)) !== null, STOP_MS))) { try { process.kill(-pid, 'SIGKILL') } catch {} }
+      if (!(await waitFor(async () => (await tmux.paneDeadStatus(session)) !== null, STOP_MS))) { forced = true; try { process.kill(-pid, 'SIGKILL') } catch {} }
     }
     await tmux.killSession(session)
   }
-  if (cur?.started_at && cur.status !== 'stopped') { runOver(markFor(repoId, cur.started_at)); await sweepNow() }
+  if (cur?.started_at && cur.status !== 'stopped') { runOver(markFor(repoId, cur.started_at)); if (sweep) await sweepNow() }
   const port = row(repoId)?.port; if (port) await waitFor(async () => !(await portBusy(port)), 3000)
+  return { forced }
 }
 
 /** Start (or restart) the repo's app. `ticket`: a finished ticket to try (its worktree, with a copy of main's data), null for
@@ -201,16 +227,22 @@ export function startPreview(repoId: string, why: string | null = null, opts: { 
     const cwd = tk?.worktree_path ?? repo.path
     const recipe = runnableRecipe(cur, cwd)
     if (!recipe) throw new NeedsSetup(`HQ doesn't know how to start ${repo.name} yet. Launch asks Claude to work it out (or set your own command with ⚙).`)
-    unwatch(repoId); await kill(repoId)
-    const got = await assignPorts(recipe, cur?.port ?? null)
+    unwatch(repoId); await kill(repoId, 'restart')
+    const stale = cur?.command ? null : recipeProblem(recipe, cwd) // the user's own command chose its install from npm's record
+    if (stale) {
+      const msg = `HQ didn't start ${repo.name}: its saved start steps would write a package-lock.json into the project, or not follow the one it has.`
+      save(repoId, { status: 'stopped', detail: `${msg} Start it again and Claude fixes them for your OK.`, url: null, port_holders: null, stopping: null })
+      throw new StepsOutdated(msg, stale) // the check's own words go to the helper, not to the user
+    }
+    const got = await assignPorts(recipe, cur?.port ?? null, portBusy, helperPortsHeld(repoId))
     const range = `ports ${PREVIEW_PORTS[0]}–${PREVIEW_PORTS.at(-1)} are all in use`
-    if (!got) { save(repoId, { status: 'stopped', detail: range, port_holders: null }); throw new Error(range) }
+    if (!got) { save(repoId, { status: 'stopped', detail: range, port_holders: null, stopping: null }); throw new Error(range) }
     if (got.taken.length) { // something else answers there (the user's own dev server, say): this app would talk to it, not to its own part
       const all = repos(), held = await Promise.all(got.taken.map(async (x) =>
         (await portHolders(x.port)).map((h): PortHolder => ({ ...h, ...whose(h.cwd, all, repoId), port: x.port, part: x.part }))))
       const known = held.flat(), msg = `Can't start ${repo.name}: ${got.taken.map((x, i) => heldText(x.port, x.part, held[i]!)).join('; ')}.`
         + (known.length ? ' Stop it here, then Launch.' : ' Stop it, then Launch.')
-      save(repoId, { status: 'stopped', detail: msg, url: null, port_holders: known.length ? JSON.stringify(known) : null })
+      save(repoId, { status: 'stopped', detail: msg, url: null, port_holders: known.length ? JSON.stringify(known) : null, stopping: null })
       throw new PortTaken(msg, got.taken.map((x) => x.port))
     }
     const port = got.ports[recipe.show]!
@@ -233,7 +265,7 @@ export function startPreview(repoId: string, why: string | null = null, opts: { 
       await tmux.newSession(previewSession(repoId), `bash ${shq(script)}`, { cwd })
       await tmux.tmux('set-option', '-t', previewSession(repoId), 'status', 'off').catch(() => {}) // the Server tab is just the app's output
       save(repoId, { status: 'starting', detail: install ? `installing packages (${install})…` : 'starting…', port, url: null, port_holders: null,
-        frameable: null, branch, head, started_at: t, ticket_id: tk?.id ?? null })
+        frameable: null, branch, head, started_at: t, ticket_id: tk?.id ?? null, stopping: null })
     } finally { runStarting(mark, false) }
     emit({ agentId: null, source: 'system', kind: 'preview.started', payload: { repo: repo.name, command, port, ports: got.ports, head, install, why, ticket: tk?.key ?? null, copied } })
     watch(repoId, t, why)
@@ -246,13 +278,16 @@ export function startPreview(repoId: string, why: string | null = null, opts: { 
     throw e
   })
 }
-export function stopPreview(repoId: string): Promise<ReturnType<typeof previewView>> {
+/** `resumed` (Bug 215): finishing, at start-up, a Stop the last backend began; no leftover look yet (index.ts does it once agents' commands are read back). */
+export function stopPreview(repoId: string, resumed = false): Promise<ReturnType<typeof previewView>> {
   return serial(repoId, async () => {
     const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
     const since = row(repoId)?.started_at ?? 0
-    unwatch(repoId); await kill(repoId)
-    save(repoId, { status: 'stopped', detail: null, url: null, frameable: null, port_holders: null })
-    emit({ agentId: null, source: 'system', kind: 'preview.stopped', payload: { repo: repo.name, ...stopReport(repoId, since) } })
+    unwatch(repoId); const { forced } = await kill(repoId, 'stop', !resumed)
+    save(repoId, { status: 'stopped', detail: null, url: null, frameable: null, port_holders: null, stopping: null })
+    // `forced`: HQ had to kill the supervisor (its whole process group), so the supervisor's own report is missing or cut short
+    emit({ agentId: null, source: 'system', kind: 'preview.stopped',
+      payload: { repo: repo.name, ...stopReport(repoId, since), ...(forced ? { forced: true } : {}), ...(resumed ? { after_restart: true } : {}) } })
     return previewView(repo)
   })
 }
@@ -327,8 +362,20 @@ async function restartAfterMerge(repoId: string, keys: string[]): Promise<void> 
     .catch(() => {}) // startPreview wrote the preview.error
 }
 
-/** On backend start (before the merge watcher's first check): previews whose app still runs in tmux are watched again. */
+/** Bug 215: apps the last backend was restarting when it went; started again by resumeRestarts once the start-up leftover look is done. */
+const restartLater: string[] = []
+/** On backend start (before the merge watcher's first check): a Stop or restart the last backend was in the middle of is finished (Bug 215: the app
+ *  it ended reads as stopped, not crashed); previews whose app still runs in tmux are watched again. */
 export async function recoverPreviews(): Promise<void> {
+  for (const p of q<Preview>('SELECT * FROM previews WHERE stopping IS NOT NULL')) {
+    if (!getRepo(p.id)) continue
+    if (p.stopping !== 'restart') { await stopPreview(p.id, true).catch((e) => console.error('finishing a Stop failed', e)); continue }
+    await serial(p.id, async () => {
+      unwatch(p.id); await kill(p.id, 'restart', false)
+      save(p.id, { status: 'stopped', detail: 'HQ restarted while it was restarting the app. Starting it again…', url: null, frameable: null, port_holders: null, stopping: null })
+    }).catch((e) => console.error('finishing a restart failed', e))
+    restartLater.push(p.id)
+  }
   for (const p of q<Preview>("SELECT * FROM previews WHERE status IN ('starting', 'running')")) {
     const session = previewSession(p.id)
     if (!getRepo(p.id) || !(await tmux.hasSession(session))) { save(p.id, { status: 'stopped', detail: 'it was not running when HQ restarted', url: null }); continue }
@@ -337,4 +384,8 @@ export async function recoverPreviews(): Promise<void> {
     watch(p.id, p.started_at ?? 0, p.status === 'running' ? p.detail : null)
     emit({ agentId: null, source: 'system', kind: 'preview.recovered', payload: { repo: p.id, status: p.status } })
   }
+}
+/** Bug 215: starts again the apps recoverPreviews found half-restarted. index.ts calls it after the start-up leftover look, which a start's own would come before. */
+export function resumeRestarts(): void {
+  for (const id of restartLater.splice(0)) void startPreview(id, 'started again (HQ restarted while restarting the app)').catch(() => {}) // startPreview wrote the preview.error
 }

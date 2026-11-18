@@ -97,6 +97,25 @@ test('no fresh start, and no typed Urgent, while the agent waits on a dialog', a
   assert.equal((await hq.state()).messages.find((x: any) => x.id === m.id).delivery_method, null) // left for the mod, not typed into the dialog
 })
 
+test('Bug 72: an API error is no dialog: its reason is kept, Urgent is typed, and a fresh start goes ahead', async () => {
+  const { f } = await setup('fresh-api-error')
+  const t = await ticket(f, 'Errored'); const eng = await building(t)
+  await hq.hook(eng.id, { hook_event_name: 'StopFailure', error: 'API Error: 529 overloaded' })
+  await waitFor('blocked by the error', async () => { const a = await agent(eng.id); return a.status === 'blocked' && a.blocked_why === 'api_error' })
+  assert.equal((await agent(eng.id)).activity ?? null, null) // its turn is over: no "Thinking" left in the Agents menu
+  const m = (await hq.api(`agents/${eng.id}/message`, { body: 'Try that again.', urgent: true })).json
+  assert.equal((await hq.state()).messages.find((x: any) => x.id === m.id).delivery_method, 'tmux') // it sits at its prompt: typed, as for an idle agent
+  const r = await hq.api(`agents/${eng.id}/fresh-start`, { then: 'park' }); assert.equal(r.status, 200, JSON.stringify(r.json))
+  await hq.mcp(eng.id, 'write_handoff_note', { text: '## Where I stopped\n- an API error' })
+  await waitFor('parked', async () => (await tk(t)).parked_at)
+  // a dialog that comes after it is a dialog again
+  const t2 = await ticket(f, 'Errored then asked'); const eng2 = await building(t2)
+  await hq.hook(eng2.id, { hook_event_name: 'StopFailure', error: 'overloaded' })
+  await hq.hook(eng2.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Claude needs your permission to use Bash' })
+  assert.equal((await agent(eng2.id)).blocked_why, 'dialog')
+  const r2 = await hq.api(`agents/${eng2.id}/fresh-start`, {}); assert.equal(r2.status, 409); assert.match(r2.json.error, /dialog/)
+})
+
 test('no note in time: HQ writes one, and a parked ticket waits for Resume', async () => {
   const { f } = await setup('fresh-fallback')
   const t = await ticket(f, 'Quiet'); const eng = await building(t)
@@ -112,6 +131,27 @@ test('no note in time: HQ writes one, and a parked ticket waits for Resume', asy
   assert.doesNotMatch(note, /none recorded|helper-search/)
   const r = await hq.api(`tickets/${t.id}/resume`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.match(await prompt(r.json.id), /Written by HQ/); assert.equal((await tk(t)).parked_at, null)
+})
+
+// Bug 196: HQ's note from the first clear stayed as if the TPM had written it, so the second clear archived it again and the third
+// TPM was told the TPM before it waits on a dialog.
+test("Bug 196: a second clear with no note from the TPM gets HQ's new note, not the first clear's", async () => {
+  const { repo, tpm } = await setup('fresh-clear-twice')
+  const tpmBack = (old: string) => waitFor('the TPM back', async () => {
+    const id = (await repoRow(repo.id)).tpm_agent_id; return id && id !== old && (await agent(id))?.status === 'working' ? id as string : null }, 40_000)
+  const handoffs = () => { const base = path.join(hq.hqHome, 'archive', 'fresh-clear-twice')
+    return fs.readdirSync(base).sort().map((d) => fs.readFileSync(path.join(base, d, 'tpm', 'HANDOFF.md'), 'utf8')) }
+  await hq.hook(tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Claude needs your permission to use Bash' })
+  await waitFor('on a dialog', async () => (await agent(tpm.id)).status === 'blocked')
+  const r1 = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r1.status, 200, JSON.stringify(r1.json)); assert.equal(r1.json.noting.length, 0)
+  const second = await tpmBack(tpm.id)
+  assert.match(await prompt(second), /didn't leave a note: .* is waiting on a dialog in its terminal/)
+  const r2 = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r2.status, 200, JSON.stringify(r2.json)); assert.equal(r2.json.noting.length, 1)
+  const third = await tpmBack(second) // the second TPM never writes its note: HQ writes one when the time is up
+  const [first, then] = handoffs()
+  assert.match(first!, /is waiting on a dialog/); assert.match(then!, /^\(Written by HQ: the TPM didn't leave a note: none came within/)
+  assert.doesNotMatch(then!, /dialog/)
+  assert.match(await prompt(third), /didn't leave a note: none came within/); assert.doesNotMatch(await prompt(third), /dialog/)
 })
 
 test('context limit: one warning past the limit; with auto, a fresh start once the step ends', async () => {

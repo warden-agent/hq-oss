@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Stand-in for the gh CLI in HQ's GitHub e2e test: the few calls HQ makes, answered from a JSON file the test edits
 // (FAKE_GH_STATE: { prs: { <branch>: [{ number, url, state, mergeable }] }, next, push?, bares?, refuseMerge? }; push: false = HQ can't push;
-// bares: { <slug>: <bare repo> } where a PR merge makes its merge commit; refuseMerge: GitHub's reason for a 405). Pushes and fetches go to a local bare
+// bares: { <slug>: <bare repo> } where a PR merge makes its merge commit; refuseMerge: GitHub's reason for a 405;
+// beforeMerge: a shell command run once as a PR merges; refuseCreate: GitHub's reason for a 403 on opening a PR). Pushes and fetches go to a local bare
 // repo through git's url.insteadOf, so no network is used. New projects: `login` (null = logged out), `repos` (made with
 // POST user/repos, each a bare repo under FAKE_GH_BARE/<owner>/<name>.git unless `noBare`, so the push fails).
 import path from 'node:path'
@@ -36,15 +37,19 @@ if (args[0] === 'api' && args[1] === '-X' && args[2] === 'PUT' && /\/pulls\/\d+\
   const head = Object.keys(s.prs).find((b) => s.prs[b].some((p) => p.number === n && p.state === 'OPEN'))
   if (!head) { console.error('gh: Pull Request is not mergeable (HTTP 405)'); process.exit(1) }
   if (s.refuseMerge) { console.error(`gh: ${s.refuseMerge} (HTTP 405)`); process.exit(1) }
-  let sha = 'f'.repeat(40); const bare = (s.bares ?? {})[slug]
+  if (s.beforeMerge) { execFileSync('sh', ['-c', s.beforeMerge]); delete s.beforeMerge; save(s) } // once, as GitHub merges (Bug 184: a commit landing meanwhile)
+  let sha = 'f'.repeat(40); const bare = (s.bares ?? {})[slug], want = args.find((a) => a.startsWith('sha='))?.slice(4) // Bug 143: the head it must still have
+  if (want) s.mergeShas = [...(s.mergeShas ?? []), want]
   if (bare) { // what GitHub does: a merge commit on main, in the bare repo HQ pushes to
     const g = (...a) => execFileSync('git', ['-C', bare, '-c', 'user.name=gh', '-c', 'user.email=gh@e2e', ...a], { encoding: 'utf8' }).trim()
+    if (want && g('rev-parse', `refs/heads/${head}`) !== want) { save(s); console.error('gh: Head branch was modified. Review and try the merge again. (HTTP 409)'); process.exit(1) }
     const tree = g('merge-tree', '--write-tree', 'main', head); sha = g('commit-tree', tree, '-p', 'main', '-p', head, '-m', `Merge pull request #${n}`); g('update-ref', 'refs/heads/main', sha)
   }
   s.prs[head] = s.prs[head].map((p) => p.number === n ? { ...p, state: 'MERGED' } : p); s.merged = [...(s.merged ?? []), n]; save(s); console.log(sha); process.exit(0)
 }
 if (args[0] === 'api' && args.includes('POST')) {
   const s = load(), head = field('head'), list = s.prs[head] ?? []
+  if (s.refuseCreate) { console.error(`gh: ${s.refuseCreate} (HTTP 403)`); process.exit(1) }
   if (list.some((p) => p.state === 'OPEN')) { console.error('gh: A pull request already exists (HTTP 422)'); process.exit(1) }
   const pr = { number: s.next, url: `https://github.com/${args.find((a) => a.startsWith('repos/')).split('/').slice(1, 3).join('/')}/pull/${s.next}`, state: 'OPEN', mergeable: 'MERGEABLE' }
   s.prs[head] = [...list, pr]; s.next++; fs.writeFileSync(file, JSON.stringify(s)); console.log(JSON.stringify({ number: pr.number, url: pr.url })); process.exit(0)

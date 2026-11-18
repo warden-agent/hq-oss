@@ -11,7 +11,7 @@ const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-diffcheck-'))
 process.env.HQ_HOME = path.join(home, 'hq'); process.env.HOME = home
 process.env.HQ_CLAUDE_BIN = path.join(import.meta.dirname, '..', 'e2e', 'fake-claude.mjs')
 const { migrate } = await import('./db.ts'); migrate()
-const { diffFor, diffPrompt, readDiff, readReport, whyRead } = await import('./diffcheck.ts')
+const { diffFor, diffPrompt, readAgain, readDiff, readReport, whyRead } = await import('./diffcheck.ts')
 import type { Proof } from './criteria.ts'
 import type { PlanCheck } from './checks.ts'
 
@@ -30,6 +30,15 @@ test('a small ticket with nothing flagged merges without one', () => {
   assert.deepEqual(whyRead({ size: 'S' }, null, []), []); assert.deepEqual(whyRead({ size: 'S' }, proof({ tests: [{ ...T, state: 'passed' }] }), [{ state: 'ok', ...cost }]), [])
   assert.deepEqual(whyRead({ size: 'S' }, proof({ tests: [{ ...T, state: 'unconfirmed' }] }), []), []) // a test runner that prints no names says nothing about the ticket
   assert.deepEqual(whyRead({ size: 'S' }, proof(), [{ state: 'checking', since: 1 }]), [])
+})
+test('Bug 185: each commit an open_pr names is read; the same commit tested again is not, and a ticket sent back merges on its next pass unread', () => {
+  const ok = { state: 'ok' as const, why: ['it is a size M ticket'], ...cost }
+  assert.equal(readAgain(null, 'aaa'), true) // never read
+  assert.equal(readAgain({ ...ok, sha: 'aaa' }, 'aaa'), false) // tested again at the same commit (main moved during the test): no second read
+  assert.equal(readAgain({ ...ok, sha: 'aaa' }, 'bbb'), true) // a later open_pr named a new commit
+  assert.equal(readAgain(ok, 'aaa'), true) // read before HQ kept the commit: HQ can't tell it is the same one
+  assert.equal(readAgain({ state: 'unchecked', at: 1, why: [], error: 'down', sha: 'aaa' }, 'aaa'), true) // the reader couldn't be asked: try again
+  assert.equal(readAgain({ state: 'sent_back', why: [], findings: [{ about: 'bug', problem: 'x' }], ...cost, sha: 'aaa' }, 'bbb'), false) // one send-back
 })
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-diffcheck-repo-'))

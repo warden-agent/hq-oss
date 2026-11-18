@@ -8,7 +8,7 @@ import { execFileSync, spawn } from 'node:child_process'
 
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-leftovers-')))
 process.env.HQ_HOME = path.join(tmp, 'hq')
-const { bashBegan, bashEnded, busySince, inHq, leftoverGroups, parsePs, rootsToAsk, stopLeftovers, sweepAgentTmp } = await import('./leftovers.ts')
+const { bashBegan, bashEnded, busySince, inHq, leftoverGroups, parsePs, readBackCommands, rootsToAsk, stopLeftovers, sweepAgentTmp } = await import('./leftovers.ts')
 const { AGENT_TMP, agentTmpDir } = await import('./config.ts')
 const { cwdsOf } = await import('./procs.ts')
 const { migrate, run } = await import('./db.ts'); migrate()
@@ -204,4 +204,21 @@ test('Bug 81: an agent\'s own temp folder goes once the agent has; a running one
   assert.equal(fs.existsSync(other), true) // another HQ's
   // Claude Code uses it for commands only up to about 30 bytes, and engineers can't read home
   if (!process.env.HQ_AGENT_TMP) assert.ok(agentTmpDir('launch-1234abcd').length <= 30 && AGENT_TMP.startsWith('/tmp/hq'), AGENT_TMP)
+})
+
+test('Bug 145: a restarted backend reads back from the events log which commands are still running, by the same steps as the hooks', () => {
+  const t = Date.now(), ev = (agent: string, kind: string, payload: object, ago: number) =>
+    run('INSERT INTO events(agent_id, source, kind, payload, created_at) VALUES (?,?,?,?,?)', agent, 'hook', kind, JSON.stringify(payload), t - ago * 1000)
+  for (const [id, status] of [['rb-1', 'working'], ['rb-2', 'idle'], ['rb-3', 'working'], ['rb-gone', 'exited']]) {
+    run("INSERT INTO agents(id, role, model_alias, token_hash, status, started_at) VALUES (?, 'engineer', 'sonnet', 'x', ?, 1)", id, status)
+  }
+  ev('rb-1', 'hook.PreToolUse:Bash', { use: 'u3' }, 700) // too long ago to be running still, whatever came after
+  ev('rb-1', 'hook.PreToolUse:Bash', { use: 'u1' }, 60); ev('rb-1', 'hook.PreToolUse:Bash', { use: 'u2' }, 50); ev('rb-1', 'hook.PostToolUse:Bash', { use: 'u2' }, 45)
+  ev('rb-2', 'hook.PreToolUse:Bash', { use: 'u4' }, 40); ev('rb-2', 'hook.Stop', {}, 30) // its turn ended: so did the command
+  ev('rb-3', 'hook.PreToolUse:Bash', { use: 'u5' }, 100); ev('rb-3', 'turns.started', { use: 'u5' }, 20) // it waited its turn: it began then
+  ev('rb-gone', 'hook.PreToolUse:Bash', { use: 'u6' }, 10) // its agent ended meanwhile
+  for (const a of ['rb-1', 'rb-2', 'rb-3', 'rb-gone']) assert.equal(busySince(a, t), 0, a) // what a restart knew before
+  readBackCommands(t)
+  assert.equal(busySince('rb-1', t), t - 60_000); assert.equal(busySince('rb-2', t), 0); assert.equal(busySince('rb-3', t), t - 20_000); assert.equal(busySince('rb-gone', t), 0)
+  assert.equal(busySince('rb-1', t + 80_000), 0) // and stops counting when its own time limit has passed, as it would have
 })

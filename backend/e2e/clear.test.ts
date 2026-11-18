@@ -63,6 +63,7 @@ test('Clear project: notes first, then the board goes; the code is kept on its b
   assert.equal(git('log', '-1', '--format=%s', t.branch), 'WIP (HQ clear): T-01 Hello'); assert.equal(git('show', `${t.branch}:hello.txt`), 'half done')
   // The archive
   const base = path.join(hq.hqHome, 'archive', 'demo-clear'), [stamp] = fs.readdirSync(base), arch = path.join(base, stamp!)
+  assert.equal(s.archive.replace(/^~(?=\/|$)/, process.env.HOME), path.join(hq.hqHome, 'archive')) // what the Clear dialog names (Bug 224)
   const [folder] = fs.readdirSync(arch).filter((x) => x !== 'SUMMARY.md' && x !== 'tpm')
   assert.match(folder!, /^F-1-demo-clear-/)
   assert.match(fs.readFileSync(path.join(arch, folder!, 'tickets', 'T-01', 'HANDOFF.md'), 'utf8'), /ENG-NOTE/)
@@ -81,4 +82,18 @@ test('Clear project: notes first, then the board goes; the code is kept on its b
   assert.equal(again.json.tpm_agent_id, next); assert.equal(again.json.handle, 'F-2')
   assert.equal((await hq.mcp(next, 'create_ticket', { feature: 'F-2', title: 'Again', size: 'S', spec: 'x', criteria: [{ kind: 'backend', text: 'The page says hello.' }] })).text,
     'Created T-02 in F-2: Again (criteria A1)')
+})
+
+test('Bug 219: a backend restart while the TPM writes its note still brings the TPM back after the clear', async () => {
+  const { repo, tpm } = await setup('restart-clear')
+  const r = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.deepEqual(r.json.noting, [tpm.display_name])
+  await hq.restart() // what HQ kept only in memory is gone; the TPM, like its tmux server, is still there writing its note
+  assert.ok((await hq.state()).repos.find((x: any) => x.id === repo.id).clearing_at)
+  assert.equal((await hq.mcp(tpm.id, 'write_handoff_note', { text: '## What the user wants\n- a demo (RESTART-NOTE)' })).isError, false)
+  await waitFor('the board gone', async () => !(await hq.state()).features.some((x: any) => x.repo_id === repo.id), 30_000)
+  const next = await waitFor('the TPM back', async () => { const id = (await hq.state()).repos.find((x: any) => x.id === repo.id).tpm_agent_id; return id && id !== tpm.id ? id : null }, 30_000)
+  await waitFor('it to run', async () => (await agent(next))?.status === 'working')
+  assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', next, 'prompt.md'), 'utf8'), /RESTART-NOTE/)
+  assert.equal((await hq.state()).repos.find((x: any) => x.id === repo.id).clear_tpm_was_on, null) // done with: the next clear starts afresh
 })

@@ -39,7 +39,8 @@ async function runTimesOut(id: string, real: string, command = 'npm run test-bac
   await hq.hook(id, { hook_event_name: 'Stop', last_assistant_message: 'The run is still going; I will read the result when it finishes.' })
   return { task, pid }
 }
-const FROZEN = 'exec node -e "setInterval(() => {}, 1e9)"', BUSY = 'exec node -e "for (;;) {}"'
+// Each ends itself after 5 min (longer than any test here): a run whose clean-up never ran (the file killed outright) can't leave one behind (Bug 166)
+const FROZEN = 'exec node -e "setTimeout(() => {}, 300e3)"', BUSY = 'exec node -e "for (const end = Date.now() + 300e3; Date.now() < end;);"'
 
 test('a frozen run: a notice, the engineer stays working meanwhile, and Stop it ends the run and tells the engineer', async () => {
   const { eng, t } = await engineer('frozen')
@@ -54,11 +55,27 @@ test('a frozen run: a notice, the engineer stays working meanwhile, and Stop it 
   await waitFor('the run to be stopped', () => !alive(pid), 5000)
   assert.equal((await alerts(eng.id)).length, 0, 'the notice went')
   assert.equal((await hq.api(`agents/${eng.id}/stop-frozen-runs`, {})).status, 409, 'a second click finds nothing to stop')
+  const tab = (await hq.api(`agents/${eng.id}/events`)).json.events.map((e: any) => e.text) // Bug 201: in plain words, not `bg.stopped`
+  assert.match(tab.find((x: string) => x.includes('frozen')) ?? tab.join(' | '), /^You stopped its frozen background run: npm run test-backend \(no CPU, no output for \d+ min\)$/)
   // Claude Code's "failed" notice wakes the engineer; after that turn it's idle, and HQ's message is on its way
   await hq.hook(eng.id, { hook_event_name: 'UserPromptSubmit', prompt: `<task-notification>\n<task-id>${task}</task-id>\n<status>failed</status>\n</task-notification>` })
   await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'It was stopped.' })
   const m = (await hq.state()).messages.find((x: any) => x.to_id === eng.id && x.from_id === 'hq'); assert.equal(m?.reason, 'fyi')
   assert.match(m.body, /did nothing for \d+ min \(no CPU, no output\), so HQ stopped it\. .*run only the test files for what you changed/s)
+})
+
+test('Bug 181: an engineer HQ stops while its frozen run is being stopped gets no message', async () => {
+  const { eng } = await engineer('stopped-meanwhile')
+  const { task, pid } = await runTimesOut(eng.id, FROZEN)
+  await waitFor('the frozen run notice', () => alerted(eng.id), 30_000)
+  const stopping = hq.api(`agents/${eng.id}/stop-frozen-runs`, {})
+  await waitFor('the run to get its SIGTERM', () => !alive(pid), 5000) // HQ now waits 2 s before its SIGKILL round
+  assert.equal((await hq.api(`agents/${eng.id}/stop`, {})).status, 200)
+  const r = await stopping; assert.equal(r.status, 200, JSON.stringify(r.json)); assert.deepEqual(r.json.stopped, [task])
+  assert.equal((await agentOf(eng.id)).status, 'exited')
+  const told = (await events('message.sent')).filter((e: any) => JSON.parse(e.payload).to === eng.id && JSON.parse(e.payload).reason === 'fyi')
+  assert.deepEqual(told, [], 'nothing sent to the stopped engineer')
+  assert.ok((await events('bg.stopped')).some((e: any) => e.agent_id === eng.id), 'the stop itself is still recorded')
 })
 
 test('a busy run is never frozen; once its process ends unheard, the engineer goes back to idle', async () => {
@@ -86,8 +103,18 @@ test('a server started in the background on purpose is never watched, however qu
 test('HQ restarts in the middle of the wait: it still knows the run, and still sees it freeze', async () => {
   const { eng } = await engineer('restart')
   const { pid } = await runTimesOut(eng.id, FROZEN)
+  // Bug 203: and its box says again what it waits on, as before the restart (the page is read anew, so it's the backend's own state)
+  const mid = await engineer('restart-mid'), use = `toolu_${++n}`, other = `toolu_${++n}`
+  await hq.hook(mid.eng.id, { hook_event_name: 'UserPromptSubmit', prompt: 'build it' })
+  await hq.hook(mid.eng.id, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_use_id: use, tool_input: { command: 'npm run build', run_in_background: true },
+    tool_response: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: `bt${n}m` } })
+  await hq.hook(mid.eng.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_use_id: other, tool_input: { file_path: '/r/src/app.ts' } })
+  assert.ok((await events('bg.started')).some((e: any) => e.agent_id === mid.eng.id), 'its build is watched in the background')
   await hq.restart()
   assert.equal((await agentOf(eng.id)).status, 'working')
+  assert.equal((await agentOf(eng.id)).activity, 'Waiting on: npm run test-backend', 'the line is back without a new hook')
+  const m = await agentOf(mid.eng.id); assert.equal(m.status, 'working')
+  assert.equal(m.activity ?? null, null, 'one still in its turn when HQ went is not said to be waiting: its next hook says what it does')
   await waitFor('the frozen run notice after the restart', () => alerted(eng.id), 30_000)
   assert.equal((await hq.api(`agents/${eng.id}/stop-frozen-runs`, {})).status, 200)
   await waitFor('the run to be stopped', () => !alive(pid), 5000)
@@ -99,6 +126,7 @@ test('on auto, HQ stops a frozen run itself', async () => {
   assert.equal((await hq.api(`repos/${repo.id}/auto`, { on: true })).status, 200)
   const ev = await waitFor('HQ to stop it', async () => (await events('bg.stopped')).find((e: any) => e.agent_id === eng.id), 30_000)
   assert.equal(JSON.parse(ev.payload).by, 'auto'); assert.ok(!alive(pid))
+  assert.ok((await hq.api(`agents/${eng.id}/events`)).json.events.some((e: any) => e.text.startsWith('Auto mode stopped its frozen background run: npm run test-backend')))
   assert.equal((await alerts(eng.id)).length, 0)
 })
 

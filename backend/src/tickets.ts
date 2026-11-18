@@ -16,8 +16,8 @@ import { autoOn, closedWhy, features, getFeature, getRepo, getTicket, liveTpm, n
   from './records.ts'
 import { ensureFresh, git } from './repos.ts'
 import { nextWorkerSlot, releaseSlot } from './slots.ts'
-import { tellTpm } from './mergewatch.ts'
-import { engineerResumePrompt } from './handover.ts'
+import { mergedPart, tellTpm } from './mergewatch.ts'
+import { engineerResumePrompt, type LateCommits } from './handover.ts'
 import { handOver, keepFirstRequest, messageTpm, tpmStarting } from './tpm.ts'
 import { writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { gitFacts, readNote } from './notes.ts'
@@ -66,8 +66,13 @@ export const launching = (id: string): boolean => starting.has(id) || fixing.has
 /** A ticket in a feature. Keys are unique in the project (their worktree folder is the key) and HQ's count up and never repeat,
  *  not even after a Clear (Bug 52): T-01, T-02… across every feature. */
 /** The project's test command, for an engineer: the usual one may not work in its sandbox, and this is the one its ticket is judged by. */
-export const testCmdNote = (cmd: string): string => 'While you work, run only the tests for what you changed. ' // a full run while working can freeze (Bug 96)
-  + `HQ tests this project with this command, so run it once, just before open_pr: use it for your full test run instead of the project's usual one: ${cmd}`
+export const testCmdNote = (cmd: string, from?: { key: string; base: string }): string => 'While you work, run only the tests for what you changed. ' // a full run while working can freeze (Bug 96)
+  + 'HQ tests this project with this command, so run it once, just before open_pr: use it for your full test run instead of the project\'s usual one'
+  // Bug 147: a repair's new command may need what its branch adds, and that only reaches another engineer's branch once the repair is in main and merged in
+  + (from ? `. It came with ${from.key}, which isn't in ${from.base} yet, and it may need files from that ticket's branch. So just before that run, merge ${from.base} `
+    + `into your branch (git merge --no-edit ${from.base}; merge, never rebase). If the run then fails only because something from ${from.key} is missing, `
+    + `${from.key} hasn't merged yet: say so under "Deviations from approved plan" and call open_pr anyway. The command` : '')
+  + `: ${cmd}`
 export function createTicket(featureId: string, t: { key?: string; title: string; size: string; spec: string; expected_files?: string[]; depends_on?: string[]; repairs_main?: string
   repairs_cmd?: string; criteria?: Criterion[] }): Ticket {
   const f = getFeature(featureId); if (!f) throw new Error('unknown feature')
@@ -83,7 +88,8 @@ export function createTicket(featureId: string, t: { key?: string; title: string
     prior_status: null, assignee_agent_id: null, expected_files: JSON.stringify(t.expected_files ?? []), deps: JSON.stringify(t.depends_on ?? []),
     edit_overrides: '[]', branch: null, worktree_path: null, pr_number: null, pr_url: null, pr_state: null, plan_round: 0, handoff_updated_at: null,
     last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, repairs_main: t.repairs_main ?? null,
-    repairs_cmd: t.repairs_cmd ?? null, fixing: null, merge_test: null, criteria: JSON.stringify(t.criteria ?? []), proof: null, diff_check: null, parked_at: null, created_at: ts, updated_at: ts,
+    repairs_cmd: t.repairs_cmd ?? null, fixing: null, merge_test: null, criteria: JSON.stringify(t.criteria ?? []), proof: null, diff_check: null,
+    finished_sha: null, parked_at: null, created_at: ts, updated_at: ts,
   }
   run(`INSERT INTO tickets(id, feature_id, key, slug, title, size, status, expected_files, deps, edit_overrides, plan_round, spec, repairs_main, repairs_cmd, criteria, created_at,
        updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec,
@@ -123,7 +129,7 @@ export async function launchEngineer(ticketId: string, opts: { synced?: boolean;
 }
 /** `fix`: an engineer that finished work goes back to (Fix conflicts, auto mode's failed test on main, or a spec the TPM changed, as
  *  `fixing` says): it starts in acceptEdits with HQ's instructions as its prompt (no plan to review), and the ticket goes to `resolving`. */
-type Resume = { prompt: (worktree: string) => Promise<string>; mode: 'plan' | 'acceptEdits'; status: TicketStatus }
+type Resume = { prompt: (worktree: string) => Promise<string>; mode: 'plan' | 'acceptEdits'; status: TicketStatus; noted: boolean } // noted: a handoff note was left
 /** `quiet`: the caller tells the TPM itself (fillSlots, Bug 127: one notice for all the engineers one click started). */
 async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolean; fix?: (worktree: string) => string; fixing?: Fixing; resume?: Resume }): Promise<Agent> {
   const f = getFeature(t.feature_id)!; notClearing(f.repo_id); const repo = opts.synced ? getRepo(f.repo_id)! : await ensureFresh(f.repo_id)
@@ -166,11 +172,21 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolea
   const prev = t.assignee_agent_id && t.assignee_agent_id !== a.id ? getAgent(t.assignee_agent_id) : undefined
   if (prev?.status === 'exited') handOver(prev.id, a.id)
   emit({ agentId: a.id, source: 'system', kind: 'ticket.launched', payload: { ticket: t.id, branch, worktree: wtPath, slot: slot.idx, fix: !!opts.fix } })
-  const why = opts.fix ? ` to ${fixWords(opts.fixing ?? null, mergeBase(repo).name).to}` : opts.resume ? ' to take over after a fresh start (the last engineer left a handoff note)' : ''
+  const why = opts.fix ? ` to ${fixWords(opts.fixing ?? null, mergeBase(repo).name).to}`
+    : opts.resume ? ` to take over after a fresh start${opts.resume.noted ? ' (the last engineer left a handoff note)' : ''}` : ''
   if (!opts.quiet) tellTpm(f, `HQ: engineer ${a.id} started on ${t.key}${why} (branch ${branch}). Address messages for this ticket to id ${a.id}.`)
   return a
 }
 
+/** Bug 184 (and 143): a ticket whose branch moved on after the commit its last open_pr handed over, so it came back: what came after, and whether HQ merged that
+ *  commit meanwhile. Null for any other ticket. From git and the ticket, so a fresh engineer after a restart is told too. */
+export async function lateCommits(repoPath: string, base: string, t: Ticket): Promise<LateCommits | null> {
+  if (!t.finished_sha || !t.branch) return null
+  const part = await mergedPart(repoPath, base, t), since = part ? base : t.finished_sha // not in main / not handed over
+  if (!part && await git(repoPath, 'merge-base', '--is-ancestor', `refs/heads/${t.branch}`, t.finished_sha).then(() => true, () => false)) return null // nothing after it
+  const commits = (await git(repoPath, 'log', '--format=%h %s', `${since}..refs/heads/${t.branch}`, '--').catch(() => '')).split('\n').filter(Boolean)
+  return commits.length ? { merged: part?.sha ?? null, finished: t.finished_sha, commits: commits.length > 10 ? [...commits.slice(0, 10), `… and ${commits.length - 10} more`] : commits } : null
+}
 /** A fresh engineer for a ticket whose engineer left a handoff note: same worktree and branch, briefed with the note, what git
  *  shows and the approved plan (or HQ's instructions for its conflicts or tests). `replace`: it takes the place of the one that just stopped, so
  *  the parallel limit doesn't hold it back; a Resume from parked respects the limit. */
@@ -189,7 +205,7 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
     const rev = one<{ edited_plan_text: string | null; plan_text: string }>(`SELECT edited_plan_text, plan_text FROM plan_revisions
       WHERE ticket_id = ? AND verdict IN ('approve', 'approve_with_edits') ORDER BY round DESC, submitted_at DESC`, t.id)
     const plan = t.status === 'planning' || t.status === 'resolving' ? null : rev ? rev.edited_plan_text ?? rev.plan_text : null
-    const a = await startEngineer(t, { synced: true, resume: { mode: t.status === 'planning' ? 'plan' : 'acceptEdits', status: t.status, prompt: async (wt) => {
+    const a = await startEngineer(t, { synced: true, resume: { mode: t.status === 'planning' ? 'plan' : 'acceptEdits', status: t.status, noted: !!note, prompt: async (wt) => {
       let fix: string | null = null
       if (t.status === 'resolving' && t.fixing === 'changes') fix = changeText({ t })
       else if (t.status === 'resolving' && forTests(t.fixing)) fix = fixTestsText({ t, base: base.name, failed: testsFailed(t, repo.test_cmd) }) // Bug 84
@@ -197,7 +213,8 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
         const mh = await git(wt, 'rev-parse', '--git-path', 'MERGE_HEAD').catch(() => '')
         fix = fixConflictsText({ t, base: base.name, files: j<string[]>(t.conflict_files, []), merged: j<string[]>(t.conflict_with, []), inProgress: !!mh && fs.existsSync(path.resolve(wt, mh)) })
       }
-      return engineerResumePrompt(t, { feature: f.title, worktree: wt, base: base.name, note, git: await gitFacts(wt, base.ref), plan, fix })
+      return engineerResumePrompt(t, { feature: f.title, worktree: wt, base: base.name, note, git: await gitFacts(wt, base.ref), plan, fix,
+        late: fix || t.status !== 'implementing' ? null : await lateCommits(repo.path, base.ref, t) })
     } } })
     if (old) { for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
     clearStalled(t.id) // someone is fixing its tests (or building its change) again
@@ -218,12 +235,13 @@ function onItsWay(a: Agent, t: number): boolean {
 }
 /** A finished ticket's engineer has nothing left to do, so HQ stops it instead of keeping it (and its memory) until the merge: every
  *  engineer that is idle (its turn ended and no helper of its own still runs) on a ticket that is ready to merge, with nothing on its
- *  way to it, no fresh start under way and nobody in its terminal. Its worktree and branch stay; if the ticket comes back (conflicts,
- *  tests, a changed spec) a fresh engineer starts on them. Returns the engineers it stopped. */
+ *  way to it, no fresh start under way and nobody in its terminal (nor a turn of its stopped there by Escape). Its worktree and branch
+ *  stay; if the ticket comes back (conflicts, tests, a changed spec) a fresh engineer starts on them. Returns the engineers it stopped. */
 export function stopFinished(): string[] {
   const t0 = now(), out: string[] = []
   for (const a of liveAgents()) {
     if (a.role !== 'engineer' || a.status !== 'idle' || !a.ticket_id || a.fresh_start_at || (a.takeover_locked_until ?? 0) > t0) continue
+    if (a.interrupted_at) continue // Bug 148: stopped mid-turn by Escape in its terminal, not finished; the next turn that ends normally clears it
     if (t0 - (a.last_event_at ?? 0) < FINISHED_STOP_MS) continue // its turn only just ended: whoever calls next (listeners.ts) stops it
     const t = getTicket(a.ticket_id)
     if (!t || !['pr_ready', 'pr_open'].includes(t.status) || fixing.has(t.id) || starting.has(t.id) || leaving.has(t.id) || onItsWay(a, t0)) continue
@@ -254,6 +272,8 @@ async function sendBack(t: Ticket, featureId: string, live: Agent | undefined, t
     return { via: 'launch', engineer }
   } finally { starting.delete(t.id) }
 }
+/** Bug 206: what a ticket.fix_tests event says it came back for (the Events tab reads it): what it went back to fix, not just whether the tests hung. */
+const backWhy = (why: Fixing, failed: Failed) => ({ why, hung: !!failed.hung, ...(failed.unproven && why === 'tests' ? { unproven: true } : {}) })
 /** Auto mode: the tests failed on main plus this ticket, so it goes back to its engineer, even over the parallel limit (like Fix conflicts). */
 export async function fixTests(ticketId: string, failed: Failed): Promise<{ via: 'message' | 'launch'; engineer: string }> {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
@@ -268,8 +288,9 @@ export async function fixTests(ticketId: string, failed: Failed): Promise<{ via:
     if (live && !(await tmux.hasSession(live.tmux_session))) throw new Error(`${t.key}'s engineer (${live.id}) can't be reached right now`)
     if (!live) { const cap = canLaunch({ ignoreCap: true }); if (!cap.ok) throw new Error(cap.why) }
     keepTestsFailed(t, failed); clearStalled(t.id)
-    const r = await sendBack(t, f.id, live, (launch) => fixTestsText({ t, base, failed, launch }), failed.review ? 'review' : failed.look ? 'look' : failed.hung ? 'tests_hung' : 'tests')
-    emit({ agentId: r.engineer, source: 'system', kind: 'ticket.fix_tests', payload: { ticket: t.id, key: t.key, via: r.via, test: failed.test, hung: !!failed.hung } })
+    const why: Fixing = failed.review ? 'review' : failed.look ? 'look' : failed.hung ? 'tests_hung' : 'tests'
+    const r = await sendBack(t, f.id, live, (launch) => fixTestsText({ t, base, failed, launch }), why)
+    emit({ agentId: r.engineer, source: 'system', kind: 'ticket.fix_tests', payload: { ticket: t.id, key: t.key, via: r.via, test: failed.test, ...backWhy(why, failed) } })
     return r
   } finally { fixing.delete(t.id) }
 }
@@ -333,7 +354,7 @@ export async function fixConflicts(ticketId: string): Promise<{ key: string; cle
       const repo = getRepo(f.repo_id)!, base = mergeBase(repo).name, failed = testsFailed(t0, repo.test_cmd)
       const { via, engineer } = await sendBack(t0, f.id, live, (launch) => fixTestsText({ t: t0, base, failed, launch }), again)
       clearStalled(t0.id)
-      emit({ agentId: engineer, source: 'ui', kind: 'ticket.fix_tests', payload: { ticket: t0.id, key: t0.key, via, test: failed.test, hung: !!failed.hung, again: true } })
+      emit({ agentId: engineer, source: 'ui', kind: 'ticket.fix_tests', payload: { ticket: t0.id, key: t0.key, via, test: failed.test, ...backWhy(again, failed), again: true } })
       return { key: t0.key, clean: false, via, engineer }
     }
     const repo = await ensureFresh(f.repo_id).catch((e) => { throw new Error(`HQ couldn't bring ${getRepo(f.repo_id)?.name ?? 'the repo'} up to date: ${(e as Error).message}`) })

@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { afterCheck, decide, fromTester, ticketGone, dueForReplay, findingKey, findingLines, judgeInCode, MAX_PER_RUN,
-   stepWords, take, ticketBlock, toSend, type Fresh, type Kept } from './findingrules.ts'
+   cssWords, stepWords, take, ticketBlock, toSend, type Fresh, type Kept } from './findingrules.ts'
 import type { Step } from './loopinputs.ts'
 
 const add: Step[] = [{ action: 'navigate', url: '/?tab=reading' }, { action: 'fill', role: 'textbox', name: 'Item', text: 'Dune' }, { action: 'click', role: 'button', name: 'Add' }]
@@ -23,6 +23,11 @@ test('the same finding is the same whatever words the model used; the key comes 
   assert.equal(findingKey(be()), 'backend|duplicate|POST /api/reading/fill') // a flag-led backend finding is its flag on its endpoint, whatever the steps
   assert.equal(findingKey(be({ steps: [] })), findingKey(be()))
   assert.notEqual(findingKey(be()), findingKey(ui('x', { evidence: be().evidence }))) // a UI finding never keys by a flag
+  // Bug 173: steps named by a selector are their selector and match, not one "click" for every such element
+  const css = (sel: string, nth?: number): Fresh => ui('x', { steps: [add[0]!, { action: 'click', css: sel, ...(nth !== undefined ? { nth } : {}) }] })
+  assert.notEqual(findingKey(css('button:has-text("Remove")')), findingKey(css('button:has-text("Clear")')))
+  assert.notEqual(findingKey(css('li button', 0)), findingKey(css('li button', 1)))
+  assert.equal(findingKey(css('li button', 0)), findingKey(css('li button')))
 })
 test('a run\'s findings: new ones get ids, the same one again is "seen again", an ignored or fine one never comes back, one being fixed waits for its replay', () => {
   const first = take([], [ui(), be(), ui('Same thing in other words, Add says nothing.')], { repoId: 'r1', runId: 'run1', next: 1 })
@@ -95,6 +100,33 @@ test('code judges a replay where it can: the flag on the same endpoint, or every
 test('the words: steps as a person says them, the fix ticket\'s block, and the summary\'s lines', () => {
   assert.deepEqual(add.map(stepWords), ['open /?tab=reading', 'type "Dune" into the "Item" box', 'click the "Add" button'])
   assert.equal(stepWords({ action: 'back' }), 'go back'); assert.equal(stepWords({ action: 'press', text: 'Escape' }), 'press Escape')
+  // Bug 173: an element named by a selector reads as what it is when the selector says, else as the selector; never "the page"
+  assert.equal(stepWords({ action: 'click', css: 'button:has-text("Remove")', nth: 0 }), 'click the "Remove" button')
+  assert.equal(stepWords({ action: 'click', css: 'ul >> a:text-is("Help")', nth: 1 }), 'click the 2nd "Help" link')
+  assert.equal(stepWords({ action: 'check', css: 'li >> nth=0 >> input[type=checkbox]', nth: -1 }), 'tick the last box "li >> nth=0 >> input[type=checkbox]"')
+  assert.equal(stepWords({ action: 'click', css: '[aria-label="Close"]' }), 'click the "Close"')
+  assert.equal(stepWords({ action: 'click', css: 'text=Borrow' }), 'click the "Borrow"')
+  assert.equal(stepWords({ action: 'click', css: '#list .row:nth-child(3)', nth: 10 }), 'click the 11th "#list .row:nth-child(3)"')
+  // the element is the selector's last part, not what it sits in: the button inside the "Rice" item is no "Rice" list item
+  assert.equal(stepWords({ action: 'click', css: 'li:has-text("Rice") button' }), 'click the button "li:has-text("Rice") button"')
+  assert.equal(stepWords({ action: 'click', css: '#list > li button:has-text("Remove")' }), 'click the "Remove" button')
+  assert.equal(stepWords({ action: 'click', css: 'form button[title="Save draft"]' }), 'click the "Save draft" button')
+  assert.equal(stepWords({ action: 'click', css: 'text=Remove all' }), 'click the "Remove all"')
+  // Bug 198: one of several same elements says which; one inside another reads as itself (its selector only finds it)
+  assert.equal(stepWords({ action: 'click', role: 'button', name: 'Edit', nth: 1 }), 'click the 2nd "Edit" button')
+  assert.equal(stepWords({ action: 'click', text: '1', nth: -1 }), 'click the last text "1"')
+  assert.equal(stepWords({ action: 'click', role: 'button', name: 'Remove', css: 'internal:role=row[name="Dune"i] >> internal:role=button[name="Remove"i]' }),
+    'click the "Remove" button in the row "Dune"')
+  assert.equal(stepWords({ action: 'click', css: 'internal:role=listitem >> internal:has-text=/^Dune$/ >> button', nth: 2 }), 'click the 3rd button in the listitem with "Dune"')
+  assert.equal(stepWords({ action: 'click', role: 'button', name: 'Edit', css: 'internal:role=row >> nth=2 >> internal:role=button[name="Edit"i]' }),
+    'click the "Edit" button in the 3rd row')
+  assert.equal(stepWords({ action: 'fill', field: 'Qty', text: '3', css: 'internal:role=listitem >> internal:has-text="Rice"i >> internal:label="Qty"i' }),
+    'type "3" into the "Qty" box in the listitem with "Rice"')
+  assert.equal(stepWords({ action: 'click', css: 'internal:role=listitem >> internal:has-text="Say \\"hi\\""i' }), 'click the listitem with "Say "hi""')
+  assert.equal(stepWords({ action: 'click', role: 'button', name: 'Add', css: 'internal:role=button[name="Add"s]' }), 'click the "Add" button') // nothing it sits in
+  assert.equal(stepWords({ action: 'click', css: 'button' }), 'click the button') // a bare tag isn't said twice
+  assert.deepEqual([cssWords('x', 0), cssWords('x', 1), cssWords('x', 2), cssWords('x', 20), cssWords('x', 21)], ['the "x"', 'the 2nd "x"', 'the 3rd "x"', 'the 21st "x"', 'the 22nd "x"'])
+  assert.equal(stepWords({ action: 'click' }), 'click the page') // a step with nothing to go by still says so
   const k: Kept = { ...kept(be()), wording: 'Emma ends up on the list twice.', strikes: 1, tickets: ['T-05'],
     checks: [{ run: 'r2', at: 1, result: 'broken', how: 'replay', why: 'the replay showed it again' }] }
   const b = ticketBlock(k)

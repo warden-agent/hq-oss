@@ -1,0 +1,50 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.322[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 5.5 · Claude[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m~/demo/repo[39m
+
+[38;5;246m  ⎿  SessionStart:startup hook error[39m
+[38;5;246m  ⎿  Failed with non-blocking status code: curl: option -H: error encountered when reading a file[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mRun the shell command: sleep 20 ; then say finished.[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;231m⏺[39m Finished.
+
+[38;5;246m✻[39m [38;5;246mBaked for 22s · done 2:21 AM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mWrite a 400-word story about a lighthouse keeper. No tools.[39m
+
+[38;5;231m[49m⏺[39m The Keeper of Halden Point
+
+  For thirty-one years, Edwin Marsh climbed the one hundred and twelve iron steps of Halden Point every evening at dusk, wound the clockwork that turned the great lens, and lit the lamp. His father
+  had done the same, and his grandfather before him. The light had never once gone out on a night when a Marsh was keeping it.
+
+  The island was small, a knuckle of granite a mile off the coast, and in winter the sea came over the rocks so hard that Edwin could feel it through the tower walls. He liked that. It reminded him
+  the world was bigger than the cottage, bigger than the ledger where he logged ship passages, bigger than the letters that came every few months from his daughter in Lisbon, who wrote that he should
+  come ashore and live properly.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          [38;5;246mCtrl+Y to paste deleted text[39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39mdraft while it writes
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;147m⏵⏵ accept edits on[38;5;246m (shift+tab to cycle)[39m

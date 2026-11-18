@@ -11,7 +11,7 @@ import { ask } from './checker.ts'
 import { findingLines, planCheckLine, planCheckOf, type Finding, type PlanCheck } from './checks.ts'
 import { criteriaLines, criteriaOf } from './criteria.ts'
 import { answerReview, getReview, getRevision } from './gate.ts'
-import { autoOn, getFeature, getTicket } from './records.ts'
+import { autoOn, closedWhy, getFeature, getTicket } from './records.ts'
 import { canLaunch } from './scheduler.ts'
 
 export const PLAN_SYSTEM = `You are a second reader for a software engineer's plan. You see only the ticket's acceptance criteria and the plan: not the code, not the ticket's
@@ -57,7 +57,7 @@ export function checkPlan(reviewId: string): void {
   if (checking.has(reviewId)) return
   const review = getReview(reviewId); if (!review || review.status !== 'open') return
   const t = getTicket(review.ticket_id), repoId = repoOf(review.ticket_id), rev = getRevision(review.plan_revision_id)
-  if (!t || !rev || !autoOn(repoId)) return
+  if (!t || !rev || !autoOn(repoId) || closedWhy(repoId!)) return // a project being cleared or removed starts no reader (Bug 177)
   const approve = (by: string) => { failed.delete(reviewId); answerReview(reviewId, 'approve', { by }) }
   const criteria = criteriaOf(t)
   if (!criteria.length) return approve('auto') // HQ's own repair tickets, and tickets from before criteria were a list: nothing to check a plan against
@@ -71,7 +71,8 @@ export function checkPlan(reviewId: string): void {
     checking.delete(reviewId)
     // Read again: the call took seconds. The user may have answered it, a newer plan replaced it, the ticket was cancelled, or auto mode went off.
     const cur = getReview(reviewId); if (!cur || cur.status !== 'open') return
-    if (a.kind === 'stopped' || !autoOn(repoId)) return record(rev.id, reviewId, null) // auto mode went off: the plan is the user's to answer, and it says so
+    // auto mode went off: the plan is the user's to answer, and it says so. Or the project is being cleared or removed: nothing follows on it (Bug 177)
+    if (a.kind === 'stopped' || !autoOn(repoId) || closedWhy(repoId!)) return record(rev.id, reviewId, null)
     if (a.kind === 'error') {
       const n = (failed.get(reviewId) ?? 0) + 1; failed.set(reviewId, n)
       emit({ agentId: rev.agent_id, source: 'system', kind: 'plan_check.failed', payload: { review: reviewId, ticket: t.key, why: a.why, tries: n } })
@@ -89,7 +90,8 @@ export function checkPlan(reviewId: string): void {
 let bump: () => void = () => {}
 /** What looks at open plans again shortly (auto mode's tick): a failed call is tried once more then. Set at startup, so this module needs nothing of auto.ts. */
 export const onRetry = (fn: () => void): void => { bump = fn }
-/** Auto mode went off for a project: its plans are the user's to answer again, so the readers at work on them stop. */
+/** Auto mode went off for a project, or it is being cleared or removed (Bug 177): its plans are the user's to answer again or go with the board, so the readers
+ *  at work on them stop. */
 export function stopPlanChecks(repoId: string): void {
   for (const [reviewId, c] of checking) { const r = getReview(reviewId); if (r && repoOf(r.ticket_id) === repoId) c.abort() }
 }

@@ -64,6 +64,72 @@ test('the TPM\'s briefing says where each ticket stands, quotes recent talk and 
   assert.match(tpmPrompt(getRepo('r1')!, { ws: '/ws', previous: null, note: 'n', board: [], messages: [], cleared: true }), /The user just cleared the board: every ticket that was on it is gone/)
 })
 
+test('Bug 163: the TPM\'s briefing says whether auto mode is on either way, and that history from the other mode no longer holds', () => {
+  const talk = [{ from_id: 'tpm-old', body: 'HQ ran the tests before each merge.' }] as never
+  const brief = (auto: number, o: { messages?: never; note?: string } = {}) =>
+    tpmPrompt({ ...getRepo('r1')!, auto_mode: auto }, { ws: '/ws', previous: 'tpm-old', board: [], messages: o.messages ?? ([] as never), note: o.note })
+  const off = brief(0, { messages: talk })
+  assert.match(off, /\n\nAuto mode is off for this project: the user starts tickets, approves plans and merges from HQ, and HQ runs no tests before a merge\./)
+  assert.match(off, /HQ runs no tests before a merge\. Don't tell the user HQ tested or merged anything by itself; each "merged" notice says what HQ ran\./)
+  assert.match(off, /If earlier messages or the handoff note say HQ starts, tests or merges tickets by itself, that was while auto mode was on\./)
+  assert.doesNotMatch(off, /Auto mode is on/)
+  assert.match(brief(0, { note: 'HQ tests each ticket.' }), /that was while auto mode was on\./) // a note is history too
+  assert.doesNotMatch(brief(0), /earlier messages/, 'nothing earlier: nothing to warn about')
+  const on = brief(1, { messages: talk })
+  assert.match(on, /\n\nAuto mode is on for this project: HQ starts ready tickets when your turn ends, approves plans, tests finished tickets on main,/)
+  assert.match(on, /tests finished tickets on main, merges them and fixes conflicts\. Follow the Auto mode rule in your instructions\./)
+  assert.match(on, /If earlier messages or the handoff note say the user starts or merges tickets, that was while auto mode was off\./)
+  assert.doesNotMatch(on, /Auto mode is off|runs no tests/)
+  assert.doesNotMatch(brief(1), /earlier messages/)
+  assert.match(tpmPrompt({ ...getRepo('r1')!, auto_mode: 0 }, { ws: '/ws', previous: null, board: [], messages: [], message: 'hi' }), /Auto mode is off for this project/) // a first start too
+})
+
+test('Bug 193: on auto, the TPM\'s briefing says HQ starts, checks, tests and merges tickets; off, the user does, as before', () => {
+  const base = { feature_id: 'f9', size: 'S', deps: '[]', go_ahead: 0, auto_parked_why: null, pr_state: null, pr_number: null, branch: null } as const
+  const board = [
+    { ...base, key: 'X-1', title: 'Ready', status: 'queued' }, { ...base, key: 'X-2', title: 'Plan', status: 'plan_review' },
+    { ...base, key: 'X-3', title: 'Local', status: 'pr_ready', pr_state: 'local' }, { ...base, key: 'X-4', title: 'Pushed', status: 'pr_ready', pr_state: 'pushed' },
+    { ...base, key: 'X-5', title: 'Open', status: 'pr_open', pr_state: 'open', pr_number: 7 },
+    { ...base, key: 'X-6', title: 'Parked', status: 'pr_ready', pr_state: 'local', auto_parked_why: 'Its tests still fail on main after 2 fixes.' },
+  ] as never[]
+  const brief = (r: object, localOnly = false) => tpmPrompt({ ...getRepo('r1')!, ...r } as never, { ws: '/ws', previous: null, messages: [], localOnly,
+    board: [{ f: { title: 'Nine', handle: 'F-9' } as never, tickets: board }] })
+  const on = brief({ auto_mode: 1 })
+  assert.match(on, /X-1 \(S\) Ready: ready; HQ starts it when your turn ends\n/)
+  assert.match(on, /X-2 \(S\) Plan: HQ checks its plan, then approves it or sends it back\n/)
+  assert.match(on, /X-3 \(S\) Local: finished; HQ tests it on main and merges it\n/)
+  assert.match(on, /X-4 \(S\) Pushed: finished and pushed; HQ tests it on main, opens its PR and merges it\n/)
+  assert.match(on, /X-5 \(S\) Open: finished; HQ tests PR #7 on main and merges it\n/)
+  // a parked ticket is the user's again (its Merge button is back): the words say so, and why
+  assert.match(on, /X-6 \(S\) Parked: finished; waits for the user to merge it \(auto mode parked it: Its tests still fail on main after 2 fixes\)\n/)
+  assert.doesNotMatch(on.replace(/X-6 [^\n]*/, ''), /the user starts it|the user's review|waits for the user|the user's merge|PR still needs opening/)
+  assert.doesNotMatch(on, /It is stopped right now/)
+  const off = brief({ auto_mode: 0 }) // manual mode: word for word as before
+  assert.match(off, /X-1 \(S\) Ready: ready to start \(the user starts it from HQ\)\n/)
+  assert.match(off, /X-2 \(S\) Plan: its plan waits for the user's review\n/)
+  assert.match(off, /X-3 \(S\) Local: finished; waits for the user to merge it\n/)
+  assert.match(off, /X-4 \(S\) Pushed: finished and pushed; its PR still needs opening\n/)
+  assert.match(off, /X-5 \(S\) Open: finished; PR #7 waits for the user's merge\n/)
+  assert.match(off, /X-6 \(S\) Parked: finished; waits for the user to merge it\n/) // parked means nothing with auto off
+  assert.doesNotMatch(off, /HQ starts it|HQ tests|HQ checks its plan|parked/)
+  // auto stopped: nothing starts or merges by itself until Resume, but plans are still checked
+  const stopped = brief({ auto_mode: 1, auto_stopped_why: "HQ couldn't test X-3: its branch is gone." })
+  assert.match(stopped, /It is stopped right now \(HQ couldn't test X-3: its branch is gone\): nothing starts or merges by itself until the user presses Resume, and meanwhile the user starts/)
+  assert.match(stopped, /X-1 \(S\) Ready: ready to start \(the user starts it from HQ\)\n/)
+  assert.match(stopped, /X-2 \(S\) Plan: HQ checks its plan, then approves it or sends it back\n/)
+  assert.match(stopped, /X-3 \(S\) Local: finished; waits for the user to merge it\n/)
+  // a project HQ can't push to
+  assert.match(brief({ auto_mode: 1, default_branch: 'main' }, true), /no PRs; HQ merges finished tickets into the local main\./)
+  assert.match(brief({ auto_mode: 0, default_branch: 'main' }, true), /no PRs; the user merges finished tickets into the local main from HQ\./)
+  // Bug 210: a project whose default branch is master says master everywhere, the board's lines and the mode line alike
+  const master = brief({ auto_mode: 1, default_branch: 'master' })
+  assert.match(master, /tests finished tickets on master, merges them and fixes conflicts\. Follow the Auto mode rule/)
+  assert.match(master, /X-3 \(S\) Local: finished; HQ tests it on master and merges it\n/)
+  assert.match(master, /X-4 \(S\) Pushed: finished and pushed; HQ tests it on master, opens its PR and merges it\n/)
+  assert.match(master, /X-5 \(S\) Open: finished; HQ tests PR #7 on master and merges it\n/)
+  assert.doesNotMatch(master.replace(/X-6 [^\n]*/, ''), /\bmain\b/) // X-6's parked reason is HQ's own text from the test data
+})
+
 test('an engineer that still uses the old TPM\'s id reaches the project\'s current TPM', () => {
   const eng = q<any>("SELECT * FROM agents WHERE id = 'eng-2'")[0]
   assert.equal(resolveRecipient(eng, 'tpm-old'), 'tpm-old') // not replaced yet: same as "tpm"

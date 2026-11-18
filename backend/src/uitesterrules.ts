@@ -2,15 +2,17 @@
 // a person would get stuck or confused. These are the shapes HQ keeps, what the tester is told, what of its answers HQ keeps, how a step it took becomes a
 // step a script can replay, and the words for the run's summary. Pure: no DB, no processes.
 import type { Criterion } from './criteria.ts'
+import { cssWords, ordinal, within } from './findingrules.ts'
 
 export type ScenarioKind = 'basic' | 'weird' | 'complex' | 'retry'
 /** One thing to try, written by the tester's planning call from the feature map and what's new (or, for `retry`, by HQ from a finding a replay couldn't
  *  reproduce by script: Part 5). `criteria`: the screen criteria it is about ("T-03 A2"). */
 export type Scenario = { id: string; kind: ScenarioKind; title: string; goal: string; criteria?: string[] }
 /** One step the tester took, as a script can replay it with no AI: built by HQ from the Playwright code the browser tools ran, never from the model's words.
- *  `code`: that line of code, for a replay that can't use the fields. */
+ *  `code`: that line of code, for a replay that can't use the fields. `css`: the selector of an element the browser named by `locator('…')`, not by role or text
+ *  (Bug 173), with `nth` the one of its matches it took (0 the first, -1 the last). */
 export type Step = { action: 'navigate' | 'click' | 'fill' | 'press' | 'select' | 'check' | 'uncheck' | 'hover' | 'back'; role?: string; name?: string; text?: string;
-  label?: string; value?: string; url?: string; code: string }
+  label?: string; css?: string; nth?: number; value?: string; url?: string; code: string }
 /** What the tester expected to see at a finding, checked by HQ in the page text it last read: is that element there? */
 export type Expect = { role?: string; name?: string; text?: string; visible: boolean }
 export const FINDING_KINDS = ['stuck', 'confusing', 'unclear_label', 'no_feedback', 'broken', 'missing'] as const
@@ -20,13 +22,17 @@ export type UiFinding = { id: string; scenario: string; kind: FindingKind; what:
 /** One step of the tester's log as HQ recorded it: when it began (HQ's clock), the browser tool, the step it ran (none for a look), whether it worked. */
 export type LogEntry = { at: number; ms: number; tool: string; step?: Step[]; ok: boolean; note?: string }
 /** How a scenario went. `ok`: it did what the map and criteria say, with nothing worth a finding. `problem`: one finding or more. `unspecified`: neither the
- *  map nor the criteria say what should happen, so there is no verdict. `not_run`: the session ended before it began, or before it finished. */
-export type Outcome = 'ok' | 'problem' | 'unspecified' | 'not_run'
+ *  map nor the criteria say what should happen, so there is no verdict. `couldnt_test`: it needs something no one can do from a browser (change the clock,
+ *  wait hours, get an email), so there is no verdict either, and nothing to fix (Bug 223); `why` says what. `not_run`: the session ended before it began, or
+ *  before it finished. */
+export type Outcome = 'ok' | 'problem' | 'unspecified' | 'couldnt_test' | 'not_run'
 export type ScenarioResult = { scenario: Scenario; outcome: Outcome; why?: string; steps: Step[]; log: LogEntry[]; findings: UiFinding[]; notes: string[];
   recording: string | null }
-/** What the run's tester did, kept with the run (auto_runs.ui_test). `skipped`: HQ couldn't have it tried, and why (`quiet`: it's how the project is set up). */
-export type UiTest = { at: number } & ({ state: 'done'; scenarios: { id: string; kind: ScenarioKind; title: string; outcome: Outcome; actions: number; why?: string }[];
-  findings: UiFinding[]; ms: number; tokens: number; cost_usd: number; model: string; sessions: number } | { state: 'skipped'; why: string; quiet?: boolean })
+/** What the run's tester did, kept with the run (auto_runs.ui_test). `skipped`: HQ couldn't have it tried, and why (`quiet`: it's how the project is set up).
+ *  `unrecorded`: why HQ's recorder wasn't on while it ran, so the backend checker has nothing of this run to read. */
+export type UiTest = { at: number } & ({ state: 'done'
+  scenarios: { id: string; kind: ScenarioKind; title: string; outcome: Outcome; actions: number; why?: string; criteria?: string[] }[]
+  findings: UiFinding[]; ms: number; tokens: number; cost_usd: number; model: string; sessions: number; unrecorded?: string } | { state: 'skipped'; why: string; quiet?: boolean })
 
 /** How many scenarios the tester writes, how many it gets per session, and what one scenario may take: browser actions (a click, typing, opening a page), looks
  *  at the page as text, and screenshots (for layout only). The tester's browser refuses a step past these (HQ's hook, uitesthost.mjs), not its prompt. */
@@ -111,10 +117,15 @@ Rules:
 - Each scenario has a fixed budget of actions, looks and screenshots. When the browser refuses a step because the budget is spent, finish the scenario.
 - outcome "ok": it worked and nothing was confusing. "problem": you have at least one finding. "unspecified": the map and what's new don't say what should
   happen here (for example what an empty name should do), so you can't say whether it's right; say what the app did in notes, without a verdict.
+  "couldnt_test": the scenario needs something a person can't do from this browser (change the computer's clock or date, wait hours, get an email or a text,
+  use a second device or account), so you couldn't check it; say what in couldnt_test, with no findings. If you also saw a real problem on the way, the
+  outcome is "problem" with that finding, and what you couldn't check still goes in couldnt_test.
 - A finding is something a person would trip over: stuck (couldn't go on), confusing (wrong click or backtrack), unclear_label (the label didn't match what
   happened), no_feedback (nothing showed that it worked or failed), broken (an error, or the wrong result), missing (the map says it's there and it isn't).
   Give the action it happened at (count your page opens, clicks, typing and key presses in this scenario from 1; looks don't count), what you saw, what you expected, and the what's-new [id] if it is
   about one. If you were looking for an element, name it in looked_for (its role and name as the page text shows them).
+- That you couldn't try something is never a finding: a finding is about what the app did. "I couldn't change the clock to see the morning greeting" goes
+  in couldnt_test.
 - Report only what you saw on the page. Nothing about how it is built or how you would build it.`
 
 export function testerPrompt(o: { map: string; news: string[]; scenarios: Scenario[]; budget: typeof BUDGET }): string {
@@ -137,15 +148,125 @@ function literal(s: string): [string, string] | null {
   }
   return null
 }
-/** The element a locator names: `getByRole('button', { name: 'Add' })`, `getByText('…')`, `getByLabel('…')`, `getByPlaceholder('…')`. */
-function target(loc: string): Pick<Step, 'role' | 'name' | 'text' | 'label'> | null {
-  const m = /^\.?getBy(Role|Text|Label|Placeholder|Title|AltText|TestId)\((.*)$/.exec(loc.trim()); if (!m) return null
-  const a = literal(m[2]!.trim()); if (!a) return null
-  if (m[1] === 'Role') {
-    const name = /name:\s*(['"`])/.exec(a[1]); const n = name ? literal(a[1].slice(name.index + name[0].length - 1)) : null
-    return { role: a[0], ...(n ? { name: n[0] } : {}) }
+/** A regular expression literal at the start of `s` (`/^Dune$/i`), as written, and what's after it. */
+function regex(s: string): [string, string] | null {
+  if (s[0] !== '/') return null
+  let cls = false
+  for (let i = 1; i < s.length; i++) {
+    const c = s[i]!
+    if (c === '\\') { i++; continue }
+    if (c === '[') cls = true; else if (c === ']') cls = false
+    else if (c === '/' && !cls) { const f = /^[a-z]*/.exec(s.slice(i + 1))![0]; return i > 1 ? [s.slice(0, i + 1 + f.length), s.slice(i + 1 + f.length)] : null }
   }
-  return m[1] === 'Label' || m[1] === 'Placeholder' ? { label: a[0] } : { text: a[0] }
+  return null
+}
+type Val = string | { re: string } | boolean | number
+/** A plain value at the start of `s` (a string, a regex, true, false, a number) and what's after it; null for anything else (a variable, a call). */
+function value(s: string): [Val, string] | null {
+  const l = literal(s); if (l) return l
+  const r = regex(s); if (r) return [{ re: r[0] }, r[1]]
+  const w = /^(true|false|-?\d+(?:\.\d+)?)(?![\w$])/.exec(s); if (!w) return null
+  return [w[1] === 'true' ? true : w[1] === 'false' ? false : Number(w[1]), s.slice(w[0].length)]
+}
+/** A call's arguments: its first value and, after it, an options object of plain values (`'button', { name: 'Add', exact: true }`). */
+function argsOf(args: string): { first?: Val; opts: Record<string, Val> } | null {
+  let s = args.trim(), first: Val | undefined
+  if (s && s[0] !== '{') { const v = value(s); if (!v) return null; first = v[0]; s = v[1].trim().replace(/^,\s*/, '') }
+  const opts: Record<string, Val> = {}
+  if (!s) return { first, opts }
+  if (s[0] !== '{') return null
+  for (s = s.slice(1).trim(); s[0] !== '}'; s = s.trim()) {
+    const k = /^([A-Za-z_$][\w$]*)\s*:\s*/.exec(s); if (!k) return null
+    const v = value(s.slice(k[0].length)); if (!v) return null
+    opts[k[1]!] = v[0]; s = v[1].trim(); if (s[0] === ',') s = s.slice(1)
+  }
+  return s.slice(1).trim() ? null : { first, opts }
+}
+/** A text in a selector the way Playwright writes it for the getBy… call (its own `internal:` selectors): quoted with `i`, or `s` when exact. */
+const quoted = (v: Val, exact: unknown, attr = false): string | null => typeof v === 'object'
+  ? v.re.replace(/(^|[^\\])(\\\\)*(["'`])/g, '$1$2\\$3').replace(/>>/g, '\\>\\>')
+  : typeof v !== 'string' ? null : `${attr ? `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : JSON.stringify(v)}${exact === true ? 's' : 'i'}`
+const ROLE_OPTS: [string, string][] = [['checked', 'checked'], ['disabled', 'disabled'], ['selected', 'selected'], ['expanded', 'expanded'],
+  ['includeHidden', 'include-hidden'], ['level', 'level'], ['name', 'name'], ['description', 'description'], ['pressed', 'pressed']]
+const ATTRS: Record<string, string> = { getByPlaceholder: 'placeholder', getByTitle: 'title', getByAltText: 'alt' }
+type Call = { name: string; args: string }
+/** One call of a locator chain as the Playwright selector it stands for (what `page.getByRole(…)` itself builds), or null when a selector can't say it
+ *  (filter({ has }), a frame, an option it doesn't know). */
+function selectorOf(c: Call): string | null {
+  const a = argsOf(c.args); if (!a) return null
+  const known = (...k: string[]) => Object.keys(a.opts).every((x) => k.includes(x))
+  if (c.name === 'getByRole') {
+    if (typeof a.first !== 'string' || !/^[a-z]+$/.test(a.first) || !known('exact', ...ROLE_OPTS.map(([k]) => k))) return null
+    let out = `internal:role=${a.first}`
+    for (const [k, n] of ROLE_OPTS) {
+      const v = a.opts[k]; if (v === undefined) continue
+      const w = k === 'name' || k === 'description' ? quoted(v, a.opts.exact, true) : typeof v === 'object' ? null : String(v); if (!w) return null
+      out += `[${n}=${w}]`
+    }
+    return out
+  }
+  const t = a.first !== undefined && known('exact') ? quoted(a.first, a.opts.exact, c.name in ATTRS) : null
+  if (c.name === 'getByText' || c.name === 'getByLabel') return t && `internal:${c.name === 'getByText' ? 'text' : 'label'}=${t}`
+  if (c.name in ATTRS) return t && `internal:attr=[${ATTRS[c.name]}=${t}]`
+  if (c.name === 'getByTestId') { const v = typeof a.first === 'string' && known() ? quoted(a.first, true, true) : null; return v && `internal:testid=[data-testid=${v}]` }
+  if (c.name === 'filter') { // a filter on text: what the code generator writes to pick one row of a list
+    const [k, v] = Object.entries(a.opts)[0] ?? []; if (a.first !== undefined || Object.keys(a.opts).length !== 1 || v === undefined) return null
+    if (k === 'hasText' || k === 'hasNotText') { const w = quoted(v, false); return w && `internal:${k === 'hasText' ? 'has-text' : 'has-not-text'}=${w}` }
+    return k === 'visible' && typeof v === 'boolean' ? `visible=${v}` : null
+  }
+  if (c.name !== 'locator' || typeof a.first !== 'string' || !a.first.trim()) return null // a plain selector, maybe with a plain hasText (Bug 173)
+  const has = a.opts.hasText; if (!known('hasText') || (has !== undefined && typeof has !== 'string')) return null
+  return has !== undefined ? `${a.first}:has-text(${JSON.stringify(has)})` : a.first
+}
+/** The element a getBy… call names by its own words: `getByRole('button', { name: 'Add' })`, `getByText('…')`, `getByLabel('…')`, `getByPlaceholder('…')`. */
+function target(c: Call): Pick<Step, 'role' | 'name' | 'text' | 'label'> | null {
+  const m = /^getBy(Role|Text|Label|Placeholder|Title|AltText|TestId)$/.exec(c.name), a = m ? argsOf(c.args) : null
+  if (!m || !a || typeof a.first !== 'string') return null
+  if (m[1] === 'Role') return { role: a.first, ...(typeof a.opts.name === 'string' ? { name: a.opts.name } : {}) }
+  return m[1] === 'Label' || m[1] === 'Placeholder' ? { label: a.first } : { text: a.first }
+}
+/** A locator chain (`locator('li').first()`) as its calls, each with its arguments' text; null when it isn't a plain chain of calls. */
+function calls(chain: string): Call[] | null {
+  const out: Call[] = []
+  for (let s = chain.trim(); s; s = s.trim()) {
+    const m = /^\.?([A-Za-z_$][\w$]*)\(/.exec(s); if (!m) return null
+    let i = m[0].length, depth = 1
+    while (i < s.length && depth) {
+      const c = s[i]!
+      if (c === '\'' || c === '"' || c === '`') { const l = literal(s.slice(i)); if (!l) return null; i = s.length - l[1].length; continue }
+      if (c === '/' && /[(,:]\s*$/.test(s.slice(0, i))) { const r = regex(s.slice(i)); if (r) { i = s.length - r[1].length; continue } }
+      if (c === '(') depth++; else if (c === ')') depth--
+      i++
+    }
+    if (depth) return null
+    out.push({ name: m[1]!, args: s.slice(m[0].length, i - 1).trim() }); s = s.slice(i)
+  }
+  return out
+}
+/** Which match a call takes: first() 0, last() -1, nth(n) n; undefined for any other call. */
+const pick = (c: Call): number | undefined => c.name === 'first' && !c.args ? 0 : c.name === 'last' && !c.args ? -1
+  : c.name === 'nth' && /^-?\d+$/.test(c.args) ? Number(c.args) : undefined
+/** The element a locator chain names, as a script can find it again. One plain getByRole, getByText, getByLabel or getByPlaceholder (texts only, no option
+ *  but a role's name): that element by its own words, and which of its matches it took when that's not the first (Bug 198: Playwright MCP writes `getByRole('button', { name: 'Edit' }).nth(1)`
+ *  for the second row's Edit). Any other chain (`exact: true` or a regex, which the words can't keep; Bug 173: `locator('button:has-text("Remove")')`;
+ *  Bug 198: `getByRole('row', { name: 'Dune' }).getByRole('button')`): the whole chain as one
+ *  Playwright selector, each later call inside the earlier ones joined by ` >> ` as Playwright itself does, with the match the chain ends on, and the last
+ *  element's own words when a getBy… call names it (never the first one's: that's only what it sits in). Null for anything a selector can't say: never a
+ *  wrong element. */
+function elementOf(chain: string): Pick<Step, 'role' | 'name' | 'text' | 'label' | 'css' | 'nth'> | null {
+  const cs = calls(chain); if (!cs?.length) return null
+  const a = argsOf(cs[0]!.args), plain = /^getBy(Role|Text|Label|Placeholder)$/.test(cs[0]!.name) && typeof a?.first === 'string'
+    && Object.entries(a.opts).every(([k, v]) => k === 'name' && typeof v === 'string' && cs[0]!.name === 'getByRole')
+  const one = plain && (cs.length === 1 || (cs.length === 2 && pick(cs[1]!) !== undefined)) ? target(cs[0]!) : null, n = cs.length === 2 ? pick(cs[1]!) : undefined
+  if (one) return { ...one, ...(n ? { nth: n } : {}) }
+  const parts: string[] = []; let nth: number | undefined, el: Pick<Step, 'role' | 'name' | 'text' | 'label'> = {}
+  for (const c of cs) {
+    if (nth !== undefined) { parts.push(`nth=${nth}`); nth = undefined }
+    const p = pick(c); if (p !== undefined) { nth = p; continue }
+    const sel = selectorOf(c); if (!sel) return null
+    parts.push(sel); if (c.name !== 'filter') el = target(c) ?? {}
+  }
+  return parts.length ? { ...el, css: parts.join(' >> '), ...(nth !== undefined ? { nth } : {}) } : null
 }
 const ACTIONS: Record<string, Step['action']> = { click: 'click', dblclick: 'click', fill: 'fill', press: 'press', pressSequentially: 'fill', selectOption: 'select',
   check: 'check', uncheck: 'uncheck', hover: 'hover', setChecked: 'check' }
@@ -159,7 +280,7 @@ export function stepOf(code: string, origin: string): Step | null {
   const key = /^await page\.keyboard\.press\((.*)\)$/.exec(c)
   if (key) { const k = literal(key[1]!.trim()); return k ? { action: 'press', value: k[0], code: c } : null }
   const m = /^await page\.(.+)\.(click|dblclick|fill|press|pressSequentially|selectOption|check|uncheck|hover|setChecked)\((.*)\)$/.exec(c); if (!m) return null
-  const loc = m[1]!.split(/\.(?=getBy|locator|first\(|nth\(|filter\()/).map((x) => target(x)).find(Boolean)
+  const loc = elementOf(m[1]!)
   const arg = m[3]!.trim(), lit = literal(arg), arr = arg.startsWith('[') ? literal(arg.slice(1).trim()) : null
   const value = lit?.[0] ?? arr?.[0]
   return { action: ACTIONS[m[2]!]!, ...(loc ?? {}), ...(value !== undefined ? { value } : {}), code: c }
@@ -177,7 +298,15 @@ export function onPage(page: string, el: { role?: string; name?: string; text?: 
 }
 
 // --- What the tester reports ------------------------------------------------------------------------------------------------------------------------------
-type Said = { outcome?: unknown; notes?: unknown; findings?: unknown }
+type Said = { outcome?: unknown; notes?: unknown; findings?: unknown; couldnt_test?: unknown }
+/** A finding that is really the tester saying it couldn't try something from the browser, not what the app did (Bug 223: "I couldn't change the clock to
+ *  check the morning greeting", kept as a finding that broke the greeting's criteria): the machine's clock, date or time zone, which no page lets a person
+ *  change. Narrow on purpose: "couldn't set the time on the reminder", "couldn't change the alarm clock" or "the clock format" are about the app, and stay
+ *  findings. The prompt asks for `couldnt_test` instead; this catches the tester that still writes it as a finding. */
+const CANT_TRY = new RegExp(String.raw`\b(?:couldn'?t|could not|can'?t|cannot|unable to|no way to)\s+(?:change|set|move|control|fake|mock|simulate|adjust|alter|override|advance)`
+  + String.raw`\s+(?:the\s+|my\s+|its\s+|this\s+)?(?:(?:system|device|computer|machine|browser|real|current|actual)(?:'s)?\s+(?:clock|time|date|time ?zone)\b`
+  + String.raw`|(?:clock|time of day)\b(?!\s+(?:format|style|setting|display|widget|face|picker|field|box)))`, 'i')
+export const cantTry = (words: string): boolean => CANT_TRY.test(words.replace(/[’‘]/g, "'"))
 /** What HQ keeps of a scenario's report: an outcome it can give, at most three findings with a known kind and something to say, each with the steps up to
  *  the one it names (HQ's own record of what ran, not the tester's words) and, when it named an element it looked for, whether that element was in the last
  *  page it read there. `steps`: what each action of the scenario ran, in order, as the tester counts them for `at_step` (spike: it counts actions, not
@@ -186,9 +315,12 @@ export function keepReport(raw: unknown, s: Scenario, steps: Step[][], pages: { 
   'outcome' | 'why' | 'findings' | 'notes'> {
   const r = (raw && typeof raw === 'object' ? raw : {}) as Said
   const notes = (Array.isArray(r.notes) ? r.notes : []).map((n) => line(n, 200)).filter(Boolean).slice(0, 8)
-  const findings: UiFinding[] = []
+  const findings: UiFinding[] = [], cant: string[] = [] // what the tester couldn't try, in its words (Bug 223)
+  const said = String(r.outcome ?? ''), untested = said === 'couldnt_test', told = line(r.couldnt_test, 300)
   for (const f of Array.isArray(r.findings) ? r.findings as Record<string, unknown>[] : []) {
     const kind = String(f?.kind ?? '') as FindingKind, what = line(f?.what, 400), expected = line(f?.expected, 300)
+    // No verdict, so nothing to fix: what it wrote as a finding anyway is kept as a note
+    if (what.length >= 10 && (untested || cantTry(what))) { cant.push(what); continue }
     if (!FINDING_KINDS.includes(kind) || what.length < 10 || findings.length >= MAX_FINDINGS) continue
     const at = Math.min(Math.max(Math.round(Number(f.at_step) || steps.length), 1), Math.max(steps.length, 1))
     const criterion = knownCriterion(f.criterion, ids), lf = (f.looked_for && typeof f.looked_for === 'object' ? f.looked_for : null) as Record<string, unknown> | null
@@ -197,7 +329,11 @@ export function keepReport(raw: unknown, s: Scenario, steps: Step[][], pages: { 
     const expect = el && (el.role || el.text) && page ? [{ ...el, visible: onPage(page.text, el) }] : undefined
     findings.push({ id: '', scenario: s.id, kind, what, expected, steps: steps.slice(0, at).flat(), ...(criterion ? { criterion } : {}), ...(expect ? { expect } : {}) })
   }
-  const said = String(r.outcome ?? '')
+  const why = told || cant[0] || ''
+  if (!findings.length && (untested || cant.length)) {
+    return { outcome: 'couldnt_test', why: why || 'the tester couldn\'t try it from the browser', findings, notes: [...notes, ...cant.filter((c) => c !== why)].slice(0, 8) }
+  }
+  if (why) notes.push(`Couldn't check: ${why}`) // a real finding, and something it couldn't try: the finding is the verdict
   if (!findings.length && said === 'problem') return { outcome: 'unspecified', why: 'the tester saw a problem but reported no finding HQ could keep', findings, notes }
   return { outcome: findings.length ? 'problem' : said === 'unspecified' ? 'unspecified' : 'ok', findings, notes }
 }
@@ -210,7 +346,8 @@ const KIND_WORDS: Record<FindingKind, string> = { stuck: 'stuck', confusing: 'co
 const cut = (v: string): string => v.length > 40 ? `${v.slice(0, 37)}…` : v
 /** A step in a few words, for a person reading the summary. */
 export function stepWords(s: Step): string {
-  const el = s.role ? `${s.role}${s.name ? ` "${s.name}"` : ''}` : s.label ? `"${s.label}"` : s.text ? `"${s.text}"` : ''
+  const el = s.role || s.label || s.text ? `${ordinal(s.nth)}${s.role ? `${s.role}${s.name ? ` "${s.name}"` : ''}` : `"${s.label ?? s.text}"`}${within(s.css)}`
+    : s.css ? cssWords(s.css, s.nth) : ''
   switch (s.action) {
     case 'navigate': return `open ${s.url}`
     case 'back': return 'go back'
@@ -223,18 +360,28 @@ export function stepWords(s: Step): string {
 const things = (n: number, one: string): string => `${n} ${one}${n === 1 ? '' : 's'}`
 /** A finding's steps in words: the last seven of a long chain (all of them are in the scenario's file). */
 const chain = (steps: Step[]): string => (steps.length > 8 ? [`(${steps.length - 7} steps before)`, ...steps.slice(-7).map(stepWords)] : steps.map(stepWords)).join(' → ')
-/** The run summary's lines for the tester: what it covered, each finding with its steps, then one line per scenario that went fine or had no verdict. */
+/** The run summary's lines for the tester: what it covered, each finding with its steps, then one line per scenario that went fine or had no verdict. When
+ *  none ran, all for one reason, that reason once (Bug 170: thirty lines of the same words hid it). */
 export function uiTestLines(u: UiTest | null): string[] {
   if (!u) return []
   if (u.state === 'skipped') return u.quiet ? [] : [`- Not tried: ${u.why}`]
   const by = (o: Outcome) => u.scenarios.filter((s) => s.outcome === o)
+  const whys = new Set(u.scenarios.map((s) => s.why))
+  if (u.scenarios.length > 1 && by('not_run').length === u.scenarios.length && whys.size === 1) {
+    const why = [...whys][0]; return [`- ${things(u.scenarios.length, 'scenario')}, none run${why ? ` (${why})` : ''}`]
+  }
   const head = `- ${things(u.scenarios.length, 'scenario')}: ${by('ok').length} fine, ${things(u.findings.length, 'finding')}, ${by('unspecified').length} unspecified`
-    + `${by('not_run').length ? `, ${by('not_run').length} not run` : ''}`
+    + `${by('couldnt_test').length ? `, ${by('couldnt_test').length} couldn't test` : ''}${by('not_run').length ? `, ${by('not_run').length} not run` : ''}`
   const title = (id: string) => u.scenarios.find((s) => s.id === id)?.title ?? id
+  const verdict = (s: typeof u.scenarios[number]): string => s.outcome === 'ok' ? 'fine'
+    : s.outcome === 'unspecified' ? `no verdict (${s.why ?? 'the map and criteria don\'t say what should happen'})`
+    // Not a finding (Bug 223): no verdict on what it's about, and nothing to fix
+    : s.outcome === 'couldnt_test' ? `couldn't test it from a browser, so ${s.criteria?.length ? `${s.criteria.join(', ')} ${s.criteria.length === 1 ? 'has' : 'have'}`
+      : 'it has'} no verdict here (${s.why ?? 'no reason given'})`
+    : `not run${s.why ? ` (${s.why})` : ''}`
   return [head,
     ...u.findings.map((f) => `- ${f.id} (${KIND_WORDS[f.kind]}, ${f.scenario} ${title(f.scenario)}${f.criterion ? `, ${f.criterion}` : ''}): ${f.what}`
       + `${f.expected ? ` Expected: ${f.expected}` : ''}${f.steps.length ? ` Steps: ${chain(f.steps)}` : ''}`),
-    ...u.scenarios.filter((s) => s.outcome !== 'problem').map((s) => `- ${s.id} ${s.title}: ${s.outcome === 'ok' ? 'fine' : s.outcome === 'unspecified'
-      ? `no verdict (${s.why ?? 'the map and criteria don\'t say what should happen'})` : `not run${s.why ? ` (${s.why})` : ''}`}`)]
+    ...u.scenarios.filter((s) => s.outcome !== 'problem').map((s) => `- ${s.id} ${s.title}: ${verdict(s)}`)]
 }
 export const uiTestOf = (json: string | null | undefined): UiTest | null => { try { return json ? JSON.parse(json) as UiTest : null } catch { return null } }

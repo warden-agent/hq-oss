@@ -108,7 +108,7 @@ export const syncDone = (repoId: string): Promise<unknown> => (syncing.get(repoI
 function noticePushChange(before: Repo, after: Repo): void {
   const kind = `repo_local:${after.id}`
   if (localOnly(after) && !localOnly(before)) {
-    attention(kind, `HQ can't push to ${after.name}, so work there stays on this Mac: finished tickets get Merge into main, nothing goes to GitHub.`)
+    attention(kind, `HQ can't push to ${after.name}, so work there stays on this Mac: finished tickets get Merge into ${after.default_branch}, nothing goes to GitHub.`)
   } else if (localOnly(before) && after.can_push === 1) {
     resolveKind(kind, null)
     attention(kind, `HQ can push to ${after.name} now: tickets that finish from now on get PRs. Anything already merged into your local ${after.default_branch} isn't on GitHub.`)

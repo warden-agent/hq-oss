@@ -10,10 +10,11 @@ import { git } from './reposync.ts'
 export type MergeResult = { ok: true; sha: string; already: boolean } | { ok: false; why: string; conflicts?: string[] }
 export const names = (files: string[]): string => files.length > 5 ? `${files.slice(0, 5).join(', ')} and ${files.length - 5} more` : files.join(', ')
 
-/** Merge `branch` into `into` in the checkout at `repoPath` with a merge commit (subject, then each body paragraph). */
-export async function mergeIntoMain(repoPath: string, o: { branch: string; into: string; subject: string; body: string[] }): Promise<MergeResult> {
+/** Merge `branch` into `into` in the checkout at `repoPath` with a merge commit (subject, then each body paragraph). `sha`: merge that commit of the branch, not
+ *  its tip (Bug 143: auto mode merges the commit it tested, and nothing the branch got after it). */
+export async function mergeIntoMain(repoPath: string, o: { branch: string; sha?: string; into: string; subject: string; body: string[] }): Promise<MergeResult> {
   const repo = path.basename(repoPath)
-  const tip = await git(repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${o.branch}^{commit}`]).catch(() => '')
+  const tip = await git(repoPath, ['rev-parse', '--verify', '--quiet', `${o.sha ?? `refs/heads/${o.branch}`}^{commit}`]).catch(() => '')
   if (!tip) return { ok: false, why: `Branch ${o.branch} is gone, so there's nothing to merge.` }
   const main = await git(repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${o.into}^{commit}`]).catch(() => '')
   if (!main) return { ok: false, why: `${repo} has no ${o.into} branch.` }

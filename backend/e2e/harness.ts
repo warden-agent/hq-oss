@@ -8,13 +8,14 @@ import net from 'node:net'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { pidsUnder } from '../src/procs.ts'
+import { elapsedMs, pidsUnder } from '../src/procs.ts'
 import { CHECKED_VERSION } from '../src/claudeversion.ts'
 import { PORT_TAKEN_EXIT } from '../src/ports.ts'
 
 const BACKEND = path.resolve(import.meta.dirname, '..')
 const FAKE = path.join(import.meta.dirname, 'fake-claude.mjs')
 const STOP_MS = 10_000, PIPE_MS = 3000 // a backend exits at once on SIGTERM (index.ts), and its pipes close with it
+const START_MS = 20_000 // for the backend to listen, and again to answer
 
 export const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 /** Polls `fn` every 100ms until it returns something truthy. */
@@ -60,24 +61,32 @@ const workingFolders = (): string => { try { return execFileSync('lsof', ['-d', 
 /** SIGKILLs every process group that has a process naming `root` on its command line (a preview's supervisor runs a spec under
  *  HQ_HOME) or working inside it (a test run: `npm test` has no path on its command line, Bug 69), except this test process's own
  *  group. Bug 47: nothing a run started outlives it, even when tmux's hang-up doesn't reach it. Synchronous, so it also works in an
- *  exit handler. */
-function killLeftovers(root: string): void {
-  const rows = execFileSync('ps', ['-axo', 'pid=,pgid=,command='], { encoding: 'utf8' }).split('\n')
-    .map((l) => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(l)).filter((m) => !!m).map((m) => ({ pid: Number(m[1]), pgid: Number(m[2]), cmd: m[3]! }))
+ *  exit handler. Bug 199: never a group with a process that began before this test HQ (`born`): the test HQ didn't start that group,
+ *  it's someone else's (a shell that looked into the folder, say), and a signal to it would stop processes the test never started. */
+export function leftoverGroups(rows: { pid: number; pgid: number; cmd: string; start: number }[], root: string, inside: Set<number>, mine: number | undefined,
+  born: number): number[] {
+  const hit = new Set(rows.filter((r) => (r.cmd.includes(root) || inside.has(r.pid)) && r.pgid > 1 && r.pgid !== mine).map((r) => r.pgid))
+  for (const r of rows) if (r.start < born) hit.delete(r.pgid) // ps counts whole seconds, so a start read from it is never early
+  return [...hit]
+}
+function killLeftovers(root: string, born: number): void {
+  const now = Date.now(), rows = execFileSync('ps', ['-axo', 'pid=,pgid=,etime=,command='], { encoding: 'utf8' }).split('\n')
+    .map((l) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s(.*)$/.exec(l)).filter((m) => !!m)
+    .map((m) => ({ pid: Number(m[1]), pgid: Number(m[2]), start: now - elapsedMs(m[3]!), cmd: m[4]! }))
   const mine = rows.find((r) => r.pid === process.pid)?.pgid, inside = new Set(pidsUnder(workingFolders(), root))
-  for (const g of new Set(rows.filter((r) => (r.cmd.includes(root) || inside.has(r.pid)) && r.pgid > 1 && r.pgid !== mine).map((r) => r.pgid))) {
-    try { process.kill(-g, 'SIGKILL') } catch { /* gone */ }
-  }
+  for (const g of leftoverGroups(rows, root, inside, mine, born)) { try { process.kill(-g, 'SIGKILL') } catch { /* gone */ } }
 }
 /** Test HQs still running: an interrupted run (Ctrl-C, a crash before `after`) stops them on its way out. */
 const live = new Set<() => void>()
 const abortAll = () => { for (const f of live) f() }
 process.once('exit', abortAll)
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.once(sig, () => { abortAll(); process.exit(130) })
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.once(sig, () => { abortAll(); process.exit(128 + os.constants.signals[sig]) }) // SIGHUP: own-tmp.mjs passes it on
 
 export type Hq = Awaited<ReturnType<typeof startHq>>
-/** `env`: extra environment for the backend (a fake `gh` on PATH, say). `ports`: the first try's ports, for a test of a taken one. */
-export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Record<'ui' | 'hooks' | 'mcp', number>> } = {}) {
+/** `env`: extra environment for the backend (a fake `gh` on PATH, say). `ports`: the first try's ports, for a test of a taken one. `startMs`: how long a start
+ *  may take to listen, and then to answer (a test of one that doesn't). */
+export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Record<'ui' | 'hooks' | 'mcp', number>>; startMs?: number } = {}) {
+  const born = Date.now() // Bug 199: nothing older than this test HQ is its leftover
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-e2e-')))
   const tmuxDir = fs.mkdtempSync(path.join(process.env.HQ_SHORT_TMPDIR ?? '/tmp', 'hq-e2e-')) // unix socket paths must stay short
   const home = path.join(root, 'home'), hqHome = path.join(root, 'hq'); fs.mkdirSync(home)
@@ -117,19 +126,26 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
   const state = async (): Promise<any> => (await api('state')).json
   /** Starts the backend and waits until it listens on all three of its ports. Bug 92: a port can be taken between the pick and the backend's
    *  listen (by a test HQ in another file, say). HQ then ran on without that server, and a test's MCP calls reached a hooks server (404).
-   *  Since Bug 118 the backend stops by itself then, with its own exit code. False when a port was taken. */
+   *  Since Bug 118 the backend stops by itself then, with its own exit code. False when a port was taken. Bug 166: a start that fails or runs out of time
+   *  stops the backend it spawned before it throws; a live one kept the test file running for good. */
   async function tryStart(): Promise<boolean> {
     const p = spawn(process.execPath, ['--experimental-strip-types', 'src/index.ts'], { cwd: BACKEND, env, stdio: ['ignore', 'pipe', 'pipe'] })
-    proc = p; started.push(p); const from = log.length // this start's output
+    proc = p; started.push(p); const from = log.length, ms = o.startMs ?? START_MS // this start's output
     p.stdout!.on('data', (d) => { log += d }); p.stderr!.on('data', (d) => { log += d })
-    const got = await waitFor('the backend to listen on its ports', () => {
-      if (p.exitCode === PORT_TAKEN_EXIT) return 'taken'
-      if (p.exitCode !== null || p.signalCode !== null) throw new Error(`the test HQ exited at startup:\n${log.slice(from)}`)
-      const mine = listeningPorts(p.pid!); return Object.values(ports).every((x) => mine.includes(x)) ? 'all' : null
-    }, 20_000)
-    if (got === 'taken') { await stopBackend(); return false }
-    await waitFor('the backend to answer', async () => (await fetch(`http://127.0.0.1:${ports.ui}/api/state`, { headers: { authorization: `Bearer ${uiToken()}` } }).catch(() => null))?.ok, 20_000)
-    return true
+    try {
+      const got = await waitFor('the backend to listen on its ports', () => {
+        if (p.exitCode === PORT_TAKEN_EXIT) return 'taken'
+        if (p.exitCode !== null || p.signalCode !== null) throw new Error(`the test HQ exited at startup:\n${log.slice(from)}`)
+        const mine = listeningPorts(p.pid!); return Object.values(ports).every((x) => mine.includes(x)) ? 'all' : null
+      }, ms)
+      if (got === 'taken') { await stopBackend(); return false }
+      await waitFor('the backend to answer', async () => (await fetch(`http://127.0.0.1:${ports.ui}/api/state`, { headers: { authorization: `Bearer ${uiToken()}` } }).catch(() => null))?.ok, ms)
+      return true
+    } catch (e) {
+      const problems = [(e as Error).message]; await stopBackend().catch((x) => { problems.push((x as Error).message) })
+      if (!(e as Error).message.includes('exited at startup')) problems.push(`its output:\n${log.slice(from)}`)
+      throw new Error(problems.join('\n'))
+    }
   }
   /** A restart keeps its ports: running agents were given them. */
   async function startBackend(): Promise<void> {
@@ -152,13 +168,17 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
   const started: ChildProcess[] = [] // every backend process this test HQ ran (restarts too), kept past stopBackend for their pipes
   const abort = () => { // the test process is going: its folders go too, last, since no tmux call may come after (Bug 81)
     try { proc?.kill('SIGKILL') } catch { /* gone */ }
-    killTmux(); killLeftovers(root)
+    killTmux(); killLeftovers(root, born)
     fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(tmuxDir, { recursive: true, force: true })
   }
   live.add(abort)
-  for (let tries = 1; !await tryStart(); tries++) { // nothing has its ports yet: new ones
-    if (tries === 3) { abort(); live.delete(abort); throw new Error(`the test HQ's ports were taken ${tries} times:\n${log}`) }
-    Object.assign(ports, await pick()); await usePorts()
+  try {
+    for (let tries = 1; !await tryStart(); tries++) { // nothing has its ports yet: new ones
+      if (tries === 3) throw new Error(`the test HQ's ports were taken ${tries} times:\n${log}`)
+      Object.assign(ports, await pick()); await usePorts()
+    }
+  } catch (e) { // Bug 166: no test HQ to stop for the file's after(), so all of it goes here: its tmux server, what it started, its folders, its pipes
+    live.delete(abort); abort(); await Promise.all(started.map(outputHeld)); throw e
   }
   let stopped = false
 
@@ -173,22 +193,29 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
       if (stopped) return; stopped = true
       const problems: string[] = []; await stopBackend().catch((e) => { problems.push((e as Error).message) })
       fs.writeFileSync(path.join(process.env.HQ_OUTER_TMPDIR ?? os.tmpdir(), 'hq-e2e-last.log'), log)
-      live.delete(abort); killLeftovers(root) // previews first: HQ leaves them running on purpose (a restart picks them up)
+      live.delete(abort); killLeftovers(root, born) // previews first: HQ leaves them running on purpose (a restart picks them up)
       killTmux()
       fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(tmuxDir, { recursive: true, force: true })
       if ((await Promise.all(started.map(outputHeld))).some(Boolean)) problems.push(`a process the test HQ started still held its output ${PIPE_MS / 1000} s after it stopped`)
       if (problems.length) throw new Error(problems.join('; '))
     },
-    /** What Claude Code's status file says for this agent (Bug 62, presence.ts): `status` busy, idle or waiting, changed now unless `at` says when. */
-    async session(agentId: string, status: string, at = Date.now()): Promise<void> {
-      const sid = (await state()).agents.find((a: any) => a.id === agentId)?.claude_session_id, dir = path.join(home, '.claude', 'sessions')
-      for (const f of fs.readdirSync(dir)) {
-        const p = path.join(dir, f), j = JSON.parse(fs.readFileSync(p, 'utf8')); if (j.sessionId === sid) fs.writeFileSync(p, JSON.stringify({ ...j, status, statusUpdatedAt: at }))
+    /** What Claude Code's status file says for this agent (Bug 62, presence.ts): `status` busy, idle or waiting, changed now unless `at` says when.
+     *  Given the agent as read before, it needs no backend (Bug 217: a dialog answered while HQ is down). */
+    async session(agent: string | { id: string; claude_session_id: string }, status: string, at = Date.now()): Promise<void> {
+      const agentId = typeof agent === 'string' ? agent : agent.id, dir = path.join(home, '.claude', 'sessions')
+      const sid = typeof agent === 'string' ? (await state()).agents.find((a: any) => a.id === agentId)?.claude_session_id : agent.claude_session_id
+      const own = (): { p: string; j: any } | null => { // Bug 159: another agent's file can be one being written; it isn't this one
+        let files: string[] = []; try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')) } catch { return null }
+        for (const f of files) { try { const p = path.join(dir, f), j = JSON.parse(fs.readFileSync(p, 'utf8')); if (j.sessionId === sid) return { p, j } } catch { /* not whole */ } }
+        return null
       }
+      const { p, j } = await waitFor(`${agentId}'s status file (session ${sid})`, own, 5000) // a test never changes nothing without being told
+      fs.writeFileSync(`${p}.tmp`, JSON.stringify({ ...j, status, statusUpdatedAt: at })); fs.renameSync(`${p}.tmp`, p) // whole, like the fake's (HQ reads only .json)
     },
-    /** Draws `text` as the agent's screen (fake-claude.mjs shows it), e.g. a dialog's menu. */
-    async screen(agentId: string, text: string): Promise<void> {
-      const sid = (await state()).agents.find((a: any) => a.id === agentId)?.claude_session_id; fs.writeFileSync(path.join(screens, `${sid}.txt`), text)
+    /** Draws `text` as the agent's screen (fake-claude.mjs shows it), e.g. a dialog's menu. Given the agent as read before, it needs no backend. */
+    async screen(agent: string | { id: string; claude_session_id: string }, text: string): Promise<void> {
+      const sid = typeof agent === 'string' ? (await state()).agents.find((a: any) => a.id === agent)?.claude_session_id : agent.claude_session_id
+      fs.writeFileSync(path.join(screens, `${sid}.txt`), text)
     },
     /** Starts `cmd` as the agent's Bash command would run: a child of its (fake) Claude Code in a process group of its own. Its pid. */
     async spawn(agentId: string, cmd: string): Promise<number> {
@@ -238,8 +265,10 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
 
 /** An ExitPlanMode permission request as Claude Code sends it in plan mode. */
 export const exitPlanMode = (plan: string) => ({ hook_event_name: 'PermissionRequest', tool_name: 'ExitPlanMode', tool_input: { plan, planFilePath: null }, permission_mode: 'plan' })
-/** Whether a promise is still pending after `ms`. */
-export const pendingAfter = (p: Promise<unknown>, ms: number): Promise<boolean> => Promise.race([p.then(() => false, () => false), new Promise<boolean>((r) => setTimeout(() => r(true), ms))])
+/** Whether a promise is still pending after `ms`. Its timer goes when the promise settles: a stopped backend's 10 s one kept a failed file running (Bug 166). */
+export const pendingAfter = (p: Promise<unknown>, ms: number): Promise<boolean> => new Promise((resolve) => {
+  const t = setTimeout(() => resolve(true), ms), done = () => { clearTimeout(t); resolve(false) }; p.then(done, done)
+})
 /** `git worktree list --porcelain` lock line for a worktree path, or null. */
 export function lockOf(repo: string, wt: string): string | null {
   const block = sh(repo, 'worktree', 'list', '--porcelain').split('\n\n').find((b) => b.startsWith(`worktree ${wt}\n`))

@@ -96,6 +96,9 @@ test("Bug 96: the engineer prompt says what a Bash timeout really does, and neve
   assert.match(text, /never end your turn to wait on a run that is still going/)
   const { testCmdNote } = await import('./tickets.ts')
   assert.match(testCmdNote('npm test'), /^While you work, run only the tests for what you changed\. .*run it once, just before open_pr: .*: npm test$/)
+  const from = testCmdNote('npm run t', { key: 'T-01', base: 'origin/main' }) // Bug 147: a repair's command may need what its branch adds
+  assert.match(from, /usual one\. It came with T-01, which isn't in origin\/main yet.* merge origin\/main into your branch \(git merge --no-edit origin\/main;.*The command: npm run t$/)
+  assert.doesNotMatch(testCmdNote('npm test'), /T-01|git merge/)
 })
 
 test('Bug 87: no hook URL or command holds the agent\'s token; http hooks send it in a header, and SessionStart reads it from a file', async () => {
@@ -146,4 +149,26 @@ test('Bug 111: no role denies `Cd` (Claude Code 2.1.322 calls that a typo on eve
     assert.ok(roleFlags(role, { worktreeName: 'w', model: 'm' }).includes('--disable-slash-commands'), role)
   }
   assert.equal((buildSettings('tpm', 'tok', { agentDir: tmp }) as any).permissions.deny, undefined)
+})
+
+test('Bug 71: engineers and the Launch helper reach crates.io and may read rustup\'s programs and toolchains, and no other part of home', () => {
+  const r = path.join(tmp, 'rust'), cargo = path.join(r, 'cargo'), rustup = path.join(r, 'real-rustup')
+  fs.mkdirSync(path.join(cargo, 'bin'), { recursive: true }); fs.mkdirSync(rustup); fs.symlinkSync(rustup, path.join(r, 'rustup'))
+  const saved = { CARGO_HOME: process.env.CARGO_HOME, RUSTUP_HOME: process.env.RUSTUP_HOME }
+  try {
+    process.env.CARGO_HOME = cargo; process.env.RUSTUP_HOME = path.join(r, 'rustup')
+    for (const role of ['engineer', 'launcher'] as const) {
+      const s = buildSettings(role, 'tok', { agentDir: tmp }) as any
+      for (const d of ['index.crates.io', 'static.crates.io']) assert.ok(s.sandbox.network.allowedDomains.includes(d), `${role} ${d}`)
+      const reads: string[] = s.sandbox.filesystem.allowRead // ~/.cargo/bin only, not ~/.cargo (credentials); a linked folder by both spellings
+      const both = (p: string) => [p, fs.realpathSync(p)]
+      assert.deepEqual(reads.sort(), [...new Set([...both(path.join(cargo, 'bin')), ...both(path.join(r, 'rustup'))])].sort(), role)
+      assert.ok(reads.includes(path.join(r, 'rustup')) && reads.includes(fs.realpathSync(rustup)), role)
+      assert.ok(!reads.includes(os.homedir()) && !reads.includes(cargo), role)
+    }
+    process.env.CARGO_HOME = path.join(r, 'none'); process.env.RUSTUP_HOME = path.join(r, 'none2') // no rustup on this machine: nothing to read
+    assert.deepEqual((buildSettings('engineer', 'tok', { agentDir: tmp }) as any).sandbox.filesystem.allowRead, [])
+  } finally {
+    for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v
+  }
 })

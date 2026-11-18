@@ -1,7 +1,7 @@
 // The UI's "needs you" list (Bug 24, frontend/src/needs.ts): what counts in the tab title and what pops up a notification.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { askedWho, claudeLine, firstLine, forRepo, goodNews, keysText, needsYou, newNeeds, plainNews, splitNeeds, ticketQuestion, titleFor, turnQuestionText, uncountedQuestions,
+import { askedWho, claudeLine, firstLine, forRepo, goodNews, keysText, needsYou, newNeeds, plainNews, splitNeeds, ticketBase, ticketQuestion, titleFor, turnQuestionText, uncountedQuestions,
   yourTurn }
   from '../../frontend/src/needs.ts'
 
@@ -23,6 +23,13 @@ test('needsYou: plans waiting, finished tickets and alerting notices, in every r
     ['fix:t3', 'api-server: T3 clashes with main: press Fix conflicts', 'r2'],
     ['attention:1', 'api-server: TPM search: no events for 10 min', 'r2'], // stuck alerts; "merged" (info), a resolved one and a cancelled feature don't
   ])
+})
+
+test('Bug 210: a ticket to fix clashes with its project\'s own default branch', () => {
+  const s = state(); s.repos[1] = { ...s.repos[1]!, default_branch: 'master' } as never
+  assert.ok(needsYou(s, (t) => acts[t.id] ?? null).some((n) => n.key === 'fix:t3' && n.text === 'api-server: T3 clashes with master: press Fix conflicts'))
+  assert.equal(ticketBase(s, 't1'), 'main') // a repo with no default_branch in the state yet
+  assert.equal(ticketBase(s, 'gone'), 'main')
 })
 
 test('Bug 61: a run\'s finished and stopped notices count for their project, and go from the count once resolved', () => {

@@ -12,8 +12,9 @@ function gh(args: string[], o: SyncOpts): Promise<string> {
 }
 
 /** Push `branch` to GitHub as the HQ account. Never forced. `pushUrl` stands in for github.com (tests). */
-export async function pushBranch(repoPath: string, slug: string, branch: string, o: SyncOpts & { pushUrl?: string }): Promise<void> {
-  try { await git(repoPath, ['push', o.pushUrl ?? `https://github.com/${slug}.git`, `refs/heads/${branch}:refs/heads/${branch}`], { net: o }) } catch (e) {
+/** `sha`: push that commit as the branch, not the local branch's tip (Bug 143: the commit auto mode tested). */
+export async function pushBranch(repoPath: string, slug: string, branch: string, o: SyncOpts & { pushUrl?: string; sha?: string }): Promise<void> {
+  try { await git(repoPath, ['push', o.pushUrl ?? `https://github.com/${slug}.git`, `${o.sha ?? `refs/heads/${branch}`}:refs/heads/${branch}`], { net: o }) } catch (e) {
     const s = String((e as { stderr?: string }).stderr || e)
     if (/permission .*denied|error: 403|write access/i.test(s)) throw new Error(`${o.account} can't push to ${slug}: give it Write access (GitHub → ${slug} → Settings → Collaborators)`)
     if (/non-fast-forward|fetch first/i.test(s)) throw new Error(`GitHub already has a different ${branch}; HQ won't overwrite it`)
@@ -65,9 +66,10 @@ export async function createPr(slug: string, base: string, branch: string, title
   }
 }
 /** Merge PR `number` on GitHub as the HQ account, with a normal merge commit (what GitHub's Merge button does by default).
- *  Returns the merge commit. GitHub's refusals come back in plain words (Bug 45: the user merges from HQ). */
-export async function mergePr(slug: string, number: number, o: SyncOpts): Promise<string> {
-  try { return await gh(['api', '-X', 'PUT', `repos/${slug}/pulls/${number}/merge`, '-f', 'merge_method=merge', '--jq', '.sha'], o) } catch (e) {
+ *  Returns the merge commit. GitHub's refusals come back in plain words (Bug 45: the user merges from HQ). `sha`: GitHub merges only while the PR's head is
+ *  still that commit (Bug 143: the commit auto mode tested), and refuses with 409 otherwise. */
+export async function mergePr(slug: string, number: number, o: SyncOpts, sha?: string): Promise<string> {
+  try { return await gh(['api', '-X', 'PUT', `repos/${slug}/pulls/${number}/merge`, '-f', 'merge_method=merge', ...(sha ? ['-f', `sha=${sha}`] : []), '--jq', '.sha'], o) } catch (e) {
     const s = (e as Error).message.replace(/^gh: /, ''), why = s.replace(/\s*\(HTTP \d+\)\s*$/, '')
     if (/HTTP 405/.test(s)) throw new Error(`GitHub won't merge PR #${number}: ${why}. A required check, a review rule or a conflict is in the way; see the PR on GitHub.`)
     if (/HTTP 409/.test(s)) throw new Error(`PR #${number}'s branch changed while it was being merged; try again.`)

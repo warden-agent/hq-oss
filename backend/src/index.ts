@@ -8,11 +8,12 @@ import { startHooksServer } from './hooks.ts'
 import { startMcpServer } from './mcp.ts'
 import { startUiServer } from './ui.ts'
 import { startStuckLoop } from './stuck.ts'
+import { lookAtStart } from './dialogclear.ts'
 import { startBgRuns } from './bgruns.ts'
 import { startMergeWatcher } from './mergewatch.ts'
 import { sweepWorktrees } from './slots.ts'
 import { startListeners } from './listeners.ts'
-import { recoverPreviews } from './preview.ts'
+import { recoverPreviews, resumeRestarts } from './preview.ts'
 import { recoverHelpers } from './launchhelper.ts'
 import { recoverSetupHelpers } from './testsetup.ts'
 import { repos } from './records.ts'
@@ -25,8 +26,10 @@ import { startAutoLoop } from './auto.ts'
 import { killTestRuns, sweepRunTmp, sweepTestWorktrees } from './testrun.ts'
 import { killChecks } from './checker.ts'
 import { sweepUiTmp } from './uitester.ts'
+import { plugIn } from './loopinputs.ts'
+import { realParts } from './loopparts.ts'
 import { forgetChecking } from './plancheck.ts'
-import { startLeftoverSweeps, sweepAgentTmp, sweepNow } from './leftovers.ts'
+import { readBackCommands, startLeftoverSweeps, sweepAgentTmp, sweepNow } from './leftovers.ts'
 import { checkClaude, claudeInfo, ensureClaude, startClaudeCheck } from './claudecheck.ts'
 import { saveTestCmds } from './heavy.ts'
 import { listeningOrStop, stopIfPortsTaken } from './ports.ts'
@@ -51,6 +54,7 @@ function ensureAssets(): void {
 async function main(): Promise<void> {
   await stopIfPortsTaken() // Bug 118: a port taken stops HQ here, before it touches the database, agents or leftovers
   migrate(); ensureAssets()
+  plugIn(realParts) // the findings loop reads the real recordings, test setup and UI tester run: before the auto loop can end a run
   forgetChecking() // a plan check under way when the backend last stopped went with it
   saveTestCmds() // Bug 112: for commands saved before this file existed, and projects removed since it was written
   try { await ensureClaude() } catch (e) { console.error((e as Error).message); process.exit(1) } // no agent could start
@@ -60,6 +64,7 @@ async function main(): Promise<void> {
   try { await ensureTrusted(PATHS.workspaces) } catch (e) { emit({ agentId: null, source: 'system', kind: 'trust.error', payload: { error: String(e) } }) }
   await recoverAgents()
   for (const a of liveAgents()) tellIfHqWasAway(a) // Bug 85: told to wait for HQ while it was down; an idle agent sends no hook to remind HQ
+  lookAtStart() // Bug 217: a dialog that ended while HQ was down sent its sign to no one
   await sweepWorktrees().catch((e) => emit({ agentId: null, source: 'system', kind: 'worktree.sweep.error', payload: { error: String(e) } }))
   for (const r of repos()) await sweepTestWorktrees(r.path).catch(() => {}) // a test run the last backend didn't finish
   try { // and its temp files (Bug 81)
@@ -69,8 +74,10 @@ async function main(): Promise<void> {
   await recoverHelpers(repos()).catch((e) => console.error('launch helper recovery failed', e))
   await recoverSetupHelpers(repos()).catch((e) => console.error('test setup helper recovery failed', e))
   startBgRuns() // before the first sweep and any hook: it reads back what agents wait on in the background (Bug 96)
+  readBackCommands() // what agents' commands are still running, so the sweep spares what they started (Bug 145)
   await sweepNow() // what agents' commands left running while HQ was down (Bug 75)
   await sweepAgentTmp() // and the temp folders of agents that ended meanwhile (Bug 81)
+  resumeRestarts() // an app the last backend was restarting starts again, now that the look is done (Bug 215)
   startListeners()
   await listeningOrStop({ hooks: startHooksServer(), mcp: startMcpServer(), ui: startUiServer() }) // never half-started (Bug 118)
   startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()

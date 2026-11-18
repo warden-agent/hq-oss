@@ -14,12 +14,13 @@ import { fallbackNote } from './freshstart.ts'
 import { stopFirstMap } from './firstmap.ts'
 import { finish, sweepStrays } from './launchhelper.ts'
 import { inMergeQueue } from './mergewatch.ts'
-import { noteScope, readNote, saveNote } from './notes.ts'
+import { agentNote, noteScope, saveNote } from './notes.ts'
 import { row, stopPreview } from './preview.ts'
 import { tpmWorkspace, writeProjectMd } from './projectmd.ts'
 import { features, getRepo, removing, repoOfAgent, setTicket, tickets } from './records.ts'
 import { syncDone } from './repos.ts'
-import { sweepTestWorktrees } from './testrun.ts'
+import { stopAutoTests, sweepTestWorktrees } from './testrun.ts'
+import { stopPlanChecks } from './plancheck.ts'
 import { rememberGone, sweepNow } from './leftovers.ts'
 import { sleep } from './util.ts'
 
@@ -33,7 +34,7 @@ async function stopAll(repoId: string): Promise<void> {
   for (const a of liveAgents().filter((x) => repoOfAgent(x) === repoId)) {
     if (a.fresh_start_at) update(a.id, { fresh_start_at: null, fresh_start_then: null, fresh_start_msg: null })
     const scope = noteScope(a)
-    if (scope && unfinished(a, tks) && !readNote(scope)) saveNote(a, fallbackNote(a, 'the project was removed from HQ'))
+    if (scope && unfinished(a, tks) && !agentNote(scope)) saveNote(a, fallbackNote(a, 'the project was removed from HQ'))
     await stopAgent(a.id, 'removed from HQ').catch(() => {})
   }
 }
@@ -51,6 +52,8 @@ export async function removeRepo(repoId: string, landing: string | null = null):
       for (const t of ofRepo(repoId).filter((x) => x.go_ahead)) setTicket(t.id, { go_ahead: 0 })
     })
     patch('repo', repoId, { auto_mode: 0, auto_stopped_why: null, auto_waiting: null })
+    stopAutoTests(repo.path) // its test run ends now, with no result, and one waiting for its turn never starts (Bug 152)
+    stopPlanChecks(repoId) // a reader checking one of its plans ends too, with nothing to say (Bug 177)
     await stopPreview(repoId).catch(() => {}) // also waits for a start or stop already under way
     stopFirstMap(repoId) // its checkout goes with the test worktrees below
     const p = row(repoId); if (p?.helper_agent_id || p?.helper_worktree) await finish(repoId, null, null).catch(() => {}) // only HQ's own scratch worktree goes

@@ -2,13 +2,15 @@
 // Pure apart from measuring title widths. App builds it once per state change; the graph and the top bar both read it.
 import { createContext, useContext, useRef, useState } from 'react'
 import { MarkerType, type Edge, type Node } from '@xyflow/react'
-import { api, errText, jsonList, keepNewest, showError, unmergedDeps, waitingFor, type Agent, type State } from './api'
+import { agentWord, alertFrom, api, planWait, interrupted, errText, jsonList, keepNewest, liveActivity, onDialog, showError, unmergedDeps, waitLine, type Agent, type State } from './api'
 import { ALERT_KINDS, askedWho, firstLine, goodNews, hqAnswersPlan, keysText, ticketQuestion, turnQuestionText, yourTurn, type Ask, type Question, type Turn } from './needs.ts'
 import { featureTestsLine, mergeTestOf, mergeTestWords, runWords } from './testruns.ts'
-import { planCheckOf } from '../../backend/src/checks.ts'
+import { planWaitsWhy } from '../../backend/src/checks.ts'
 import { boxCriteria, criteriaOf } from '../../backend/src/criteria.ts'
+import { archiveName } from '../../backend/src/projectname.ts'
 import { fitSets } from './fit.ts'
 import { MORE, replyPreview } from './reply.ts'
+import { kTok } from './usage.ts'
 
 export type Tone = 'plain' | 'muted' | 'amber' | 'rose' | 'sky' | 'emerald' | 'indigo'
 /** `rows`: set by the layout (a long line wraps to two). `since`: something going on right now (Bug 106: HQ's own test run): the line starts with a dot and ends
@@ -155,6 +157,8 @@ export function cancelConfirm(title: string, body: string, go: string): Promise<
 /** Open tickets that wait on `t` (Bug 50): they can't start once it's removed, until the TPM rewires them. */
 export const waitingOn = (s: State, t: any): string[] => s.tickets.filter((x) => x.feature_id === t.feature_id && x.status !== 'merged' && x.status !== 'cancelled'
   && jsonList(x.deps).includes(t.key)).map((x) => x.key)
+/** Where Clear and Remove put the project's notes (Bug 224): HQ's own archive, which follows HQ_HOME, and the folder name HQ gives it. */
+const archiveOf = (all: State, repo: any): string => `${all.archive ?? '~/.hq/archive'}/${archiveName(repo.name)}/`
 /** HQ's confirm before Remove from HQ (Bug 66): what stops, what HQ forgets, and that the folder isn't touched. */
 export function removeConfirm(all: State, repo: any): Promise<boolean> {
   const fids = new Set(all.features.filter((f) => f.repo_id === repo.id).map((f) => f.id))
@@ -163,7 +167,7 @@ export function removeConfirm(all: State, repo: any): Promise<boolean> {
   return ask({ title: `Remove ${repo.name} from HQ?`, go: 'Remove from HQ', danger: true, leaving: null, staysHead: 'These stop straight away, with no handoff note:',
     body: `HQ forgets ${repo.name}: ${nf} feature${nf === 1 ? '' : 's'}, ${nt} ticket${nt === 1 ? '' : 's'}, their messages and notices${repo.auto_mode ? ', and its auto mode' : ''}. `
       + `Its folder isn't touched: worktrees, branches and uncommitted work stay where they are, but HQ won't know about them any more. GitHub is left alone. `
-      + `HQ's notes go to ~/.hq/archive/${repo.name}/. You can add the folder again later, as a new project.`,
+      + `HQ's notes go to ${archiveOf(all, repo)}. You can add the folder again later, as a new project.`,
     apps: [...(isOn(p) ? [`${repo.name}'s app`] : []), ...(helperOn(p) ? ["the Launch helper"] : [])], parks: [], stays: agents.map((a) => about(all, a)) })
 }
 /** HQ's confirm before Clear project: what goes (the board, the app), who saves a handoff note first, and who stops at once. */
@@ -173,12 +177,12 @@ export function clearConfirm(all: State, repo: any): Promise<boolean> {
   const agents = all.agents.filter((a) => live(a) && a.role !== 'launcher' && repoOfAgent(all, a) === repo.id)
   const notes = agents.filter((a) => a.fresh_start_at || ((a.role === 'tpm' || a.role === 'engineer') && !freshBlocker(a, all)))
   const p = all.previews.find((x) => x.id === repo.id)
-  return ask({ title: `Clear ${repo.name}?`, go: 'Clear project', danger: true, leaving: null, staysHead: 'These stop at once (HQ writes their note from its records):',
+  return ask({ title: `Clear ${repo.name}?`, go: 'Clear project', danger: true, leaving: null, staysHead: 'These stop at once (HQ writes a note from its records for any with none yet):',
     body: `Deletes ${repo.name}'s board from HQ: ${nf} feature${nf === 1 ? '' : 's'}, ${nt} ticket${nt === 1 ? '' : 's'}, their messages, notes and notices. `
       + "Code that isn't committed yet is saved as a WIP commit on its branch; branches, GitHub and PRs are left alone. "
-      + `The feature files, handoff notes and a summary go to ~/.hq/archive/${repo.name}/. The TPM stays: it remembers what was built, not the old tickets.`,
+      + `The feature files, handoff notes and a summary go to ${archiveOf(all, repo)}. The TPM stays: it remembers what was built, not the old tickets.`,
     apps: isOn(p) ? [`${repo.name}'s app`] : [], parks: notes.map((a) => about(all, a)),
-    stays: agents.filter((a) => !notes.includes(a)).map((a) => `${about(all, a)}: ${freshBlocker(a, all) ?? 'not a TPM or engineer'}`) })
+    stays: agents.filter((a) => !notes.includes(a)).map((a) => `${about(all, a)}: ${freshBlocker(a, all, true) ?? 'not a TPM or engineer'}`) })
 }
 /** Every ticket of the feature (at least one, cancelled ones aside) is merged. */
 export const featureDone = (s: State, fid: string): boolean => {
@@ -197,17 +201,19 @@ export function ctxLimit(s: State, role: string): number | null {
   const pick = Number(s.settings.context_limit ?? s.defaults.context_limit ?? 150_000)
   return role === 'tpm' ? pick : role === 'engineer' ? Number(s.defaults.engineer_limit?.[pick] ?? Math.round(pick * 2 / 3)) : null
 }
-export const kTok = (n: number): string => `${Math.round(n / 1000)}k`
+export { kTok } // lives in usage.ts (the Agent tab's header, unit-tested), shared here
 /** How full an agent's context is, as a share of its limit (1 = at the limit), or null when HQ hasn't measured it. */
 export function ctxShare(a: Agent, s: State): number | null { const l = ctxLimit(s, a.role); return l && a.context_tokens ? a.context_tokens / l : null }
-/** Why `a` can't have a fresh start now, or null. */
-export function freshBlocker(a: Agent, s: State): string | null {
+/** Why `a` can't have a fresh start now, or null. `clear`: the reason as Clear's dialog gives it (Bug 220: the clear stops HQ's plan check). */
+export function freshBlocker(a: Agent, s: State, clear = false): string | null {
   if (!live(a) || (a.role !== 'tpm' && a.role !== 'engineer')) return 'It isn\'t running.'
   if (a.fresh_start_at) return 'It is writing its handoff note.'
-  if (a.status === 'blocked' || a.status === 'paused') return 'It is waiting on a dialog in its terminal. Answer it first.'
+  if (onDialog(a)) return 'It is waiting on a dialog in its terminal. Answer it first.'
   if (a.role === 'tpm') return null
   const t = s.tickets.find((x) => x.id === a.ticket_id); if (!t) return 'It has no ticket.'
-  if (t.status === 'plan_review') return `${t.key}'s plan is waiting for your review. Answer it first.`
+  if (t.status === 'plan_review') { // on auto HQ's plan check answers it, not the user (Bug 220)
+    const r = s.reviews.find((x) => x.ticket_id === t.id && x.status === 'open'); return planWaitsWhy(t.key, !!r && hqAnswersPlan(s, r), clear)
+  }
   return RESUMABLE.includes(t.status) ? null : `${t.key} is finished: nothing to hand over.`
 }
 /** Whether a box offers Fresh start for `a` at all: a running TPM, or an engineer on unfinished work (while its plan waits for
@@ -244,9 +250,6 @@ export function mergeActs(t: any, base: string, eng: Agent | null): Act[] {
   }
   return fix
 }
-/** What an agent is doing, in words. */
-export const agentWord = (a: Agent): string => ({ working: 'working', idle: 'idle', plan_review: 'waiting for your review', blocked: 'waiting on a dialog', paused: 'paused',
-  launching: 'starting', exited: 'stopped' } as Record<string, string>)[a.status] ?? a.status
 export const DO_REST = 'Do the rest automatically'
 /** A notice's kind in words (the ⚠ menu and box lines); unknown kinds lose their underscores. */
 export const kindLabel = (k: string): string => k.startsWith('auto_stopped:') ? 'Auto mode stopped' : k.startsWith('auto_finished:') ? 'Auto mode finished' :
@@ -255,7 +258,7 @@ export const kindLabel = (k: string): string => k.startsWith('auto_stopped:') ? 
   ({ auto_parked: 'Parked by auto mode', merged: 'Merged', stuck: 'Looks stuck', engineer_exited: 'Engineer stopped', agent_exited: 'Agent stopped',
   message_for_user: 'Message for you', blocked: 'Blocked', dialog: 'Waiting on a dialog', usage_limit: 'Usage limit', merge_conflict: 'Merge conflict', fix_stalled: 'Fix stalled',
   look_stalled: 'Fix stalled', review_stalled: 'Fix stalled',
-  change_stalled: 'Change stalled',
+  change_stalled: 'Change stalled', merged_part: 'Partly merged', // Bug 212
   conflicts_fixed: 'Conflicts fixed', delivery_failed: 'Message not delivered', dm_refused: 'Message not sent', context_high: 'Memory filling up', fresh_start_failed: "Fresh start didn't finish",
   tpm_rotate: 'TPM memory full', api_error: 'API error', rate_limit: 'Usage limit', backend_error: 'HQ error', user_override: 'Approved in the terminal',
   cap_reached: 'Sent back too often', tpm_away: 'TPM not running', pr_failed: "Couldn't open the PR", mod_missing: 'Agent not connected',
@@ -379,12 +382,15 @@ export function boardKeeper(): (next: Board) => Board {
   let prev: Board | null = null
   return (next) => prev = prev ? { ...next, nodes: keep(prev.nodes, next.nodes), edges: keep(prev.edges, next.edges) } : next
 }
-export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ?? null): Board {
+/** `opened`: the done features the user opened (Bug 164, donefold.ts): their tickets stay on the board. */
+export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ?? null, opened: ReadonlySet<string> = new Set()): Board {
   const agentById = new Map(s.agents.map((a) => [a.id, a])), ticketById = new Map(s.tickets.map((t) => [t.id, t]))
-  // 1. Which boxes exist. Cancelled features stay only while one of their agents runs; a feature whose tickets all merged collapses.
+  // 1. Which boxes exist. Cancelled features stay only while one of their agents runs; a feature whose tickets all merged is done, and
+  //    collapses unless the user opened it (Bug 164).
   const groups = s.features.filter((f) => f.status !== 'cancelled' || s.agents.some((a) => a.feature_id === f.id && live(a)))
     .sort((a, b) => a.created_at - b.created_at) // explicit: the backend sends newest first and patches prepend
-    .map((f) => { const all = s.tickets.filter((t) => t.feature_id === f.id && t.status !== 'cancelled'); return { f, all, collapsed: all.length > 0 && all.every((t) => t.status === 'merged') } })
+    .map((f) => { const all = s.tickets.filter((t) => t.feature_id === f.id && t.status !== 'cancelled'), done = all.length > 0 && all.every((t) => t.status === 'merged')
+      return { f, all, done, collapsed: done && !opened.has(f.id) } })
   const ids = new Set<string>(['tpm'])
   for (const g of groups) { ids.add(`f:${g.f.id}`); if (!g.collapsed) for (const t of g.all) ids.add(`t:${t.id}`) }
   const has = (n: string) => ids.has(n)
@@ -395,12 +401,18 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
   const attNode = (x: any): string | null => ticketBox(x.ticket_id) ?? (x.agent_id ? agentNode(x.agent_id) : null)
   const attOf = new Map<string, any[]>()
   for (const x of [...s.attention].sort((a, b) => b.created_at - a.created_at)) { const n = attNode(x); if (n) attOf.set(n, [...(attOf.get(n) ?? []), x]) }
-  /** The box's newest notice, else messages waiting for its agent, else what the agent is doing (`quiet`: not while it waits on the user). */
-  const note = (att: any[], a: Agent | null, quiet = false): Line | null => {
-    if (att.length) { const ok = goodNews(att[0].kind); return { text: `${ok ? '✓' : '⚠'} ${kindLabel(att[0].kind)}: ${noLinks(att[0].detail)}`, tone: ok ? 'emerald' : 'rose' } }
-    const w = live(a) ? waitingFor(a, s, now) : null
-    if (w) return { text: `✉ ${w.count} waiting · ${w.why}`, tone: w.held ? 'amber' : 'muted' }
-    return !quiet && live(a) && a.activity ? { text: String(a.activity), tone: 'muted' } : null
+  /** The box's newest notice, else messages waiting for its agent, else what the agent is doing (`quiet`: not while it waits on the user).
+   *  Bug 228: a hold on what HQ sends it shows with a notice too, and with nothing waiting yet: the next message would wait for it. */
+  const note = (att: any[], a: Agent | null, quiet = false): Line[] => {
+    const w = live(a) ? waitLine(a, s, now) : null, wait: Line | null = w && { text: w.text, tone: w.held ? 'amber' : 'muted' }
+    if (att.length) {
+      const ok = goodNews(att[0].kind), from = alertFrom(att[0], s, now) // Bug 165: not the running agent's
+      const top: Line = { text: `${ok ? '✓' : '⚠'} ${kindLabel(att[0].kind)}${from ? ` (${from.tag})` : ''}: ${noLinks(att[0].detail)}`, tone: ok ? 'emerald' : 'rose' }
+      return wait && w!.held ? [top, wait] : [top]
+    }
+    if (wait) return [wait]
+    const doing = !quiet && live(a) ? liveActivity(a) : null // Bug 179: not "Thinking" on a dialog; its first line says it waits on one
+    return doing ? [{ text: doing, tone: 'muted' }] : []
   }
   /** How full a running agent's context is; amber from 80% of its limit, rose past it. */
   const ctxLine = (a: Agent | null): Line | null => {
@@ -410,13 +422,13 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
     return { text: `context ${kTok(a.context_tokens)} / ${kTok(ctxLimit(s, a.role)!)}${share >= 1 ? ' · full' : ''}`, tone: share >= 1 ? 'rose' : share >= 0.8 ? 'amber' : 'muted' }
   }
   const featureView = (g: (typeof groups)[number]): FeatureView => {
-    const f = g.f, att = attOf.get(`f:${f.id}`) ?? [], done = g.collapsed // finished: a small box, out of the way
+    const f = g.f, att = attOf.get(`f:${f.id}`) ?? [], done = g.done // finished: a small box, out of the way
     const merged = g.all.filter((t) => t.status === 'merged').length
     const lines: Line[] = done ? [{ text: `✓ done · all ${g.all.length} merged`, tone: 'emerald' }]
       : [{ text: g.all.length ? `${merged}/${g.all.length} merged` : f.status === 'cancelled' ? 'cancelled' : 'no tickets yet', tone: 'muted' }]
     const tested = done ? featureTestsLine(g.all) : null // its tickets are folded away: what HQ ran on them (Bug 126)
     if (tested) lines.push({ text: tested.text, tone: tested.passed ? 'emerald' : 'amber', tip: tested.tip })
-    const n = done ? null : note(att, null); if (n) lines.push(n)
+    if (!done) lines.push(...note(att, null))
     return { f, lines, att, total: g.all.length, collapsed: g.collapsed, done, border: '#3f3f46' }
   }
   /** The TPM box: what the TPM is doing (or that it starts with the user's message), its last reply, Your turn. */
@@ -429,7 +441,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
       : { text: tpm ? 'not running · your message starts it again' : 'starts when you send it a message', tone: 'muted' }]
     const c = ctxLine(tpm); if (c) lines.push(c)
     if (reply) { const p = replyPreview(reply.body); lines.push({ text: `💬 ${p.text}`, tone: 'plain', more: p.more }) }
-    const n = note(att, tpm); if (n) lines.push(n)
+    lines.push(...note(att, tpm))
     const turn = yourTurn(s, repo?.id ?? null), mine = turnOn(turn)
     return { repo, tpm, live: up, lines, att, turn, tpmIds, empty: !s.features.length && !reply,
       border: mine ? '#f59e0b' : up ? agentColor[tpm.status] ?? '#3f3f46' : '#3f3f46' }
@@ -438,23 +450,23 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
     const eng = liveEngineer(t, s), att = attOf.get(`t:${t.id}`) ?? []
     const review = s.reviews.find((r) => r.ticket_id === t.id && r.status === 'open') ?? null // a newer plan closes the older round
     // On auto no person is asked for a plan: HQ's plan check answers it (plancheck.ts), in seconds, or once a usage limit lifts
-    const hqPlan = !!review && hqAnswersPlan(s, review), check = hqPlan ? planCheckOf(review.plan_check) : null, checking = check?.state === 'checking' ? check : null
+    const hqPlan = !!review && hqAnswersPlan(s, review), wait = review ? planWait(s, t.id, review) : null // whom its plan waits on; the Agents menu says the same (Bug 216)
     const question = ticketQuestion(s, t), who = question ? askedWho(question, s.agents) : '' // Bug 129: whom it waits on, and what it asked
     const waits = t.status === 'queued' ? unmerged(t, all) : [], dead = waits.filter((k) => !all.some((x) => x.key === k))
     const gone = dead.filter((k) => s.tickets.some((x) => x.feature_id === t.feature_id && x.key === k)), unknown = dead.filter((k) => !gone.includes(k))
     const auto = !!repo?.auto_mode && !repo.auto_stopped_why && !t.auto_parked_why // HQ does the next step itself
+    const clearing = !!repo?.clearing_at // the clear stopped HQ's plan check: nothing reads the plan before the board goes (Bug 197)
     // Bug 106: HQ's own test run on this ticket, while it goes. On a finished ticket it takes the place of "HQ tests it, then merges it"; anywhere else (a repair
     // whose engineer waits for HQ's try of its test command, a parked ticket whose run hasn't ended) it is a line of its own.
     const run = (s.testRuns ?? []).find((r) => r.ticket_id === t.id) ?? null, going = run?.state === 'running'
     const testing: Line | null = run ? { text: runWords(run, t.key, base).box, tone: going ? 'emerald' : 'sky', since: run.since, dot: run.state } : null
     const inPlace = !!run && run.what !== 'command' && (t.status === 'pr_ready' || t.status === 'pr_open') && !t.auto_parked_why
     const detail: Line | null = inPlace ? testing : t.auto_parked_why ? { text: `parked: ${t.auto_parked_why}`, tone: 'rose' }
-      : review && hqPlan ? (checking ? { text: 'HQ is checking its plan against its criteria', tone: 'sky', since: checking.since, dot: 'running' }
-        : { text: "its plan waits for HQ's check", tone: 'sky' })
-      : review ? { text: `Plan R-${review.round} waiting for you`, tone: 'amber' }
+      : wait && hqPlan && clearing ? { text: "HQ won't check its plan: the project is being cleared", tone: 'muted' } // Bug 197
+      : wait ? (wait.since !== null ? { text: wait.text, tone: 'sky', since: wait.since, dot: 'running' } : { text: wait.text, tone: wait.hq ? 'sky' : 'amber' })
       : t.pr_state === 'closed' ? { text: `PR #${t.pr_number} was closed without merging`, tone: 'rose' }
       : t.status === 'resolving' ? (!eng ? { text: `${ticketLabel(t)} · its engineer stopped`, tone: 'rose' }
-        : eng.status === 'idle' ? { text: 'its engineer went idle before finishing', tone: 'rose' }
+        : eng.status === 'idle' ? { text: `its engineer ${interrupted(eng) ? 'was interrupted' : 'went idle'} before finishing`, tone: 'rose' }
         : { text: t.fixing === 'changes' ? 'its spec changed · its engineer is building the change'
           : t.fixing === 'tests_hung' ? `its tests never finished on ${base} · its engineer is finding why`
           : t.fixing === 'review' ? 'a fresh reader of its changes found problems · its engineer is fixing them'
@@ -477,7 +489,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
           tone: 'emerald' })
       : t.status === 'merged' ? null : { text: 'no engineer running', tone: 'muted' }
     const told = question?.to_target === 'user' ? att.filter((a) => a.kind !== 'message_for_user') : att // a question for the user: its first line says it already
-    const lines = [detail, inPlace ? null : testing, ctxLine(eng), t.auto_parked_why ? null : note(told, eng, !!review)].filter((l): l is Line => !!l) // parked: the first line says it
+    const lines = [detail, inPlace ? null : testing, ctxLine(eng), ...t.auto_parked_why ? [] : note(told, eng, !!review)].filter((l): l is Line => !!l) // parked: the first line says it
     const acts: Act[] = []
     if (t.auto_parked_why) acts.push({ kind: 'auto-retry' })
     if (t.status === 'queued' && !t.assignee_agent_id && !waits.length && !loop && !t.go_ahead && !auto) acts.push({ kind: 'launch', waits }) // go-ahead: starts on its own
@@ -560,6 +572,7 @@ export function buildBoard(s: State, now = Date.now(), repo: any = s.repos[0] ??
     const up = (y.get(a) ?? 0) > (y.get(b) ?? 0)
     edges.push({ id: `m-${m.id}`, source: a, sourceHandle: up ? 'ts' : 'b', target: b, targetHandle: up ? 'bt' : 't', animated: true, style: { stroke: '#22d3ee' } })
   }
-  const fits = fitSets(nodes.map((n) => n.id), groupIds.map((ids, i) => ({ ids, done: fviews[i]!.done, needsYou: needsYou[i]! })), turnOn(tv0.turn))
+  const fits = fitSets(nodes.map((n) => n.id), groupIds.map((ids, i) => ({ ids, done: groups[i]!.collapsed, needsYou: needsYou[i]!, opened: groups[i]!.done && !groups[i]!.collapsed })),
+    turnOn(tv0.turn))
   return { nodes, edges, fits, has, attNode, agentNode }
 }

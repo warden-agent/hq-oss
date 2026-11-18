@@ -1,12 +1,17 @@
 // Starts an app's parts as its launch recipe says, inside HQ's test sandbox, for whatever then opens its pages: HQ's look before a merge (smokerun.mjs) and
 // the tester's browser tools (testermcp.mjs). Plain Node, no imports from HQ. The parts are children in the caller's process group, so whoever ran the caller
-// ends them with it.
+// ends them with it; or, for a caller that stops and starts the app again itself (`group`), each in a group of its own that ends with the caller.
 // spec: { parts: [{ name, cwd, run, port: number | 'auto' }], show, startMs }
 import { spawn, spawnSync } from 'node:child_process'
 import net from 'node:net'
 
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/** A part in a process group of its own (Bug 170): a stop then reaches everything the part started with no `ps`, which HQ's test sandbox refuses, so
+ *  `npm start` (a shell running npm running node) goes whole and frees its port. A watcher in the group reads a pipe from this process and ends the group
+ *  when the pipe closes, so the part still ends when this process ends, however it ends (SIGKILL included), as it did in this process's group. */
+const OWN_GROUP = 'exec 3<&0 0</dev/null; (read -r -u 3 _; kill -KILL 0) & exec 3<&-; exec /bin/bash -c "$1"'
+const grouped = new WeakSet()
 const freePort = () => new Promise((resolve, reject) => {
   const s = net.createServer(); s.on('error', reject); s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)) })
 })
@@ -19,7 +24,8 @@ const answers = async (port) => {
 }
 
 /** Starts the parts and waits for the page's port to answer. `{ port, kids, ports }` when it's up. `o.ports`: the port of each part, as a start before this one
- *  picked them (a restart). `o.onLine(part, line, at)`: every line the parts print, as it arrives. Otherwise `{ kind: 'skipped', why }` (a port the project
+ *  picked them (a restart). `o.onLine(part, line, at)`: every line the parts print, as it arrives. `o.group`: each part in a process group of its own, for
+ *  stopApp to end whole. Otherwise `{ kind: 'skipped', why }` (a port the project
  *  hard-wires is taken: nothing about the code) or `{ kind: 'no_start', why, output }` (a part stopped, or nothing answered in time), with `kids` to end. */
 export async function startApp(spec, o = {}) {
   const kids = [], tails = new Map()
@@ -37,7 +43,9 @@ export async function startApp(spec, o = {}) {
   let exited = null
   for (const p of spec.parts) { // as the preview's supervisor starts them (supervise.mjs): bash, PORT, the other parts' ports, no browser of its own
     const env = { ...process.env, ...shared, PORT: String(ports[p.name]), BROWSER: 'none' }
-    const k = spawn(p.run, { cwd: p.cwd, shell: '/bin/bash', env, stdio: ['ignore', 'pipe', 'pipe'] })
+    const k = o.group ? spawn('/bin/bash', ['-c', OWN_GROUP, 'hq-part', p.run], { cwd: p.cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] })
+      : spawn(p.run, { cwd: p.cwd, shell: '/bin/bash', env, stdio: ['ignore', 'pipe', 'pipe'] })
+    if (o.group) { grouped.add(k); k.stdin.on('error', () => {}) } // the watcher's pipe: nothing is written to it, it only closes
     let part = '' // a line split across two reads is passed on whole
     const keep = (buf) => {
       const s = buf.toString().replace(ANSI, ''); tails.set(p.name, ((tails.get(p.name) ?? '') + s).slice(-3000))
@@ -70,9 +78,10 @@ function under(pid) {
 }
 const alive = (pid) => { try { process.kill(pid, 0); return true } catch { return false } }
 /** Ends the parts startApp started, each with everything under it (`npm start` runs a shell that runs node: the shell alone would leave the server
- *  holding its port), and waits until `ports` no longer answer. SIGTERM first, SIGKILL to what's left after `graceMs`. */
+ *  holding its port), and waits until `ports` no longer answer. SIGTERM first, SIGKILL to what's left after `graceMs`. A part in a group of its own goes
+ *  as its whole group (a negative pid), even when its first process has already ended; any other, with what `ps` finds under it. */
 export async function stopApp(kids, ports = [], graceMs = 3000) {
-  const all = kids.flatMap((k) => k.exitCode === null && k.signalCode === null && k.pid ? [k.pid, ...under(k.pid)] : [])
+  const all = kids.flatMap((k) => !k.pid ? [] : grouped.has(k) ? [-k.pid] : k.exitCode === null && k.signalCode === null ? [k.pid, ...under(k.pid)] : [])
   for (const p of all) { try { process.kill(p, 'SIGTERM') } catch { /* gone */ } }
   for (const t0 = Date.now(); all.some(alive) && Date.now() - t0 < graceMs;) await sleep(50)
   for (const p of all.filter(alive)) { try { process.kill(p, 'SIGKILL') } catch { /* gone */ } }

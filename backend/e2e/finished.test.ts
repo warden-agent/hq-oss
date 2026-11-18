@@ -58,7 +58,7 @@ test('a spec changed after the ticket is finished goes back to its engineer, and
   await finish(e, wtOf(dir, t), 'v1\norders\n')
   // A new title alone (or the spec it already has) changes nothing that was built: saved, nothing goes back, nobody is told.
   let r = await spec(tpm, t, { title: 'Order list' }); assert.equal(r.text, 'Updated.')
-  r = await spec(tpm, t, { spec: 'Orders.' }); assert.equal(r.text, 'Updated.')
+  r = await spec(tpm, t, { spec: 'Orders.' }); assert.equal(r.text, `${t.key} already says that: nothing changed.`) // Bug 168: and the TPM hears so
   let now = await tk(t); assert.deepEqual([now.status, now.title, now.spec, now.fixing], ['pr_ready', 'Order list', 'Orders.', null])
   assert.equal((await sent(tpm, e.id)).length + (await sent('hq', e.id)).length, 0)
   // The spec changes: the ticket goes back to its engineer, with the new spec and title saved.
@@ -188,7 +188,7 @@ test('Bug 103: a finished engineer the Stop hook hands a message to is kept whil
   const first = (await hq.modNext(e.id)).batch; await hq.modEvent(e.id, { kind: 'batch_received', id: first.id })
   await hq.hook(e.id, { hook_event_name: 'UserPromptSubmit', prompt: first.text })
   await finish(e, wtOf(dir, t), 'v1\norders\n')
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite')) // its mod has gone quiet, so the Stop hook carries the message
+  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 }) // its mod has gone quiet, so the Stop hook carries the message
   try { db.prepare('UPDATE agents SET mod_seen_at = ? WHERE id = ?').run(Date.now() - 300_000, e.id) } finally { db.close() }
   assert.equal((await hq.api(`agents/${e.id}/message`, { body: 'Is the list sorted?', reason: 'fyi' })).status, 200)
   const r = await hq.hookOnce(e.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' }); assert.equal(r.decision, 'block'); assert.match(r.reason, /Is the list sorted\?/)

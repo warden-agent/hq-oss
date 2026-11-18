@@ -59,14 +59,20 @@ test('runSandboxed: the tests can use their own folder and localhost, and nothin
   const t = await runSandboxed(d, 'sleep 30', { network: false, timeoutMs: 300 }); assert.equal(t.timedOut, true); assert.notEqual(t.code, 0)
 })
 
-const listen = (file: string): Promise<net.Server> => new Promise((resolve) => { fs.mkdirSync(path.dirname(file), { recursive: true })
-  const s = net.createServer((c) => c.end('reached')).listen(file, () => resolve(s)) })
+// Bug 150: a listen that fails rejects, and the servers close whatever the checks do: one left open kept the test file, and the run, from ever ending.
+// What failed was the made-up home's socket: from a checkout in a deep folder its path was longer than a socket's can be (104 bytes on macOS).
+const listen = (file: string): Promise<net.Server> => new Promise((resolve, reject) => { fs.mkdirSync(path.dirname(file), { recursive: true })
+  const s = net.createServer((c) => c.end('reached')).once('error', (e: NodeJS.ErrnoException) => reject(e.code !== 'EINVAL' ? e
+    : new Error(`can't listen on ${file}: its ${Buffer.byteLength(file)} bytes are likely too long for a socket's path (104 on macOS); run from a shorter folder`, { cause: e })))
+  s.listen(file, () => resolve(s)) })
 test('runSandboxed: another program\'s socket is out of reach, network on or off; the run\'s own works', boxed, async () => {
-  const d = dir({}), tmux = path.join(tmp, 'tmux.sock'), docker = path.join(home, '.docker', 'd.sock'), servers = [await listen(tmux), await listen(docker)]
+  const d = dir({}), tmux = path.join(tmp, 'tmux.sock'), docker = path.join(home, '.docker', 'd.sock'), servers: net.Server[] = []
   const dial = (file: string, network: boolean) => runSandboxed(d, `node -e "require('net').connect(${JSON.stringify(JSON.stringify(file)).slice(1, -1)})
     .on('data',(b)=>console.log(String(b)))"`, { network, timeoutMs: 10_000 })
-  for (const file of [tmux, docker]) for (const network of [false, true]) assert.doesNotMatch((await dial(file, network)).output, /reached/, `${file} network ${network}`)
-  servers.forEach((s) => s.close())
+  try {
+    for (const file of [tmux, docker]) servers.push(await listen(file))
+    for (const file of [tmux, docker]) for (const network of [false, true]) assert.doesNotMatch((await dial(file, network)).output, /reached/, `${file} network ${network}`)
+  } finally { servers.forEach((s) => s.close()) }
   const own = await runSandboxed(d, `node -e "const s=require('net').createServer((c)=>c.end('here')).listen('own.sock',()=>require('net').connect('own.sock')
     .on('data',(b)=>{console.log(String(b));s.close()}))"`, { network: false, timeoutMs: 10_000 })
   assert.equal(own.output, 'here')

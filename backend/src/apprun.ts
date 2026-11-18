@@ -7,6 +7,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { shq } from './util.ts'
+import { lockedInstalls, npmInstalls, type LockedInstall, type NpmInstall } from './npminstalls.ts'
 
 /** The ports HQ hands out to previews, from HQ_PREVIEW_PORTS ("3090-3099", the default; engineers' slots use 3101+ and 3110+).
  *  A test HQ gets a range of its own (Bug 44): two HQs that share one can both pick the same free port before either app is up. */
@@ -74,16 +75,82 @@ export const recipeShape = {
 }
 const recipeSchema = z.object(recipeShape)
 
+/** The folders from `dirPath` up to `root` (both included; just `dirPath` when it isn't inside `root`). */
+function upTo(dirPath: string, root: string): string[] {
+  const out = [dirPath], top = path.resolve(root)
+  for (let d = path.resolve(dirPath); d !== top && path.dirname(d) !== d && !path.relative(top, d).startsWith('..');) { d = path.dirname(d); out.push(d) }
+  return out
+}
+/** Does the workspace root `ws` (its package.json) list `member` as one of its npm workspaces? */
+function lists(ws: string, member: string): boolean {
+  let pkg: { workspaces?: unknown }
+  try { pkg = JSON.parse(fs.readFileSync(path.join(ws, 'package.json'), 'utf8')) } catch { return false }
+  const w = pkg?.workspaces, globs = Array.isArray(w) ? w : Array.isArray((w as { packages?: unknown })?.packages) ? (w as { packages: unknown[] }).packages : []
+  const rel = path.relative(ws, member).split(path.sep).join('/')
+  return globs.some((g) => typeof g === 'string' && !g.startsWith('!') && path.matchesGlob(rel, g.replace(/^\.\//, '').replace(/\/+$/, '')))
+}
+/** The package-lock.json an npm install in `dirPath` follows (Bug 156): its project's own (the nearest folder with a
+ *  package.json, up to the repo root), else, for a workspace member, the workspace root's, as npm does. Null: none applies,
+ *  and an `npm install` would write one. */
+export function npmLock(dirPath: string, root: string): string | null {
+  const up = upTo(dirPath, root), i = Math.max(0, up.findIndex((d) => fs.existsSync(path.join(d, 'package.json'))))
+  const lock = (d: string) => ['package-lock.json', 'npm-shrinkwrap.json'].map((f) => path.join(d, f)).find((f) => fs.existsSync(f)) ?? null
+  const own = lock(up[i]!); if (own) return own
+  const ws = up.slice(i + 1).find((d) => lists(d, up[i]!))
+  return ws ? lock(ws) : null
+}
 /** An install that would rewrite the lockfile instead of following it, which would leave changes behind in a worktree (Try
- *  it) and drift from what the repo pins. Null when fine. */
-export function lockfileProblem(install: string, dirPath: string): string | null {
-  const has = (f: string) => fs.existsSync(path.join(dirPath, f))
-  const cmd = install.trim()
-  if (/^npm (install|i)\b/.test(cmd) && has('package-lock.json')) return 'use `npm ci` (there is a package-lock.json)'
-  if (/^uv sync\b/.test(cmd) && has('uv.lock') && !/--(locked|frozen)\b/.test(cmd)) return 'use `uv sync --locked` (there is a uv.lock)'
-  if (/^yarn( install)?\s*$/.test(cmd) && has('yarn.lock')) return 'use `yarn install --frozen-lockfile` (or --immutable) (there is a yarn.lock)'
-  if (/^pnpm (install|i)\b/.test(cmd) && has('pnpm-lock.yaml') && !/--frozen-lockfile\b/.test(cmd)) return 'use `pnpm install --frozen-lockfile` (there is a pnpm-lock.yaml)'
+ *  it) and drift from what the repo pins, or that would write a package-lock.json into a project that has none (Bug 156).
+ *  `dirPath`: the part's folder in the checkout `root`. Null when fine. */
+export function lockfileProblem(install: string, dirPath: string, root: string = dirPath, installWhen?: string): string | null {
+  return installProblem(install, dirPath, root, installWhen)?.why ?? null
+}
+/** The first install in `cmd` that the lockfile check refuses, and why. Each is found anywhere in the command and checked in the
+ *  folder it runs in: `cd web && npm install` (Bug 191), `cd server && uv sync` (Bug 211). */
+function installProblem(cmd: string, dirPath: string, root: string, installWhen?: string): { text: string; why: string } | null {
+  for (const n of npmInstalls(cmd)) { const why = npmProblem(n, dirPath, root, installWhen); if (why) return { text: n.text, why } }
+  for (const n of lockedInstalls(cmd)) { const why = lockedProblem(n, dirPath, root); if (why) return { text: n.text, why } }
   return null
+}
+/** Where an install runs: its folder, whether that's inside the checkout, and the words that name it when it isn't the part's own. */
+function placed(n: { text: string; dir: string | null }, dirPath: string, root: string) {
+  const at = n.dir === null ? null : path.resolve(dirPath, n.dir), inRepo = at !== null && !path.relative(path.resolve(root), at).startsWith('..')
+  return { at: inRepo ? at : null, where: n.dir && at ? `\`${n.text}\` runs in ${path.relative(root, at) || '.'}: ` : '' }
+}
+/** A uv, yarn or pnpm install that would rewrite the lockfile of the folder it runs in instead of following it. */
+function lockedProblem(n: LockedInstall, dirPath: string, root: string): string | null {
+  if (n.frozen) return null // follows the lockfile wherever it runs
+  const { at, where } = placed(n, dirPath, root)
+  if (!at) return `HQ can't tell which folder of the repo \`${n.text}\` runs in: use ${n.fix}, or give the part that folder as its dir`
+  if (!fs.existsSync(at)) return `${where}that folder doesn't exist`
+  return fs.existsSync(path.join(at, n.lock)) ? `${where}use ${n.fix} (there is a ${n.lock})` : null
+}
+/** One npm install of a part's command, checked in the folder it runs in (the part's, or where its `cd`/`--prefix` takes it). */
+function npmProblem(n: NpmInstall, dirPath: string, root: string, installWhen?: string): string | null {
+  const { at, where } = placed(n, dirPath, root) // where: named when it isn't the part's own folder
+  if (!at) return `HQ can't tell which folder of the repo \`${n.text}\` runs in: give the part that folder as its dir instead of a \`cd\` or \`--prefix\``
+  if (!fs.existsSync(at)) return `${where}that folder doesn't exist`
+  const lock = npmLock(at, root)
+  if (lock) { // npm ci follows it; --no-package-lock writes nothing (a git-ignored lockfile may be in one checkout only)
+    const above = path.dirname(lock) !== at ? ` at ${path.relative(root, lock)}, which this folder follows` : ''
+    return n.ci || n.noLock ? null : `${where}use \`npm ci\` (there is a ${path.basename(lock)}${above})`
+  }
+  if (!n.noLock) return `${where}use \`${NO_LOCK_INSTALL}\` with install_when \`package.json\` (there is no package-lock.json`
+    + `${n.ci ? ' for `npm ci` to follow' : ', and `npm install` would write one into the user\'s project'})`
+  return installWhen === undefined || path.basename(installWhen) === 'package.json' ? null // its own or a workspace member's (web/package.json)
+    : `${where}install_when must be a \`package.json\` with \`${NO_LOCK_INSTALL}\` (there is no lockfile to watch)`
+}
+/** The first part of a saved recipe whose install (or run) the lockfile check refuses in this checkout, and why (Bug 156: recipes saved
+ *  before the check, or a lockfile added or removed since). Null when every part is fine. */
+export function recipeProblem(r: Recipe, root: string): string | null {
+  for (const p of r.parts) { const bad = partProblem(p, path.join(root, p.dir), root); if (bad) return `${p.name}: ${bad}` }
+  return null
+}
+/** A part's install, and any install in its run command (it would run on every start, Bugs 191, 211), checked in this checkout. */
+function partProblem(p: RecipePart, dir: string, root: string): string | null {
+  const bad = p.install ? lockfileProblem(p.install, dir, root, p.install_when) : null; if (bad) return bad
+  const run = installProblem(p.run, dir, root)
+  return run && `run has an install that would run on every start (\`${run.text}\`; put installs in install): ${run.why}`
 }
 
 /** The recipe if it's one HQ can run in `root` (a checkout), else what's wrong, in words the helper can act on. */
@@ -100,7 +167,7 @@ export function checkRecipe(input: unknown, root: string): { recipe: Recipe } | 
     const dir = path.join(root, p.dir)
     if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return { error: `${p.name}: folder ${p.dir} doesn't exist` }
     if (p.install && !p.install_when) return { error: `${p.name}: install_when is required with install (the lockfile, so HQ installs again only when it changes)` }
-    const bad = p.install ? lockfileProblem(p.install, dir) : null; if (bad) return { error: `${p.name}: ${bad}` }
+    const bad = partProblem(p, dir, root); if (bad) return { error: `${p.name}: ${bad}` }
   }
   return { recipe }
 }
@@ -118,35 +185,59 @@ export function commandRecipe(command: string, repoPath: string): Recipe {
 }
 
 /** Ports for every part: fixed ones as written, auto ones from the preview range (the show part keeps `saved` when it's free).
- *  `taken`: fixed ports something else already holds, so HQ won't start an app that would talk to the wrong server. */
-export async function assignPorts(r: Recipe, saved: number | null, busy: (port: number) => Promise<boolean> = portBusy):
+ *  `taken`: fixed ports something else already holds, so HQ won't start an app that would talk to the wrong server. `avoid`: ports
+ *  a Launch helper was given for its test runs (Bug 226), taken only when nothing else in the range is free. */
+export async function assignPorts(r: Recipe, saved: number | null, busy: (port: number) => Promise<boolean> = portBusy, avoid: number[] = []):
   Promise<{ ports: Record<string, number>; taken: { part: string; port: number }[] } | null> {
   const ports: Record<string, number> = {}, taken: { part: string; port: number }[] = []
   for (const p of r.parts) if (p.port !== 'auto') { ports[p.name] = p.port; if (await busy(p.port)) taken.push({ part: p.name, port: p.port }) }
   const order = (p: RecipePart) => p.name === r.show ? 0 : 1 // the page the user sees gets the saved port first
   for (const p of [...r.parts].filter((x) => x.port === 'auto').sort((a, b) => order(a) - order(b))) {
-    const prefer = p.name === r.show && saved && PREVIEW_PORTS.includes(saved) ? [saved] : []
+    const prefer = p.name === r.show && saved && PREVIEW_PORTS.includes(saved) && !avoid.includes(saved) ? [saved] : []
+    const tryIn = [...prefer, ...PREVIEW_PORTS.filter((c) => !avoid.includes(c)), ...PREVIEW_PORTS.filter((c) => avoid.includes(c))]
     let got: number | null = null
-    for (const c of [...prefer, ...PREVIEW_PORTS]) if (!Object.values(ports).includes(c) && !(await busy(c))) { got = c; break }
+    for (const c of tryIn) if (!Object.values(ports).includes(c) && !(await busy(c))) { got = c; break }
     if (got === null) return null
     ports[p.name] = got
   }
   return { ports, taken }
 }
 
-/** Fingerprint of a part's `install_when` file (null when it has none or the file is missing). */
-export function installMark(dirPath: string, file: string | undefined): string | null {
+/** Bug 226: the Launch helper's test runs use ports HQ gives it, from the preview range, never a port of its own choosing (it once ran an app on
+ *  3180, outside its HQ's 4080–4089, where another HQ's app could answer). Up to `n` free ports, from the top of the range (previews take theirs
+ *  from the bottom), in order: ones no other helper holds first, then (a busy HQ with many helpers) free ones another helper was given too, since
+ *  they are still HQ's own. [] when no port in the range is free. */
+export async function testPorts(held: number[], busy: (port: number) => Promise<boolean> = portBusy, n = 3, range: number[] = PREVIEW_PORTS): Promise<number[]> {
+  const got: number[] = [], top = [...range].reverse()
+  for (const c of [...top.filter((x) => !held.includes(x)), ...top.filter((x) => held.includes(x))]) {
+    if (got.length >= n) break; if (!(await busy(c))) got.push(c)
+  }
+  return got.sort((a, b) => a - b)
+}
+/** The first port of the OS's own range (macOS 49152, Linux 32768): a dev server's internal workers listen there on whatever the OS hands them. */
+export const EPHEMERAL_FROM = 32768
+/** Ports a helper's test servers listen on that it wasn't given and that aren't a fixed port of its recipe (the project hard-wires those), in order.
+ *  Ports the OS picked (EPHEMERAL_FROM and up) aren't the helper's choice. */
+export function strayPorts(listening: number[], given: number[], r: Recipe): number[] {
+  const fixed = r.parts.flatMap((p) => p.port === 'auto' ? [] : [p.port])
+  return [...new Set(listening)].filter((p) => p < EPHEMERAL_FROM && !given.includes(p) && !fixed.includes(p)).sort((a, b) => a - b)
+}
+
+/** Fingerprint of a part's `install_when` file: in its folder, else the nearest one above it in the checkout `root` (a workspace
+ *  member's lockfile is the root's, Bug 156). Null when it has none or the file is missing. */
+export function installMark(dirPath: string, file: string | undefined, root: string = dirPath): string | null {
   if (!file) return null
-  try { return createHash('sha256').update(fs.readFileSync(path.join(dirPath, file))).digest('hex').slice(0, 16) } catch { return null }
+  const at = upTo(dirPath, root).map((d) => path.join(d, file)).find((f) => fs.existsSync(f)); if (!at) return null
+  try { return createHash('sha256').update(fs.readFileSync(at)).digest('hex').slice(0, 16) } catch { return null }
 }
 /** Should this part install before it runs? With install_when (the helper's recipes): when it never installed in this
  *  checkout, or that file changed since (marks from the supervisor, keyed by the folder). Without it (the user's own command,
  *  whose install installStep already chose from npm's own record): every time it's there. */
-export function needsInstall(p: RecipePart, dirPath: string, marks: Record<string, string>): boolean {
+export function needsInstall(p: RecipePart, dirPath: string, marks: Record<string, string>, root: string = dirPath): boolean {
   if (!p.install) return false
   if (!p.install_when) return true
   const done = marks[dirPath]; if (done === undefined) return true
-  const now = installMark(dirPath, p.install_when); return now !== null && now !== done
+  const now = installMark(dirPath, p.install_when, root); return now !== null && now !== done
 }
 
 /** What the supervisor (supervise.mjs) runs: per part its folder, install (only if needed), command and environment. */
@@ -159,8 +250,9 @@ export function supervisorSpec(o: { recipe: Recipe; root: string; ports: Record<
   return {
     header: o.header, marksFile: o.marksFile,
     parts: o.recipe.parts.map((p) => {
-      const cwd = path.join(o.root, p.dir), install = needsInstall(p, cwd, o.marks) ? p.install! : null
-      return { name: p.name, cwd, install, mark: install ? installMark(cwd, p.install_when) ?? 'installed' : null, run: p.run, env: { ...shared, PORT: String(o.ports[p.name]), BROWSER: 'none' } }
+      const cwd = path.join(o.root, p.dir), install = needsInstall(p, cwd, o.marks, o.root) ? p.install! : null
+      return { name: p.name, cwd, install, mark: install ? installMark(cwd, p.install_when, o.root) ?? 'installed' : null, run: p.run,
+        env: { ...shared, PORT: String(o.ports[p.name]), BROWSER: 'none' } }
     }),
   }
 }

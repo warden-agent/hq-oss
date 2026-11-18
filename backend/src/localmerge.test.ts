@@ -63,6 +63,16 @@ test('refusals leave everything as it was', async () => {
     const r = await mergeIntoMain(d, opts); assert.deepEqual(r, { ok: false, why: `A merge is in progress in ${path.basename(d)}. Finish or abort it, then press Merge again.` }) }
 })
 
+test('Bug 143: given the commit that was tested, only that commit merges, not what the branch got after it', async () => {
+  const d = repo(), tested = sh(d, 'rev-parse', B)
+  sh(d, 'checkout', '-q', B); fs.writeFileSync(path.join(d, 'late.txt'), 'late\n'); sh(d, 'add', '.'); sh(d, 'commit', '-qm', 'late'); sh(d, 'checkout', '-q', 'main')
+  const main = sh(d, 'rev-parse', 'main'), r = await mergeIntoMain(d, { ...opts, sha: tested }); assert.equal(r.ok, true)
+  assert.equal(sh(d, 'log', '-1', '--format=%P', 'main'), `${main} ${tested}`); assert.equal(fs.existsSync(path.join(d, 'api.txt')), true)
+  assert.equal(fs.existsSync(path.join(d, 'late.txt')), false, 'the later commit stays on the branch')
+  assert.deepEqual(await mergeIntoMain(d, { ...opts, sha: tested }), { ok: true, sha: sh(d, 'rev-parse', 'main'), already: true })
+  assert.equal((await mergeIntoMain(d, opts) as { already: boolean }).already, false, 'without it, the branch as it is now')
+})
+
 test('a missing branch is refused', async () => {
   const d = repo(); assert.deepEqual(await mergeIntoMain(d, { ...opts, branch: 'nope' }), { ok: false, why: "Branch nope is gone, so there's nothing to merge." })
 })

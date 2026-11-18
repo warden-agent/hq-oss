@@ -32,7 +32,7 @@ export function commands(line: string): string[] {
 }
 /** Output joined or thrown away: it changes nothing about what runs. */
 const QUIET = / ?(?:2>&1|&>\/dev\/null|[12]?>\/dev\/null)/g
-const bare = (c: string): string => squeezed(c.replace(QUIET, ' '))
+export const bare = (c: string): string => squeezed(c.replace(QUIET, ' '))
 const VALUE = String.raw`[\w.,:@/+-]*`
 const SETS = new RegExp(`^[A-Za-z_]\\w*=${VALUE}$`), OPTION = new RegExp(`^--?[A-Za-z][\\w-]*(?:=${VALUE})?$`)
 /** Programs that are never git in disguise, whatever their arguments: a package manager's script, and the tools that cut output down. */
@@ -48,7 +48,7 @@ function plain(c: string, worktree: string | null): boolean {
 }
 /** Is `c` the test command's own command `p`, give or take what engineers add: plain options (`--test-force-exit`, `--test-timeout=120000`),
  *  plain settings in front (`CI=1`), and `timeout 540`? */
-function same(c: string[], p: string[]): boolean {
+export function same(c: string[], p: string[]): boolean {
   let i = 0
   for (let k = 0; k < c.length; k++) {
     if (i < p.length && c[k] === p[i]) i++
@@ -80,4 +80,12 @@ export const refusedTestCmd = (line: string, testCmd: string, worktree: string |
  *  that Claude Code may refuse (Claude Code decides before anything runs, so a line that ran at all was let through whole). */
 export const ranTestCmd = (line: string, testCmd: string, worktree: string | null): boolean => {
   const m = testCmdParts(line, testCmd, worktree); return !!m && (m.whole || (m.hardInCmd > 0 && m.hard === m.hardInCmd))
+}
+/** Bug 213: the commands of a Bash line that come after its last command of the test command's (as `commands` splits it, pipes included), so
+ *  `npm test && sed -i … && git commit` gives the sed and the commit. Empty: the line ends with the test command, or HQ can't place it. */
+export function afterTestCmd(line: string, testCmd: string): string[] {
+  const parts = commands(testCmd).map(bare).filter(Boolean), cs = commands(line)
+  const isPart = (c: string): boolean => { const b = bare(c); return parts.some((p) => b === p || b.startsWith(`${p} `) || same(b.split(' '), p.split(' '))) }
+  let last = -1; cs.forEach((c, i) => { if (isPart(c)) last = i })
+  return last < 0 ? [] : cs.slice(last + 1)
 }

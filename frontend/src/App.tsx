@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, connectWs, endedLine, errText, jsonList, showError, waitingFor, FINISHED, type Agent, type State, type WsMsg } from './api'
+import { agentPill, agentPlanWait, api, connectWs, endedLine, errText, jsonList, menuActivity, nextHoldEnd, onDialog, showError, waitLine, FINISHED, type Agent, type State, type WsMsg } from './api'
 import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
 import { AttentionList, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
@@ -10,9 +10,12 @@ import { mergeTestOf, mergeTestWords, runWords } from './testruns.ts'
 import { byKind, criteriaOf, flagLines, KIND_HEADING, proofOf, proofWords } from '../../backend/src/criteria.ts'
 import { lookWords } from '../../backend/src/smokerules.ts'
 import { diffCheckOf, diffCheckWords, planCheckOf, planCheckWords } from '../../backend/src/checks.ts'
-import { pauseAt, usageParts } from './usage.ts'
+import { messageRoute } from '../../backend/src/msgroute.ts'
+import { agentHeader, pauseAt, usageParts } from './usage.ts'
 import { LaunchBtn, PreviewPane } from './Preview'
-import { clampH, clampW, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
+import { clampH, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
+import { fitsRight, mainWidth, panelWidth, rightWidthIn, PANEL_DEFAULT } from './layout'
+import { openDone, useOpenDone } from './donefold'
 import { useAlerts } from './alerts'
 import { AlertsLine } from './AlertsLine'
 import { askedWho, claudeLine, goodNews, hqAnswersPlan, keysText, splitNeeds, ticketQuestion, turnQuestionText, uncountedQuestions, yourTurn, type Need } from './needs.ts'
@@ -20,6 +23,7 @@ import { AutoBanner, AutoDialog, AutoSwitch, DoRestBtn, LastRunBtn } from './Aut
 import { Events } from './Events'
 import { MapBtn } from './FeatureMap'
 import { eventLog } from './eventlog.ts'
+import { deliveryMark } from './msgmark.ts'
 
 type Tab = 'agent' | 'ticket' | 'messages' | 'events'
 type Sel = { node: string | null; agentId: string | null; ticketId: string | null }
@@ -62,8 +66,10 @@ export default function App() {
   const [pop, setPop] = useState<Pop>(null)
   const [focusReq, setFocusReq] = useState<Focus>(null)
   const [panel, setPanel] = useState<{ open: boolean; tab: Tab }>(() => ({ open: readOpen(), tab: 'messages' }))
-  const [panelW, setPanelW] = useState(() => { try { return clampPanel(Number(localStorage.getItem(PANEL_KEY)) || PANEL_DEFAULT) } catch { return PANEL_DEFAULT } })
-  useEffect(() => { const r = () => setPanelW((w) => clampPanel(w)); window.addEventListener('resize', r); return () => window.removeEventListener('resize', r) }, [])
+  // The panel's width as the user chose it; it's drawn through panelWidth, so a narrow window doesn't overwrite the choice (Bug 154)
+  const [panelW, setPanelW] = useState(() => { try { return Number(localStorage.getItem(PANEL_KEY)) || PANEL_DEFAULT } catch { return PANEL_DEFAULT } })
+  const [win, setWin] = useState(() => ({ w: window.innerWidth, h: window.innerHeight })) // the panes are sized from it, so a resize redraws
+  useEffect(() => { const r = () => setWin({ w: window.innerWidth, h: window.innerHeight }); window.addEventListener('resize', r); return () => window.removeEventListener('resize', r) }, [])
   useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') setPop(null) }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k) }, [])
   const [now, setNow] = useState(() => Date.now()) // the board's clock: "held · until 14:12" expires without a state change
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 15_000); return () => clearInterval(t) }, [])
@@ -105,8 +111,11 @@ export default function App() {
   const feed = useCallback((agentId: string, cb: (d: string) => void) => { feeds.current.set(agentId, cb); return () => { feeds.current.delete(agentId) } }, [])
   const repoNow = all ? all.repos.find((r) => r.id === repoId) ?? all.repos[all.repos.length - 1] ?? null : null
   const state = useMemo(() => all && forRepo(all, repoNow?.id ?? null), [all, repoNow?.id]) // each repo is its own slate
+  const holdEnd = state ? nextHoldEnd(state.agents, now) : null // Bug 228: a held line goes when its hold ends, not up to 15 s later
+  useEffect(() => { if (holdEnd === null) return; const t = setTimeout(() => setNow(Date.now()), holdEnd - Date.now() + 50); return () => clearTimeout(t) }, [holdEnd])
   const [steady] = useState(boardKeeper) // Bug 98: boxes that came out the same are last time's, so only a changed box is redrawn
-  const board = useMemo(() => state ? steady(buildBoard(state, now, state.repos.find((r) => r.id === repoNow?.id) ?? null)) : null, [state, now, repoNow?.id, steady])
+  const opened = useOpenDone() // Bug 164: done features the user opened
+  const board = useMemo(() => state ? steady(buildBoard(state, now, state.repos.find((r) => r.id === repoNow?.id) ?? null, opened)) : null, [state, now, repoNow?.id, steady, opened])
   const showNeed = useRef<(n: Need) => void>(() => {}) // set below, once the board is known
   const needs = useAlerts(all, (n) => showNeed.current(n))
   // A clicked notification opens its box when it's in the repo on screen; another repo's is only named (switching parks agents).
@@ -154,11 +163,15 @@ export default function App() {
   const selectNode = (id: string) => {
     if (id === 'tpm') { const t = repo?.tpm_agent_id ? state.agents.find((a) => a.id === repo.tpm_agent_id) : undefined // its terminal, else the conversation
       setSel({ node: id, agentId: t?.id ?? null, ticketId: null }); showPanel(true, t && t.status !== 'exited' ? 'agent' : 'messages') }
-    else if (id.startsWith('f:')) { setSel({ node: id, agentId: null, ticketId: null }); showPanel(true, 'messages') } // the feature's messages
+    else if (id.startsWith('f:')) { setSel({ node: id, agentId: null, ticketId: null }); showPanel(true, 'messages') // the feature's messages
+      const ts = state.tickets.filter((t) => t.feature_id === id.slice(2) && t.status !== 'cancelled') // done: shows its tickets again (Bug 164)
+      if (ts.length && ts.every((t) => t.status === 'merged') && !board.has(`t:${ts[0]!.id}`)) openDone(id.slice(2)) }
     else if (id.startsWith('t:')) { const t = state.tickets.find((x) => x.id === id.slice(2)); if (!t) return; const eng = liveEngineer(t, state); setSel({ node: id, agentId: eng?.id ?? t.assignee_agent_id ?? null, ticketId: t.id }); showPanel(true, eng ? 'agent' : 'ticket') }
   }
   const pickAgent = (a: Agent) => { setSel({ node: board.agentNode(a.id), agentId: a.id, ticketId: a.ticket_id ?? null }); showPanel(true, 'agent') }
-  const pvOpen = !!repo && !!pv && prefs.open, pvBelow = prefs.dock === 'bottom'
+  // Bug 167: the graph and the app pane share what the side panel leaves; with too little room the pane shows below the graph
+  const panelPx = panelWidth(panelW, win.w), room = mainWidth(win.w, panel.open ? panelPx : null), roomRight = fitsRight(room)
+  const pvOpen = !!repo && !!pv && prefs.open, pvBelow = prefs.dock === 'bottom' || !roomRight, pvW = rightWidthIn(prefs.w, room)
   const tabLabel: Record<Tab, string> = { agent: `Agent${selAgent ? `: ${selAgent.display_name ?? selAgent.id}` : ''}`, ticket: `Ticket${selTicket ? `: ${selTicket.key}` : ''}`, messages: 'Messages', events: 'Events' }
   return <BoardCtx.Provider value={ctx}>
     {updated && <UpdatedBar />}
@@ -188,14 +201,14 @@ export default function App() {
       {repo && <AutoBanner all={all!} repo={repo} />}
       <ErrorBar />
       </div>
-      <div className="grid min-h-0" style={{ gridTemplateColumns: panel.open ? `minmax(0,1fr) 6px ${panelW}px` : 'minmax(0,1fr)' }}>
-        <main className="grid min-h-0 min-w-0" style={!pvOpen ? { gridTemplateRows: 'minmax(0,1fr)' } : pvBelow ? { gridTemplateRows: `minmax(0,1fr) 6px ${clampH(prefs.h)}px` } : { gridTemplateColumns: `minmax(0,1fr) 6px ${clampW(prefs.w)}px` }}>
+      <div className="grid min-h-0" style={{ gridTemplateColumns: panel.open ? `minmax(0,1fr) 6px ${panelPx}px` : 'minmax(0,1fr)' }}>
+        <main className="grid min-h-0 min-w-0" style={!pvOpen ? { gridTemplateRows: 'minmax(0,1fr)' } : pvBelow ? { gridTemplateRows: `minmax(0,1fr) 6px ${clampH(prefs.h)}px` } : { gridTemplateColumns: `minmax(0,1fr) 6px ${pvW}px` }}>
           <div className="min-h-0 min-w-0"><Graph nodes={board.nodes} edges={board.edges} fits={board.fits} focus={focusReq} onSelect={selectNode} onPane={() => setPop(null)} /></div>
-          {pvOpen && <><Splitter dir={pvBelow ? 'row' : 'col'} label="Resize preview" size={pvBelow ? clampH(prefs.h) : clampW(prefs.w)} def={pvBelow ? Math.round(window.innerHeight * 0.45) : rightWidth(prefs.device)}
-            set={(n) => { const c = pvBelow ? clampH(n) : clampW(n); setPrefs(pvBelow ? { h: c } : { w: c }, false); return c }} save={(n) => setPrefs(pvBelow ? { h: n } : { w: n })} />
-            <PreviewPane all={all!} p={pv} repo={repo} prefs={prefs} setPrefs={setPrefs} ws={ws} feed={feed} onRepo={switchRepo} /></>}
+          {pvOpen && <><Splitter dir={pvBelow ? 'row' : 'col'} label="Resize preview" size={pvBelow ? clampH(prefs.h) : pvW} def={pvBelow ? Math.round(window.innerHeight * 0.45) : rightWidth(prefs.device)}
+            set={(n) => { const c = pvBelow ? clampH(n) : rightWidthIn(n, room); setPrefs(pvBelow ? { h: c } : { w: c }, false); return c }} save={(n) => setPrefs(pvBelow ? { h: n } : { w: n })} />
+            <PreviewPane all={all!} p={pv} repo={repo} prefs={prefs} setPrefs={setPrefs} ws={ws} feed={feed} onRepo={switchRepo} roomRight={roomRight} /></>}
         </main>
-        {panel.open && <><Splitter dir="col" label="Resize panel" size={panelW} def={PANEL_DEFAULT} set={(w) => { const c = clampPanel(w); setPanelW(c); return c }} save={(w) => { try { localStorage.setItem(PANEL_KEY, String(w)) } catch { /* private window: width just isn't remembered */ } }} />
+        {panel.open && <><Splitter dir="col" label="Resize panel" size={panelPx} def={PANEL_DEFAULT} set={(w) => { const c = panelWidth(w, win.w); setPanelW(c); return c }} save={(w) => { try { localStorage.setItem(PANEL_KEY, String(w)) } catch { /* private window: width just isn't remembered */ } }} />
           <aside className="flex min-h-0 min-w-0 flex-col gap-2 p-2">
             <div className="flex items-center gap-1 text-xs">{(['agent', 'ticket', 'messages', 'events'] as Tab[]).map((t) => <button key={t} className={`btn min-w-0 truncate ${panel.tab === t ? 'btn-primary' : ''}`} onClick={() => showPanel(true, t)}>{tabLabel[t]}</button>)}
               <span className="grow" /><button className="btn" title="Close the panel" onClick={() => showPanel(false)}>×</button></div>
@@ -226,9 +239,7 @@ function applyPatch(s: State, m: { entity: string; id: string; patch: Record<str
   if (key === 'messages' && next.length > 500) next = next.slice(0, 500) // newest first; the snapshot starts with 300
   return { ...s, [key]: next }
 }
-const REPO_KEY = 'hq.repo', PANEL_KEY = 'hq.panelW', OPEN_KEY = 'hq.panelOpen', PANEL_DEFAULT = 520, PANEL_MIN = 360
-/** The panel's width: what the user dragged it to, but on a narrow window it gives way so the graph keeps at least ~420px. */
-const clampPanel = (w: number) => Math.round(Math.max(Math.min(PANEL_MIN, window.innerWidth * 0.45), Math.min(w, window.innerWidth * 0.8, window.innerWidth - 420)))
+const REPO_KEY = 'hq.repo', PANEL_KEY = 'hq.panelW', OPEN_KEY = 'hq.panelOpen'
 const readOpen = () => { try { return localStorage.getItem(OPEN_KEY) !== '0' } catch { return true } }
 const saveOpen = (open: boolean) => { try { localStorage.setItem(OPEN_KEY, open ? '1' : '0') } catch { /* private window: just not remembered */ } }
 /** Drag strip in front of a pane that sits to its right (`col`) or below it (`row`). Drag, arrow keys (16px; ←/↑ grow the pane)
@@ -278,7 +289,7 @@ function RepoBar({ state, all, repo, onRepo, onRemoved, now }: { state: State; a
     {repo && (failed && busy !== 'sync' ? <Menu label={`${status}${when}`} align="left" className="btn border-rose-500/50! text-rose-300!">{() => <div className="w-80 text-xs text-rose-200">{repo.sync_detail}</div>}</Menu>
       : <span className="max-w-52 truncate text-zinc-500" title={`${status}${when}`}>{status}{when}</span>)}
     {localOnly(repo) && <Menu label="Local edits only" align="left" className="btn border-indigo-500/50! text-indigo-300!">{() => <div className="w-80 text-xs text-indigo-200">
-      {account} can't push to {repo.name}, so HQ works on it locally: finished tickets get Merge into main, into your local {repo.default_branch}. Nothing is pushed and no PRs are opened.</div>}</Menu>}
+      {account} can't push to {repo.name}, so HQ works on it locally: finished tickets get Merge into {repo.default_branch}, which merges them into your local checkout. Nothing is pushed and no PRs are opened.</div>}</Menu>}
     {repo && <button className="btn" onClick={sync} disabled={!!busy}>Sync</button>}
     {repo && (repo.clearing_at || busy === 'clear'
       ? <span className="max-w-52 truncate text-rose-300" role="status" title="Each agent that was mid-work writes a handoff note (up to 3 minutes); then the board is archived and deleted.">
@@ -336,12 +347,15 @@ function AgentsMenu({ state, selected, onPick }: { state: State; selected: strin
   return <Menu label={`Agents · ${running} running`} title="Every agent, including stopped ones and ones with no box on the graph">{(close) => <div className="flex max-h-[75vh] w-80 flex-col gap-1 overflow-y-auto">
     {state.claude && (() => { const c = claudeLine(state.claude); return <div className={`break-words px-1 text-[11px] ${c.warn ? 'text-amber-300' : 'text-zinc-500'}`}>{c.text}</div> })()}
     {!state.agents.length && <div className="p-1 text-xs text-zinc-500">No agents yet.</div>}
-    {state.agents.map((a) => { const w = waitingFor(a, state); return <button key={a.id} onClick={() => { onPick(a); close() }} className={`card w-full p-2! text-left text-xs ${selected === a.id ? 'border-indigo-500/60!' : ''}`}>
-      <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate font-medium" title={a.display_name ?? a.id}>{a.display_name ?? a.id}</span><Pill s={a.status} /></div>
+    {state.agents.map((a) => { const w = waitLine(a, state); return <button key={a.id} onClick={() => { onPick(a); close() }} className={`card w-full p-2! text-left text-xs ${selected === a.id ? 'border-indigo-500/60!' : ''}`}>
+      <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate font-medium" title={a.display_name ?? a.id}>{a.display_name ?? a.id}</span>
+        <Pill s={a.status} label={agentPill(a, state)} /></div>
       <div className="mt-1 text-zinc-500">{a.role} · {a.model_live ?? a.model_alias}{a.in_plan_mode ? ' · plan' : ''}{a.steps_total ? ` · step ${a.steps_done}/${a.steps_total}` : ''}</div>
       {a.status === 'exited' ? (() => { const e = endedLine(a, state); return e && <div className="mt-1 break-words text-zinc-500">{e}</div> })()
-        : a.activity && <div className="mt-1 truncate text-zinc-400">{a.activity}</div>}
-      {w && <div className={`mt-1 ${w.held ? 'text-amber-300' : 'text-zinc-400'}`}>✉ {w.count} waiting · {w.why}</div>}
+        : (() => { const line = menuActivity(a, state), tone = onDialog(a) ? 'text-rose-300' : a.status !== 'plan_review' ? 'text-zinc-400'
+          : agentPlanWait(a, state).hq ? 'text-sky-300' : 'text-amber-300' // whom its plan waits on: you (amber), or HQ's check (sky), as on its box
+          return line && <div className={`mt-1 truncate ${tone}`} title={line}>{line}</div> })()}
+      {w && <div className={`mt-1 ${w.held ? 'text-amber-300' : 'text-zinc-400'}`}>{w.text}</div>}
     </button> })}</div>}</Menu>
 }
 /** What other projects need, beside ⚠ (Bug 63): ⚠ is about this project, and a project stopped elsewhere has to be impossible to miss. Stopped comes from the
@@ -406,13 +420,14 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
     {merges.map(({ t, acts }) => { const node = `t:${t.id}`; return <div key={t.id} className="flex items-center gap-2 rounded-md border border-zinc-800 p-2"><span className="min-w-0 grow truncate text-indigo-300" title={`${t.key}: ${t.title}`}>{t.key} · {t.title}</span>
       {acts.map((a, i) => <MergeAct key={i} a={a} t={t} />)}{board.has(node) && <button className="btn-sm" onClick={() => { b.focus(node); close() }}>Show</button>}</div> })}
     {state.attention.length > 0 && <div className="font-semibold text-zinc-400">Attention</div>}
-    <AttentionList items={state.attention} show={(a) => showAtt(a, close)} />
+    <AttentionList items={state.attention} show={(a) => showAtt(a, close)} s={state} />
   </div>}</Menu>
 }
 function TicketInfo({ t, state }: { t: any | null; state: State }) {
   if (!t) return <div className="p-4 text-sm text-zinc-500">Click a ticket box to see its details here.</div>
   const f = state.features.find((x) => x.id === t.feature_id), deps = jsonList(t.deps), files = jsonList(t.expected_files), ask = ticketQuestion(state, t)
-  return <div className="h-full overflow-y-auto pr-1 text-xs">
+  // break-words: a long run with no spaces (a path in a stack trace) wraps instead of making the tab scroll sideways (Bug 144)
+  return <div className="h-full overflow-y-auto break-words pr-1 text-xs">
     <div className="flex items-center gap-2"><span className="font-semibold">{t.key}</span><span className="text-zinc-500">{t.size}</span>
       <Pill s={t.status} label={ticketLabel(t, state.reviews.some((r) => r.ticket_id === t.id && r.status === 'open' && hqAnswersPlan(state, r)))} /></div>
     <div className="mt-1 text-sm text-zinc-200">{t.title}</div>
@@ -428,7 +443,7 @@ function TicketInfo({ t, state }: { t: any | null; state: State }) {
     <Criteria t={t} />
     <Readers t={t} state={state} />
     <div className="mt-3 font-semibold text-zinc-400">Spec</div>
-    <pre className="mt-1 whitespace-pre-wrap text-[11px] text-zinc-300">{t.spec || '—'}</pre>
+    <pre className="mt-1 whitespace-pre-wrap break-words text-[11px] text-zinc-300">{t.spec || '—'}</pre>
     <HandoffNote scope={`resume:ticket:${t.id}`} stamp={`${t.parked_at}:${t.assignee_agent_id}`} />
   </div>
 }
@@ -452,7 +467,7 @@ function Criteria({ t }: { t: any }) {
  *  Nothing for a ticket neither has read. The plan check shown is the one that sent a plan back, if any did, else the newest. */
 function Readers({ t, state }: { t: any; state: State }) {
   const plans = state.reviews.filter((r) => r.ticket_id === t.id).map((r) => planCheckOf(r.plan_check)).filter((c) => !!c)
-  const plan = planCheckWords(plans.find((c) => c.state === 'sent_back') ?? plans[0] ?? null), diff = diffCheckWords(diffCheckOf(t))
+  const plan = planCheckWords(plans.find((c) => c.state === 'sent_back') ?? plans[0] ?? null), diff = diffCheckWords(diffCheckOf(t), t)
   if (!plan && !diff) return null
   const part = (w: NonNullable<typeof plan>, key: string) => <div key={key} className="mt-1"><div className={`break-words ${TONE[w.tone]}`}>{w.text}</div>
     {w.findings.length > 0 && <ul className="mt-0.5 space-y-0.5 text-zinc-300">{w.findings.map((f, i) => <li key={i} className="break-words">
@@ -479,17 +494,28 @@ function MergeTests({ t }: { t: any }) {
 }
 function AgentPane({ a, ws, feed }: { a: any; ws: WebSocket | null; feed: (id: string, cb: (d: string) => void) => () => void }) {
   const [text, setText] = useState(''); const { state } = useBoard()
-  const lim = ctxLimit(state, a.role), ctx = a.context_tokens ? `${kTok(a.context_tokens)}${lim ? ` / ${kTok(lim)}` : ''}` : ''
-  const who = `${a.role} · ${a.model_live ?? a.model_alias}${ctx ? ` · context ${ctx}` : ''}`, usage = usageParts(a, pauseAt(state.settings, state.defaults))
+  // Bug 161: an exited agent's tab shows why and when it ended, with no Stop and no figure from its last session
+  const { who, stop } = agentHeader(a, ctxLimit(state, a.role), endedLine(a, state)), usage = usageParts(a, pauseAt(state.settings, state.defaults))
+  // Bug 174: a stopped agent's box says where a message goes (the session that takes its place), or has none when nothing will
+  const route = messageRoute(a, state.tickets.find((t) => t.id === a.ticket_id), state.repos.find((r) => r.id === a.repo_id))
+  // cleared at once (a second click sends nothing), and put back if HQ refuses it (a stale tab of an agent nothing comes after: 409)
+  const send = (how: { reason?: string; urgent?: boolean }) => { const body = text; if (!body.trim()) return; setText('')
+    api(`agents/${a.id}/message`, { body, ...how }).catch((x) => { setText((t) => t || body); showError(errText(x)) }) }
   return <div className="flex h-full flex-col gap-2">
-    <div className="flex flex-wrap items-center gap-2 text-xs"><span className="shrink-0 whitespace-nowrap font-semibold">{a.display_name ?? a.id}</span><Pill s={a.status} />
-      <span className="grow" /><FreshBtn a={a} label="Fresh start" /><button className="btn" onClick={() => api(`agents/${a.id}/stop`, {})}>Stop</button>
+    <div className="flex flex-wrap items-center gap-2 text-xs"><span className="shrink-0 whitespace-nowrap font-semibold">{a.display_name ?? a.id}</span>
+      <Pill s={a.status} label={agentPill(a, state)} />
+      <span className="grow" /><FreshBtn a={a} label="Fresh start" />{stop && <button className="btn" onClick={() => api(`agents/${a.id}/stop`, {})}>Stop</button>}
       <span className="basis-full text-zinc-500">{who}{usage.map((u) => <span key={u.key}>{'\u00a0· '}{/* a wrap never starts a line with the dot */}
         <span className="cursor-help whitespace-nowrap" title={u.tip}>{u.text}</span></span>)}</span></div>
     <div className="min-h-0 grow overflow-hidden rounded-md border border-zinc-800">{a.status !== 'exited' ? <AgentTerminal agentId={a.id} ws={ws} feed={feed} /> : <div className="p-4 text-zinc-500">Exited.</div>}</div>
-    <form className="flex gap-1" onSubmit={(e) => { e.preventDefault(); if (!text.trim()) return; api(`agents/${a.id}/message`, { body: text, reason: 'fyi' }); setText('') }}>
-      <input className="input" placeholder={`Message ${a.display_name ?? a.id} (delivered when idle)`} value={text} onChange={(e) => setText(e.target.value)} /><button className="btn btn-primary">Send</button>
-      <button type="button" className="btn" onClick={() => { if (text.trim()) { api(`agents/${a.id}/message`, { body: text, urgent: true }); setText('') } }}>Urgent</button></form>
+    {'none' in route ? <div className="text-xs text-zinc-500">It has stopped, so a message can't reach it. {route.none}</div>
+      : <>{'next' in route && <div className="text-xs text-zinc-500">It has stopped: a message here goes to {route.next}, once one starts.</div>}
+        <form className="flex gap-1" onSubmit={(e) => { e.preventDefault(); send({ reason: 'fyi' }) }}>
+          <input className="input" placeholder={'next' in route ? `Message for ${route.next}` : `Message ${a.display_name ?? a.id} (delivered when idle)`}
+            value={text} onChange={(e) => setText(e.target.value)} />
+          <button className="btn btn-primary">Send</button>
+          {/* Urgent interrupts a running turn; a stopped agent has none */}
+          {'live' in route && <button type="button" className="btn" onClick={() => send({ urgent: true })}>Urgent</button>}</form></>}
   </div>
 }
 /** Messages, newest first. "Yours" (the default): what you sent and what agents said to you (the TPM's replies included); "Everything"
@@ -506,9 +532,14 @@ function Messages({ state, featureId }: { state: State; featureId: string | null
       {what && <span className="min-w-0 truncate text-zinc-500" title={what}>· {what}</span>}</div>
     <div className="min-h-0 grow overflow-y-auto">{!msgs.length && <div className="p-4 text-sm text-zinc-500">No messages yet.</div>}
       {msgs.map((m) => <div key={m.id} className="mb-2"><div className="text-zinc-500">{name(m.from_id)} → {m.to_id ? name(m.to_id) : 'everyone'}{all ? ` [${m.reason}]` : ''}
-        {m.ack_at ? ' ✓' : m.delivered_at ? ' ·' : ' ⏳'} · {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
+        {' '}<MsgMark m={m} /> · {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
         <div className="text-zinc-300"><Md text={m.body} /></div></div>)}</div>
   </div>
+}
+/** Bug 187: a dropped or undelivered message has its own mark, never the delivered "·"; the hover says what each mark means. */
+function MsgMark({ m }: { m: any }) {
+  const k = deliveryMark(m), tone = k.kind === 'dropped' ? 'text-amber-400' : k.kind === 'failed' ? 'text-rose-400' : ''
+  return <span data-mark={k.kind} title={k.title} className={`cursor-help ${tone}`}>{k.text}</span>
 }
 /** The handoff note the last engineer left for the next one (fresh start), read-only; refetched when the ticket's engineer changes. */
 function HandoffNote({ scope, stamp }: { scope: string; stamp: string }) {

@@ -101,11 +101,13 @@ export function freshFrom(v: Verdict, s: ScenarioRun, rec: Recorded): Fresh[] {
 }
 
 export type CheckedRun = { findings: Fresh[]; verdicts: Verdict[]; note?: string; ms: number; tokens: number }
-/** Judges every recorded scenario of a run, a batch at a time. Scenarios with no recording are left out and said once in `note`. */
-export async function checkRun(repo: Repo, runId: string, scenarios: ScenarioRun[], gen = autoGen(repo.path)): Promise<CheckedRun | 'stopped'> {
+/** Judges every recorded scenario of a run, a batch at a time. Scenarios with no recording are left out and said once in `note`, with `unrecorded` (why
+ *  the recorder wasn't on for the run) when that is the reason. */
+export async function checkRun(repo: Repo, runId: string, scenarios: ScenarioRun[], gen = autoGen(repo.path), unrecorded?: string): Promise<CheckedRun | 'stopped'> {
   const recs = scenarios.map((s) => ({ run: s, rec: s.recording ? inputs().recording(repo.id, s.recording) : null })), have = recs.filter((x): x is { run: ScenarioRun; rec: Recorded } => !!x.rec)
   const missing = recs.length - have.length, out: CheckedRun = { findings: [], verdicts: [], ms: 0, tokens: 0 }
-  const notes: string[] = missing ? [`${missing} of ${recs.length} scenarios had no recording, so the backend checker couldn't judge them`] : []
+  const notes: string[] = !missing ? [] : unrecorded && !have.length ? [`The backend checker had nothing to read: the tester's run wasn't recorded (${unrecorded})`]
+    : [`${missing} of ${recs.length} scenarios had no recording, so the backend checker couldn't judge them`]
   if (!have.length) return { ...out, note: notes.join('; ') || undefined }
   const criteria = backendCriteria(repo.id), names = criteria.map((c) => c.name), dec = decisions(repo.id), endpoints = inputs().endpoints(repo.id), sha = await ref(repo)
   const r = await inCheckout(repo.path, sha, 'checker', gen, { repoId: repo.id, ticketId: null, what: 'checker' }, async (wt, signal) => {
@@ -124,6 +126,9 @@ export async function checkRun(repo: Repo, runId: string, scenarios: ScenarioRun
     return 'done' as const
   })
   if (r === 'stopped') return 'stopped'
+  // What it read, said once in the summary even when it found nothing: a clean pass would otherwise look the same as a checker that never ran
+  const n = out.verdicts.length, k = out.findings.length
+  if (n) notes.unshift(`The backend checker read what the backend did in ${n} scenario${n === 1 ? '' : 's'}: ${k ? `${k} problem${k === 1 ? '' : 's'} reported` : 'nothing wrong found'}`)
   return { ...out, note: notes.join('; ') || undefined }
 }
 

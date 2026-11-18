@@ -16,8 +16,9 @@ export type Replayed = { kind: 'checked'; check: Omit<Check, 'run' | 'at'> } | {
  *  tester to the checker, never the other way). */
 export const retryGoal = (k: Kept): string => `${k.id}: ${fromTester(k) ? k.expected : k.evidence.goal ?? 'do the same thing again, from the start page'}`
 /** What a retry tells the tester. */
-export const retryOf = (k: Kept): Retry => fromTester(k) ? { goal: retryGoal(k), what: k.wording ?? k.what, expected: k.expected, steps: k.steps }
-  : { goal: retryGoal(k), what: 'These steps used to work here. Do the same thing again and report anything that gets in your way.', expected: k.evidence.goal ?? '', steps: k.steps }
+export const retryOf = (k: Kept): Retry => fromTester(k) ? { goal: retryGoal(k), what: k.wording ?? k.what, expected: k.expected, steps: k.steps, own: true }
+  : { goal: retryGoal(k), what: 'These steps used to work here. Do the same thing again and report anything that gets in your way.', expected: k.evidence.goal ?? '', steps: k.steps,
+    own: false }
 /** The criterion a finding broke, as the checker reads it ("T-03 A4"), from the merged ticket it names. */
 function namedCriterion(repoId: string, name?: string): { name: string; text: string } | null {
   const [key, cid] = (name ?? '').split(' '); if (!key || !cid) return null

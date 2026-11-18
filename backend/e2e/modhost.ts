@@ -14,7 +14,7 @@ export async function startMod(o: { backend: string; agentId: string; tokenFile:
   const mod = await import(`data:text/javascript;base64,${Buffer.from(`${SOURCE}\n// copy ${++copies}`).toString('base64')}`)
   const hooks = new Map<string, (...a: any[]) => any>(); mod.register((event: string, hook: (...a: any[]) => any) => hooks.set(event, hook))
   const ticks: (() => void)[] = [], over = new AbortController()
-  let asks = 0, ended = 0
+  let asks = 0, ended = 0, unanswered = 0
   const env: Record<string, string> = { HQ_BACKEND: o.backend, HQ_AGENT_ID: o.agentId, HQ_TOKEN_FILE: o.tokenFile, HOME: path.dirname(o.tokenFile) }
   const $ = {
     env: { get: async (name: string) => env[name] },
@@ -26,6 +26,7 @@ export async function startMod(o: { backend: string; agentId: string; tokenFile:
     http: { fetch: async (url: string, init?: RequestInit) => {
       const next = /\/next\?/.test(url); if (next) asks++ // counted as the mod calls, before anything goes over the network
       try { const r = await fetch(url, { ...init, signal: over.signal }); return { status: r.status, ok: r.ok, headers: {}, text: await r.text() } }
+      catch (e) { unanswered++; throw e }
       finally { if (next) ended++ }
     } },
   }
@@ -37,6 +38,10 @@ export async function startMod(o: { backend: string; agentId: string; tokenFile:
     asks: (): number => asks,
     /** How many of them have ended: answered, refused or failed. */
     ended: (): number => ended,
+    /** How many of the mod's requests of any kind got no answer (HQ away). */
+    unanswered: (): number => unanswered,
+    /** One of Claude Code's events, as the mod's hooks get it (e.g. `turn.complete`). */
+    fire: (event: string, e: object): Promise<unknown> => hooks.get(event)!($, e, async (x: unknown) => x),
     /** The session is over: its open requests end. */
     stop: (): void => over.abort(),
   }

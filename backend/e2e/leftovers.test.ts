@@ -122,10 +122,14 @@ test('Clear and Remove from HQ stop what was left in the worktrees, before the f
   await gone(left2, 15_000)
 })
 
-test('what was left while HQ was down goes when it starts again', async () => {
+test('what was left while HQ was down goes when it starts again; what a command still running started does not (Bug 145)', async () => {
   const { eng, wt } = await engineer('left-restart')
-  await bash(eng.id, 'PreToolUse'); const left = await orphan(wt) // HQ forgets the running command when it restarts
-  await hq.restart(); await gone(left, 20_000)
+  await bash(eng.id, 'PreToolUse', 'npm test', 'r1'); await bash(eng.id, 'PostToolUse', 'npm test', 'r1')
+  await hq.down(); const left = await orphan(wt); await hq.up(); await gone(left, 20_000) // nothing running claims it
+  // a restart in the middle of a command: HQ reads back from its events log that the command still runs (it used to forget it, and stop what it started)
+  await bash(eng.id, 'PreToolUse', 'npm test', 'r2'); const own = await orphan(wt)
+  await hq.restart(); await new Promise((r) => setTimeout(r, 2000)); assert.ok(alive(own), 'kept while the command that started it runs')
+  await bash(eng.id, 'PostToolUse', 'npm test', 'r2'); await gone(own)
 })
 
 test('Bug 81: an engineer\'s own temp folder outlives an HQ restart while it runs, and goes with what was left in it once it stops', async () => {

@@ -44,6 +44,17 @@ test("the engineer taking over gets the goal, the note, git and the plan, and no
   assert.match(planning, /call ExitPlanMode/); assert.match(planning, /\(none\)/); assert.doesNotMatch(planning, /Approved plan/)
 })
 
+test('Bug 184: an engineer taking over a ticket that came back for commits made after its open_pr is told what is merged and what is left', () => {
+  const t = { key: 'UI-4', size: 'S', title: 'Rename', branch: 'hq/ui/UI-4', spec: 'Rename.', status: 'implementing' } as never, none = { status: '', log: '', diffStat: '' }
+  const brief = (merged: string | null) => engineerResumePrompt(t, { feature: 'phone', worktree: '/wt', base: 'main', note: null, git: none, plan: 'PLAN', fix: null,
+    late: { merged, finished: 'f'.repeat(40), commits: ['abc1234 notes'] } })
+  assert.match(brief('a'.repeat(40)), /it was finished once\. HQ already merged the commit an earlier open_pr handed over \(aaaaaaa\) into main, as it passed HQ's tests: that part /)
+  assert.match(brief('a'.repeat(40)), /aren't in main yet:\n- abc1234 notes\nCheck they finish what they started, run the tests, commit, then call open_pr again /)
+  assert.match(brief('a'.repeat(40)), /\(with the same tests\): HQ tests them and merges them\./)
+  assert.match(brief(null), /The last open_pr handed over fffffff, so HQ hasn't merged the ticket: these commits came after it:\n- abc1234 notes\n.+HQ tests it and merges it\./)
+  assert.doesNotMatch(brief(null), /carry on from where/)
+})
+
 test('Bug 84: an engineer taking over a ticket sent back says what it was fixing, conflicts or tests, and so does the TPM\'s board', () => {
   const none = { status: '', log: '', diffStat: '' }
   const t = (fixing: string | null) => ({ key: 'UI-3', size: 'S', title: 'Totals', branch: 'hq/ui/UI-3', spec: 'Add totals.', status: 'resolving', fixing }) as never
@@ -52,8 +63,8 @@ test('Bug 84: an engineer taking over a ticket sent back says what it was fixing
   assert.match(brief('tests'), /It was fixing its tests on main;/); assert.doesNotMatch(brief('tests'), /conflict/)
   assert.match(brief('tests_hung'), /It was finding what never finishes in its tests on main;/)
   assert.match(brief('changes'), /It was building the change to its spec; HQ's instructions for that are below\./); assert.doesNotMatch(brief('changes'), /conflict|its tests/)
-  const board = (fixing: string | null) => tpmPrompt({ name: 'phone', path: '/p', auto_mode: 1 } as never, { ws: '/ws', previous: null, messages: [],
-    board: [{ f: { title: 'Totals', handle: 'F-1' } as never, tickets: [t(fixing)] }] })
+  const board = (fixing: string | null, base = 'main') => tpmPrompt({ name: 'phone', path: '/p', auto_mode: 1, default_branch: base } as never, { ws: '/ws',
+    previous: null, messages: [], board: [{ f: { title: 'Totals', handle: 'F-1' } as never, tickets: [t(fixing)] }] })
   assert.match(board(null), /UI-3 \(S\) Totals: its engineer is fixing its conflicts with main/)
   assert.match(board('tests'), /UI-3 \(S\) Totals: its engineer is fixing its tests on main/)
   // what HQ saw when it opened the app is not a test failure, to the next engineer or to the TPM
@@ -62,6 +73,10 @@ test('Bug 84: an engineer taking over a ticket sent back says what it was fixing
   assert.match(brief('review'), /It was fixing what a fresh reader of its changes found;/); assert.doesNotMatch(brief('review'), /conflict|its tests/)
   assert.match(board('review'), /UI-3 \(S\) Totals: its engineer is fixing what a fresh reader of its changes found/)
   assert.match(board('changes'), /UI-3 \(S\) Totals: its engineer is building the change to its spec/)
+  // Bug 210: the project's own default branch, not always main
+  assert.match(board(null, 'master'), /UI-3 \(S\) Totals: its engineer is fixing its conflicts with master/)
+  assert.match(board('tests', 'master'), /UI-3 \(S\) Totals: its engineer is fixing its tests on master/)
+  assert.doesNotMatch(board('tests', 'master'), /\bmain\b/)
 })
 
 test("Bug 101: HQ's note lists the engineer's own last six tool calls, oldest first, readable", () => {
@@ -77,4 +92,13 @@ test("Bug 101: HQ's note lists the engineer's own last six tool calls, oldest fi
   assert.deepEqual(lines, [1, 2, 3, 4, 5].map((i) => `- Edit {"file_path":"f${i}.ts"}`).concat('- Bash {"command":"npm test"}'))
   assert.doesNotMatch(note, /none recorded|old\.ts|helper|other\.ts/)
   assert.match(fallbackNote({ id: 'eng-c', role: 'engineer', ticket_id: null } as never, ''), /- \(none recorded\)/)
+})
+
+test("Bug 176: HQ's note ends its first line with one stop, whether or not the reason has one", () => {
+  const head = (why: string, role = 'tpm') => fallbackNote({ id: 'x', role, ticket_id: null } as never, why).split('\n')[0]
+  assert.equal(head('T-01 is waiting on a dialog in its terminal. Answer it first.'),
+    "(Written by HQ: the TPM didn't leave a note: T-01 is waiting on a dialog in its terminal. Answer it first.)")
+  assert.equal(head('the project was removed from HQ'), "(Written by HQ: the TPM didn't leave a note: the project was removed from HQ.)")
+  assert.equal(head('is it running?', 'engineer'), "(Written by HQ: the engineer didn't leave a note: is it running?)")
+  assert.equal(head(''), "(Written by HQ: the TPM didn't leave a note.)")
 })

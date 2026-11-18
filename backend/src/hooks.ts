@@ -8,6 +8,7 @@ import { agentByToken, getAgent, update, tmuxToken, revokeToken, type Agent } fr
 import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
 import { ackBatchFromPrompt, deliveredByStopHook, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway, nextDeadline } from './delivery.ts'
 import { turnEnded } from './delivery.ts'
+import { lateReportFits, submittedWhileAway } from './delivery.ts'
 import { listen, wake, type Waiter } from './wake.ts'
 import { onPostModelSwitch, onTurnStep } from './modelguard.ts'
 import { attention, resolveKind } from './attention.ts'
@@ -19,12 +20,19 @@ import * as tmux from './tmux.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
 import { TOKEN_HEADER } from './roles.ts'
 import { sawTestCmd } from './auto.ts'
+import { overPause, pauseLevels } from './scheduler.ts'
+import { keepBefore, keepState, suiteRan } from './suiteran.ts'
+import { dialogMayBeOver } from './dialogclear.ts'
 
 const TAKEOVER_ATTACHED_MS = 365 * 86_400_000 // "until they detach"
 /** Bug 99: the longest a waiting `next` goes without looking, for a change that woke nothing (a write that wake.ts doesn't hear of). */
 const NEXT_BACKSTOP_MS = Number(process.env.HQ_NEXT_BACKSTOP_MS ?? 5000)
 /** Notification types that mean a dialog is open and waiting for a person (checked on 2.1.300). */
 const DIALOGS = new Set(['permission_prompt', 'elicitation_dialog', 'elicitation_url_dialog', 'agent_needs_input', 'worker_permission_prompt'])
+/** Bug 188: hooks of the agent's own main loop that say its dialog may be over (its turn went on or ended), so HQ looks at once (dialogclear.ts). Not a
+ *  helper's: the main loop's dialog stays open while one works. Not PermissionRequest: that comes before a dialog. Not proof either: a helper's dialog,
+ *  or a second one, can still be open, and only the status file and the screen tell. */
+const DIALOG_MAY_BE_OVER = new Set(['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop', 'StopFailure'])
 
 const json = (res: http.ServerResponse, code: number, obj: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)) }
 const deny = (message: string) => ({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message } } })
@@ -60,6 +68,23 @@ const helperActivity = (m: Map<string, string>): string => `Subagent: ${[...m.va
 const stillOn = (id: string, m: Map<string, string>): string | null => m.size ? helperActivity(m) : waitingText(id)
 /** The stuck loop saw the agent's idle prompt for minutes: nothing HQ thought was running is. */
 export function forgetHelpers(agentId: string): void { helpers.delete(agentId) }
+/** Bug 148: the agent's own turn was interrupted (Escape in its terminal), as its mod tells it. No Stop hook comes for such a turn, so this is where it ends:
+ *  the agent is idle at once, with no activity line, unless a helper or a run in the background of its own still goes (Bugs 94, 95). It counts as a sign of
+ *  life (an engineer's idle time starts here, bgruns.ts idleTooLong). Only a working agent: a plan review or a pause has its own way out, and one on a dialog
+ *  gets here once HQ has seen the dialog is gone (Bug 188, onDialogEnd). */
+function turnOver(agentId: string, afterDialog = false): void {
+  const a = getAgent(agentId) // read again: turnEnded has just written to it. Bug 188: after a dialog's clear, idle or working by its status file
+  if (!a || !(a.status === 'working' || (afterDialog && a.status === 'idle'))) return
+  const turn = turns.get(agentId); if (turn) turn.stop = ++turnSeq // a helper that ends from now on leaves it idle (SubagentStop)
+  const on = stillOn(agentId, helpers.get(agentId) ?? new Map())
+  update(agentId, { status: on ? 'working' : 'idle', last_event_at: now() }, { activity: on }) // one patch (Bug 98)
+}
+/** Bug 188: Escape or a denial on a dialog ends the turn with no Stop hook, and the mod's `turn.complete` says isAborted false (checked on 2.1.322). Once HQ
+ *  has seen the dialog gone, the turn ends as above, unless a new one has started since (a prompt typed or sent meanwhile). */
+const onDialogEnd = (agentId: string): (() => void) => {
+  const at = turns.get(agentId)?.prompt ?? 0
+  return () => { if ((turns.get(agentId)?.prompt ?? 0) === at) turnOver(agentId, true) }
+}
 function handleHook(agent: Agent, body: Record<string, unknown>, res: http.ServerResponse): void {
   const ev = String(body.hook_event_name ?? ''); const tool = String(body.tool_name ?? ''); const input = (body.tool_input ?? {}) as Record<string, unknown>
   const mode = body.permission_mode as string | undefined; const t = now()
@@ -96,14 +121,15 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
       if (tool === 'Bash' && !sub) { // Bug 95: still running in the background, and the agent waits on it
         const task = watchedTask(input, body.tool_response, getRepo(repoOfAgent(agent) ?? '')?.test_cmd ?? null)
         if (task) { addRun(agent.id, { task, use: String(body.tool_use_id ?? ''), command: String(input.command ?? '') }); payload.bg = task } }
-      payload.ran = ranBash(agent, tool, input); break
+      payload.ran = ranBash(agent, tool, input); if (tool === 'Bash') payload.suite = suiteRan(agent, String(input.command ?? '')); break
     case 'PostToolUseFailure': Object.assign(payload, { input: trim(input, 200), use: body.tool_use_id, error: trim(body.error, 300), is_interrupt: body.is_interrupt })
-      payload.ran = ranBash(agent, tool, input, body.error ?? ''); break
+      payload.ran = ranBash(agent, tool, input, body.error ?? ''); if (tool === 'Bash') payload.suite = suiteRan(agent, String(input.command ?? ''), String(body.error ?? '')); break
     case 'Stop': { turn.stop = ++turnSeq; payload.last = trim(body.last_assistant_message, 600); const on = stillOn(agent.id, bg); fields.status = on ? 'working' : 'idle'
       if (agent.interrupted_at) fields.interrupted_at = null // Bug 110: a turn ended normally (an interrupted one sends no Stop), so the mod's prompts get through again
       Object.assign(live, { activity: on, last_message: trim(body.last_assistant_message, 2000) })
       if (agent.role === 'tpm') recordReply(agent, String(body.last_assistant_message ?? '')); break }
-    case 'StopFailure': payload.error = trim(body.error ?? body, 400); fields.status = 'blocked'; break
+    // Bug 72: no dialog, the turn just ended with an error. It waits at its prompt for a message, isn't "waiting on a dialog", and isn't "Thinking"
+    case 'StopFailure': payload.error = trim(body.error ?? body, 400); Object.assign(fields, { status: 'blocked', blocked_why: 'api_error' }); live.activity = null; break
     case 'Notification': Object.assign(payload, { ntype: body.notification_type, message: trim(body.message, 200) }); break
     case 'PostModelSwitch': case 'PreModelSwitch': Object.assign(payload, { from: body.from_model, to: body.to_model, source: body.source, requested: body.requested_model }); break
     case 'PreCompact': case 'PostCompact': payload.trigger = body.trigger; break
@@ -116,9 +142,14 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (fields.status && fields.status !== 'paused' && agent.paused_reason?.startsWith('quota_auto_resume')) { // the usage wait is over: a turn moved on
     fields.paused_reason = null; resolveKind('usage_limit', agent.id)
   }
-  if (agent.status === 'exited') { delete fields.status; delete fields.ended_why } // a late hook from a session HQ already counts as gone doesn't bring it back, or say why it went
+  // Bug 178: a turn after an API error started (or one ended normally), so that error is over. An ended agent's stays: auto mode acts on it
+  if ((ev === 'UserPromptSubmit' || ev === 'Stop') && agent.status !== 'exited') resolveKind('api_error', agent.id)
+  // a late hook from a session HQ already counts as gone doesn't bring it back, or say why it went
+  if (agent.status === 'exited') { delete fields.status; delete fields.ended_why; delete fields.blocked_why }
   update(agent.id, fields, agent.status !== 'exited' ? live : {}) // one patch (Bug 98)
-  emit({ agentId: agent.id, sessionId: String(body.session_id ?? ''), source: 'hook', kind: `hook.${ev}${tool ? ':' + tool : ''}`, payload })
+  const row = emit({ agentId: agent.id, sessionId: String(body.session_id ?? ''), source: 'hook', kind: `hook.${ev}${tool ? ':' + tool : ''}`, payload })
+  if (payload.suite && !payload.bg && row.id) keepState(agent, row.id, String(input.command ?? ''), String(body.tool_use_id ?? '')) // Bug 194: what the worktree held when the test command was over
+  if (!sub && DIALOG_MAY_BE_OVER.has(ev) && agent.status !== 'exited') dialogMayBeOver(agent.id, `hook:${ev}`) // Bug 188: after the update, which the look reads
   // Bug 107: a Bash command of an engineer's (or of a helper of its: same session, same worktree) is over. Was it the project's test command, refused by Claude Code?
   if (tool === 'Bash' && (ev === 'PostToolUse' || ev === 'PostToolUseFailure')) sawTestCmd(agent, String(input.command ?? ''), ev === 'PostToolUse' ? undefined : String(body.error ?? ''))
 
@@ -135,9 +166,13 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   // Bug 76: a build or a full test run waits here for its turn; the answer is what lets the command start. The agent itself and each helper of its run one tool
   // at a time, so the next tool starting (or a helper finishing) means the turn its last command held is free
   const lane = sub ? String(body.agent_id) : 'main'
-  if (ev === 'PreToolUse' || ev === 'SubagentStop') laneMoved(agent.id, lane)
+  if (ev === 'PreToolUse' || ev === 'SubagentStop') laneMoved(agent.id, lane, ev === 'PreToolUse' && tool === 'Bash' ? String(body.tool_use_id ?? '') : '') // Bug 145: asked again
+  // Bug 213: a test run with a command after it that may change files starts once HQ has what the worktree holds before it (suiteran.ts)
+  const goAhead = (): void => { const p = row.id ? keepBefore(agent, String(input.command ?? ''), row.id, input.run_in_background === true) : null
+    if (!p) return json(res, 200, {}); void p.then(() => { if (!res.writableEnded && !res.destroyed) json(res, 200, {}) }) }
   if (ev === 'PreToolUse' && tool === 'Bash' && gateBash(agent, { use: String(body.tool_use_id ?? ''), command: String(input.command ?? ''), timeout: input.timeout,
-    background: input.run_in_background === true, lane, plan: mode === 'plan', activity: describeTool(tool, input) }, res, () => json(res, 200, {}))) return
+    background: input.run_in_background === true, lane, plan: mode === 'plan', activity: describeTool(tool, input) }, res, goAhead)) return
+  if (ev === 'PreToolUse' && tool === 'Bash') return goAhead()
   if (ev === 'PreModelSwitch') return json(res, 200, { hookSpecificOutput: { hookEventName: 'PreModelSwitch', permissionDecision: 'deny', permissionDecisionReason: 'HQ controls models for this agent.' } })
   if (ev === 'PostModelSwitch') { onPostModelSwitch(agent, body); return json(res, 200, {}) }
   if (ev === 'ConfigChange') return json(res, 200, agent.role === 'engineer' || agent.role === 'launcher' ? { decision: 'block', reason: 'HQ: configuration changes are not allowed' } : {})
@@ -146,7 +181,9 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (ev === 'PostToolUse' && (tool === 'TaskCreate' || tool === 'TaskUpdate')) { recordTask(agent, tool, input, body.tool_response as Record<string, unknown> | undefined) }
   if (ev === 'UserPromptSubmit' || ev === 'Stop') {
     const ctx: string[] = []
-    const unread = unreadCount(agent); if (unread) ctx.push(`HQ: ${unread} unread message(s) are queued and will arrive as a new turn when you are idle.`)
+    // Only as a turn starts (Bug 139): on Stop the note made the agent answer it, again and again, and never go idle for the message to come in
+    const unread = ev === 'UserPromptSubmit' ? unreadCount(agent) : 0
+    if (unread) ctx.push(`HQ: ${unread} unread message(s) are queued and will arrive as a new turn when you are idle.`)
     if (agent.ticket_id) { const rv = openReviews().find((r) => r.ticket_id === agent.ticket_id); if (rv) ctx.push(`HQ: plan review R-${rv.round} is pending; if your ExitPlanMode call was denied without an HQ message, call ExitPlanMode again without changing the plan.`) }
     if (ev === 'Stop') { const modAlive = agent.mod_seen_at && t - agent.mod_seen_at < 120_000; const pend = pendingFor(agent)
       // The mod has gone quiet: the batch goes in this answer, and the turn goes on with it (Bug 103). So the agent is working again, as
@@ -159,7 +196,8 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (ev === 'Notification') { // Bug 62: exact names. elicitation_response and _complete mean a dialog ended, and quota_auto_resume_fired that Claude Code carries on
     const nt = String(body.notification_type ?? ''), who = agent.display_name ?? agent.id
     if (nt === 'permission_prompt' && /plan/i.test(String(body.message ?? ''))) { /* gate open; not stuck */ }
-    else if (DIALOGS.has(nt)) { update(agent.id, { status: 'blocked' }); attention('dialog', `${who}: ${trim(body.message, 160)}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
+    else if (DIALOGS.has(nt)) { update(agent.id, { status: 'blocked', blocked_why: 'dialog' })
+      attention('dialog', `${who}: ${trim(body.message, 160)}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
     else if (nt === 'quota_auto_resume_stale' || nt === 'quota_auto_resume_disabled') {
       update(agent.id, { status: 'paused', paused_reason: nt }); attention('usage_limit', `${who}: ${trim(body.message, 160)}`, { agentId: agent.id })
     } else if (nt === 'quota_auto_resume_fired') {
@@ -207,7 +245,7 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
       try { // later looks run from a timer, outside the server's own catch
         const a = getAgent(agent.id); if (!a || a.status === 'exited') return finish(200, {})
         w.status = a.status
-        const b = nextBatchFor(a); if (b) return finish(200, { batch: { id: b.id, text: b.text, asUser: b.asUser, raw: b.raw } })
+        const b = nextBatchFor(a); if (b) return finish(200, { batch: { id: b.id, text: b.text, asUser: b.asUser, raw: b.raw, handed: b.handed_at } })
         const left = end - now(); if (left <= 0) return finish(200, {})
         const due = nextDeadline(a); if (!soon) timer = setTimeout(look, Math.max(5, Math.min(left, NEXT_BACKSTOP_MS, due === null ? Infinity : due - now())))
       } catch (e) { emit({ agentId: agent.id, source: 'system', kind: 'backend.error', payload: { server: 'mod', error: String(e) } }); return finish(500, { error: 'HQ error' }) }
@@ -219,10 +257,14 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
     emit({ agentId: agent.id, source: 'mod', kind: `mod.${kind}`, payload: body })
     if (kind === 'session.start') { resolveKind('mod_missing', agent.id); if (!body.hasToken) attention('mod_token_missing', `${agent.id}: mod could not read its token file`, { agentId: agent.id }) }
     if (kind === 'turn.step') onTurnStep(agent, body)
-    if (kind === 'batch_received') markReceived(String(body.id ?? ''))
-    if (kind === 'batch_submitted') { markSubmitted(String(body.id ?? '')); if (agent.interrupted_at) wake(agent.id) } // Bug 110: submitted after an interrupt is dropped; look now
+    const bid = String(body.id ?? ''), late = body.late === true, fits = !late || lateReportFits(agent, bid, body.handed) // Bug 140: a resend counts for its own hand-out only
+    if (kind === 'batch_received' && fits) markReceived(bid)
+    if (kind === 'batch_submitted' && fits) {
+      if (late) submittedWhileAway(agent, bid, body.interrupted === true); else markSubmitted(bid)
+      if (agent.interrupted_at) wake(agent.id) // Bug 110: submitted after an interrupt is dropped; look now
+    }
     if (kind === 'turn.complete' && !body.agentId) turnEnded(agent, body.isAborted === true) // the agent's own turn, not a helper's
-    if (kind === 'batch_submit_failed') requeue(String(body.id ?? ''), 'submit_failed')
+    if (kind === 'batch_submit_failed' && fits) requeue(bid, 'submit_failed')
     if (kind === 'plugin.register' && body.name && body.name !== 'hq') attention('foreign_mod', `${agent.id}: another mod tried to load: ${body.name}`, { agentId: agent.id })
     if (kind === 'session.measure') {
       const u = (body.usage ?? {}) as { context?: { tokens?: number; percent?: number }; rateLimits?: { kind: string; percentUsed: number }[]; cost?: { usd?: number } }
@@ -230,8 +272,11 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
       run('INSERT INTO usage_samples(agent_id, at, context_tokens, context_pct, five_hour_pct, seven_day_pct, cost_usd) VALUES (?,?,?,?,?,?,?)', agent.id, t, u.context?.tokens ?? null, u.context?.percent ?? null, fh, sd, u.cost?.usd ?? null)
       patch('agent', agent.id, { context_tokens: u.context?.tokens ?? null, five_hour_pct: fh, seven_day_pct: sd })
       checkContext(agent, u.context?.tokens)
-      if ((fh ?? 0) >= getSetting('pause_five_hour_pct', DEFAULTS.pause_five_hour_pct) || (sd ?? 0) >= getSetting('pause_seven_day_pct', DEFAULTS.pause_seven_day_pct)) attention('rate_limit', `Usage at five-hour ${fh}% / seven-day ${sd}%: new launches paused`, { keep: true }) // the percentages change every sample
+      const over = overPause(fh, sd, pauseLevels()); if (over) attention('rate_limit', `${over}: new launches paused`, { keep: true }) // the percentages change every sample
     }
+    if (kind === 'turn.complete' && !body.agentId && body.isAborted === true) turnOver(agent.id) // Bug 148: after turnEnded, which keeps the interrupt
+    // Bug 188: its turn is over, so a dialog may be too (Escape or a denial on it ends the turn)
+    if (kind === 'turn.complete' && !body.agentId) dialogMayBeOver(agent.id, body.isAborted === true ? 'interrupted' : 'turn_end', onDialogEnd(agent.id))
     return json(res, 200, { ok: true })
   }
   json(res, 404, {})

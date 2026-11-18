@@ -15,19 +15,13 @@ import { bus, emit, type HqEvent } from './events.ts'
 import { attention, resolveKind } from './attention.ts'
 import { AGENT_TMP } from './config.ts'
 import { repos } from './records.ts'
-import { cwdsOf } from './procs.ts'
+import { cwdsOf, elapsedMs } from './procs.ts'
 import { runsOf } from './bgruns.ts'
 import { testRunDirs } from './testrun.ts'
 import { real, sleep } from './util.ts'
 
 export type Proc = { pid: number; ppid: number; pgid: number; uid: number; tty: string; stat: string; start: number }
 const PS = 'pid=,ppid=,pgid=,uid=,tty=,stat=,etime='
-/** ps's elapsed time, `[[dd-]hh:]mm:ss`, in ms. */
-function elapsedMs(etime: string): number {
-  const [days, clock] = etime.includes('-') ? etime.split('-') as [string, string] : ['0', etime]
-  const [s = 0, m = 0, h = 0] = clock.split(':').map(Number).reverse()
-  return (((Number(days) * 24 + h) * 60 + m) * 60 + s) * 1000
-}
 /** `ps -axo` with the fields of PS: fixed ones only (macOS's comm is a path and can hold spaces). `start` is when the process
  *  began, from its elapsed time (whole seconds, so up to a second late; `now` when ps doesn't say). */
 export const parsePs = (s: string, now = Date.now()): Proc[] => s.split('\n').map((l) => l.trim().split(/\s+/)).filter((f) => f.length >= 7 && Number(f[0]) > 0)
@@ -195,6 +189,20 @@ export function bashEnded(agentId: string, o: { use?: unknown; turn?: boolean },
  *  has ended, but what it starts is its own until it ends too. */
 export function busySince(agentId: string, t = Date.now()): number {
   const at = [...running(agentId, t), ...runsOf(agentId)].map((c) => c.at); return at.length ? Math.min(...at) : 0
+}
+/** Bug 145: the commands under way when the last backend stopped, read back from the events log at start (before the first sweep), by the same steps as the
+ *  hooks that told it. Only events young enough for a command to still be inside its own time limit, and only agents that are still there. */
+export function readBackCommands(t = Date.now()): void {
+  const since = t - bashLimitMs(Number.MAX_SAFE_INTEGER) - 15_000
+  for (const { id } of q<{ id: string }>("SELECT id FROM agents WHERE status != 'exited'")) {
+    const evs = q<{ kind: string; payload: string; created_at: number }>(`SELECT kind, payload, created_at FROM events WHERE agent_id = ? AND created_at >= ?
+      AND kind IN ('hook.PreToolUse:Bash', 'turns.started', 'hook.PostToolUse:Bash', 'hook.PostToolUseFailure:Bash', 'hook.Stop') ORDER BY id`, id, since)
+    for (const e of evs) {
+      const p = JSON.parse(e.payload) as Record<string, unknown>
+      if (e.kind === 'hook.PreToolUse:Bash' || e.kind === 'turns.started') bashBegan(id, p, e.created_at)
+      else if (e.kind === 'hook.Stop') { if (!p.sub) bashEnded(id, { turn: true }, e.created_at) } else bashEnded(id, { use: p.use }, e.created_at)
+    }
+  }
 }
 /** Repos just removed from HQ: their folders still count for a while, for what their stopped agents leave as they exit. */
 const gone: { until: number; dirs: HqDirs }[] = []

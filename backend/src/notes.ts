@@ -15,6 +15,10 @@ type Who = Pick<Agent, 'role' | 'repo_id' | 'feature_id' | 'ticket_id'>
 export const noteScope = (a: Who): string | null =>
   a.role === 'tpm' && a.repo_id ? `resume:repo:${a.repo_id}` : a.role === 'engineer' && a.ticket_id ? `resume:ticket:${a.ticket_id}` : null
 export function readNote(scope: string): string | null { return one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'note'", scope)?.text ?? null }
+/** How HQ's own note starts when the agent left none (freshstart.ts fallbackNote). Notes saved before Bug 196 carry it too. */
+export const HQ_NOTE_HEAD = '(Written by HQ'
+/** The note the agent itself wrote, or null. HQ's stand-in from an earlier fresh start or Clear never counts as one (Bug 196). */
+export function agentNote(scope: string): string | null { const t = readNote(scope); return t && !t.startsWith(HQ_NOTE_HEAD) ? t : null }
 
 /** Why `text` can't be a note for `role` (empty, or over the cap with both numbers), or null. */
 export function noteProblem(role: 'tpm' | 'engineer', text: string): string | null {

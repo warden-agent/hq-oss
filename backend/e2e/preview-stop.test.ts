@@ -11,7 +11,10 @@ import { startHq, sh, waitFor, type Hq } from './harness.ts'
 
 let hq: Hq
 const extra: number[] = []
-before(async () => { hq = await startHq() })
+// Bug 134: the stubborn helper takes the supervisor's whole 5 s grace, and on a busy Mac the rest of its ending can pass HQ's 8 s; HQ
+// then kills the supervisor before it writes what it took, and the first test has no report to read. A roomier budget here: what
+// this file checks is that report (an app whose supervisor is killed is the last test's)
+before(async () => { hq = await startHq({ env: { HQ_PREVIEW_STOP_MS: '20000' } }) })
 after(async () => { for (const p of [...extra, ...KINDS.flatMap((k) => tagged(k))]) try { process.kill(p, 'SIGKILL') } catch { /* gone */ } await hq?.stop() })
 
 const KINDS = ['stubborn', 'slow', 'detached', 'daemon', 'jobctl'] as const
@@ -49,11 +52,20 @@ function users(cwd: string): number {
 }
 const helpers = async (n: number, kinds: readonly string[]) => waitFor('the helpers', () => { const ps = kinds.map((k) => tagged(k, n)); return ps.every((x) => x.length === 1) ? ps.flat() : null })
 const left = (n: number, kinds: readonly string[]) => kinds.filter((k) => tagged(k, n).length)
+/** Every process of app `n` now: its supervisor and all under it, and its tagged helpers (those that left it too). */
+function appPids(id: string, n: number): Set<number> {
+  const ps = execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8' }).split('\n').map((l) => l.trim().split(/\s+/))
+  const sup = ps.find((f) => f.includes(path.join(hq.hqHome, 'previews', id, 'spec.json')) && f.some((x) => x.endsWith('supervise.mjs')))
+  const tree = new Set<number>(), todo = sup ? [Number(sup[0])] : []
+  while (todo.length) { const p = todo.pop()!; if (tree.has(p)) continue; tree.add(p); todo.push(...ps.filter((f) => Number(f[1]) === p).map((f) => Number(f[0]))) }
+  return new Set([...tree, ...KINDS.flatMap((k) => tagged(k, n))])
+}
 
 test('Stop on main stops everything the app started, and nothing else in the project folder', async () => {
   const { dir, n } = app(KINDS), mine = users(dir)
   const { id, port } = await launch(dir); await helpers(n, KINDS)
-  const [stubborn] = tagged('stubborn', n), [daemon] = tagged('daemon', n)
+  const [stubborn] = tagged('stubborn', n), [daemon] = tagged('daemon', n), own = appPids(id, n)
+  assert.ok(own.size > KINDS.length, `the app's processes: ${[...own]}`)
   assert.equal((await hq.api(`previews/${id}/stop`, {})).status, 200)
   assert.deepEqual(left(n, KINDS), [], 'still running when Stop came back')
   assert.equal(await fetch(`http://127.0.0.1:${port}/`).then(() => true, () => false), false, 'the page is gone')
@@ -61,8 +73,14 @@ test('Stop on main stops everything the app started, and nothing else in the pro
   assert.ok(!(await hq.state()).attention.some((a: any) => /^leftovers_/.test(a.kind)), 'no alert when it worked')
   // the Events tab says what it took: what ran outside the app's own group, what had to be killed, and what had no parent left
   const events = (await hq.api('events?limit=200')).json, payload = (kind: string) => JSON.parse(events.find((e: any) => e.kind === kind)?.payload ?? '{}')
-  const stopped = payload('preview.stopped'); assert.ok(stopped.outside >= 2, JSON.stringify(stopped)); assert.deepEqual(stopped.killed, [stubborn])
-  assert.ok(payload('procs.leftovers_stopped').stopped?.some((x: any) => x.pids.includes(daemon) && x.folder === path.basename(dir)), JSON.stringify(payload('procs.leftovers_stopped')))
+  // Bug 134: on a busy Mac more than the stubborn one can outlast the grace; whatever was killed was the app's own
+  const stopped = payload('preview.stopped'); assert.ok(stopped.outside >= 2, JSON.stringify(stopped))
+  assert.equal(stopped.forced, undefined, `the supervisor ended in time, so HQ didn't force it (Bug 182): ${JSON.stringify(stopped)}`)
+  assert.ok(stopped.killed?.includes(stubborn) && stopped.killed.every((p: number) => own.has(p)), `${JSON.stringify(stopped)}; the app's: ${[...own]}`)
+  // the daemon, by either path: usually the leftover look stops it (no parent left, the run's mark); the supervisor ends it itself
+  // when one of its looks caught it while its parent was still there (more likely when the Mac is slow), and then counts it outside
+  const swept = payload('procs.leftovers_stopped')
+  assert.ok(swept.stopped?.some((x: any) => x.pids.includes(daemon) && x.folder === path.basename(dir)) || stopped.outside >= 3, `${JSON.stringify(stopped)} ${JSON.stringify(swept)}`)
 })
 
 test('an app that stops by itself takes what it started with it', async () => {

@@ -119,6 +119,69 @@ test('Bug 37: Launch asks Claude, the user OKs its steps once, and HQ runs a two
   assert.equal(p.helper_state, null)
 })
 
+/** A free port below the OS's own range (HQ leaves those alone: a dev server's workers get them), outside this HQ's preview range. */
+async function lowFreePort(): Promise<number> {
+  for (let p = 21000 + Math.floor(Math.random() * 8000); ; p++) {
+    const free = await new Promise<boolean>((resolve) => { const s = net.createServer(); s.once('error', () => resolve(false)); s.listen(p, '127.0.0.1', () => s.close(() => resolve(true))) })
+    if (free) return p
+  }
+}
+
+test('Bug 226: the helper tries the app on ports HQ gives it from its preview range; a test server on another port is stopped and its save refused', async () => {
+  const [lo, hi] = hq.env.HQ_PREVIEW_PORTS!.split('-').map(Number) as [number, number]
+  const dir = hq.repo('porty'); fs.rmSync(path.join(dir, 'package.json')); sh(dir, 'commit', '-qam', 'nothing to guess from')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const one = { parts: [{ name: 'app', dir: '.', run: 'node server.js', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  const r = (await hq.api(`previews/${repo.id}/start`, {})).json, h = r.helper_agent_id, wt = r.helper_worktree
+  const given = r.helper_ports as number[]
+  assert.deepEqual(given, [hi - 2, hi - 1, hi]) // from the top of the range: previews take theirs from the bottom
+  await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching'))
+  const brief = await nextBatch(h)
+  assert.ok(brief.includes(`Ports for your test runs: ${given.join(', ')}, free ports in HQ's preview range ${lo}–${hi}. $PORT is ${given[0]} in your shell`), brief)
+  assert.doesNotMatch(brief, /3180/)
+  const script = fs.readFileSync(path.join(hq.hqHome, 'agents', h, 'launch.sh'), 'utf8')
+  assert.match(script, new RegExp(`export PORT='?${given[0]}'?\n`)); assert.match(script, new RegExp(`export HQ_TRY_PORTS='${given.join(' ')}'`))
+
+  // Another project's helper at the same time gets other ports
+  const dir2 = hq.repo('porty2'); fs.rmSync(path.join(dir2, 'package.json')); sh(dir2, 'commit', '-qam', 'nothing to guess from')
+  const repo2 = (await hq.api('repos', { path: dir2 })).json
+  const r2 = (await hq.api(`previews/${repo2.id}/start`, {})).json
+  assert.deepEqual(r2.helper_ports, [hi - 5, hi - 4, hi - 3])
+
+  // A test server on a port of its own choosing (as 3180 was): stopped, the save refused and not counted, and said why
+  const wrong = await lowFreePort(), stray = holder(wt, wrong)
+  await waitFor('the stray test server', async () => (await fetch(`http://127.0.0.1:${wrong}`).catch(() => null))?.ok)
+  const refused = await hq.mcp(h, 'save_launch', one); assert.ok(refused.isError)
+  assert.match(refused.text, new RegExp(`listened on port ${wrong}, which HQ didn't give you\\.[^]*HQ stopped your test servers\\.[^]*\\$PORT is ${given[0]}[^]*didn't count`))
+  await waitFor('the stray to stop', () => !alive(stray.pid!))
+  let p = await preview(repo.id); assert.equal(p.helper_saves, 0); assert.equal(p.draft_recipe, null); assert.equal(p.helper_state, 'working')
+  const ev = (await hq.api('events?limit=200')).json.find((e: any) => e.kind === 'launch.test_port')
+  assert.deepEqual(JSON.parse(ev.payload), { repo: 'porty', ports: [wrong], given }); assert.equal(ev.agent_id, h)
+
+  // What it must not catch: a test server on a given port, or on a port the recipe fixes (the project hard-wires it)
+  const ok1 = holder(wt, given[0]!), fixed = await lowFreePort(), ok2 = holder(path.join(wt), fixed)
+  await waitFor('the right test servers', async () => (await fetch(`http://127.0.0.1:${given[0]}`).catch(() => null))?.ok && (await fetch(`http://127.0.0.1:${fixed}`).catch(() => null))?.ok)
+  const two = { parts: [{ name: 'api', dir: '.', run: 'node api.js', port: fixed }, { name: 'app', dir: '.', run: 'node server.js', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  const saved = await hq.mcp(h, 'save_launch', two); assert.equal(saved.isError, false, saved.text)
+  assert.ok(alive(ok1.pid!) && alive(ok2.pid!)); p = await preview(repo.id); assert.equal(p.helper_saves, 1); assert.equal(p.helper_state, 'needs_ok')
+
+  // Done: the ports go back
+  for (const id of [repo.id, repo2.id]) assert.equal((await hq.api(`previews/${id}/dismiss`, {})).status, 200)
+  assert.equal((await preview(repo.id)).helper_ports, null); assert.equal((await preview(repo2.id)).helper_ports, null)
+  await waitFor('its test servers to stop', () => !alive(ok1.pid!) && !alive(ok2.pid!))
+
+  // Every port of the range in use: no helper starts on some other port; the pane says why, and the next Launch clears it
+  const squat = Array.from({ length: hi - lo + 1 }, (_, i) => holder(hq.root, lo + i)) // one exits at once where the first test's app still runs
+  await waitFor('the range to fill', async () => (await Promise.all(squat.map((_, i) => fetch(`http://127.0.0.1:${lo + i}`).then(() => true, () => false)))).every(Boolean))
+  const full = await hq.api(`previews/${repo2.id}/start`, {}); assert.equal(full.status, 409)
+  assert.match(full.json.error, new RegExp(`Claude needs a free port in HQ's preview ports ${lo}–${hi} to try porty2, and they are all in use`))
+  p = await preview(repo2.id); assert.equal(p.helper_agent_id, null); assert.match(p.detail, /they are all in use\. Stop a preview, then Launch again/)
+  for (const k of squat) { try { process.kill(-k.pid!, 'SIGKILL') } catch { /* gone */ } }
+  await waitFor('the squatters to go', () => squat.every((k) => !alive(k.pid!)))
+  const back = (await hq.api(`previews/${repo2.id}/start`, {})).json; assert.ok(back.helper_agent_id); assert.equal(back.detail, null)
+  assert.equal((await hq.api(`previews/${repo2.id}/dismiss`, {})).status, 200)
+})
+
 test('Bug 37: a helper gets four saves; report_cant_start tells the user why', async () => {
   const dir = hq.repo('capped'); const repo = (await hq.api('repos', { path: dir })).json
   const one = { parts: [{ name: 'app', dir: '.', run: 'node server.js', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
@@ -155,7 +218,7 @@ test('Bug 41: two Launches at once start one helper; a helper HQ lost track of i
   const old = a.json.helper_agent_id, wt = a.json.helper_worktree, port = await freePort()
   await waitFor('the helper', async () => (await hq.state()).agents.find((x: any) => x.id === old && x.status !== 'launching'))
   const stray = holder(path.join(wt), port); await waitFor('the stray server', async () => (await fetch(`http://127.0.0.1:${port}`).catch(() => null))?.ok)
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'))
+  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 })
   db.prepare('UPDATE previews SET helper_agent_id = NULL, helper_worktree = NULL, helper_state = NULL WHERE id = ?').run(repo.id); db.close()
   const next = (await hq.api(`previews/${repo.id}/setup`, {})).json.helper_agent_id
   assert.ok(next && next !== old)
@@ -251,4 +314,39 @@ test('Bug 67: Launch on a project with no files says so, with no helper and no t
 test('Bug 67: the repo around a project needn\'t be one HQ knows yet', async () => {
   const outer = hq.repo('notadded'), made = (await hq.api('repos/new', { name: 'inside', parent: outer, github: false, nested: true })).json
   assert.deepEqual((await hq.api(`repos/${made.id}/around`, {})).json.around, { path: fs.realpathSync(outer), name: 'notadded', repoId: null })
+})
+
+test('Bug 156: npm steps that would write a package-lock.json are refused, and OK\'d ones saved before the check are not run', async () => {
+  const dir = hq.repo('lockless'); const repo = (await hq.api('repos', { path: dir })).json
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'lockless', private: true, dependencies: { ms: '2.1.3' } })) // packages, no lockfile
+  sh(dir, 'commit', '-qam', 'a dependency, no lockfile')
+  const steps = (install?: string, when?: string) => ({ parts: [{ name: 'app', dir: '.', ...(install ? { install, install_when: when } : {}), run: 'node server.js', port: 'auto' }],
+    show: 'app', worktree_files: [], notes: '' })
+  const h = (await hq.api(`previews/${repo.id}/start`, {})).json.helper_agent_id
+  await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching'))
+  const bad = await hq.mcp(h, 'save_launch', steps('npm install', 'package-lock.json')); assert.ok(bad.isError)
+  assert.match(bad.text, /app: use `npm install --no-package-lock` with install_when `package.json`/)
+  assert.equal((await hq.mcp(h, 'save_launch', steps())).isError, false); assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  await waitFor('the app', async () => (await preview(repo.id)).status === 'running', 20_000)
+  assert.equal((await hq.mcp(h, 'launch_ok')).isError, false)
+  await waitFor('the helper to go', async () => (await preview(repo.id)).helper_agent_id === null)
+
+  // Steps OK'd before the check (or a lockfile removed since): Launch doesn't run them; a helper is briefed to fix them
+  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'))
+  db.prepare('UPDATE previews SET recipe = ? WHERE id = ?').run(JSON.stringify(steps('npm install', 'package-lock.json')), repo.id); db.close()
+  const re = await hq.api(`previews/${repo.id}/command`, { command: null }); assert.equal(re.status, 409) // a restart with no helper (as after a merge): the pane says so
+  let p = await preview(repo.id); assert.equal(p.status, 'stopped'); assert.match(p.detail, /saved start steps would write a package-lock\.json.*Start it again/)
+  assert.equal(p.helper_agent_id, null)
+  const r = await hq.api(`previews/${repo.id}/start`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.equal(r.json.status, 'stopped'); assert.equal(r.json.helper_state, 'working'); assert.equal(r.json.detail, null)
+  assert.match(r.json.helper_note, /didn't run the start steps you OK'd: they would write a package-lock\.json/) // what the pane says while Claude fixes them
+  assert.ok(!fs.existsSync(path.join(dir, 'package-lock.json')))
+  const errs = (await hq.api('events?limit=100')).json.filter((e: any) => e.kind === 'preview.error').map((e: any) => JSON.parse(e.payload))
+  assert.ok(errs.some((e: any) => e.repo === 'lockless' && /saved start steps would write a package-lock\.json/.test(e.error)), JSON.stringify(errs))
+  const h2 = r.json.helper_agent_id; assert.ok(h2 && h2 !== h)
+  await waitFor('the fixing helper', async () => (await hq.state()).agents.find((a: any) => a.id === h2 && a.status !== 'launching'))
+  assert.match(await nextBatch(h2), /HQ won't run its start steps any more: app: use `npm install --no-package-lock`[^]*"install": "npm install"/)
+  const fixed = await hq.mcp(h2, 'save_launch', steps('npm install --no-package-lock', 'package.json')); assert.equal(fixed.isError, false, fixed.text)
+  p = await preview(repo.id); assert.equal(p.helper_state, 'needs_ok')
+  assert.equal((await hq.api(`previews/${repo.id}/dismiss`, {})).status, 200)
 })

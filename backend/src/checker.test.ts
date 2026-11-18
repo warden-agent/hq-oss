@@ -67,7 +67,34 @@ test('what HQ keeps of a check reads back, and says in words what the page and t
   assert.equal(diffCheckLine(null), null); assert.equal(diffCheckLine({ state: 'ok', why: ['size M'], ...cost }), null)
   assert.equal(diffCheckLine({ state: 'sent_back', why: ['size M'], findings, ...cost }), "HQ's read of its changes sent it back once (A2: No step shows the total in bold.)")
   assert.equal(diffCheckLine({ state: 'unchecked', at: 1, why: ['size M'], error: 'no answer within 180 s' }), "its changes weren't read before it merged: no answer within 180 s")
-  assert.equal(diffCheckWords({ state: 'ok', why: ['it is a size M ticket', 'it deleted tests'], ...cost })!.text,
+  const merged = { status: 'merged', finished_sha: null }
+  assert.equal(diffCheckWords({ state: 'ok', why: ['it is a size M ticket', 'it deleted tests'], ...cost }, merged)!.text,
     'A fresh reader read its changes before it merged (it is a size M ticket; it deleted tests) and found nothing wrong.')
-  assert.equal(diffCheckWords({ state: 'unchecked', at: 1, why: [], error: 'no answer within 180 s' })!.text, 'Nobody read its changes before it merged: no answer within 180 s.')
+  assert.equal(diffCheckWords({ state: 'unchecked', at: 1, why: [], error: 'no answer within 180 s' }, merged)!.text, 'Nobody read its changes before it merged: no answer within 180 s.')
+  assert.equal(diffCheckWords(null, merged), null)
+})
+
+test("Bug 207: the Ticket tab says a read came before the merge only on a ticket that merged with the commit read", () => {
+  const cost = { at: 5, ms: 2400, tokens: 1802, model: 'opus' }, A = 'a'.repeat(40), B = 'b'.repeat(40), why = ['it is a size M ticket']
+  const ok = { state: 'ok' as const, why, ...cost, sha: A }, un = { state: 'unchecked' as const, at: 1, why, error: 'no answer within 180 s', sha: A }
+  // read, then its branch moved during the test: back to building, nothing merged (bug185demo.mts stage 1)
+  for (const status of ['implementing', 'pr_ready', 'pr_open', 'resolving', 'cancelled']) {
+    const t = { status, finished_sha: A }
+    assert.equal(diffCheckWords(ok, t)!.text, 'A fresh reader read its changes at commit aaaaaaa (it is a size M ticket) and found nothing wrong.', status)
+    assert.equal(diffCheckWords(un, t)!.text, 'Nobody read its changes at commit aaaaaaa (it is a size M ticket): no answer within 180 s.', status)
+    assert.doesNotMatch(diffCheckWords(ok, t)!.text, /merged/, status)
+  }
+  // merged with the commit read, or a read from before HQ kept the commit, or a ticket from before HQ kept its open_pr's commit: before it merged
+  assert.match(diffCheckWords(ok, { status: 'merged', finished_sha: A })!.text, /^A fresh reader read its changes before it merged \(/)
+  assert.match(diffCheckWords({ ...ok, sha: undefined }, { status: 'merged', finished_sha: A })!.text, /read its changes before it merged/)
+  assert.match(diffCheckWords(un, { status: 'merged' })!.text, /^Nobody read its changes before it merged/)
+  // merged with a later commit the reader never saw (not worth a read by then, or the check turned off): which commit was read, no claim about the merge
+  assert.equal(diffCheckWords(ok, { status: 'merged', finished_sha: B })!.text, 'A fresh reader read its changes at commit aaaaaaa (it is a size M ticket) and found nothing wrong.')
+  // not merged, a read from before HQ kept the commit: no commit to name, still no "merged"
+  assert.equal(diffCheckWords({ ...ok, sha: undefined }, { status: 'implementing', finished_sha: A })!.text,
+    'A fresh reader read its changes (it is a size M ticket) and found nothing wrong.')
+  // a send-back never said "merged": unchanged
+  const back = { state: 'sent_back' as const, why, findings: [{ about: 'A1', problem: 'x' }], ...cost, sha: A }
+  assert.equal(diffCheckWords(back, { status: 'implementing', finished_sha: A })!.text, 'A fresh reader read its changes (it is a size M ticket) and sent it back once:')
+  assert.equal(diffCheckWords(back, { status: 'merged', finished_sha: B })!.text, 'A fresh reader read its changes (it is a size M ticket) and sent it back once:')
 })

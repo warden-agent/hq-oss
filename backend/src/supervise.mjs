@@ -54,7 +54,8 @@ function end(code) {
   let killed = [], rounds = 0
   const look = () => {
     const left = mine()
-    if (!left) { // no ps: the old way, the group and nothing more
+    if (!left) { // no ps: the old way, the group and nothing more. Bug 182: still reported, so HQ's Events entry says why it has no figures
+      report({ no_ps: true })
       for (const k of kids) { try { k.kill('SIGTERM') } catch { /* gone */ } }
       try { process.kill(-me, 'SIGTERM') } catch { /* not a group leader */ }
       return void setTimeout(() => process.exit(code), 300)

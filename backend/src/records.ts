@@ -14,6 +14,8 @@ export type Repo = {
   id: string; name: string; path: string; remote: string | null; default_branch: string; context_doc_path: string | null
   network_allowlist: string; ignore_patterns: string; kind: 'local' | 'github' | null; sync_ok: number | null; sync_status: string | null
   sync_detail: string | null; synced_at: number | null; head: string | null; can_push: number | null; clearing_at: number | null
+  /** Bug 219: during a clear, 1 when its TPM was running as the clear began (it starts again once the clear is done). */
+  clear_tpm_was_on: number | null
   empty: number | null
   /** The project's TPM (Bug 52): its latest session, and when it was parked (switched away from). */
   tpm_agent_id: string | null; tpm_parked_at: number | null; next_ticket: number; next_feature: number
@@ -46,6 +48,7 @@ export type Ticket = {
   criteria: string // JSON criteria.ts Criterion[]: what the finished ticket must do, as a list HQ can check; '[]' for a ticket with none
   proof: string | null // JSON criteria.ts Proof, set at open_pr: the test named for each criterion and what git flagged; null until it's finished once
   diff_check: string | null // JSON diffcheck.ts DiffCheck: how auto mode's reader of its changes answered before the merge; null when nothing read them
+  finished_sha: string | null // Bug 143: the branch's commit at its last open_pr, the one auto mode tests and merges; null on tickets finished before HQ kept it
   parked_at: number | null; created_at: number; updated_at: number
 }
 
@@ -66,6 +69,9 @@ export const localOnly = (repo: Repo): boolean => repo.kind === 'github' && repo
 export const syncBlocks = (repo: Repo): boolean => repo.kind === 'github' && !localOnly(repo) && !repo.sync_ok
 /** Whether the project runs on auto mode. */
 export const autoOn = (repoId: string | null | undefined): boolean => !!repoId && !!one<{ x: number }>('SELECT 1 AS x FROM repos WHERE id = ? AND auto_mode = 1', repoId)
+/** Bugs 193, 209: HQ moves this ticket on by itself (starts it, tests and merges it): auto mode is on, not stopped, and hasn't parked it. Otherwise the user
+ *  does, with the board's buttons, and what HQ tells the TPM says so. */
+export const hqMoves = (repo: Repo, t: Ticket): boolean => !!repo.auto_mode && !repo.auto_stopped_why && !t.auto_parked_why
 export const repos = (): Repo[] => q<Repo>('SELECT * FROM repos ORDER BY created_at')
 export const getRepo = (repoId: string): Repo | undefined => one<Repo>('SELECT * FROM repos WHERE id = ?', repoId)
 /** Repos on their way out of HQ (remove.ts). In memory, not clearing_at: the fresh-start sweep finishes any clear it finds, and that changes the folder. */

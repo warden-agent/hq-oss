@@ -47,3 +47,12 @@ test('the weekly figure shows too, after the 5-hour one; alone when it is the on
   assert.match(p.tip, /weekly \(7-day\) usage limit/)
   assert.match(p.tip, /stops starting new agents at 90%/)
 })
+
+test('Bug 160: with only the weekly figure, its hover says Claude Code sends no 5-hour one, so the 5-hour pause can\'t act', () => {
+  const [p] = usageParts({ status: 'working', five_hour_pct: null, seven_day_pct: 5 }, { five: 70, seven: 90 })
+  assert.match(p.tip, /sends no 5-hour figure for this account/)
+  assert.match(p.tip, /5-hour pause \(at 70%\) can't act/)
+  const both = usageParts({ status: 'working', five_hour_pct: 30, seven_day_pct: 5 }, pause)
+  assert.equal(both.some((x) => /no 5-hour/.test(x.tip)), false, 'not when the 5-hour figure came')
+  assert.equal(usageParts({ status: 'working', five_hour_pct: 30 }, pause).some((x) => /no 5-hour/.test(x.tip)), false)
+})

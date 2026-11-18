@@ -17,6 +17,11 @@ const kindRepo = (k: string): string | null => /^[a-z_]+:(.+)$/.exec(k)?.[1] ?? 
 /** Only the picked repo's work: its features, their tickets, agents, messages and reviews, and the notices about them or about the
  *  repo itself. Notices about nothing in particular (the usage limit, an HQ error) stay. Each repo is a slate of its own; the others'
  *  work is still in HQ, and the chip beside ⚠ says what it needs (Bug 63). */
+/** The default branch of a ticket's project: what HQ tests it on and merges it into (Bug 210: not always main). */
+export function ticketBase(s: Pick<S, 'repos' | 'features' | 'tickets'>, ticketId: string | null | undefined): string {
+  const t = s.tickets.find((x) => x.id === ticketId), f = s.features.find((x) => x.id === t?.feature_id)
+  return s.repos.find((r) => r.id === f?.repo_id)?.default_branch ?? 'main'
+}
 export function forRepo<T extends S & { messages: any[] }>(s: T, repoId: string | null): T {
   const fids = new Set(s.features.filter((f) => f.repo_id === repoId).map((f) => f.id))
   const tickets = s.tickets.filter((t) => fids.has(t.feature_id)), tids = new Set(tickets.map((t) => t.id))
@@ -122,7 +127,7 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
         : t.status === 'resolving' && t.fixing === 'review' ? `${where(f.repo_id)}what a reader found in ${t.key} isn't fixed yet and its engineer stopped: press Fix what it found`
         : t.status === 'resolving' && t.fixing === 'look' ? `${where(f.repo_id)}${t.key}'s app problems aren't fixed yet and its engineer stopped: press Fix the app`
         : t.status === 'resolving' && t.fixing ? `${where(f.repo_id)}${t.key}'s tests aren't fixed yet and its engineer stopped: press Fix tests`
-        : `${where(f.repo_id)}${t.key} clashes with main: press Fix conflicts` })
+        : `${where(f.repo_id)}${t.key} clashes with ${ticketBase(s, t.id)}: press Fix conflicts` })
   }
   for (const a of s.attention.filter((x) => !x.resolved_at && (ALERT_KINDS.has(x.kind) || autoNeeds(x.kind)))) {
     const t = s.tickets.find((x) => x.id === a.ticket_id), ag = s.agents.find((x) => x.id === a.agent_id)

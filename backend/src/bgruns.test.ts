@@ -83,6 +83,32 @@ test('the list: what the box says, ended by its notice, and read back from the e
   rebuildRuns(); assert.equal(hasRuns('eng-r'), false, 'a new session started since: nothing of the old one is waited on')
 })
 
+test("Bug 203: after a restart the box says again what an agent whose turn ended waits on; never for one still in its turn, an idle one, or a helper's end", () => {
+  const t = Date.now(), said = new Map<string, unknown>()
+  const seen = (p: { entity: string; id: string; patch: Record<string, unknown> }) => { if (p.entity === 'agent' && 'activity' in p.patch) said.set(p.id, p.patch.activity) }
+  bus.on('patch', seen)
+  const eng = (id: string, status: string, ...turn: [string, Record<string, unknown>?][]) => {
+    run(`INSERT INTO agents(id, role, model_alias, claude_session_id, tmux_session, cwd, token_hash, status, in_plan_mode, started_at)
+      VALUES (?, 'engineer', 'sonnet', 's', ?, '/r', 'x', ?, 0, ?)`, id, `hq-${id}`, status, t)
+    emit({ agentId: id, source: 'hook', kind: 'hook.SessionStart', payload: {} })
+    for (const [kind, payload] of turn) {
+      if (kind === 'run') addRun(id, { task: `b-${id}`, use: `u-${id}`, command: 'npm run test-backend', at: t })
+      else emit({ agentId: id, source: kind.startsWith('mod.') ? 'mod' : 'hook', kind, payload: payload ?? {} })
+    }
+  }
+  eng('w-stop', 'working', ['hook.UserPromptSubmit'], ['run'], ['hook.Stop'])
+  eng('w-esc', 'working', ['hook.UserPromptSubmit'], ['run'], ['mod.turn.complete', { isAborted: true }])
+  eng('w-mid', 'working', ['hook.UserPromptSubmit'], ['run'], ['hook.PreToolUse:Edit'])
+  eng('w-next', 'working', ['hook.UserPromptSubmit'], ['run'], ['hook.Stop'], ['hook.UserPromptSubmit', { prompt: 'a message' }])
+  eng('w-helper', 'working', ['hook.UserPromptSubmit'], ['run'], ['mod.turn.complete', { agentId: 'helper1', isAborted: false }])
+  eng('w-idle', 'idle', ['hook.UserPromptSubmit'], ['run'], ['hook.Stop'])
+  eng('w-none', 'working', ['hook.UserPromptSubmit'], ['hook.Stop'])
+  said.clear(); rebuildRuns(); bus.off('patch', seen)
+  assert.deepEqual([...said], [['w-stop', 'Waiting on: npm run test-backend'], ['w-esc', 'Waiting on: npm run test-backend']],
+    'only the two whose own turn ended while a run went on; one in its turn, a helper\'s turn end, an idle one and one with no run are left alone')
+  for (const id of ['w-stop', 'w-esc', 'w-mid', 'w-next', 'w-helper', 'w-idle']) endRuns(id, 'all', 'test')
+})
+
 test("Bug 96 gap 3: a build or test run's turn stays taken while it goes on in the background, and comes back when it ends", () => {
   startTurns(); setSetting('heavy_at_once', 1)
   take({ id: 'eng-h:use1', who: 'eng h', what: 'tests', agentId: 'eng-h', lane: 'main', limitMs: 60_000 })

@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
+import type { HqEvent } from './events.ts'
 
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-clear-'))
 const { migrate, run, q, one } = await import('./db.ts')
@@ -19,6 +20,8 @@ const { keptBuilt, tpmWorkspace } = await import('./projectmd.ts')
 const { getRepo } = await import('./records.ts')
 const { starting } = await import('./scheduler.ts')
 const { PATHS } = await import('./config.ts')
+const { autoGen } = await import('./testrun.ts')
+const { bus } = await import('./events.ts')
 
 const sh = (cwd: string, ...args: string[]): string =>
   execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
@@ -59,8 +62,9 @@ ticket('f1-m', 'f1', 'T0', 'merged') // built: "Built so far" keeps it after the
 run("INSERT INTO docs(scope, key, text, updated_at) VALUES ('resume:repo:r1', 'note', '## What the user wants\n- a item list', ?)", now) // the project TPM's note
 
 test("clearing a repo deletes its board, archives the notes, saves unsaved code on its branch, and leaves other repos alone", async () => {
-  const r = await clearRepo('r1')
+  const gen = autoGen(repoDir), r = await clearRepo('r1')
   assert.deepEqual(r, { noting: [], stopped: [], done: true }) // nobody ran: done at once
+  assert.equal(autoGen(repoDir), gen + 1, "auto mode's test runs in it were stopped (Bug 152)")
   for (const [table, where] of [['features', "id = 'f1'"], ['tickets', "id = 'f1-t'"], ['agents', "feature_id = 'f1'"], ['sessions', "agent_id = 'f1-eng'"],
     ['messages', "feature_id = 'f1'"], ['events', "agent_id = 'f1-eng'"], ['plan_revisions', "ticket_id = 'f1-t'"], ['review_requests', "ticket_id = 'f1-t'"],
     ['docs', "scope LIKE '%f1%'"], ['needs_attention', "id = 'na-f1'"]] as const) assert.equal(count(table, where), 0, table)
@@ -81,7 +85,7 @@ test("clearing a repo deletes its board, archives the notes, saves unsaved code 
   // The archive: SUMMARY.md, FEATURE.md, the note and the plan
   const [dir] = fs.readdirSync(path.join(PATHS.archive, 'demo')).map((d) => path.join(PATHS.archive, 'demo', d))
   const sum = fs.readFileSync(path.join(dir!, 'SUMMARY.md'), 'utf8')
-  assert.match(sum, /## List f1 \(planning\): list-f1-f1\//); assert.match(sum, /> I want a list \(f1\)\./)
+  assert.match(sum, /## List f1 \(1\/2 merged\): list-f1-f1\//); assert.match(sum, /> I want a list \(f1\)\./)
   assert.match(sum, /\| T1 T1 title \| implementing \| hq\/list\/T1-api \| [0-9a-f]+ \(WIP commit\) \|  \| yes \|/)
   const fdir = path.join(dir!, 'list-f1-f1')
   assert.match(fs.readFileSync(path.join(fdir, 'FEATURE.md'), 'utf8'), /JSON file/)
@@ -97,6 +101,7 @@ test('a clear waits for notes being written; meanwhile nothing new starts there;
   run("UPDATE agents SET fresh_start_at = ?, fresh_start_then = 'continue' WHERE id = 'f3-eng'", now) // already writing a note (a fresh start)
   const r = await clearRepo('r3')
   assert.deepEqual(r, { noting: ['f3-eng'], stopped: [], done: false })
+  assert.equal(getRepo('r3')!.clear_tpm_was_on, null) // no TPM ran: none starts after the clear (Bug 219)
   assert.equal(one<{ fresh_start_then: string }>("SELECT fresh_start_then FROM agents WHERE id = 'f3-eng'")!.fresh_start_then, 'clear') // no new session after it
   assert.equal(one<{ go_ahead: number }>("SELECT go_ahead FROM tickets WHERE id = 'f3-q'")!.go_ahead, 0)
   await assert.rejects(clearRepo('r3'), /already being cleared/)
@@ -108,8 +113,16 @@ test('a clear waits for notes being written; meanwhile nothing new starts there;
   assert.equal(count('features', "id = 'f3'"), 1)
   // The note comes in: the agent stops, and with nobody left the clear finishes (no park, no restart)
   run("UPDATE agents SET status = 'exited' WHERE id = 'f3-eng'")
+  // completeFreshStart starts the finish without waiting for it (it runs git), so wait for HQ's own "cleared" or "failed"
+  // event for r3. The 60 s limit is only for a finish that never ends: on a loaded Mac it took over 1 s (Bug 133).
+  const finished = new Promise<{ kind: string; error?: string }>((resolve, reject) => {
+    const timer = setTimeout(() => { off(); reject(new Error('the clear of r3 neither finished nor failed within 60 s')) }, 60_000)
+    const on = (ev: HqEvent): void => { if ((ev.payload as { repo?: string }).repo === 'r3') { off(); resolve({ kind: ev.kind, error: (ev.payload as { error?: string }).error }) } }
+    const off = (): void => { clearTimeout(timer); bus.off('event:repo.cleared', on); bus.off('event:repo.clear_failed', on) }
+    bus.on('event:repo.cleared', on); bus.on('event:repo.clear_failed', on)
+  })
   await completeFreshStart('f3-eng', 'note')
-  for (let i = 0; i < 50 && count('features', "id = 'f3'"); i++) await new Promise((res) => setTimeout(res, 20))
+  assert.deepEqual(await finished, { kind: 'repo.cleared', error: undefined })
   assert.equal(count('features', "id = 'f3'"), 0); assert.equal(count('agents', "feature_id = 'f3'"), 0)
   assert.equal(getRepo('r3')!.clearing_at, null)
 })
@@ -153,4 +166,86 @@ test('Bug 63: a test command waiting for the user\'s OK goes with the board, as 
   attention('test_cmd_proposed:r9', 'ninth: a repair wants to change the test command.')
   await clearRepo('r9')
   assert.equal(openAttention().some((a) => a.kind === 'test_cmd_proposed:r9'), false); assert.equal(getRepo('r9')?.test_cmd_proposed, null)
+})
+
+test('Bug 73: a TPM on a dialog keeps the note it wrote earlier; one with no note gets HQ\'s', async () => {
+  const note = (scope: string) => one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'note'", scope)?.text
+  for (const [r, f] of [['r6', 'f6'], ['r7', 'f7']] as const) {
+    run("INSERT INTO repos(id, name, path, kind, created_at) VALUES (?, ?, ?, 'local', ?)", r, `repo-${r}`, `/tmp/${r}`, now)
+    feature(f, r); ticket(`${f}-t`, f, 'T1', 'implementing')
+    agent(`${f}-tpm`, 'tpm', 'blocked', f)
+    // An engineer still writing its note keeps the clear from finishing, so no new TPM session starts in this test
+    agent(`${f}-eng`, 'engineer', 'working', f, `${f}-t`); run("UPDATE agents SET fresh_start_at = ?, fresh_start_then = 'continue' WHERE id = ?", now, `${f}-eng`)
+  }
+  run("INSERT INTO docs(scope, key, text, updated_at) VALUES ('resume:repo:r6', 'note', '## What the user wants\n- dark mode everywhere', ?)", now)
+  const r6 = await clearRepo('r6')
+  assert.deepEqual(r6, { noting: ['f6-eng'], stopped: ['f6-tpm: f6-tpm is waiting on a dialog in its terminal. Answer it first.'], done: false })
+  assert.equal(note('resume:repo:r6'), '## What the user wants\n- dark mode everywhere')
+  assert.equal(getRepo('r6')!.clear_tpm_was_on, 1) // its TPM ran: kept in the DB, so it starts again after the clear even across a restart (Bug 219)
+  assert.equal(fs.existsSync(path.join(tpmWorkspace('r6'), 'HANDOFF.md')), false) // nothing of HQ's written over it
+  await clearRepo('r7')
+  assert.match(note('resume:repo:r7') ?? '', /^\(Written by HQ: the TPM didn't leave a note: f7-tpm is waiting on a dialog/)
+})
+
+test('Bug 73: an engineer that never answers a clear\'s note request keeps its earlier note, and that one is archived', async () => {
+  run("INSERT INTO repos(id, name, path, kind, created_at) VALUES ('r8', 'eighth', '/tmp/eighth', 'local', ?)", now)
+  feature('f8', 'r8'); ticket('f8-t', 'f8', 'T1', 'implementing'); ticket('f8-u', 'f8', 'T2', 'implementing')
+  for (const t of ['t', 'u']) {
+    agent(`f8-${t}-eng`, 'engineer', 'working', 'f8', `f8-${t}`)
+    run("UPDATE agents SET fresh_start_at = ?, fresh_start_then = 'continue' WHERE id = ?", now, `f8-${t}-eng`)
+  }
+  run("INSERT INTO docs(scope, key, text, updated_at) VALUES ('resume:ticket:f8-t', 'note', '## Where I stopped\n- the old real note', ?)", now)
+  assert.deepEqual(await clearRepo('r8'), { noting: ['f8-t-eng', 'f8-u-eng'], stopped: [], done: false })
+  run("UPDATE agents SET status = 'exited' WHERE feature_id = 'f8'")
+  await completeFreshStart('f8-t-eng', 'fallback', 'it never answered')
+  await completeFreshStart('f8-u-eng', 'fallback', 'it never answered')
+  for (let i = 0; i < 50 && count('features', "id = 'f8'"); i++) await new Promise((res) => setTimeout(res, 20))
+  assert.equal(count('features', "id = 'f8'"), 0)
+  const [dir] = fs.readdirSync(path.join(PATHS.archive, 'eighth')).map((d) => path.join(PATHS.archive, 'eighth', d))
+  assert.equal(fs.readFileSync(path.join(dir!, 'list-f8-f8', 'tickets', 'T1', 'HANDOFF.md'), 'utf8'), '## Where I stopped\n- the old real note\n')
+  assert.match(fs.readFileSync(path.join(dir!, 'list-f8-f8', 'tickets', 'T2', 'HANDOFF.md'), 'utf8'), /^\(Written by HQ: the engineer didn't leave a note: it never answered/)
+})
+
+test('Bug 73 leaves fresh starts outside a clear as they were: no note in time means HQ\'s, even over an older one', async () => {
+  run("INSERT INTO repos(id, name, path, kind, created_at) VALUES ('r10', 'tenth', '/tmp/tenth', 'local', ?)", now)
+  feature('f10', 'r10'); ticket('f10-t', 'f10', 'T1', 'implementing'); agent('f10-eng', 'engineer', 'exited', 'f10', 'f10-t')
+  run("UPDATE agents SET fresh_start_at = ?, fresh_start_then = 'park' WHERE id = 'f10-eng'", now)
+  run("INSERT INTO docs(scope, key, text, updated_at) VALUES ('resume:ticket:f10-t', 'note', '## Where I stopped\n- an older session', ?)", now)
+  await completeFreshStart('f10-eng', 'fallback', 'it never answered')
+  assert.match(one<{ text: string }>("SELECT text FROM docs WHERE scope = 'resume:ticket:f10-t' AND key = 'note'")!.text, /^\(Written by HQ: the engineer didn't leave a note: it never answered/)
+})
+
+test("Bug 220: an engineer whose plan HQ's plan check has (auto) stops with that reason, not \"waiting for your review\"; in manual mode it's the user's", async () => {
+  for (const [r, f, auto] of [['r11', 'f11', 1], ['r12', 'f12', 0]] as const) {
+    run("INSERT INTO repos(id, name, path, kind, auto_mode, created_at) VALUES (?, ?, ?, 'local', ?, ?)", r, `repo-${r}`, `/tmp/${r}`, auto, now)
+    feature(f, r); ticket(`${f}-t`, f, 'T5', 'plan_review'); agent(`${f}-eng`, 'engineer', 'plan_review', f, `${f}-t`)
+  }
+  assert.deepEqual(await clearRepo('r11'), { noting: [], stopped: ["f11-eng: T5's plan waits for HQ's plan check."], done: true })
+  assert.deepEqual(await clearRepo('r12'), { noting: [], stopped: ["f12-eng: T5's plan is waiting for your review. Answer it first."], done: true })
+  const [dir] = fs.readdirSync(path.join(PATHS.archive, 'repo-r11')).map((d) => path.join(PATHS.archive, 'repo-r11', d))
+  assert.match(fs.readFileSync(path.join(dir!, 'list-f11-f11', 'tickets', 'T5', 'HANDOFF.md'), 'utf8'),
+    /^\(Written by HQ: the engineer didn't leave a note: T5's plan waits for HQ's plan check\.\)/)
+})
+
+test("Bug 196: HQ's own note from an earlier clear isn't the TPM's: a second clear writes a new one, on a dialog or after no answer", async () => {
+  const note = (scope: string) => one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'note'", scope)?.text
+  const old = "(Written by HQ: the TPM didn't leave a note: an old reason from the first clear.)\nRely on PROJECT.md, the ticket list and the recent messages with the user."
+  for (const [r, f] of [['r13', 'f13'], ['r14', 'f14']] as const) {
+    run("INSERT INTO repos(id, name, path, kind, created_at) VALUES (?, ?, ?, 'local', ?)", r, `repo-${r}`, `/tmp/${r}`, now)
+    feature(f, r); ticket(`${f}-t`, f, 'T1', 'implementing')
+    // An engineer still writing its note keeps the clear from finishing, so no new TPM session starts in this test
+    agent(`${f}-eng`, 'engineer', 'working', f, `${f}-t`); run("UPDATE agents SET fresh_start_at = ?, fresh_start_then = 'continue' WHERE id = ?", now, `${f}-eng`)
+    run("INSERT INTO docs(scope, key, text, updated_at) VALUES (?, 'note', ?, ?)", `resume:repo:${r}`, old, now - 60_000)
+  }
+  agent('f13-tpm', 'tpm', 'blocked', 'f13') // on a dialog: HQ writes the note at once
+  await clearRepo('r13')
+  assert.match(note('resume:repo:r13') ?? '', /^\(Written by HQ: the TPM didn't leave a note: f13-tpm is waiting on a dialog in its terminal\. Answer it first\.\)/)
+  assert.match(fs.readFileSync(path.join(tpmWorkspace('r13'), 'HANDOFF.md'), 'utf8'), /f13-tpm is waiting on a dialog/)
+  agent('f14-tpm', 'tpm', 'working', 'f14') // asked for a note and never answered: HQ's note when the time is up
+  run("UPDATE agents SET fresh_start_at = ?, fresh_start_then = 'continue' WHERE id = 'f14-tpm'", now)
+  const r14 = await clearRepo('r14'); assert.deepEqual([r14.noting.sort(), r14.done], [['f14-eng', 'f14-tpm'], false])
+  run("UPDATE agents SET status = 'exited' WHERE id = 'f14-tpm'")
+  await completeFreshStart('f14-tpm', 'fallback', 'none came within 3 minutes')
+  assert.match(note('resume:repo:r14') ?? '', /^\(Written by HQ: the TPM didn't leave a note: none came within 3 minutes\.\)/)
+  assert.doesNotMatch(note('resume:repo:r14') ?? '', /old reason/)
 })

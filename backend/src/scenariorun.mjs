@@ -2,12 +2,12 @@
 // recorder's address, and does the steps one by one, each one stamped, settled and snapshotted. No model: the steps are given. HQ runs `node scenariorun.mjs
 // <spec json>` inside its test sandbox, in a throwaway checkout. What each step did goes to spec.out/result.json; the recordings stay next to it.
 // Plain Node with no imports from HQ; the browser is HQ's own playwright-core, whose folder is in the spec.
-// spec: recorder.mjs's spec + { pwCore, steps, stepMs }
+// spec: recorder.mjs's spec + { pwCore, steps, stepMs, expect? }   (expect: what should or shouldn't be on the page after the last step; see steps.mjs holds)
 // A step: { action: 'navigate'|'click'|'fill'|'press'|'select'|'check'|'back'|'reset', role?, name?, text?, value?, url?, label? }
 import fs from 'node:fs'
 import path from 'node:path'
 import { startRecording } from './recorder.mjs'
-import { runStep, stepLabel } from './steps.mjs'
+import { holds, runStep, stepLabel } from './steps.mjs'
 
 const spec = JSON.parse(process.argv[2])
 const result = { started: null, why: null, output: null, steps: [], ms: 0 }
@@ -43,6 +43,10 @@ try {
     }
     if (!s.hq) result.steps.push(r)
     write()
+  }
+  // What the page should show now: looked for only when every step could be done (after one that couldn't, the page is somewhere else)
+  if (spec.expect?.length && result.steps.every((r) => r.ok)) {
+    result.expect = []; for (const e of spec.expect) result.expect.push(await holds(page, e, spec.stepMs ?? 5000))
   }
   result.ms = Date.now() - t0
   await finish()

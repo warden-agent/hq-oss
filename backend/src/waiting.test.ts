@@ -29,3 +29,11 @@ test('Bug 110: after an interrupted turn HQ types the message, and the box says 
   assert.equal(why(agent({ status: 'working', interrupted_at: null, type_waits: 'screen' })), 'waits for its current turn to end')
   assert.match(why(agent({ interrupted_at: NOW - 5000, type_waits: 'screen', takeover_locked_until: NOW + 60_000 }))!, /you typed in its terminal/)
 })
+test('Bug 149: a half-written line in its prompt box holds the message, and the box says where to send or clear it', () => {
+  const draft = 'held · a half-written line is in its terminal · send or clear it there'
+  assert.deepEqual(waitingFor(agent({ status: 'working', interrupted_at: NOW - 5000, type_waits: 'draft' }), state(), NOW), { count: 1, held: true, why: draft })
+  assert.equal(why(agent({ interrupted_at: NOW - 5000, type_waits: 'draft' })), draft)
+  // what it must not catch: a reason left over from an interrupt that is over (the mod delivers then), a hold that comes first
+  assert.equal(why(agent({ status: 'working', interrupted_at: null, type_waits: 'draft' })), 'waits for its current turn to end')
+  assert.match(why(agent({ interrupted_at: NOW - 5000, type_waits: 'draft', takeover_locked_until: NOW + 60_000 }))!, /you typed in its terminal/)
+})

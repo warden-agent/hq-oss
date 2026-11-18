@@ -4,14 +4,14 @@
 // working while one runs, and a run that uses no CPU and writes nothing for `bg_stall_min` minutes is frozen: a notice with Stop it and tell the engineer,
 // which HQ presses itself on auto. Watched: a command that went to the background without being asked (a timeout, or moved to let a message through), and a
 // test run or build the agent put there itself. A server it started with run_in_background is its own business: quiet for hours, and that's fine.
-// The list is in memory and in the events log (bg.started / bg.ended), so a backend restart in the middle of a wait reads it back.
+// The list is in memory and in the events log (bg.started / bg.ended), so a backend restart in the middle of a wait reads it back, and the box's line (Bug 203).
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { agentTmpDir, DEFAULTS } from './config.ts'
 import { getSetting, now, one, q } from './db.ts'
 import { bus, emit, patch, type HqEvent } from './events.ts'
-import { getAgent, liveAgents, type Agent } from './agents.ts'
+import { beingStopped, getAgent, liveAgents, type Agent } from './agents.ts'
 import { resolveKind } from './attention.ts'
 import { sendMessage } from './delivery.ts'
 import { heavyKind } from './heavy.ts'
@@ -62,7 +62,17 @@ export function rebuildRuns(): void {
       mine(a.id).set(p.task, { task: p.task, use: p.use, command: p.command, at: p.at, cpu: -1, bytes: -1, quietSince: now(), missed: 0 })
     }
     if (!runs.get(a.id)?.size) runs.delete(a.id)
+    else if (turnHadEnded(a, since)) patch('agent', a.id, { activity: waitingText(a.id) })
   }
+}
+/** Bug 203: the box's "Waiting on" line lives in memory only (ui.ts extras), so a restart says it again for an agent whose turn had ended with a run still
+ *  going (hooks.ts Stop, or an Escape's turn.complete: working, by stillOn). Its run's notice is the next hook it sends, maybe many minutes away. Not for one
+ *  still in its turn: it may be doing something else, and its next hook shows that. */
+function turnHadEnded(a: Agent, since: number): boolean {
+  if (a.status !== 'working') return false
+  const last = one<{ kind: string }>(`SELECT kind FROM events WHERE agent_id = ? AND id > ? AND (kind IN ('hook.UserPromptSubmit', 'hook.Stop')
+    OR (kind = 'mod.turn.complete' AND COALESCE(json_extract(payload, '$.agentId'), '') = '')) ORDER BY id DESC LIMIT 1`, a.id, since)
+  return !!last && last.kind !== 'hook.UserPromptSubmit'
 }
 
 // ---- the processes ----
@@ -135,14 +145,17 @@ export async function stopFrozen(agentId: string, by: 'user' | 'auto'): Promise<
   kill('SIGTERM'); await sleep(2000)
   const left = new Set((await ps()).map((r) => r.pgid)); for (const x of hit) if (left.has(x.g)) try { process.kill(-x.g, 'SIGKILL') } catch { /* gone */ }
   const minutes = Math.max(1, Math.round((t - Math.min(...hit.map((x) => x.r.quietSince))) / 60_000)), cmds = hit.map((x) => `\`${cut(x.r.command, 120)}\``).join(', ')
+  // Bug 181: read the agent again after the waits; one stopped, replaced or begun anew meanwhile isn't told about a run of a session that's over
+  const still = getAgent(a.id), same = !!still && still.status !== 'exited' && !beingStopped(a.id) && still.claude_session_id === a.claude_session_id
   const testCmd = getRepo(repoOfAgent(a) ?? '')?.test_cmd
-  sendMessage({ repoId: a.repo_id, featureId: a.feature_id, channel: 'dm', from: 'hq', to: a.id, reason: 'fyi', body: `Your background run ${cmds} did nothing `
+  if (same) sendMessage({ repoId: a.repo_id, featureId: a.feature_id, channel: 'dm', from: 'hq', to: a.id, reason: 'fyi', body: `Your background run ${cmds} did nothing `
     + `for ${minutes} min (no CPU, no output), so HQ stopped it. Don't wait on a run in the background: run only the test files for what you changed, with the test `
     + "runner's force-exit and per-test time limit (for node --test: --test-force-exit --test-timeout=120000). "
     + (testCmd ? `For the full suite, run the project's test command once, just before open_pr: ${testCmd}` : "If the full suite won't finish, say so in your handoff.") })
   endRuns(a.id, hit.map((x) => x.r.task), 'stopped'); resolveKind('bg_stalled', a.id)
-  if (!hasRuns(a.id)) patch('agent', a.id, { activity: 'HQ stopped its frozen run: waking it' }) // its "failed" notice comes as a new turn
-  emit({ agentId: a.id, source: by === 'user' ? 'ui' : 'system', kind: 'bg.stopped', payload: { by, tasks: hit.map((x) => x.r.task), groups: hit.map((x) => x.g), minutes } })
+  if (same && !hasRuns(a.id)) patch('agent', a.id, { activity: 'HQ stopped its frozen run: waking it' }) // its "failed" notice comes as a new turn
+  emit({ agentId: a.id, source: by === 'user' ? 'ui' : 'system', kind: 'bg.stopped', payload: { by, tasks: hit.map((x) => x.r.task), groups: hit.map((x) => x.g), minutes,
+    commands: hit.map((x) => cut(x.r.command, 120)) } }) // Bug 201: the Events tab says which run
   return { stopped: hit.map((x) => x.r.task) }
 }
 

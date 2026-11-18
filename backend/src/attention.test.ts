@@ -8,9 +8,9 @@ import os from 'node:os'
 import path from 'node:path'
 
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-att-'))
-const { migrate, q } = await import('./db.ts')
+const { migrate, q, run } = await import('./db.ts')
 migrate()
-const { attention, openAttention, resolveKind } = await import('./attention.ts')
+const { attention, openAttention, resolveKind, resolveEndedAgent, resolveLeftOnEnded, ENDS_WITH_AGENT } = await import('./attention.ts')
 
 const open = (kind: string) => openAttention().filter((a) => a.kind === kind)
 const ids = (kind: string) => open(kind).map((a) => a.id).sort()
@@ -55,4 +55,35 @@ test('with no agent, notices are one per ticket; with no ticket either, one per 
   assert.notEqual(s1.id, s2.id)
   assert.deepEqual(open('repo_sync:r1').map((x) => [x.id, x.detail]), [[s2.id, 'demo: no network']])
   resolveKind('repo_sync:r1', null); assert.deepEqual(open('repo_sync:r1'), [])
+})
+
+const agent = (id: string, status: string) => run(`INSERT INTO agents(id, role, model_alias, tmux_session, cwd, token_hash, status, in_plan_mode, started_at)
+  VALUES (?, 'engineer', 'sonnet', ?, '/tmp', ?, ?, 0, 1)`, id, `hq-${id}`, `h-${id}`, status)
+const openOf = (agentId: string) => openAttention().filter((a) => a.agent_id === agentId).map((a) => a.kind).sort()
+
+test('Bug 153: an ended agent gets none of the notices about what it is doing now; the ones about what happened still come', () => {
+  agent('eng-gone', 'exited')
+  for (const kind of ENDS_WITH_AGENT) assert.equal(attention(kind, `eng-gone: ${kind}`, { agentId: 'eng-gone', ticketId: 't-9' }), null, kind)
+  for (const kind of ['message_for_user', 'blocked', 'api_error', 'engineer_exited']) assert.ok(attention(kind, `eng-gone: ${kind}`, { agentId: 'eng-gone' }), kind)
+  assert.deepEqual(openOf('eng-gone'), ['api_error', 'blocked', 'engineer_exited', 'message_for_user'])
+  assert.ok(attention('mod_missing', 'eng-unknown: never reported in', { agentId: 'eng-unknown' }), 'no row (the unit tests above): raised as before')
+})
+
+test('Bug 153: an agent that ends takes its notices about what it is doing with it, and only those, and only its own', () => {
+  agent('eng-a', 'working'); agent('eng-b', 'working')
+  for (const who of ['eng-a', 'eng-b']) for (const kind of [...ENDS_WITH_AGENT, 'message_for_user', 'blocked']) attention(kind, `${who}: ${kind}`, { agentId: who })
+  resolveEndedAgent('eng-a')
+  assert.deepEqual(openOf('eng-a'), ['blocked', 'message_for_user'])
+  assert.equal(openOf('eng-b').length, ENDS_WITH_AGENT.length + 2, "the other agent's are untouched")
+})
+
+test('Bug 153: one left open on an agent that has ended, or is gone from the list, closes on the next look; a live agent keeps its own', () => {
+  agent('eng-live', 'idle'); agent('eng-old', 'working')
+  for (const who of ['eng-live', 'eng-old', 'eng-deleted']) for (const kind of ['bg_stalled', 'mod_missing', 'blocked']) attention(kind, `${who}: ${kind}`, { agentId: who })
+  run("UPDATE agents SET status = 'exited' WHERE id = 'eng-old'") // as a row saved before the fix, or a race, would leave it
+  resolveLeftOnEnded()
+  assert.deepEqual(openOf('eng-live'), ['bg_stalled', 'blocked', 'mod_missing'])
+  assert.deepEqual(openOf('eng-old'), ['blocked']); assert.deepEqual(openOf('eng-deleted'), ['blocked'])
+  attention('repo_sync:r1', 'demo: offline'); resolveLeftOnEnded()
+  assert.equal(open('repo_sync:r1').length, 1, 'a notice with no agent is untouched')
 })

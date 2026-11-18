@@ -18,6 +18,7 @@ const { save, row } = await import('./preview.ts')
 const { writeProjectMd, tpmWorkspace } = await import('./projectmd.ts')
 const { starting } = await import('./scheduler.ts')
 const { PATHS } = await import('./config.ts')
+const { autoGen } = await import('./testrun.ts')
 
 const sh = (cwd: string, ...args: string[]): string =>
   execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
@@ -57,8 +58,8 @@ test('Bug 66: Remove forgets the project, leaves its folder exactly as it was, a
   board('r1', 'f1', 't1', 'a1', { worktree: wt, branch: 'hq/list/T1-api' }); board('r2', 'f2', 't2', 'a2')
   writeProjectMd('r1'); fs.mkdirSync(path.join(PATHS.agents, 'a1'), { recursive: true }); fs.mkdirSync(path.join(PATHS.projects, 'r1'), { recursive: true })
   const before = folder(dir), half = fs.readFileSync(path.join(wt, 'app.js'), 'utf8'), wtStatus = sh(wt, 'status', '--porcelain')
-  const r = await removeRepo('r1')
-  assert.equal(getRepo('r1'), undefined)
+  const gen = autoGen(dir), r = await removeRepo('r1')
+  assert.equal(getRepo('r1'), undefined); assert.equal(autoGen(dir), gen + 1, "auto mode's test runs in it were stopped (Bug 152)")
   for (const [table, where, arg] of [['features', 'repo_id = ?', 'r1'], ['tickets', 'id = ?', 't1'], ['agents', 'repo_id = ?', 'r1'], ['messages', 'repo_id = ?', 'r1'],
     ['auto_runs', 'repo_id = ?', 'r1'],
     ['previews', 'id = ?', 'r1'], ['needs_attention', 'kind LIKE ?', '%:r1'], ['docs', 'scope LIKE ?', '%repo:r1']] as const) assert.equal(count(table, where, arg), 0, `${table} ${arg}`)
@@ -127,4 +128,18 @@ test('adding a removed folder again makes a new project, and its first ticket ca
   const dir = project('r10', 'tenth'); sh(dir, 'branch', 'hq/list/T-05-old'); const wt = path.join(dir, '.claude', 'worktrees', 'T-05'); sh(dir, 'worktree', 'add', '-q', wt, 'hq/list/T-05-old')
   await removeRepo('r10')
   const back = await addRepo(dir); assert.notEqual(back.id, 'r10'); assert.equal(back.name, path.basename(dir)); assert.equal(back.next_ticket, 6)
+})
+
+test("Bug 196: HQ's own note from an earlier clear isn't the TPM's: Remove writes its own, and a real note stays", async () => {
+  const old = "(Written by HQ: the TPM didn't leave a note: an old reason from a clear.)"
+  for (const [r, text] of [['r196a', old], ['r196b', '## What the user wants\n- the real note']] as const) {
+    project(r, `p-${r}`)
+    run("INSERT INTO docs(scope, key, text, updated_at) VALUES (?, 'note', ?, ?)", `resume:repo:${r}`, text, now)
+    run(`INSERT INTO agents(id, role, repo_id, model_alias, token_hash, status, tmux_session, started_at)
+      VALUES (?, 'tpm', ?, 'opus', ?, 'working', 'hq-remove-test-none', ?)`, `tpm-${r}`, r, `tpm-${r}`, now)
+  }
+  const a = await removeRepo('r196a'), b = await removeRepo('r196b')
+  assert.equal(fs.readFileSync(path.join(a.archive, 'tpm', 'HANDOFF.md'), 'utf8').split('\n')[0],
+    "(Written by HQ: the TPM didn't leave a note: the project was removed from HQ.)")
+  assert.equal(fs.readFileSync(path.join(b.archive, 'tpm', 'HANDOFF.md'), 'utf8'), '## What the user wants\n- the real note\n')
 })

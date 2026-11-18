@@ -12,8 +12,8 @@ const refusedCmd = (repo: any): { cmd: string; ticket?: string } | null => { try
 const runsOf = (all: State, repoId: string): any[] => (all.autoRuns ?? []).filter((r) => r.repo_id === repoId)
 const latestRun = (all: State, repoId: string): any => runsOf(all, repoId).filter((r) => r.summary).sort((a, b) => b.started_at - a.started_at)[0]
 const finishedNotice = (all: State, repoId: string): any => all.attention.find((a) => a.kind === `auto_finished:${repoId}`)
-const SWITCH_TIP = 'Auto mode: HQ starts tickets, approves plans, tests finished tickets on main and merges them, with nobody pressing anything. '
-  + 'The computer stays awake during a run, but closing a laptop\'s lid still sleeps it.'
+const switchTip = (base: string): string => `Auto mode: HQ starts tickets, approves plans, tests finished tickets on ${base} and merges them, with nobody pressing`
+  + ' anything. The computer stays awake during a run, but closing a laptop\'s lid still sleeps it.' // Bug 210: the project's default branch
 
 /** The top-bar switch. Off is instant: engineers finish their ticket and nothing new starts or merges. */
 export function AutoSwitch({ repo }: { all: State; repo: any }) {
@@ -21,7 +21,7 @@ export function AutoSwitch({ repo }: { all: State; repo: any }) {
   const on = !!repo.auto_mode, stopped = !!repo.auto_stopped_why
   const tone = stopped ? 'border-rose-500/60! text-rose-300!' : repo.auto_waiting ? 'border-amber-500/60! text-amber-300!' : on ? 'border-emerald-500/60! text-emerald-300!' : ''
   const label = stopped ? 'Auto stopped' : repo.auto_waiting ? 'Auto waiting' : on ? 'Auto on' : 'Auto off'
-  return <button className={`btn whitespace-nowrap ${tone}`} role="switch" aria-checked={on} disabled={busy} title={on ? `${SWITCH_TIP} Click to turn it off.` : SWITCH_TIP}
+  return <button className={`btn whitespace-nowrap ${tone}`} role="switch" aria-checked={on} disabled={busy} title={`${switchTip(repo.default_branch ?? 'main')}${on ? ' Click to turn it off.' : ''}`}
     onClick={() => on ? run(() => api(`repos/${repo.id}/auto`, { on: false })) : openAuto(repo.id)}>{label}</button>
 }
 /** The summary and Undo once the banner has gone. Not while a run goes: undoing would pull main out from under it. */
@@ -42,7 +42,9 @@ function autoPreview(all: State, repoId: string): string[] {
   const count = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
   const plans = all.reviews.filter((r) => r.status === 'open' && ids.includes(r.ticket_id)).length
   const ready = yourTurn(all, repoId).start.length, done = tickets.filter((t) => t.status === 'pr_ready' || t.status === 'pr_open').length
-  return [plans ? `${count(plans, 'plan')} approved` : '', ready ? `${count(ready, 'ticket')} started` : '', done ? `${count(done, 'finished ticket')} tested on main and merged` : ''].filter(Boolean)
+  const base = all.repos.find((r) => r.id === repoId)?.default_branch ?? 'main'
+  return [plans ? `${count(plans, 'plan')} approved` : '', ready ? `${count(ready, 'ticket')} started` : '',
+    done ? `${count(done, 'finished ticket')} tested on ${base} and merged` : ''].filter(Boolean)
 }
 /** Turning auto mode on: what happens right now, and how HQ will test. */
 export function AutoDialog({ all }: { all: State }) {
@@ -105,6 +107,7 @@ export function AutoDialog({ all }: { all: State }) {
 
 function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; onClose: () => void; all: State }) {
   const [busy, go] = useBusy(), [err, setErr] = useState('') // shown in this box: the page's error strip is behind it
+  const base = all.repos.find((r) => r.id === run.repo_id)?.default_branch ?? 'main'
   const undo = () => go(async () => { setErr(''); if (await undoConfirm(name)) await api(`auto-runs/${run.id}/undo`, {}).then(onClose, (e: Error) => setErr(errText(e))) })
   useEffect(() => { // busy: Undo's are-you-sure is up, and its Escape is only for that
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onClose() }
@@ -119,7 +122,7 @@ function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; on
       <Findings all={all.findings ?? []} repoId={run.repo_id} />
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex flex-wrap justify-end gap-1.5">{(run.status === 'finished' || run.status === 'off') && run.start_sha && run.end_sha !== run.start_sha
-        && <button className="btn" disabled={busy} title="Put main back where this run started. The work stays on its branches." onClick={undo}>{busy ? 'Undoing…' : 'Undo this run'}</button>}
+        && <button className="btn" disabled={busy} title={`Put ${base} back where this run started. The work stays on its branches.`} onClick={undo}>{busy ? 'Undoing…' : 'Undo this run'}</button>}
         <button className="btn btn-primary" autoFocus disabled={busy} onClick={onClose}>Close</button></div>
     </div>
   </div>

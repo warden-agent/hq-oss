@@ -53,7 +53,18 @@ test('HQ\'s check says what\'s wrong: no seed, a reset that doesn\'t reset, a de
 })
 test('a scenario with no test setup, or none to run, says why and runs nothing', async () => {
   const r = await runScenario(R, [{ action: 'navigate', url: '/' }])
-  assert.ok(r !== 'stopped' && 'why' in r && !('id' in r)); assert.match((r as { why: string }).why, /no test setup yet/)
+  assert.ok(r !== 'stopped' && 'why' in r && !('id' in r)); assert.equal((r as { why: string }).why, 'HQ isn\'t set up to record this app yet: Set up testing is under the preview\'s ⚙')
+  // Bug 223: a project with tests of its own is never told it has "no test setup": the words say the setup is HQ's recording, not its tests
+  const { noSetupWhy } = await import('./scenario.ts')
+  fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }))
+  try {
+    assert.equal(noSetupWhy(R), 'HQ isn\'t set up to record this app yet: Set up testing is under the preview\'s ⚙. This is separate from the project\'s own tests, `npm test`, '
+      + 'which still run as usual')
+    run('UPDATE repos SET test_cmd = ? WHERE id = ?', 'npm run test:unit', R); assert.match(noSetupWhy(R), /own tests, `npm run test:unit`, which still run/) // the saved command wins
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({ scripts: { test: 'echo "Error: no test specified" && exit 1' } })); run('UPDATE repos SET test_cmd = NULL WHERE id = ?', R)
+    assert.doesNotMatch(noSetupWhy(R), /own tests/) // npm init's placeholder isn't tests
+    assert.doesNotMatch(noSetupWhy(R), /no test setup/)
+  } finally { fs.rmSync(path.join(repoDir, 'package.json')); run('UPDATE repos SET test_cmd = NULL WHERE id = ?', R) }
 })
 
 const waitFor = async (cond: () => boolean, ms = 60_000) => {

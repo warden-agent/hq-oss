@@ -94,3 +94,13 @@ test('HQ\'s own test of a finished ticket waits in the same line as an engineer\
   await theirs.end()
   await waitFor('the ticket to be tested and merged', async () => (await hq.state()).tickets.find((x: any) => x.id === t.id).status === 'merged', 60_000)
 })
+
+test('Bug 213: a held test run with a change after it in its line has the worktree\'s state taken when its turn comes, before it starts', async () => {
+  const a = await engineer('turn213-a'), b = await engineer('turn213-b')
+  const first = bash(a.eng.id, 'npm test'); assert.deepEqual(await first.begin, {})
+  const line = "npm test && sed -i 's/x/y/' list.js && git commit -qam y", second = bash(b.eng.id, line); assert.ok(await pendingAfter(second.begin, 1000), 'held while the first runs')
+  const kept = async () => (await events('hook.PreToolUse:Bash')).find((e) => e.agent === b.eng.id && JSON.parse(e.input).command === line)?.before
+  assert.equal(await kept(), undefined, 'nothing taken while it waits: its files may still change')
+  await first.end(); assert.deepEqual(await second.begin, {}); assert.match(String(await kept()), /^[0-9a-f]{64}$/, 'taken before HQ let it start')
+  await second.end()
+})

@@ -4,10 +4,12 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import { WebSocketServer, type WebSocket } from 'ws'
-import { BIND, PORTS, DEFAULTS, CHOICES, ENGINEER_LIMIT, NOTE_CAP, GITHUB_ACCOUNT, uiToken, validSetting } from './config.ts'
+import { noFiveHourFigure, NO_FIVE_HOUR } from './scheduler.ts'
+import { BIND, PATHS, PORTS, DEFAULTS, CHOICES, ENGINEER_LIMIT, NOTE_CAP, GITHUB_ACCOUNT, uiToken, validSetting } from './config.ts'
+import { homeShort } from './projectname.ts'
 import { q, getSetting, setSetting, now, one } from './db.ts'
 import { bus, emit, patch, type Patch, type HqEvent } from './events.ts'
-import { allAgents, getAgent, pageAgent, stopAgent, update, type Agent } from './agents.ts'
+import { allAgents, getAgent, onDialog, pageAgent, stopAgent, update, type Agent } from './agents.ts'
 import type { Term } from './terminal.ts'
 import { termMessage } from './termws.ts'
 import { createFeature, createTicket, launchEngineer, resumeEngineer, startReady, startReadyRepo, fillSlots, cancelTicket, cancelFeature, fixConflicts } from './tickets.ts'
@@ -16,7 +18,8 @@ import { messageTpm, restartTpm } from './tpm.ts'
 import { freshStart, freshStartAll, parkRepo, resumeRepo } from './freshstart.ts'
 import { clearRepo } from './clear.ts'
 import { removeRepo } from './remove.ts'
-import { repos, features, tickets, getTicket } from './records.ts'
+import { repos, features, tickets, getTicket, getRepo } from './records.ts'
+import { messageRoute } from './msgroute.ts'
 import { pump } from './heavy.ts'
 import { addRepo, defaultParent, pickParent, pickRepo, repoAroundProject, syncRepo } from './repos.ts'
 import { createProject, githubReady, RepoHere } from './newproject.ts'
@@ -28,7 +31,7 @@ import { openAttention, resolveAttention } from './attention.ts'
 import { resumeRole } from './modelguard.ts'
 import * as tmux from './tmux.ts'
 import { answerAsk, answerOpenAsks, openAsks } from './asks.ts'
-import { freePort, NeedsSetup, previews, setPreviewCommand, startPreview, stopPreview } from './preview.ts'
+import { freePort, NeedsSetup, previews, setPreviewCommand, startPreview, StepsOutdated, stopPreview } from './preview.ts'
 import { approve, dismiss, launchWithoutRecipe, startHelper } from './launchhelper.ts'
 import { dismissSetup, startSetupHelper } from './testsetup.ts'
 import { runScenario, type Step } from './scenario.ts'
@@ -77,7 +80,7 @@ function snapshot() {
     attention: openAttention(), asks: openAsks(), questions: openQuestions(), settings: Object.fromEntries(q<{ key: string; value: string }>('SELECT key, value FROM settings').map((r) => [r.key,
       JSON.parse(r.value)])), defaults: { ...DEFAULTS, github_account: GITHUB_ACCOUNT, choices: CHOICES, engineer_limit: ENGINEER_LIMIT, note_cap: NOTE_CAP }, held: heldCount(),
         ports: PORTS, previews: previews(), build: build(), claude: claudeInfo(), testRuns: testRunViews(), maps: mapViews(repos().map((r) => r.id)),
-        findings: allFindings() }
+        findings: allFindings(), archive: homeShort(PATHS.archive, process.env.HOME) } // Bug 224: where Clear and Remove put HQ's notes
 }
 const json = (res: http.ServerResponse, code: number, obj: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)) }
 const cookieToken = (req: http.IncomingMessage): string | null => { const m = /(?:^|;\s*)hq=([^;]+)/.exec(req.headers.cookie ?? ''); return m ? decodeURIComponent(m[1]!) : null }
@@ -155,11 +158,14 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'tickets' && r1 && r2 === 'launch') { try { return json(res, 200, agentView(await launchEngineer(r1))) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'agents' && r1 && r2 === 'message') {
       const a = getAgent(r1); if (!a) return json(res, 404, {})
+      // Bug 174: a stopped agent's message waits for the session that takes its place; with none to come, it would wait for ever
+      const route = messageRoute(a, a.ticket_id ? getTicket(a.ticket_id) : undefined, a.repo_id ? getRepo(a.repo_id) : undefined)
+      if ('none' in route) return json(res, 409, { error: `${a.display_name ?? a.id} has stopped, so a message can't reach it. ${route.none}` })
       const m = sendMessage({ repoId: a.repo_id, featureId: a.feature_id, channel: 'dm', from: 'user', to: a.id, reason: body.urgent ? 'urgent' : String(body.reason ?? 'fyi'), body: String(body.body ?? '') })
       if (a.role === 'tpm' && a.repo_id) answerOpenAsks(a.repo_id, m.body) // what the user tells the TPM answers what it asked (Bug 43)
       // Typed after Escape (a mod prompt is dropped after an interrupt), but never into a dialog or menu, where Enter picks an option:
       // then the mod delivers it as usual, once the agent is free.
-      const typeable = !['blocked', 'paused', 'plan_review', 'exited'].includes(a.status)
+      const typeable = !onDialog(a) && !['plan_review', 'exited'].includes(a.status) // after an API error it sits at its prompt (Bug 72)
       if (body.urgent && typeable) { emit({ agentId: a.id, source: 'ui', kind: 'urgent.interrupt', payload: {} }); await interruptAndType(a, m) }
       return json(res, 200, m)
     }
@@ -189,7 +195,12 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'previews' && r1 && ['start', 'stop', 'command', 'setup', 'approve', 'dismiss', 'free-port'].includes(r2 ?? '')) {
       // Launch with nothing to run yet (no OK'd recipe, no ⚙ command) asks Claude to work it out (Bug 37)
       const start = () => startPreview(r1, null, { ticket: typeof body.ticket === 'string' ? body.ticket : null })
-        .catch((e) => { if (e instanceof NeedsSetup) return launchWithoutRecipe(r1, typeof body.ticket === 'string' ? body.ticket : null); throw e })
+        .catch((e) => {
+          const ticket = typeof body.ticket === 'string' ? body.ticket : null
+          if (e instanceof NeedsSetup) return launchWithoutRecipe(r1, ticket)
+          if (e instanceof StepsOutdated) return launchWithoutRecipe(r1, ticket, e.reason) // Bug 156: Claude fixes the steps, for a new OK
+          throw e
+        })
       const act = { start, stop: () => stopPreview(r1), command: () => setPreviewCommand(r1, typeof body.command === 'string' ? body.command : null),
         setup: () => startHelper(r1, body.why === 'fix' ? 'fix' : 'first'), approve: () => approve(r1), dismiss: () => dismiss(r1),
         'free-port': () => freePort(r1, Array.isArray(body.pids) ? body.pids.map(Number).filter((n: number) => Number.isInteger(n) && n > 1) : []) }[r2 as 'start']
@@ -211,6 +222,7 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
       if (body.key === 'concurrency_cap') void fillSlots().catch(() => {})
       if (body.key === 'heavy_at_once') pump() // raised: whoever waits for a turn may go
       if (body.key === 'paused_roles' || body.key === 'batch_receive_s') wakeAll() // Bug 99: who may get a batch, or when one falls due
+      if (body.key === 'pause_five_hour_pct' && noFiveHourFigure()) return json(res, 200, { ok: true, note: NO_FIVE_HOUR }) // Bug 160
       return json(res, 200, { ok: true })
     }
     if (r0 === 'roles' && r1 && r2 === 'resume') { resumeRole(r1); return json(res, 200, { ok: true }) }

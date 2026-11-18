@@ -13,8 +13,8 @@ import { rememberGone, sweepNow } from './leftovers.ts'
 import { attention, resolveKind } from './attention.ts'
 import { agentDir, liveAgents, stopAgent, update, type Agent } from './agents.ts'
 import { features, getRepo, repoOfAgent, setTicket, tickets, type Feature, type Repo, type Ticket } from './records.ts'
-import { fallbackNote, freshStart, freshStartBlocker, inRepo } from './freshstart.ts'
-import { readNote, saveNote } from './notes.ts'
+import { fallbackNote, featureState, freshStart, freshStartBlocker, inRepo } from './freshstart.ts'
+import { agentNote, noteScope, readNote, saveNote } from './notes.ts'
 import { launching } from './tickets.ts'
 import { builtLines, dropFeatureMd, keepBuilt, tpmWorkspace, writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { restartTpm, tpmStarting } from './tpm.ts'
@@ -22,12 +22,12 @@ import { stopPreview } from './preview.ts'
 import { stopFirstMap } from './firstmap.ts'
 import { git } from './repos.ts'
 import { dropFindings } from './findings.ts'
+import { stopAutoTests } from './testrun.ts'
+import { stopPlanChecks } from './plancheck.ts'
 
 const name = (a: Agent): string => a.display_name ?? a.id
 /** The repo's agents that a clear stops: its TPM, engineers and reviewers (not a Launch helper: it goes with the app). */
 const ofRepo = (repoId: string) => (a: Agent): boolean => a.role !== 'launcher' && repoOfAgent(a) === repoId
-/** Repos whose TPM was running when their clear started: it comes back once the clear is done. */
-const tpmWasOn = new Set<string>()
 const UNFINISHED = ['planning', 'implementing', 'awaiting_answer', 'resolving', 'plan_review']
 
 /** What of the repo is starting right now: stopping it halfway could leave an agent behind. */
@@ -39,27 +39,30 @@ export const startingWhy = (busy: string[]): string => `${busy.join(', ')} ${bus
 
 /** Clear `repoId`: lock it, stop its app, and have each running TPM and engineer write a handoff note and stop (`noting`). Ones
  *  that can't write one now (waiting on a dialog or a plan review, or done) stop at once, with a note from HQ when their work
- *  was unfinished (`stopped`, with why). The rest happens in finishClear once the last of them has stopped. */
+ *  was unfinished and they have none yet (`stopped`, with why). The rest happens in finishClear once the last of them has stopped. */
 export async function clearRepo(repoId: string): Promise<{ noting: string[]; stopped: string[]; done: boolean }> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
   if (repo.clearing_at) throw new Error(`${repo.name} is already being cleared.`)
   const fids = inRepo(repoId), tks = tickets().filter((t) => fids.has(t.feature_id))
   const busy = startingNow(repoId); if (busy.length) throw new Error(startingWhy(busy))
-  const at = now()
+  const at = now(), tpmOn = liveAgents().some((a) => a.role === 'tpm' && ofRepo(repoId)(a)) ? 1 : null
   tx(() => { // locked first: a stop below frees a slot, and nothing of this repo may start in it
-    run('UPDATE repos SET clearing_at = ? WHERE id = ?', at, repoId)
+    // A running TPM comes back once the clear is done: kept in the DB, as a backend restart can come before that (Bug 219)
+    run('UPDATE repos SET clearing_at = ?, clear_tpm_was_on = ? WHERE id = ?', at, tpmOn, repoId)
     for (const t of tks.filter((x) => x.go_ahead)) setTicket(t.id, { go_ahead: 0 })
   })
   patch('repo', repoId, { clearing_at: at })
+  stopAutoTests(repo.path) // auto mode is off for it from here: its test run ends now, not at its time limit, with no result (Bug 152)
+  stopPlanChecks(repoId) // and so does a reader checking one of its plans: nothing it says lands on the cleared board (Bug 177)
   if ((one<{ status: string }>('SELECT status FROM previews WHERE id = ?', repoId)?.status ?? 'stopped') !== 'stopped') await stopPreview(repoId).catch(() => {})
   stopFirstMap(repoId) // a first map half written goes; one already saved stays (the app is still what it was)
   const noting: string[] = [], stopped: string[] = []
   for (const a of liveAgents().filter(ofRepo(repoId))) {
-    if (a.role === 'tpm') tpmWasOn.add(repoId)
     if (a.fresh_start_at) { update(a.id, { fresh_start_then: 'clear' }); noting.push(name(a)); continue } // already writing one
     let why = a.role === 'tpm' || a.role === 'engineer' ? freshStartBlocker(a) : `${a.role}s don't keep notes`
     if (!why) { try { await freshStart(a.id, { how: 'now', then: 'clear' }); noting.push(name(a)); continue } catch (e) { why = (e as Error).message } }
-    if (unfinished(a, tks)) saveNote(a, fallbackNote(a, why))
+    const scope = noteScope(a) // HQ's note only where there's none: a real one the agent wrote earlier stays (Bug 73)
+    if (scope && unfinished(a, tks) && !agentNote(scope)) saveNote(a, fallbackNote(a, why))
     await stopAgent(a.id, 'cleared'); stopped.push(`${name(a)}: ${why}`)
   }
   emit({ agentId: null, source: 'ui', kind: 'repo.clear_started', payload: { repo: repoId, noting, stopped } })
@@ -93,7 +96,7 @@ async function finishClear(repo: Repo): Promise<void> {
   const dir = archive(repo, fs0, tks, saved)
   const built = builtLines(fs0)
   rememberGone(repo.id) // its tickets go next, and with them the names that say which folders are HQ's
-  tx(() => { keepBuilt(repo.id, built); deleteRows(repo.id, F, T, A) })
+  tx(() => { keepBuilt(repo.id, built); deleteRows(repo.id, F, T, A); run('UPDATE repos SET clear_tpm_was_on = NULL WHERE id = ?', repo.id) })
   for (const a of A) fs.rmSync(agentDir(a), { recursive: true, force: true })
   for (const f of fs0) dropFeatureMd(f)
   writeProjectMd(repo.id)
@@ -104,7 +107,7 @@ async function finishClear(repo: Repo): Promise<void> {
     + `Notes and a summary are in ${dir.replace(process.env.HOME ?? '\0', '~')}.`
     + (failed.length ? ` These worktrees couldn't be removed (their code is safe on its branch): ${failed.join('; ')}.` : ''))
   bus.emit('resnapshot') // the UI drops everything at once (ui.ts)
-  if (tpmWasOn.delete(repo.id)) { // it was running: a new session, from its note and what has been built, without the old tickets
+  if (repo.clear_tpm_was_on) { // it was running: a new session, from its note and what has been built, without the old tickets
     void restartTpm(repo.id, { cleared: true }).catch((e) => attention(`repo_cleared:${repo.id}`, `Cleared ${repo.name}, but its TPM didn't start again: `
       + `${(e as Error).message} Send it a message to start it.`))
   }
@@ -137,17 +140,29 @@ async function saveWork(repo: Repo, tks: Ticket[]): Promise<Map<string, Saved>> 
   return out
 }
 
-const stamp = (t: number): string => new Date(t).toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
+const p2 = (n: number): string => String(n).padStart(2, '0')
+/** The archive folder's name: the time on the user's clock, like the summary's heading (Bug 225, it was UTC). */
+export const stamp = (t: number): string => {
+  const d = new Date(t); return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`
+}
+/** A new folder under `base`: `name`, else name-2, name-3… (two archives in one second, or the hour the clocks go back). */
+function newDir(base: string, name: string): string {
+  fs.mkdirSync(base, { recursive: true })
+  for (let i = 1; ; i++) {
+    const dir = path.join(base, i === 1 ? name : `${name}-${i}`)
+    try { fs.mkdirSync(dir); return dir } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e }
+  }
+}
 const safe = (s: string): string => s.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'repo'
 /** ~/.hq/archive/<repo>/<time>/: each feature's workspace (FEATURE.md brought up to date, CONTEXT.md, the handoff notes), any
  *  note, update_handoff log or plan not in it yet, and SUMMARY.md: the requests, tickets, branches and where their code is. */
 export function archive(repo: Repo, fs0: Feature[], tks: Ticket[], saved: Map<string, Saved>, how: 'cleared' | 'removed' = 'cleared'): string {
-  const dir = path.join(PATHS.archive, safe(repo.name), stamp(now())); fs.mkdirSync(dir, { recursive: true })
+  const at = now(), dir = newDir(path.join(PATHS.archive, safe(repo.name)), stamp(at))
   const put = (file: string, text: string | null | undefined) => {
     if (!text || fs.existsSync(file)) return
     fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, text.endsWith('\n') ? text : `${text}\n`)
   }
-  const lines = [`# ${repo.name}: ${how} ${new Date().toLocaleString('en-GB')}`, '',
+  const lines = [`# ${repo.name}: ${how} ${new Date(at).toLocaleString('en-GB')}`, '',
     `HQ's ${how === 'cleared' ? 'Clear project' : 'Remove from HQ'} archived this ${how === 'cleared' ? 'board' : "project's records"}. Each feature's folder has FEATURE.md`
       + " (the request, tickets, decisions and specs) and the engineers' handoff notes (HANDOFF.md); tpm/HANDOFF.md is the TPM's note at the time.",
     how === 'cleared' ? 'No code was deleted: changes that were not committed are in a "WIP (HQ clear)" commit on the ticket\'s branch, and every branch is kept.'
@@ -173,7 +188,7 @@ export function archive(repo: Repo, fs0: Feature[], tks: Ticket[], saved: Map<st
         'SELECT plan_text, edited_plan_text FROM plan_revisions WHERE ticket_id = ? ORDER BY round DESC, submitted_at DESC', t.id)
       put(path.join(tdir, 'PLAN.md'), plan ? plan.edited_plan_text ?? plan.plan_text : null)
     }
-    lines.push(`## ${f.title} (${f.status}): ${folder}/`, '', ...f.request_text.split('\n').map((l) => `> ${l}`), '')
+    lines.push(`## ${f.title} (${featureState(f)}): ${folder}/`, '', ...f.request_text.split('\n').map((l) => `> ${l}`), '')
     if (!mine.length) { lines.push('No tickets.', ''); continue }
     lines.push('| Ticket | Status | Branch | Code | PR | Note |', '|---|---|---|---|---|---|')
     for (const t of mine) {
@@ -215,7 +230,8 @@ export function deleteRows(repoId: string, F: string[], T: string[], A: string[]
   del('auto_runs', 'repo_id = ?', repoId)
   dropFindings(repoId) // the findings loop's: about runs and tickets that are gone
   // test_cmd_refused (Bug 107): the command stays, but its repair ticket went with the board, so the next engineer it's refused for says so afresh
-  run(`UPDATE repos SET clearing_at = NULL, tpm_agent_id = NULL, tpm_parked_at = NULL, auto_mode = 0, auto_stopped_why = NULL, auto_waiting = NULL, test_cmd_proposed = NULL,
+  // Bug 221: auto mode stays as the user left it: Clear empties the board, and an empty board gives auto mode nothing to do until the next request
+  run(`UPDATE repos SET clearing_at = NULL, tpm_agent_id = NULL, tpm_parked_at = NULL, auto_stopped_why = NULL, auto_waiting = NULL, test_cmd_proposed = NULL,
     test_cmd_refused = NULL WHERE id = ?`, repoId) // its sessions' rows went with the board
 }
 /** What only goes when the repo itself does (Remove from HQ): Clear keeps all of it. */

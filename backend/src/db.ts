@@ -178,6 +178,41 @@ CREATE INDEX auto_runs_repo ON auto_runs(repo_id, started_at);`,
 // The UI tester at the end of an auto run (uitester.ts): what it did and found (JSON, uitesterrules.ts UiTest; NULL: not yet), and a project's own switch
 // for it ('off'; NULL follows HQ's setting).
 `ALTER TABLE auto_runs ADD COLUMN ui_test TEXT; ALTER TABLE repos ADD COLUMN ui_test TEXT;`,
+// Bug 72: why a `blocked` agent is blocked: 'dialog' (a dialog or menu waits in its terminal) or 'api_error' (its turn ended with an API error, and
+// it sits at its prompt). Agents blocked before this: an open dialog notice wins (the safe reading: nothing is typed there), then an API error's.
+`ALTER TABLE agents ADD COLUMN blocked_why TEXT;
+UPDATE agents SET blocked_why = CASE WHEN NOT EXISTS (SELECT 1 FROM needs_attention n WHERE n.agent_id = agents.id AND n.resolved_at IS NULL AND n.kind = 'dialog')
+  AND EXISTS (SELECT 1 FROM needs_attention n WHERE n.agent_id = agents.id AND n.resolved_at IS NULL AND n.kind = 'api_error') THEN 'api_error' ELSE 'dialog' END
+  WHERE status = 'blocked';`,
+// Bug 143: the commit a ticket's branch was on when its engineer called open_pr. Auto mode tests and merges that commit and nothing later: a branch that moved
+// after it is unfinished again until open_pr names the new commit. NULL: finished before HQ kept it (HQ then tests the branch as it is).
+`ALTER TABLE tickets ADD COLUMN finished_sha TEXT;`,
+// Bug 145: agents' builds and full test runs that hold a turn (started_at set; until: when its command's own time limit has passed) or wait for one
+// (started_at NULL), so a restarted backend still counts them and keeps the line's order (heavy.ts). HQ's own test runs aren't kept: a restart ends them.
+`CREATE TABLE turns (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, who TEXT NOT NULL, what TEXT NOT NULL, lane TEXT NOT NULL,
+  asked_at INTEGER NOT NULL, started_at INTEGER, until INTEGER);`,
+// Bug 186: what the agent's box said the command was doing ("Running: npm test"), so a restarted backend shows it again. NULL: kept before this column.
+`ALTER TABLE turns ADD COLUMN activity TEXT;`,
+// Bug 187: why HQ dropped a message unread (delivery.ts dropMessage), so Messages can say so. Before this each reason was dropped for one cause
+// only. And HQ's notes to an engineer went out with no feature, so Messages hid them with its box picked: they take the engineer's feature.
+`ALTER TABLE messages ADD COLUMN dropped_why TEXT;
+UPDATE messages SET dropped_why = CASE reason WHEN 'test_cmd' THEN 'finished' WHEN 'fresh_start' THEN 'fresh_start_over' END WHERE delivery_method = 'dropped';
+UPDATE messages SET feature_id = (SELECT feature_id FROM agents WHERE agents.id = messages.to_id)
+  WHERE feature_id IS NULL AND from_id = 'hq' AND to_id IN (SELECT id FROM agents WHERE role = 'engineer');`,
+// Bug 215: HQ is ending the app's run ('stop': the user's Stop, Clear or Remove; 'restart': to start it again), kept before anything is signalled, so a
+// backend restart in the middle finishes the job instead of reading the ended app as a crash. NULL: not ending it.
+`ALTER TABLE previews ADD COLUMN stopping TEXT;`,
+// Bug 219 (migration 38): a clear under way remembers whether the project's TPM was running when it started (1), so the TPM comes back after the clear even if the
+// backend restarted in between. A clear already under way at this migration: its TPM was on if it still runs or stopped after the clear began.
+`ALTER TABLE repos ADD COLUMN clear_tpm_was_on INTEGER;
+UPDATE repos SET clear_tpm_was_on = 1 WHERE clearing_at IS NOT NULL AND EXISTS (SELECT 1 FROM agents a WHERE a.id = repos.tpm_agent_id
+  AND (a.status != 'exited' OR a.ended_at >= repos.clearing_at));`,
+// Bug 218 (migration 39 in fix round 3; 37 and 38 are Bugs 215, 219): an agent that left `blocked` kept why it was blocked (agents.ts update now
+// clears it): rows from before lose that stale reason.
+`UPDATE agents SET blocked_why = NULL WHERE status != 'blocked' AND blocked_why IS NOT NULL;`,
+// Bug 226 (migration 40 in fix round 3; 37–39 are Bugs 215, 219, 218): the ports in HQ's preview range a Launch helper was given for its test runs (JSON
+// list), so its test servers can't clash with another app on the machine and HQ's previews leave them alone. NULL: no helper, or one started before this.
+`ALTER TABLE previews ADD COLUMN helper_ports TEXT;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

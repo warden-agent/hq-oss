@@ -14,7 +14,28 @@ export function canLaunch(o: { ignoreCap?: boolean } = {}): { ok: boolean; why?:
   if (!free && !o.ignoreCap) return { ok: false, why: `Parallel limit reached (${running}/${cap})`, free }
   const paused = getSetting<string[]>('paused_roles', []); if (paused.includes('engineer')) return { ok: false, why: 'Engineer role is paused (model fallback or usage limit)', free: 0 }
   const u = one<{ fh: number | null; sd: number | null }>('SELECT MAX(five_hour_pct) fh, MAX(seven_day_pct) sd FROM usage_samples WHERE at > ?', Date.now() - 600_000)
-  if ((u?.fh ?? 0) >= getSetting('pause_five_hour_pct', DEFAULTS.pause_five_hour_pct)) return { ok: false, why: `Five-hour usage at ${u?.fh}%`, free: 0 }
-  if ((u?.sd ?? 0) >= getSetting('pause_seven_day_pct', DEFAULTS.pause_seven_day_pct)) return { ok: false, why: `Seven-day usage at ${u?.sd}%`, free: 0 }
+  const why = overPause(u?.fh, u?.sd, pauseLevels()); if (why) return { ok: false, why, free: 0 }
   return { ok: true, free }
+}
+
+/** The usage (in %) at which HQ stops starting new agents, as the user set it or HQ's default. */
+export const pauseLevels = (): { five: number; seven: number } =>
+  ({ five: getSetting('pause_five_hour_pct', DEFAULTS.pause_five_hour_pct), seven: getSetting('pause_seven_day_pct', DEFAULTS.pause_seven_day_pct) })
+/** Bug 160: which usage figures are at their pause, in words ("Weekly usage at 91%"), or null. Claude Code's usage report
+ *  (`session.measure`) has only the limits the account has, and the one HQ runs on has only ever sent the weekly (seven_day) one.
+ *  So only figures that came are named, and a missing one never counts as 0% (a pause set to 0 would stop everything "at null%"). */
+export function overPause(fh: number | null | undefined, sd: number | null | undefined, at: { five: number; seven: number }): string | null {
+  const over: string[] = [], has = (n: number | null | undefined): n is number => n != null && Number.isFinite(n)
+  if (has(fh) && fh >= at.five) over.push(`5-hour usage at ${Math.round(fh)}%`)
+  if (has(sd) && sd >= at.seven) over.push(`${over.length ? 'weekly' : 'Weekly'} usage at ${Math.round(sd)}%`)
+  return over.length ? over.join(' and ') : null
+}
+/** Bug 160: what setting the 5-hour pause answers (ui.ts) when no 5-hour figure comes. */
+export const NO_FIVE_HOUR = 'Claude Code sends no 5-hour usage figure for this account (its latest usage report had only the weekly one), '
+  + 'so the 5-hour pause can\'t act: only the weekly pause (pause_seven_day_pct) stops new launches.'
+/** Bug 160: whether Claude Code's latest usage report had a weekly figure but no 5-hour one. The limits are the account's, so
+ *  then HQ's 5-hour pause can't act: only the weekly one stops new launches. */
+export function noFiveHourFigure(): boolean {
+  const r = one<{ fh: number | null }>('SELECT five_hour_pct fh FROM usage_samples WHERE five_hour_pct IS NOT NULL OR seven_day_pct IS NOT NULL ORDER BY id DESC LIMIT 1')
+  return !!r && r.fh == null
 }

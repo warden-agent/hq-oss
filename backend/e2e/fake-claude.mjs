@@ -12,8 +12,8 @@ if (args.includes('--version')) { console.log(`${process.env.HQ_FAKE_VERSION ?? 
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined }
 // `-p`: HQ's one-shot reader (src/checker.ts), which answers a plan or a diff check and ends. No model here: what it reads says what it answers. A line
 // `FAKE-CHECK: <json>` anywhere in the prompt (a test puts it in the plan, or in a file of the diff) is the structured answer; with none, "ok". `FAKE-CHECK:
-// error` is an API error (exit 1, as the real one), `hang` never answers, `garbage` answers with something that isn't the answer asked for. Each call is
-// logged to $HOME/fake-checks.jsonl, so a test can count them and read what the reader was shown.
+// error` is an API error (exit 1, as the real one), `hang` never answers, `garbage` answers with something that isn't the answer asked for, `hold <name>`
+// answers "ok" once the test makes $HOME/<name>. Each call is logged to $HOME/fake-checks.jsonl, so a test can count them and read what the reader was shown.
 if (args.includes('-p')) {
   let prompt = ''; for await (const c of process.stdin) prompt += c
   const said = /FAKE-CHECK: (.*)/.exec(prompt)?.[1]?.trim()
@@ -43,35 +43,47 @@ if (args.includes('-p')) {
       { kind: 'weird', title: 'Add nothing', goal: 'Press Add with an empty name and see what the app says.' }] }
     console.log(JSON.stringify({ type: 'result', is_error: false, result: '', structured_output, usage: { input_tokens: 3000, output_tokens: 500 }, total_cost_usd: 0.01 })); process.exit(0)
   }
+  // The backend checker (src/backendcheck.ts) reads the recordings of the tester's run. `FAKE-BACKEND: <json>` in its prompt is its answer: a test puts it in
+  // a backend criterion's text, where the other readers (which also see criteria) don't take it for theirs. `FAKE-CHECK:` works for it too, as for any reader.
+  const backend = /^You check what a web app's backend did/.test(flag('--system-prompt') ?? '') ? /FAKE-BACKEND: (.*)/.exec(prompt)?.[1]?.trim() : null
+  if (backend) {
+    console.log(JSON.stringify({ type: 'result', is_error: false, result: '', structured_output: JSON.parse(backend), usage: { input_tokens: 9000, output_tokens: 700 }, duration_ms: 7 }))
+    process.exit(0)
+  }
   // Its sessions come with the browser and HQ's scenario tools. The stand-in starts neither: it does what they and Claude Code's hooks would, against the
   // tester's host (src/uitesthost.mjs, which is real: the app runs under it): for each scenario in the prompt, start it, open the page, look, click Add, and
-  // finish it. `FAKE-UITEST: <json>` (by scenario id) is what it reports for each; with none, "ok". `hang` never answers; `error` is an API error.
+  // finish it. As a browser would, it asks the app for the page when it opens it, and POSTs to /api/add when it clicks (at the address the host gave it).
+  // `FAKE-UITEST: <json>` (by scenario id) is what it reports for each; with none, "ok". `hang` never answers; `error` is an API error.
   const uitest = JSON.parse(flag('--mcp-config') ?? '{}').mcpServers?.uitest
   if (uitest) {
     const told = /FAKE-UITEST: (.*)/.exec(prompt)?.[1]?.trim(), ctrl = JSON.parse(uitest.args[1]).ctrl
     if (told === 'error') { console.log(JSON.stringify({ type: 'result', is_error: true, result: 'API Error: Overloaded' })); process.exit(1) }
     const host = async (what, body) => (await fetch(`http://127.0.0.1:${ctrl}/${what}`, { method: 'POST', body: JSON.stringify(body) })).json()
     let n = 0
-    const tool = async (name, input, answer) => { const h = { tool_name: `mcp__browser__browser_${name}`, tool_input: input, tool_use_id: `t${++n}` }
+    const tool = async (name, input, answer, act) => { const h = { tool_name: `mcp__browser__browser_${name}`, tool_input: input, tool_use_id: `t${++n}` }
       const pre = await host('pre', h); if (pre.hookSpecificOutput) return pre.hookSpecificOutput.permissionDecisionReason
+      if (act) await act().then((r) => r.text()).catch(() => {})
       await host('post', { ...h, tool_response: [{ type: 'text', text: answer }] }) }
     const reports = told && told !== 'hang' ? JSON.parse(told) : {}
     for (const [, id] of prompt.matchAll(/^### (s-\d+)/gm)) {
       const s = await host('start', { id }); if (!s.ok) break
       if (told === 'hang') { setInterval(() => {}, 1000); await new Promise(() => {}) }
-      await tool('navigate', { url: s.url }, `### Ran Playwright code\n\`\`\`js\nawait page.goto('${s.url}');\n\`\`\`\n### Page\n- Page URL: ${s.url}`)
+      await tool('navigate', { url: s.url }, `### Ran Playwright code\n\`\`\`js\nawait page.goto('${s.url}');\n\`\`\`\n### Page\n- Page URL: ${s.url}`, () => fetch(s.url))
       await tool('snapshot', {}, '### Page\n- Page URL: /\n### Snapshot\n```yaml\n- textbox "Name" [ref=e2]\n- button "Add" [ref=e3]\n```')
-      await tool('click', { ref: 'e3' }, "### Ran Playwright code\n```js\nawait page.getByRole('button', { name: 'Add' }).click();\n```")
+      await tool('click', { element: 'Add button', ref: 'e3' }, "### Ran Playwright code\n```js\nawait page.getByRole('button', { name: 'Add' }).click();\n```",
+        () => fetch(`${s.url}api/add`, { method: 'POST', body: '{"name":"Dune"}' }))
       await host('finish', { id, report: reports[id] ?? { outcome: 'ok', notes: [], findings: [] } })
     }
     console.log(JSON.stringify({ type: 'result', is_error: false, result: 'Done.', usage: { input_tokens: 20000, output_tokens: 1000 }, total_cost_usd: 0.05 })); process.exit(0)
   }
   if (said === 'hang') { setInterval(() => {}, 1000); await new Promise(() => {}) } // the timer keeps it alive: Node ends a script that only waits
+  const hold = said?.startsWith('hold ') ? path.join(process.env.HOME, said.slice(5)) : null // Bug 208: the test acts while the reader has it
+  while (hold && !fs.existsSync(hold)) await new Promise((r) => setTimeout(r, 100))
   const usage = { input_tokens: 2, cache_creation_input_tokens: 1500, cache_read_input_tokens: 0, output_tokens: 300 }
   if (said === 'crash') { console.error('Error: the stand-in fell over\n    at somewhere\n        ^'); process.exit(2) }
   if (said === 'error') { console.log(JSON.stringify({ type: 'result', is_error: true, api_error_status: 529, result: 'API Error: Overloaded', usage })); process.exit(1) }
   if (said === 'garbage') { console.log(JSON.stringify({ type: 'result', is_error: false, result: 'Looks fine to me!', usage })); process.exit(0) }
-  const structured_output = said ? JSON.parse(said) : { verdict: 'ok', findings: [] }
+  const structured_output = said && !hold ? JSON.parse(said) : { verdict: 'ok', findings: [] }
   console.log(JSON.stringify({ type: 'result', is_error: false, result: JSON.stringify(structured_output), structured_output, usage, duration_ms: 5 })); process.exit(0)
 }
 const settings = JSON.parse(fs.readFileSync(flag('--settings'), 'utf8'))
@@ -81,15 +93,17 @@ if (worktree) {
   try { execFileSync('git', ['-C', process.cwd(), 'worktree', 'lock', '--reason', `claude session ${worktree} (pid ${process.pid} start ${new Date().toUTCString()})`, wt], { stdio: 'pipe' }) }
   catch (e) { console.error(`fake-claude: could not lock ${wt}: ${String(e.stderr ?? e).trim()}`) }
 }
+// Claude Code's own status file (Bug 62, presence.ts), which the tests then change as Claude Code would: hq.session(). Written before HQ hears of the session, so
+// it is there once the agent shows as started, and never lands after a test's dialog to look newer than its alert (Bug 159). Whole or not at all: a temp file
+// that HQ and hq.session() pass over (not .json), renamed into place.
+const sessions = path.join(process.env.HOME, '.claude', 'sessions'), own = path.join(sessions, `${process.pid}.json`); fs.mkdirSync(sessions, { recursive: true })
+fs.writeFileSync(`${own}.tmp`, JSON.stringify({ pid: process.pid, sessionId: flag('--session-id'), status: 'busy', statusUpdatedAt: Date.now() })); fs.renameSync(`${own}.tmp`, own)
 // Runs HQ's own SessionStart command, as Claude Code does: the token comes from the agent's header file (Bug 87)
 const start = { hook_event_name: 'SessionStart', session_id: flag('--session-id'), transcript_path: null, cwd: process.cwd(), source: 'startup', model: 'fake' }
 execFileSync('/bin/sh', ['-c', settings.hooks.SessionStart[0].hooks[0].command], { input: JSON.stringify(start), stdio: ['pipe', 'ignore', 'inherit'] })
 console.log(`fake-claude ${flag('--name') ?? ''} up (pid ${process.pid})`)
 // Claude Code 2.1.300's screen when it waits at its prompt (Bug 25 tests): the input box and a footer with no "esc to interrupt"
 if (process.env.HQ_FAKE_IDLE_SCREEN) console.log(`\n✻ Baked for 2s · done\n\n${'─'.repeat(60)}\n❯ \n${'─'.repeat(60)}\n  ⏸ manual mode on · ? for shortcuts · ← for agents`)
-// Claude Code's own status file (Bug 62, presence.ts), which the tests then change as Claude Code would: hq.session()
-const sessions = path.join(process.env.HOME, '.claude', 'sessions'); fs.mkdirSync(sessions, { recursive: true })
-fs.writeFileSync(path.join(sessions, `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: flag('--session-id'), status: 'busy', statusUpdatedAt: Date.now() }))
 // A screen a test draws (hq.screen()), shown whenever it changes: a dialog's menu, say
 const drawn = process.env.HQ_FAKE_SCREEN_DIR && path.join(process.env.HQ_FAKE_SCREEN_DIR, `${flag('--session-id')}.txt`); let shown = ''
 setInterval(() => { if (!drawn) return; let t = ''; try { t = fs.readFileSync(drawn, 'utf8') } catch { return } if (t !== shown) { shown = t; process.stdout.write(`\x1b[2J\x1b[H${t}`) } }, 200)

@@ -63,6 +63,16 @@ test('recorder: seed, proxy, stream, settle, snapshots, reset, stop', async () =
   assert.ok(log.every((l) => /^\d{13}\tapp\t/.test(l)), 'every server line is stamped'); assert.ok(log.some((l) => l.endsWith('Error: boom')))
   assert.deepEqual(jsonl(path.join(out, 'actions.jsonl')).map((m) => `${m.phase} ${m.label}`),
     ['start add Dune twice', 'end add Dune twice', 'start slow and broken', 'end slow and broken', 'start reset', 'end reset'])
+  // A folder of its own from here on (the UI tester's host gives each scenario one): its actions and snapshots count from the start, and a stream the
+  // last page left open, which this one's reset ends, isn't written into it
+  const before = jsonl(path.join(out, 'api.jsonl')).length, own = path.join(out, 'rec', 's-02')
+  const left = await fetch(`${rec.url}/events`); rec.cut(own); await rec.reset(); void left.body?.cancel().catch(() => {})
+  await rec.action('add Emma', () => post('Emma'))
+  assert.deepEqual(jsonl(path.join(own, 'api.jsonl')).map((r) => [r.method, r.path, r.action]), [['POST', '/add', 2]])
+  assert.deepEqual(jsonl(path.join(own, 'actions.jsonl')).map((m) => `${m.phase} ${m.label} ${m.action}`), ['start reset 1', 'end reset 1', 'start add Emma 2', 'end add Emma 2'])
+  assert.deepEqual(jsonl(path.join(own, 'snaps.jsonl')).map((x) => [x.n, x.label, x.changed]), [[0, 'reset', true], [1, 'add Emma', true]])
+  assert.equal(JSON.parse(fs.readFileSync(path.join(own, 'snapshots', '0001', 'data', 'items.json'), 'utf8')).length, 2, 'the seed and Emma')
+  assert.equal(jsonl(path.join(out, 'api.jsonl')).length, before, 'nothing more in the first folder'); assert.ok(fs.existsSync(path.join(out, 'seed', 'data', 'items.json')))
   await rec.stop()
   assert.deepEqual(running(tag), [], 'the app and its shell are gone, through two starts')
   await assert.rejects(fetch(url, { signal: AbortSignal.timeout(1000) }), 'and the proxy too')

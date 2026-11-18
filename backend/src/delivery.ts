@@ -5,13 +5,15 @@ import { one, q, run, now, getSetting, tx } from './db.ts'
 import { DEFAULTS } from './config.ts'
 import { emit, patch } from './events.ts'
 import { id } from './util.ts'
-import { agentDir, getAgent, liveAgents, update, type Agent } from './agents.ts'
+import { agentDir, getAgent, liveAgents, onDialog, update, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
 import * as tmux from './tmux.ts'
-import { paneLooksIdle, paneShowsDialog } from './screen.ts'
+import { paneHasDraft, paneLooksIdle, paneShowsDialog, plainScreen } from './screen.ts'
 import { wake, wakeAll } from './wake.ts'
 
-export type Message = { id: string; repo_id: string | null; feature_id: string | null; channel: string; from_id: string; to_id: string | null; reason: string; in_reply_to: string | null; body: string; created_at: number; batch_id: string | null; delivered_at: number | null; delivery_method: string | null; ack_at: number | null }
+export type Message = { id: string; repo_id: string | null; feature_id: string | null; channel: string; from_id: string; to_id: string | null; reason: string; in_reply_to: string | null; body: string; created_at: number; batch_id: string | null; delivered_at: number | null; delivery_method: string | null; ack_at: number | null
+  /** Bug 187: why HQ dropped it unread (delivery_method 'dropped'; see dropMessage). */
+  dropped_why: string | null }
 export type Batch = { id: string; agent_id: string; text: string; created_at: number; handed_at: number | null; submitted_at: number | null; acked_at: number | null; method: string | null; received_at: number | null; dropped_at: number | null }
 export type Handed = Batch & { raw: boolean; asUser: boolean }
 
@@ -24,14 +26,15 @@ export function displayName(agentOrId: string): string {
 
 /** `from`: an agent id, 'user' (the person running HQ) or 'hq' (HQ's own notices, which are never the user's words or an answer). */
 export function sendMessage(m: { repoId?: string | null; featureId?: string | null; channel: 'team' | 'dm'; from: string; to?: string | null; reason: string; body: string; inReplyTo?: string | null; method?: string }): Message {
-  const row: Message = { id: id('msg'), repo_id: m.repoId ?? repoFor(m.featureId, m.from, m.to), feature_id: m.featureId ?? null, channel: m.channel, from_id: m.from, to_id: m.to ?? null, reason: m.reason, in_reply_to: m.inReplyTo ?? null, body: m.body, created_at: now(), batch_id: null, delivered_at: null, delivery_method: null, ack_at: null }
+  const row: Message = { id: id('msg'), repo_id: m.repoId ?? repoFor(m.featureId, m.from, m.to), feature_id: m.featureId ?? null, channel: m.channel, from_id: m.from, to_id: m.to ?? null, reason: m.reason, in_reply_to: m.inReplyTo ?? null, body: m.body, created_at: now(), batch_id: null, delivered_at: null, delivery_method: null, ack_at: null,
+    dropped_why: null }
   run('INSERT INTO messages(id, repo_id, feature_id, channel, from_id, to_id, reason, in_reply_to, body, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)', row.id, row.repo_id, row.feature_id, row.channel, row.from_id, row.to_id, row.reason, row.in_reply_to, row.body, row.created_at)
   patch('message', row.id, row as unknown as Record<string, unknown>)
   if (row.channel === 'team') wakeAll(); else wake(row.to_id) // Bug 99: its waiting `next` hands it out at once
   emit({ agentId: m.from === 'user' || m.from === 'hq' ? null : m.from, source: 'system', kind: 'message.sent', payload: { id: row.id, to: row.to_id, reason: m.reason, channel: m.channel } })
   // What answers an engineer's question: anything the user sends it (their message box says 'fyi'), or the TPM's reply marked as one.
   const answers = m.from === 'user' || (getAgent(m.from)?.role === 'tpm' && (!!m.inReplyTo || m.reason === 'answer'))
-  if (row.to_id && row.to_id !== 'team' && row.to_id !== 'user' && answers) resolveQuestion(row.to_id, row.id, m.inReplyTo ?? null)
+  if (row.to_id && row.to_id !== 'team' && row.to_id !== 'user' && answers) resolveQuestion(row.to_id, row.id, m.inReplyTo ?? null, m.from)
   // The user answered this agent: what it told them and what it's blocked on are dealt with. HQ's notices and the TPM's aren't that.
   if (m.from === 'user' && row.to_id) for (const k of ['message_for_user', 'blocked']) resolveKind(k, row.to_id)
   if (row.to_id === 'user') { run('UPDATE messages SET delivered_at = ?, delivery_method = ? WHERE id = ?', now(), 'ui', row.id); attention('message_for_user', `${displayName(m.from)} (${m.reason}): ${m.body.slice(0, 200)}`, { agentId: m.from }) }
@@ -49,7 +52,7 @@ function repoFor(featureId: string | null | undefined, from: string, to: string 
 export function recordReply(agent: Agent, text: string): void {
   const body = text.trim(); if (!body) return
   const t = now(), row: Message = { id: id('msg'), repo_id: agent.repo_id, feature_id: agent.feature_id, channel: 'dm', from_id: agent.id, to_id: 'user', reason: 'reply', in_reply_to: null, body: body.slice(0, 8000),
-    created_at: t, batch_id: null, delivered_at: t, delivery_method: 'terminal', ack_at: t }
+    created_at: t, batch_id: null, delivered_at: t, delivery_method: 'terminal', ack_at: t, dropped_why: null }
   run('INSERT INTO messages(id, repo_id, feature_id, channel, from_id, to_id, reason, body, created_at, delivered_at, delivery_method, ack_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
     row.id, row.repo_id, row.feature_id, row.channel, row.from_id, row.to_id, row.reason, row.body, t, t, 'terminal', t)
   patch('message', row.id, row as unknown as Record<string, unknown>)
@@ -93,14 +96,15 @@ export function nextBatchFor(agent: Agent, by: 'mod' | 'typed' = 'mod'): Handed 
   if (launch) { run('UPDATE batches SET handed_at = ? WHERE id = ?', t, launch.id); emit({ agentId: agent.id, source: 'system', kind: 'batch.handed', payload: { id: launch.id, launch: true } }); return { ...launch, handed_at: t, raw: true, asUser: true } }
   // While it writes its handoff note, the request is all it gets; the rest waits for the session that takes over.
   const all = pendingFor(agent), stale = agent.fresh_start_at ? [] : all.filter((m) => m.reason === 'fresh_start') // its fresh start is over
-  for (const m of stale) { run("UPDATE messages SET delivered_at = ?, delivery_method = 'dropped' WHERE id = ?", t, m.id); patch('message', m.id, { delivered_at: t, delivery_method: 'dropped' }) }
+  for (const m of stale) dropMessage(m.id, 'fresh_start_over', t)
   const msgs = agent.fresh_start_at ? all.filter((m) => m.reason === 'fresh_start') : all.filter((m) => m.reason !== 'fresh_start'); if (!msgs.length) return null
   // Bug 110: after an interrupted turn the mod's prompt would be dropped, so nothing is handed to it. HQ types the messages itself, when the screen allows it.
   if (by === 'mod' && interrupted) { typeNext(agent.id); return null }
   const user = msgs.map((m) => m.body).join('\n\n'), bid = id('B')
   const labelled = msgs.map((m) => `[${m.reason}] from ${displayName(m.from_id)}${m.from_id === 'user' || m.from_id === 'hq' ? '' : ` (id ${m.from_id})`}${m.in_reply_to ? ' (reply)' : ''} [msg ${m.id}]: ${m.body}`).join('\n\n')
-  // What the user wrote goes in as their own words. Typed, only when the line can't be taken for a command; otherwise labelled, like everyone else's
-  const allUser = msgs.every((m) => m.from_id === 'user') && (by === 'mod' || startsPlain(oneLine(user)))
+  // What the user wrote goes in as their own words, but only when it can't be taken for a command; otherwise labelled, like everyone else's.
+  // Bug 146: the mod's `$.prompt.submit` refuses a text that begins with "/" (2.1.322), so its words had never got through that way either
+  const allUser = msgs.every((m) => m.from_id === 'user') && startsPlain(oneLine(user))
   const text = by === 'typed' ? (allUser ? oneLine(user) : `HQ message batch ${bid}: ${oneLine(labelled)}`) : allUser ? user : labelled
   const how = by === 'typed' ? 'tmux' : 'mod'
   const b: Batch = { id: bid, agent_id: agent.id, text, created_at: t, handed_at: t, submitted_at: null, acked_at: null, method: by === 'typed' ? 'typed' : allUser ? 'mod_user' : 'mod',
@@ -125,10 +129,11 @@ function inTerminal<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
   const p = (typing.get(agentId) ?? Promise.resolve()).then(fn, fn), done = (): void => { if (typing.get(agentId) === p) typing.delete(agentId) }
   typing.set(agentId, p); p.then(done, done); return p
 }
-/** Statuses with a menu or a dialog on the screen, where Enter would pick an option, and one that takes no messages. */
-const NOT_TYPEABLE = ['blocked', 'paused', 'plan_review']
+/** A menu or a dialog on the screen, where Enter would pick an option, or a status that takes no messages. Blocked by an API error isn't one (Bug 72). */
+const notTypeable = (a: Agent): boolean => onDialog(a) || a.status === 'plan_review'
 /** Why HQ holds back from typing into each agent's terminal right now: 'status' (HQ knows of a dialog or a plan menu), 'dialog' or 'busy' (its screen
- *  shows one, or a turn at work), 'screen' (anything else that isn't the waiting prompt: Claude Code's Rewind menu after Escape twice, say). Logged
+ *  shows one, or a turn at work), 'draft' (Bug 149: a line somebody typed sits unsent in its prompt box, and Enter would send the two as one),
+ *  'screen' (anything else that isn't the waiting prompt: Claude Code's Rewind menu after Escape twice, say). Logged
  *  once per reason, not at every look, and sent to the page, whose box says why the message waits (`type_waits`, frontend waitingFor). */
 const typeWaits = new Map<string, string>()
 function typeWaiting(a: Agent, why: string | null): void {
@@ -137,22 +142,33 @@ function typeWaiting(a: Agent, why: string | null): void {
   patch('agent', a.id, { type_waits: why })
 }
 /** Bug 110: types the agent's next batch into its terminal, as a person would, because the mod can't deliver it (see turnEnded). Only into Claude Code's
- *  waiting prompt: never into a menu or a dialog, and not while it works. Otherwise nothing happens now, and the mod's `next` request looks again
- *  when something changes and every few seconds (hooks.ts). The prompt's UserPromptSubmit hook acks the batch like any other; one that never
+ *  empty waiting prompt: never into a menu or a dialog, not while it works, and not after a half-written line in the box (Bug 149). Otherwise nothing
+ *  happens now, and the mod's `next` request looks again when something changes and every NEXT_BACKSTOP_MS (5 s, hooks.ts): a draft sent or cleared
+ *  changes nothing HQ hears of, so that look is what ends its hold. The prompt's UserPromptSubmit hook acks the batch like any other; one that never
  *  starts is typed again after NOT_ACKED_MS, three times at most (requeue). */
 export function typeNext(agentId: string): void {
   if (typing.has(agentId)) return
   inTerminal(agentId, async () => {
     const was = getAgent(agentId); if (!was) return
-    const screen = await tmux.visiblePane(was.tmux_session)
+    const styled = await tmux.visiblePaneStyled(was.tmux_session), screen = plainScreen(styled)
     const a = getAgent(agentId); if (!a || a.status === 'exited' || !a.interrupted_at) return // read again: the look at the screen took a moment
-    const why = NOT_TYPEABLE.includes(a.status) ? 'status' : paneLooksIdle(screen) ? null : paneShowsDialog(screen) ? 'dialog' : /esc to interrupt/.test(screen) ? 'busy' : 'screen'
+    const why = notTypeable(a) ? 'status' : paneShowsDialog(screen) ? 'dialog' : paneHasDraft(styled) ? 'draft' : paneLooksIdle(screen) ? null
+      : /esc to interrupt/.test(screen) ? 'busy' : 'screen'
     typeWaiting(a, why); if (why) return
     const b = nextBatchFor(a, 'typed'); if (!b) return
     try { await tmux.typeLine(a.tmux_session, b.text) }
     catch (e) { emit({ agentId: a.id, source: 'system', kind: 'batch.type_failed', payload: { id: b.id, error: String(e) } }); return requeue(b.id, 'type_failed') }
     markSubmitted(b.id); emit({ agentId: a.id, source: 'system', kind: 'batch.typed', payload: { id: b.id } })
   }).catch((e) => emit({ agentId, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
+}
+/** Bug 149: an urgent message or a fresh start's request found a half-written line in the agent's prompt box after HQ's Escape. It goes back in the
+ *  queue and on from there like any other message. If the Escape interrupted a turn (the mod says so within milliseconds, turnEnded), typeNext
+ *  types it once the box is empty, and its box says why it waits. If there was no turn to stop, the mod hands it out at once: a prompt the mod
+ *  submits goes in on its own and leaves the draft in the box (2.1.322). A fresh start's request that never gets in gets HQ's note (NEVER_MS). */
+function holdForDraft(agentId: string, m: Message): void {
+  run('UPDATE messages SET delivered_at = NULL, delivery_method = NULL WHERE id = ? AND ack_at IS NULL', m.id); patch('message', m.id, { delivered_at: null, delivery_method: null })
+  emit({ agentId, source: 'system', kind: 'message.held', payload: { id: m.id, why: 'draft' } })
+  wake(agentId) // its waiting `next` looks at once
 }
 /** Bug 99: when nextBatchFor could next find something with nothing else changing (no message, no ack, no setting): a hold ends,
  *  a batch handed out or submitted is due to be handed out again, or the one in flight stops holding the rest back. Null: none. */
@@ -164,17 +180,24 @@ export function nextDeadline(agent: Agent): number | null {
   }
   const later = times.filter((x) => x >= t); return later.length ? Math.min(...later) + 1 : null // the checks compare with < and >
 }
+/** The line an urgent message is typed as. The user's goes in as written only when it starts with a letter or a digit: Bug 146, "/cd …" ran as Claude Code's
+ *  own command. Otherwise, and for everyone else's, labelled; a label starts with "[", which Claude Code takes as text (2.1.322). */
+function urgentLine(m: Pick<Message, 'from_id' | 'reason' | 'body'>): string {
+  return m.from_id === 'user' && startsPlain(oneLine(m.body)) ? oneLine(m.body) : oneLine(`[${m.reason}] from ${displayName(m.from_id)}: ${m.body}`)
+}
 /** Urgent delivery: Escape stops the agent's current turn and `m` is typed into its terminal. After an interrupt Claude Code
  *  drops prompts a mod submits until a normal turn has ended (seen on 2.1.300 and 2.1.322), so the mod can't carry it. `m` is marked
  *  delivered before the first await, so the mod's long-poll never hands it out as well. */
 export async function interruptAndType(agent: Agent, m: Message): Promise<void> {
   const t0 = now(); run("UPDATE messages SET delivered_at = ?, delivery_method = 'tmux' WHERE id = ?", t0, m.id); patch('message', m.id, { delivered_at: t0, delivery_method: 'tmux' })
+  let draft = false
   await inTerminal(agent.id, async () => { // not in the middle of a batch HQ is typing there (Bug 110)
     await tmux.sendEscape(agent.tmux_session).catch(() => {})
     await new Promise((r) => setTimeout(r, 1500)) // let the interrupted turn wind down
-    const text = (m.from_id === 'user' ? m.body : `[${m.reason}] from ${displayName(m.from_id)}: ${m.body}`).replace(/\s*\n\s*/g, ' ')
-    await tmux.sendKeys(agent.tmux_session, text)
+    if ((draft = paneHasDraft(await tmux.visiblePaneStyled(agent.tmux_session)))) return // Bug 149: one Escape leaves a half-written line in the box
+    await tmux.typeLine(agent.tmux_session, urgentLine(m)) // in pieces, as typeNext does: sent in one go, Claude Code kept only the end of a long one (Bug 183)
   })
+  if (draft) return holdForDraft(agent.id, m)
   const t = now(); run('UPDATE messages SET ack_at = ? WHERE id = ?', t, m.id); patch('message', m.id, { ack_at: t })
   emit({ agentId: agent.id, source: 'system', kind: 'message.typed', payload: { id: m.id, reason: m.reason } })
 }
@@ -212,7 +235,14 @@ function giveUp(b: Batch, why: string, tries: number): void {
   const how = why === 'submit_failed' ? 'the mod could not submit it' : why === 'not_received' ? 'the mod never got it' : why === 'type_failed' ? "HQ couldn't type it into its terminal"
     : 'it went in but the agent never started on it'
   attention('delivery_failed', `${displayName(b.agent_id)}: HQ couldn't deliver ${b.method === 'launch' ? 'its launch prompt' : 'a message batch'} ${tries} times (${how}), so it stopped trying. `
-    + 'Check its terminal, then send the message again.', { agentId: b.agent_id })
+    + whatNow(b, why), { agentId: b.agent_id })
+}
+/** Bug 146: what the user can do that will work. Sent again the normal way a message goes through the same mod, so when the mod is what failed, Urgent:
+ *  HQ types that one into the terminal itself. */
+function whatNow(b: Batch, why: string): string {
+  if (b.method === 'launch' || (why !== 'submit_failed' && why !== 'not_received')) return 'Check its terminal, then send the message again.'
+  return "Sent again the normal way it may fail the same way: send it with Urgent in the agent's panel instead, and HQ types it into its terminal "
+    + '(that stops what the agent is doing).'
 }
 export function ackBatchFromPrompt(agent: Agent, prompt: string): string | null {
   const m = /HQ message batch (B-[0-9a-f]+)/.exec(prompt)
@@ -231,6 +261,22 @@ function ackBatch(agent: Agent, batchId: string): void {
   for (const row of q<Message>('SELECT * FROM messages WHERE batch_id = ?', batchId)) patch('message', row.id, { ack_at: t, delivered_at: row.delivered_at, delivery_method: row.delivery_method })
   emit({ agentId: agent.id, source: 'system', kind: 'batch.acked', payload: { id: batchId } })
   wake(agent.id) // the one in flight arrived: the next can go
+}
+/** Bug 140: a report on a batch that the mod sends again because HQ was away when it first sent it (`late`). It counts only for the
+ *  hand-out it names (`handed`: a launch prompt handed out again keeps its id), and only while that batch is still on its way: a resend
+ *  for one that was dropped and handed out again in a new batch never touches the new one. */
+export function lateReportFits(agent: Agent, batchId: string, handed: unknown): boolean {
+  const b = one<Batch>('SELECT * FROM batches WHERE id = ? AND agent_id = ?', batchId, agent.id)
+  return !!b && !b.dropped_at && b.handed_at !== null && b.handed_at === handed
+}
+/** Bug 140: the mod's "it's in", sent again once HQ is back. The prompt's UserPromptSubmit hook reaches HQ before the mod's report does,
+ *  so while HQ was away that hook failed too and nothing else will ack the batch: this does. Unless the turn that ended next was
+ *  interrupted (`interrupted`, as the mod saw it) or HQ knows of an interrupt: then the prompt was most likely dropped (Bug 110), and
+ *  it only counts as submitted (the "submitted but never started" rule in nextBatchFor sends it again, typed). */
+export function submittedWhileAway(agent: Agent, batchId: string, interrupted: boolean): void {
+  markSubmitted(batchId)
+  const b = one<Batch>('SELECT * FROM batches WHERE id = ?', batchId)
+  if (b && !b.acked_at && !interrupted && !agent.interrupted_at) ackBatch(agent, batchId)
 }
 /** Bug 103: a batch handed over in the Stop hook's answer, when the agent's mod has gone quiet. Claude Code goes on with it as feedback
  *  on the turn that was ending, and no UserPromptSubmit follows (checked on 2.1.322), so nothing would ever ack it, and the "submitted
@@ -258,10 +304,26 @@ export function readInbox(agent: Agent): Message[] {
   for (const m of msgs) { run('UPDATE messages SET delivered_at = ?, delivery_method = ?, ack_at = ? WHERE id = ?', t, 'mcp_read', t, m.id); patch('message', m.id, { delivered_at: t, ack_at: t }) }
   return msgs
 }
+/** Bug 187: a message HQ won't hand out. Its delivered_at takes it out of the queue; delivery_method and dropped_why say it was never read
+ *  and why ('fresh_start_over': a fresh-start request whose fresh start was over; 'finished': a test-command note its engineer hadn't read
+ *  by open_pr, Bug 147), so Messages shows it as dropped, not as delivered. */
+function dropMessage(msgId: string, why: 'fresh_start_over' | 'finished', t: number): void {
+  run("UPDATE messages SET delivered_at = ?, delivery_method = 'dropped', dropped_why = ? WHERE id = ?", t, why, msgId)
+  patch('message', msgId, { delivered_at: t, delivery_method: 'dropped', dropped_why: why })
+}
 export function messagesForFeature(featureId: string | null, limit = 200): Message[] {
   return featureId ? q<Message>('SELECT * FROM messages WHERE feature_id = ? ORDER BY created_at DESC LIMIT ?', featureId, limit) : q<Message>('SELECT * FROM messages ORDER BY created_at DESC LIMIT ?', limit)
 }
 export function unreadCount(agent: Agent): number { return pendingFor(agent).length }
+/** Bug 147: HQ's note that the test command changed (auto.ts tellEngineers, reason 'test_cmd') is for an engineer at work. One it hasn't read
+ *  when it calls open_pr would come after its last full run and start a turn it can do nothing with, and keep it from being stopped
+ *  (tickets.ts stopFinished): it's dropped. HQ tests the ticket with the new command whatever the engineer ran. */
+export function dropLateNotes(agentId: string | null): void {
+  const late = agentId ? q<{ id: string }>("SELECT id FROM messages WHERE to_id = ? AND from_id = 'hq' AND reason = 'test_cmd' AND delivered_at IS NULL", agentId) : []
+  const t = now()
+  for (const m of late) dropMessage(m.id, 'finished', t)
+  if (late.length) emit({ agentId, source: 'system', kind: 'message.dropped', payload: { ids: late.map((m) => m.id), why: 'finished' } })
+}
 export function resolveRecipient(agent: Agent, to: string): string | null {
   if (to === 'user' || to === 'team') return to
   const tpmOfRepo = (repoId: string | null) => repoId ? one<{ tpm_agent_id: string | null }>('SELECT tpm_agent_id FROM repos WHERE id = ?', repoId)?.tpm_agent_id ?? null : null
@@ -318,11 +380,26 @@ export const openQuestions = (): QuestionView[] => q<QuestionView>(`${QUESTION_S
 export function patchQuestion(questionId: string): void {
   const row = one<QuestionView>(`${QUESTION_SQL} WHERE q.id = ?`, questionId); if (row) patch('question', row.id, row as unknown as Record<string, unknown>)
 }
-export function resolveQuestion(engineerId: string, answerMessageId: string, inReplyTo: string | null): void {
-  const qrow = inReplyTo ? one<{ id: string; ticket_id: string | null }>('SELECT id, ticket_id FROM questions WHERE message_id = ? AND answered_at IS NULL', inReplyTo) : one<{ id: string; ticket_id: string | null }>('SELECT id, ticket_id FROM questions WHERE from_agent_id = ? AND answered_at IS NULL ORDER BY asked_at', engineerId)
-  if (!qrow) return
-  // tickets.ts hears question.answered and takes the ticket out of awaiting_answer (it owns ticket writes; no import cycle).
-  tx(() => { const at = now(); run('UPDATE questions SET answered_at = ?, answer_message_id = ? WHERE id = ?', at, answerMessageId, qrow.id)
+type QRow = { id: string; ticket_id: string | null }
+/** An answer from `from` (the user, or the TPM) to `engineerId`. One that says which question it answers (`inReplyTo`) answers that one.
+ *  One that doesn't answers every open question the engineer asked `from` (the user: those to the user; the TPM: to it or the team),
+ *  or, when it asked `from` nothing, its oldest open question (Bug 157: one answer used to leave the newer of two questions open). */
+export function resolveQuestion(engineerId: string, answerMessageId: string, inReplyTo: string | null, from: string): void {
+  const open = 'SELECT id, ticket_id FROM questions WHERE from_agent_id = ? AND answered_at IS NULL'
+  const asked = () => q<QRow>(`${open} AND to_target IN (?, ?) ORDER BY asked_at`, engineerId, from, from === 'user' ? 'user' : 'team')
+  const rows = inReplyTo ? q<QRow>('SELECT id, ticket_id FROM questions WHERE message_id = ? AND answered_at IS NULL', inReplyTo)
+    : ((r) => r.length ? r : q<QRow>(`${open} ORDER BY asked_at LIMIT 1`, engineerId))(asked())
+  // listeners.ts hears question.answered and takes the ticket out of awaiting_answer once none is left open (it owns ticket writes; no import cycle).
+  tx(() => { const at = now(); for (const qrow of rows) { run('UPDATE questions SET answered_at = ?, answer_message_id = ? WHERE id = ?', at, answerMessageId, qrow.id)
     patch('question', qrow.id, { answered_at: at })
-    emit({ agentId: engineerId, source: 'system', kind: 'question.answered', payload: { question: qrow.id, answer: answerMessageId, ticket: qrow.ticket_id } }) })
+    emit({ agentId: engineerId, source: 'system', kind: 'question.answered', payload: { question: qrow.id, answer: answerMessageId, ticket: qrow.ticket_id } }) } })
+}
+/** Bug 157: whether `ticketId` still waits on an answer to one of its engineer's questions. */
+export const waitsOnQuestion = (ticketId: string): boolean => !!one('SELECT 1 AS x FROM questions WHERE ticket_id = ? AND answered_at IS NULL', ticketId)
+/** Bug 157: a new question starts a new wait. Questions on `ticketId` still open from an earlier wait that ended without their answer
+ *  (the engineer opened its PR anyway, a new engineer took over) aren't waited on any more: they close, with no answer, and leave the page. */
+export function dropOldQuestions(ticketId: string): void {
+  const old = q<{ id: string }>('SELECT id FROM questions WHERE ticket_id = ? AND answered_at IS NULL', ticketId); if (!old.length) return
+  const at = now(); run('UPDATE questions SET answered_at = ? WHERE ticket_id = ? AND answered_at IS NULL', at, ticketId)
+  for (const x of old) patch('question', x.id, { answered_at: at })
 }

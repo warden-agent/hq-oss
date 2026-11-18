@@ -6,10 +6,26 @@ let token = ''
 let pending = null
 let polling = false
 let followUp = false // Bug 135: an empty answer may be followed by one ask at once; each tick of the clock allows one more
+let reports = [] // Bug 140: batch reports HQ hasn't answered yet: on their way, or `late` (HQ was away, most likely a restart)
 
 function post($, path, obj) {
   if (!backend || !token) return Promise.resolve(null)
   return $.http.fetch(backend + '/mod/' + token + '/' + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(obj) }).catch(() => null)
+}
+
+// Bug 140: a report on a batch (got it, it's in, it failed). One that gets no answer is kept and sent again, in order, before the
+// mod's next ask (sendLate), marked `late`. `handed` names the hand-out, so HQ can tell a resend that comes after the batch was handed
+// out again. A batch that went in while HQ was away is acked by the resend (its prompt's UserPromptSubmit hook was lost as well).
+function report($, obj) {
+  reports.push(obj)
+  return post($, 'event', obj).then((r) => { if (r) reports = reports.filter((x) => x !== obj); else obj.late = true })
+}
+async function sendLate($) {
+  for (const obj of reports.filter((x) => x.late)) {
+    if (!(await post($, 'event', obj))) return false
+    reports = reports.filter((x) => x !== obj)
+  }
+  return true
 }
 
 // Asks HQ for the next batch. HQ holds the request open until it has one, 15 s at most. Bug 135: the mod asks again as soon as a
@@ -21,16 +37,18 @@ async function poll($) {
   polling = true
   let again = false
   try {
+    if (!(await sendLate($))) return // HQ is still away: the next tick tries again
     const r = await $.http.fetch(backend + '/mod/' + token + '/next?wait=15000', { method: 'GET' })
     if (r && r.ok && r.text) {
       const data = JSON.parse(r.text)
       if (data && data.batch) {
         pending = data.batch
-        post($, 'event', { kind: 'batch_received', id: data.batch.id })
+        const b = { id: data.batch.id, handed: data.batch.handed }
+        report($, { kind: 'batch_received', ...b })
         $.ui.log('HQ: delivering ' + data.batch.id + ' (waits for idle)')
         $.prompt.submit({ text: data.batch.raw ? data.batch.text : 'HQ message batch ' + data.batch.id + ':\n' + data.batch.text, asUser: data.batch.asUser ? true : undefined })
-          .then(() => { post($, 'event', { kind: 'batch_submitted', id: data.batch.id }); pending = null; poll($) })
-          .catch((err) => { post($, 'event', { kind: 'batch_submit_failed', id: data.batch.id, error: String(err) }); pending = null })
+          .then(() => { report($, { kind: 'batch_submitted', ...b }); pending = null; poll($) })
+          .catch((err) => { report($, { kind: 'batch_submit_failed', ...b, error: String(err) }); pending = null })
       } else if (followUp) { followUp = false; again = true }
     }
   } catch (err) {
@@ -67,7 +85,13 @@ export function register(on) {
       usage: result && result.usage ? { input: result.usage.input_tokens, output: result.usage.output_tokens, cacheRead: result.usage.cache_read_input_tokens, cacheWrite: result.usage.cache_creation_input_tokens } : null })
     return result
   })
-  on('turn.complete', async ($, e, next) => { post($, 'event', { kind: 'turn.complete', turnId: e.turnId, agentId: e.agentId || null, isAborted: !!e.isAborted, durationMs: e.durationMs, answer: String(e.answer || '').slice(0, 300) }); return next(e) })
+  on('turn.complete', async ($, e, next) => {
+    // Bug 140: an interrupted turn drops a prompt submitted as it ended (Bug 110: the aborted turn.complete comes right after the
+    // submit). HQ hears of neither while it is away, so a report still waiting for it says how the first turn to end after it ended.
+    if (!e.agentId) for (const x of reports) if (x.kind === 'batch_submitted' && x.interrupted === undefined) x.interrupted = !!e.isAborted
+    post($, 'event', { kind: 'turn.complete', turnId: e.turnId, agentId: e.agentId || null, isAborted: !!e.isAborted, durationMs: e.durationMs, answer: String(e.answer || '').slice(0, 300) })
+    return next(e)
+  })
   on('session.measure', async ($, e, next) => {
     let usage = null
     try { usage = await $.session.usage() } catch (err) { usage = { error: String(err) } }

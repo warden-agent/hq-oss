@@ -41,7 +41,7 @@ export const MAX_PER_RUN = 30
 const squash = (s: string | undefined): string => (s ?? '').toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 :/_-]/g, '').trim()
 /** A step in a few words of code: what it acts on, not what it typed (a value typed differently is the same place in the app). */
 export const target = (s: Step): string => s.action === 'navigate' ? `go:${squash(s.url).replace(/\?.*$/, '')}` : s.action === 'back' ? 'back'
-  : `${s.action}:${squash(s.role)}:${squash(s.name ?? s.text)}`
+  : s.css && !s.role && !(s.name ?? s.text) ? `${s.action}:css:${squash(s.css)}:${s.nth ?? 0}` : `${s.action}:${squash(s.role)}:${squash(s.name ?? s.text)}`
 /** What makes two findings the same one, whatever words the model used: computed from the steps, the flag and the criterion, never from the text.
  *  A flag-led backend finding is its flag on its endpoint. Anything else is its source, its criterion and the last two places its steps acted on. */
 export function findingKey(f: Pick<Kept, 'source' | 'criterion' | 'steps' | 'evidence'>): string {
@@ -140,15 +140,78 @@ export function judgeInCode(k: Kept, rec: { flags: Flag[]; expect?: { ok: boolea
 }
 
 const q = (s?: string): string => s ? `"${s}"` : ''
+const TAGS: Record<string, string> = { button: 'button', a: 'link', input: 'box', textarea: 'box', select: 'list', option: 'option', li: 'list item', tr: 'row',
+  td: 'cell', img: 'image', h1: 'heading', h2: 'heading', h3: 'heading', h4: 'heading', label: 'label', summary: 'button' }
+/** The element itself in a CSS selector: its last compound part (`li:has-text("Rice") button` → `button`), not what it sits in. */
+function lastPart(sel: string): string {
+  let start = 0, depth = 0, quote = ''
+  for (let i = 0; i < sel.length; i++) {
+    const c = sel[i]!
+    if (quote) { if (c === '\\') i++; else if (c === quote) quote = ''; continue }
+    if (c === '"' || c === '\'') quote = c; else if (c === '(' || c === '[') depth++; else if (c === ')' || c === ']') depth--
+    else if (!depth && /[\s>+~]/.test(c)) start = i + 1
+  }
+  return sel.slice(start).trim() || sel.trim()
+}
+/** Which of its matches a step took, as words before the element: nothing for the first, "last ", "2nd "… */
+export function ordinal(nth?: number): string {
+  if (!nth) return ''
+  const n = nth + 1, th = n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'
+  return nth < 0 ? 'last ' : `${n}${th} `
+}
+// A selector HQ wrote from a locator chain (Bug 198: `internal:role=listitem >> internal:has-text="Rice"i >> internal:role=button[name="Remove"i]`), in words
+const FILTERS = /^(internal:has(-not)?-text=|visible=|nth=)/
+/** A text in such a selector: "Rice"i → "Rice"; a regex that is only a text (/^Rice$/) → "Rice"; any other regex as written. */
+const textOf = (v: string): string => {
+  const s = /^"((?:[^"\\]|\\.)*)"[is]?$/.exec(v); if (s) return q(s[1]!.replace(/\\(.)/g, '$1'))
+  const r = /^\/\^?((?:[^\\/[\](){}*+?|.$^]|\\[^\w])*)\$?\/[a-z]*$/.exec(v); return r ? q(r[1]!.replace(/\\(.)/g, '$1')) : v
+}
+/** One part of it: internal:role=row[name="Dune"i] → row "Dune", internal:has-text="Rice"i → with "Rice", a plain selector as cssWords says its element. */
+function partWords(p: string): string {
+  const role = /^internal:role=([a-z]+)(.*)$/.exec(p), name = role && /\[name=(".*"[is]|\/.*\/[a-z]*)\]/.exec(role[2]!)
+  if (role) return `${role[1]}${name ? ` ${textOf(name[1]!)}` : ''}`
+  const t = /^internal:(has-text|has-not-text|text|label)=(.*)$/.exec(p)
+  if (t) return `${t[1] === 'has-text' ? 'with ' : t[1] === 'has-not-text' ? 'without ' : ''}${textOf(t[2]!)}`
+  const a = /^internal:(?:attr|testid)=\[[\w-]+=(.*)\]$/.exec(p); if (a) return textOf(a[1]!)
+  if (p === 'visible=true') return '(shown)'
+  return cssWords(p).replace(/^the /, '')
+}
+/** A chain's parts as words, a match taken half-way before the element it picks ("the 3rd row"). */
+const partsWords = (ps: string[]): string => ps.reduce((out: string[], p) => {
+  const n = /^nth=(-?\d+)$/.exec(p); if (!n) return [...out, partWords(p)]
+  const at = Number(n[1]) === 0 ? 'first ' : ordinal(Number(n[1])); return out.length ? [...out.slice(0, -1), `${at}${out.at(-1)}`] : out
+}, []).join(' ')
+/** What a step's element sits in, from such a selector: " in the listitem with "Rice""; nothing for any other selector. */
+export function within(css?: string): string {
+  if (!css?.includes('internal:')) return ''
+  const ps = css.split(' >> '); let i = ps.length - 1; while (i > 0 && FILTERS.test(ps[i]!)) i--
+  return i > 0 ? ` in the ${partsWords(ps.slice(0, i))}` : ''
+}
+/** An element named by a selector (Bug 173), as a person would say it: `button:has-text("Remove")` → the "Remove" button, `li >> nth=1` → the 2nd
+ *  "li"; else the selector itself. `nth`: which of its matches (0 the first, -1 the last); the first of several reads as just the one. One HQ wrote
+ *  from a locator chain (Bug 198) reads as its element and what it sits in: the 3rd button in the listitem with "Dune". */
+export function cssWords(css: string, nth?: number): string {
+  if (css.includes('internal:')) {
+    const ps = css.split(' >> '); let i = ps.length - 1; while (i > 0 && FILTERS.test(ps[i]!)) i--
+    return `the ${ordinal(nth)}${partsWords(ps.slice(i))}${within(css)}`
+  }
+  const end = css.split(' >> ').filter((p) => !/^nth=-?\d+$/.test(p)).at(-1)?.trim() ?? css, el = /^text=/.test(end) ? end : lastPart(end)
+  const said = /:(?:has-text|text-is|text)\((['"])(.*?)\1\)/.exec(el) ?? /\[(?:aria-label|title|placeholder|alt|value)=(['"])(.*?)\1\]/.exec(el)
+    ?? /^text=(['"]?)(.+)\1$/.exec(el)
+  const tag = TAGS[/^([a-z][a-z0-9]*)/.exec(el)?.[1] ?? ''], at = ordinal(nth)
+  return said ? `the ${at}${q(said[2])}${tag ? ` ${tag}` : ''}` : tag && el === css.trim() && el === /^[a-z][a-z0-9]*/.exec(el)?.[0] ? `the ${at}${tag}`
+    : `the ${at}${tag ? `${tag} ` : ''}${q(css)}`
+}
 /** A step as a person would say it: click the "Add" button. */
 export function stepWords(s: Step): string {
-  const what = s.name ? `the ${q(s.name)}${s.role ? ` ${s.role}` : ''}` : s.text ? `the text ${q(s.text)}` : s.role ? `the ${s.role}` : 'the page'
+  const at = ordinal(s.nth), inside = within(s.css), what = s.name ? `the ${at}${q(s.name)}${s.role ? ` ${s.role}` : ''}${inside}`
+    : s.css && !s.role ? cssWords(s.css, s.nth) : s.text ? `the ${at}text ${q(s.text)}${inside}` : s.role ? `the ${at}${s.role}${inside}` : 'the page'
   switch (s.action) {
     case 'navigate': return `open ${s.url ?? '/'}`
     case 'back': return 'go back'
     case 'click': return `click ${what}`
     case 'check': return `tick ${what}`
-    case 'fill': return `type ${q(s.text) || 'nothing'} into ${s.name ? `the ${q(s.name)} box` : 'the box'}`
+    case 'fill': return `type ${q(s.text) || 'nothing'} into ${s.name ?? s.field ? `the ${q(s.name ?? s.field)} box${inside}` : s.css ? what : 'the box'}`
     case 'press': return `press ${s.text ?? 'Enter'}`
     case 'select': return `pick ${q(s.value)} in ${what}`
     case 'uncheck': return `untick ${what}`
@@ -156,7 +219,8 @@ export function stepWords(s: Step): string {
     case 'reset': return 'start again from a fresh app'
   }
 }
-export const expectWords = (e: Expect): string => `${e.name ? `the ${q(e.name)}${e.role ? ` ${e.role}` : ''}` : e.text ? `the text ${q(e.text)}` : 'it'} ${e.visible ? 'shows' : 'is gone'}`
+export const expectWords = (e: Expect): string => `${e.name ? `the ${q(e.name)}${e.role ? ` ${e.role}` : ''}` : e.text ? `the text ${q(e.text)}` : e.role ? `the ${e.role}` : 'it'} ${
+  e.visible ? 'shows' : 'is gone'}`
 export const SOURCE_WORDS: Record<Source, string> = { ui: 'On the screen', backend: 'Behind the screen', unspecified: 'No criterion covers it' }
 export const STATE_WORDS: Record<State, string> = { new: 'waiting for you', sent: 'sent to the TPM', fixing: 'being fixed', fixed: 'fixed', closed: 'closed', flagged: 'broken twice' }
 export const said = (k: Kept): string => k.wording ?? k.what

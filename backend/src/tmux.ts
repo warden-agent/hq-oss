@@ -16,9 +16,14 @@ export async function newSession(name: string, command: string, opts: { cwd: str
   await tmux('set-option', '-t', name, 'window-size', 'latest').catch(() => {})
 }
 export async function killSession(name: string): Promise<void> { await tmux('kill-session', '-t', name).catch(() => {}) }
-export async function capturePane(name: string, lines = 60): Promise<string> { return tmux('capture-pane', '-p', '-t', name, '-S', `-${lines}`).catch(() => '') }
+/** `styled`: with its styles (`-e`), as visiblePaneStyled below. */
+export async function capturePane(name: string, lines = 60, styled = false): Promise<string> {
+  return tmux('capture-pane', ...(styled ? ['-e'] : []), '-p', '-t', name, '-S', `-${lines}`).catch(() => '')
+}
 /** Only what's on the screen now, no scrollback: a menu that scrolled away isn't open any more. */
 export async function visiblePane(name: string): Promise<string> { return tmux('capture-pane', '-p', '-t', name).catch(() => '') }
+/** The same with its styles (`-e`): only they tell a line somebody typed from Claude Code's grey suggestion (Bug 149, screen.ts paneHasDraft). */
+export async function visiblePaneStyled(name: string): Promise<string> { return tmux('capture-pane', '-e', '-p', '-t', name).catch(() => '') }
 export async function paneHash(name: string): Promise<string> { return createHash('sha1').update(await capturePane(name, 80)).digest('hex') }
 export async function clientPids(name: string): Promise<number[]> { const out = await tmux('list-clients', '-t', name, '-F', '#{client_pid}').catch(() => ''); return out.split('\n').map(Number).filter((n) => n > 0) }
 export async function sendKeys(name: string, text: string, enter = true): Promise<void> {

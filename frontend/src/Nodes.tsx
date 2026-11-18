@@ -5,17 +5,18 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Handle, Position, useStore, type Node, type NodeProps } from '@xyflow/react'
-import { api } from './api'
+import { alertFrom, api, type State } from './api'
 import { askLabels, askText, cancelConfirm, mergeConfirm, startLabel, startText, turnOn, waitingOn } from './board'
 import { actLabel, answerReview, kindLabel, freshBlocker, freshConfirm, freshOffered, localOnly, OPEN_PREVIEW, stopOthers, ticketLabel, useBoard, useBusy, useRevisionCap,
   type Act, type FeatureView, type Line, type TicketView, type TpmView, type Tone } from './board'
-import { goodNews, plainNews, turnQuestionText, type Question, type Turn } from './needs.ts'
+import { goodNews, plainNews, ticketBase, turnQuestionText, type Question, type Turn } from './needs.ts'
 import { MORE } from './reply.ts'
 import { mergeTestOf, mergeTestWords } from './testruns.ts'
 import { DoRestBtn } from './Auto'
 import type { Agent } from './api'
 import { ActBtn, Elapsed, Linked, LiveDot, Md, Pill } from './ui'
 import { placePop } from './fit'
+import { openDone } from './donefold'
 import { byKind, criteriaOf, KIND_HEADING } from '../../backend/src/criteria.ts'
 
 const tone: Record<Tone, string> = { plain: 'text-zinc-200', muted: 'text-zinc-400', amber: 'text-amber-300', rose: 'text-rose-300', sky: 'text-sky-300', emerald: 'text-emerald-300', indigo: 'text-indigo-300' }
@@ -109,7 +110,7 @@ function AttChip({ id, items }: { id: string; items: any[] }) {
 /** Fix conflicts: HQ checks again, then the ticket's engineer (or a fresh one on the same branch) merges main in. `why` tests: Fix tests,
  *  for one auto mode sent back for its tests whose fix stalled: the same instructions again, with what the tests printed (Bug 84).
  *  `why` change: Build the change, for one whose spec the TPM changed after it was finished and whose engineer stopped before building it. */
-export function FixAct({ t, why }: { t: any; why?: 'tests' | 'change' | 'look' | 'review' }) {
+export function FixAct({ t, why, base }: { t: any; why?: 'tests' | 'change' | 'look' | 'review'; base: string }) {
   if (why === 'review') return <ActBtn primary label="Fix what it found" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
     title={'Its tests passed, but a fresh reader of its changes found problems, and its engineer stopped before fixing them. HQ sends it the findings again; if that'
       + ' engineer has stopped, a new one starts on the same branch.'} />
@@ -120,10 +121,10 @@ export function FixAct({ t, why }: { t: any; why?: 'tests' | 'change' | 'look' |
     title={'Its spec changed after it was finished, and its engineer stopped before building the change. HQ sends the instructions again;'
       + ' if that engineer has stopped, a new one starts on the same branch.'} />
   if (why === 'tests') return <ActBtn primary label="Fix tests" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
-    title={"Its tests failed or never finished on main, and its engineer stopped before fixing them. HQ sends it what the tests printed again;"
+    title={`Its tests failed or never finished on ${base}, and its engineer stopped before fixing them. HQ sends it what the tests printed again;`
       + ' if that engineer has stopped, a new one starts on the same branch.'} />
   return <ActBtn primary label="Fix conflicts" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
-    title={'HQ checks the branch against main again. If it still conflicts, its engineer merges main in, keeps both sides, runs the tests and commits;'
+    title={`HQ checks the branch against ${base} again. If it still conflicts, its engineer merges ${base} in, keeps both sides, runs the tests and commits;`
       + ' if that engineer has stopped, a new one starts on the same branch. You merge it afterwards.'} />
 }
 /** A run the agent waits on in the background that has done nothing for minutes (Bug 96): HQ stops it and tells the agent what to run instead. */
@@ -134,16 +135,18 @@ const StopRunAct = ({ agentId }: { agentId: string }) => <ActBtn primary label="
 /** A stop or a question that stays until it's answered: ticking it away would hide a project that's still stopped (Bug 63). Resume, Turn off or Use it clear it. */
 const answerOnly = (kind: string): boolean => /^(auto_stopped|test_cmd_proposed):/.test(kind)
 const FIX_KINDS = new Set(['merge_conflict', 'fix_stalled', 'look_stalled', 'review_stalled', 'change_stalled']) // notices with the ticket's fix button
-export function AttentionList({ items, show }: { items: any[]; show?: (a: any) => (() => void) | null }) {
+export function AttentionList({ items, show, s }: { items: any[]; show?: (a: any) => (() => void) | null; s: Pick<State, 'agents' | 'repos' | 'features' | 'tickets'> }) {
   return <div className="flex flex-col gap-1">{items.map((a) => { const go = show?.(a); return <div key={a.id} className="rounded-md border border-zinc-800 bg-zinc-950/60 p-2 text-xs">
     <div className="flex items-start justify-between gap-2"><span className={`min-w-0 break-words font-medium ${goodNews(a.kind) ? 'text-emerald-300' : plainNews(a.kind) ? 'text-sky-300' : 'text-rose-300'}`}>{kindLabel(a.kind)}</span><span className="flex shrink-0 gap-1">
-      {FIX_KINDS.has(a.kind) && a.ticket_id && <FixAct t={{ id: a.ticket_id }} why={a.kind === 'fix_stalled' ? 'tests' : a.kind === 'look_stalled' ? 'look' : a.kind === 'review_stalled' ? 'review' : a.kind === 'change_stalled' ? 'change' : undefined} />}{a.kind === 'bg_stalled' && a.agent_id && <StopRunAct agentId={a.agent_id} />}{go && <button className="btn-sm" onClick={go}>Show</button>}{!answerOnly(a.kind) && <ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} />}</span></div>
-    <div className="mt-1 break-words text-zinc-400"><Linked text={a.detail} /></div></div> })}</div>
+      {FIX_KINDS.has(a.kind) && a.ticket_id && <FixAct t={{ id: a.ticket_id }} base={ticketBase(s, a.ticket_id)} why={a.kind === 'fix_stalled' ? 'tests' : a.kind === 'look_stalled' ? 'look' : a.kind === 'review_stalled' ? 'review' : a.kind === 'change_stalled' ? 'change' : undefined} />}{a.kind === 'bg_stalled' && a.agent_id && <StopRunAct agentId={a.agent_id} />}{go && <button className="btn-sm" onClick={go}>Show</button>}{!answerOnly(a.kind) && <ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} />}</span></div>
+    <div className="mt-1 break-words text-zinc-400"><Linked text={a.detail} /></div>
+    {(() => { const from = alertFrom(a, s); return from && <div className="mt-1 break-words text-zinc-500">{from.line}</div> })()}</div> })}</div>
 }
 /** A box's notices, under it. Only while it has some: a reply can clear the last one, and an empty popover has no chip to close it. */
 function AttPop({ id, open, items }: { id: string; open: boolean; items: any[] }) {
+  const b = useBoard()
   return !open || !items.length ? null : <BoardPop id={id} want={380}>
-    <div className="hq-pop max-h-[var(--pop-h,70vh)] w-full overflow-y-auto"><AttentionList items={items} /></div></BoardPop>
+    <div className="hq-pop max-h-[var(--pop-h,70vh)] w-full overflow-y-auto"><AttentionList items={items} s={b.state} /></div></BoardPop>
 }
 /** A plan's "In plain words" section (engineers start their plans with one, for the user) and everything else. */
 function splitPlan(text: string): { plain: string; rest: string } {
@@ -227,9 +230,17 @@ export function FeatureNode({ id, data }: NodeProps<Node<{ view: FeatureView }>>
       <AttChip id={id} items={v.att} />
       {!v.done && f.status !== 'cancelled' && <CancelBtn tip="Cancel this feature…" title={`Cancel "${f.title}"?`} go="Cancel feature" path={`features/${f.id}/cancel`}
         body={featureCancelText(v, b.state)} />}</div>
-    <Lines lines={v.lines} />
+    {v.done ? <><DoneLine v={v} /><Lines lines={v.lines.slice(1)} /></> : <Lines lines={v.lines} />}
     <AttPop id={id} open={pop === 'attention'} items={v.att} />
   </Card>
+}
+/** A done feature's first line, "✓ done · all N merged", with the link that shows its tickets on the board or folds them away (Bug 164). */
+function DoneLine({ v }: { v: FeatureView }) {
+  const l = v.lines[0]!, n = v.total
+  return <div className={`flex h-4 items-center gap-1 ${tone[l.tone]}`}><span className="min-w-0 truncate" title={l.tip ?? l.text}>{l.text}</span>
+    <button className="nopan h-4 shrink-0 whitespace-nowrap text-indigo-300 hover:underline" aria-expanded={!v.collapsed} onClick={() => openDone(v.f.id, v.collapsed)}
+      title={v.collapsed ? `Show its ${n === 1 ? 'ticket' : `${n} tickets`} on the board: click one for its Ticket tab` : 'Fold its tickets back into this box'}>
+      {v.collapsed ? 'show tickets' : 'hide tickets'}</button></div>
 }
 /** You and the project's TPM: its replies (taken from the end of each of its turns) and what you sent it, newest last, across its
  *  sessions. Write in the TPM box; its terminal (click the box) has everything else. */
@@ -278,7 +289,7 @@ export function TicketNode({ id, data }: NodeProps<Node<{ view: TicketView }>>) 
       <AttChip id={id} items={v.att} /><FreshBtn a={v.eng} />
       {t.status !== 'merged' && t.status !== 'cancelled' && <CancelBtn tip={`Remove ${t.key}…`} title={`Remove ${t.key}?`} go="Remove" path={`tickets/${t.id}/cancel`}
         body={removeText(t, v.eng, waitingOn(b.state, t))} />}<Pill s={t.status} label={ticketLabel(t, v.hqPlan)} className="py-0! text-[10px]! leading-4!" /></div>
-    <div className={v.titleRows === 2 ? 'line-clamp-2 h-8' : 'h-4 truncate'} title={t.title}>{t.title}</div>
+    <div className={v.titleRows === 2 ? 'line-clamp-2 h-8 break-words' : 'h-4 truncate'} title={t.title}>{t.title}</div>
     {v.crit && <button className="nopan block h-4 max-w-full truncate text-left text-indigo-300 hover:underline" title={`${v.crit}. Click to read them: they say what "done" means for ${t.key}.`}
       onClick={() => pop === 'criteria' ? b.setPop(null) : b.focus(id, 'criteria')}>{v.crit} ›</button>}
     <Lines lines={v.lines} />
@@ -356,7 +367,7 @@ function TryAct({ on, t }: { on: boolean; t: any }) {
  *  why), Make PR, the PR link, or Fix conflicts. On the box and in the ⚠ menu. */
 export function MergeAct({ a, t }: { a: Act; t: any }) {
   const { state } = useBoard()
-  if (a.kind === 'fix') return <FixAct t={t} why={a.why} />
+  if (a.kind === 'fix') return <FixAct t={t} why={a.why} base={ticketBase(state, t.id)} />
   if (a.kind === 'merge') {
     const go = async () => { if (await mergeConfirm(t, a, state.defaults.github_account ?? 'the HQ account')) await api(`tickets/${t.id}/merge`, {}) }
     return <ActBtn primary label={`Merge into ${a.into}`} busyLabel="Merging…" run={go} title={a.github

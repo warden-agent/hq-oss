@@ -35,9 +35,9 @@ export function LaunchBtn({ all, repo, p, open, setOpen }: { all: State; repo: a
 }
 
 /** The live preview: the app HQ runs from the repo's checkout (normally main), in a frame, with its server output a tab away. */
-export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo }: {
+export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo, roomRight }: {
   all: State; p: any; repo: any; prefs: Prefs; setPrefs: (p: Partial<Prefs>, save?: boolean) => void; ws: WebSocket | null; feed: (id: string, cb: (d: string) => void) => () => void
-  onRepo: (id: string) => void }) {
+  onRepo: (id: string) => void; roomRight: boolean /* false: no room beside the graph, so the pane shows below it whatever its dock (Bug 167) */ }) {
   const [picked, setTab] = useState<'app' | 'server' | 'claude'>('app')
   const [reloads, setReloads] = useState(0)
   const can = runnable(p), helper = helperOn(p) ? p.helper_agent_id : null
@@ -72,7 +72,9 @@ export function PreviewPane({ all, p, repo, prefs, setPrefs, ws, feed, onRepo }:
       <ActBtn label="Stop" busyLabel="Stopping…" disabled={stopped} run={() => api(`previews/${p.id}/stop`, {})} />
       <a className={`btn-sm ${running ? '' : 'pointer-events-none opacity-40'}`} href={p.url ?? undefined} target="_blank" rel="noreferrer" title="Open in your browser">↗</a>
       <div className="flex">{(['desktop', 'phone'] as const).map((d) => <button key={d} className={`btn-sm rounded-none first:rounded-l-md last:rounded-r-md ${prefs.device === d ? 'btn-primary' : ''}`} onClick={() => device(d)}>{d === 'desktop' ? 'Desktop' : 'Phone'}</button>)}</div>
-      <button className="btn-sm" title={prefs.dock === 'bottom' ? 'Dock to the right of the graph' : 'Dock below the graph'} onClick={() => setPrefs({ dock: prefs.dock === 'bottom' ? 'right' : 'bottom' })}>⇵</button>
+      <button className="btn-sm" disabled={!roomRight} onClick={() => setPrefs({ dock: prefs.dock === 'bottom' ? 'right' : 'bottom' })}
+        title={!roomRight ? 'No room beside the graph, so the app shows below it. Widen the window or close the side panel to dock it right.'
+          : prefs.dock === 'bottom' ? 'Dock to the right of the graph' : 'Dock below the graph'}>⇵</button>
       <Menu label="⚙" title="How HQ starts this app" className="btn-sm">{(close) => <CommandForm p={p} close={close} />}</Menu>
     </div>
     <div className="relative min-h-0 grow overflow-hidden rounded-md border border-zinc-800">
@@ -111,6 +113,7 @@ function Notice({ p, repo, can, start, toServer, toClaude, onRepo }: { p: any; r
   const fix = <ActBtn label="Ask Claude to fix it" busyLabel="Asking…" run={() => api(`previews/${p.id}/setup`, { why: 'fix' })}
     title="Claude reads the output, works out what changed and suggests new start steps for you to OK" />
   if (helperOn(p) && p.status === 'stopped') return <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center text-sm text-zinc-400">
+    {p.helper_note && <div className="text-xs text-amber-300">{p.helper_note}</div>}
     <div>Claude is working out how to start {repo.name}{fromTicket(p)}.</div>
     <div className="text-xs">It looks at the project and tries it in its sandbox. Watch it in the <button className="text-indigo-300 underline" onClick={toClaude}>Claude</button> tab.</div>
   </div>

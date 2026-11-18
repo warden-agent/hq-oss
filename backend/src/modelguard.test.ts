@@ -8,7 +8,7 @@ import path from 'node:path'
 import type { ServerResponse } from 'node:http'
 
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-modelguard-'))
-const { migrate, run, one, q, getSetting } = await import('./db.ts')
+const { migrate, run, one, q, getSetting, setSetting } = await import('./db.ts')
 migrate()
 const { onExitPlanMode, answerReview } = await import('./gate.ts')
 const { onTurnStep, onPostModelSwitch } = await import('./modelguard.ts')
@@ -86,4 +86,63 @@ test('while it plans, a request on the build model is a mismatch; a helper\'s re
   assert.deepEqual(alerts(e), [])
   step(e, SONNET, ['Read'])
   assert.deepEqual(alerts(e), [['model_mismatch', `engineer ${e}: main-loop request on ${SONNET}, expected opus (plan mode)`]])
+})
+
+// Bug 141. Real 2.1.322 (a throwaway spike): `--model haiku --permission-mode plan` makes every planning request on Sonnet; when the
+// plan is allowed it switches to Haiku by itself (PostModelSwitch, source auto, 20 ms after the allow) and builds on Haiku. `--model claude-haiku-5-5`
+// plans on Haiku and never switches.
+const HAIKU = 'claude-haiku-5-5'
+const toHaiku = (id: string) => onPostModelSwitch(agent(id), { from_model: SONNET, to_model: HAIKU, source: 'auto', requested_model: null })
+const fallback = (id: string, from: string, to: string) => [['model_fallback', `engineer ${id}: model switched ${from} → ${to} (source auto); role paused`]]
+const unpause = () => setSetting('paused_roles', [])
+
+test('Bug 141: an engineer on haiku plans on Sonnet, switches to Haiku at the approval, and nothing is raised or paused', async () => {
+  unpause()
+  const e = engineer('haiku')
+  step(e, SONNET, ['Read']); step(e, SONNET, ['Write']); step(e, SONNET, ['ExitPlanMode'])
+  assert.deepEqual(alerts(e), [])
+  await approvedAtOnce(e); toHaiku(e); step(e, HAIKU, ['Edit']); step(e, HAIKU, [])
+  assert.deepEqual(alerts(e), []); assert.deepEqual(getSetting('paused_roles', []), [])
+  assert.equal(agent(e).model_live, HAIKU); assert.equal(agent(e).in_plan_mode, 0)
+  assert.equal(one<any>('SELECT expected FROM model_switches WHERE agent_id = ?', e).expected, 1)
+})
+
+test('Bug 141: the request that asked to leave plan mode, reported after the switch to Haiku, is no alarm either', async () => {
+  unpause()
+  const e = engineer('haiku')
+  step(e, SONNET, ['Read']); await approvedAtOnce(e); toHaiku(e); step(e, SONNET, ['Write', 'ExitPlanMode'])
+  assert.deepEqual(alerts(e), []); assert.equal(agent(e).model_live, HAIKU)
+})
+
+test('Bug 141: every other switch Claude Code makes by itself still pauses the role', async () => {
+  unpause()
+  const noPlan = engineer('haiku') // Sonnet → Haiku while still planning: no plan was allowed
+  toHaiku(noPlan)
+  assert.deepEqual(alerts(noPlan), fallback(noPlan, SONNET, HAIKU)); assert.deepEqual(getSetting('paused_roles', []), ['engineer'])
+  assert.equal(agent(noPlan).in_plan_mode, 1)
+  unpause()
+  const late = engineer('haiku') // the allow was long before the switch
+  await approvedAtOnce(late); run('UPDATE agents SET last_gate_allow_at = ? WHERE id = ?', Date.now() - 60_000, late); toHaiku(late)
+  assert.deepEqual(alerts(late), fallback(late, SONNET, HAIKU)); assert.deepEqual(getSetting('paused_roles', []), ['engineer'])
+  unpause()
+  const back = engineer('haiku') // back to Sonnet while building
+  await approvedAtOnce(back); toHaiku(back)
+  onPostModelSwitch(agent(back), { from_model: HAIKU, to_model: SONNET, source: 'auto', requested_model: null })
+  assert.deepEqual(alerts(back), fallback(back, HAIKU, SONNET)); assert.deepEqual(getSetting('paused_roles', []), ['engineer'])
+  unpause()
+  const other = engineer('opusplan') // opusplan's switch is opus → sonnet, not haiku's sonnet → haiku
+  await approvedAtOnce(other); toHaiku(other)
+  assert.deepEqual(alerts(other), fallback(other, SONNET, HAIKU))
+  unpause()
+})
+
+test('Bug 141: building on Sonnet is still a mismatch for haiku, and the full Haiku id is expected to plan on Haiku', async () => {
+  unpause()
+  const e = engineer('haiku')
+  await approvedAtOnce(e); toHaiku(e); step(e, SONNET, ['Edit'])
+  assert.deepEqual(alerts(e), mismatch(e, SONNET, 'haiku'))
+  const full = engineer(HAIKU)
+  step(full, SONNET, ['Read'])
+  assert.deepEqual(alerts(full), [['model_mismatch', `engineer ${full}: main-loop request on ${SONNET}, expected haiku (plan mode)`]])
+  assert.deepEqual(getSetting('paused_roles', []), [])
 })

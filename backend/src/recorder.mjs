@@ -10,7 +10,8 @@
 // - Every line the app prints goes to server.log, stamped. Console errors and failed requests from the browser page go to browser.jsonl.
 // - After each action, once the app has gone quiet, the state paths are copied to snapshots/<n>/ when they changed (snaps.jsonl says which). HQ diffs
 //   them afterwards (timeline.ts).
-// Plain Node, no imports from HQ. The app's parts are children in the caller's process group, so whoever ran the caller ends them with it.
+// Plain Node, no imports from HQ. Each of the app's parts runs in a process group of its own, so a reset ends all of it with no `ps` (Bug 170: `npm start`
+// kept its port), and it still ends with the caller, as appstart.mjs says.
 // spec: { parts: [{ name, cwd, run, port, build? }], show, startMs, root, out, snapshot: [paths in root], seed: command }
 import fs from 'node:fs'
 import http from 'node:http'
@@ -65,15 +66,21 @@ const freePort = () => new Promise((resolve, reject) => {
 /** Starts recording: seeds the state, builds and starts the app, puts the proxy in front. `{ rec }` when it's up, else `{ kind, why, output? }`:
  *  'no_seed' (the seed command failed), 'no_build', 'no_start' or 'skipped' (as startApp says). */
 export async function startRecording(spec) {
-  const out = spec.out, root = spec.root; fs.mkdirSync(path.join(out, 'snapshots'), { recursive: true })
-  const files = Object.fromEntries(['actions', 'api', 'browser', 'snaps'].map((n) => [n, fs.openSync(path.join(out, `${n}.jsonl`), 'a')]))
-  const serverLog = fs.openSync(path.join(out, 'server.log'), 'a')
+  const root = spec.root
+  // The logs' folder: spec.out, until `cut` names another (the UI tester's host gives each scenario its own). The seed's copy stays in spec.out.
+  let out = spec.out, files = {}, serverLog = -1
+  const openLogs = (dir) => {
+    out = dir; fs.mkdirSync(path.join(out, 'snapshots'), { recursive: true })
+    files = Object.fromEntries(['actions', 'api', 'browser', 'snaps'].map((n) => [n, fs.openSync(path.join(out, `${n}.jsonl`), 'a')]))
+    serverLog = fs.openSync(path.join(out, 'server.log'), 'a')
+  }
   const log = (n, o) => { try { fs.writeSync(files[n], `${JSON.stringify(o)}\n`) } catch { /* closed: the run is over */ } }
   const onLine = (part, line, at) => { try { fs.writeSync(serverLog, `${at}\t${part}\t${line.slice(0, 2000)}\n`) } catch { /* closed */ } }
   const closeLogs = () => { for (const fd of [...Object.values(files), serverLog]) { try { fs.closeSync(fd) } catch { /* closed */ } } }
+  openLogs(spec.out)
 
   // The seed: written once by its command on empty state paths, then kept to put back at every reset.
-  const seedDir = path.join(out, 'seed')
+  const seedDir = path.join(spec.out, 'seed')
   clearState(spec.snapshot, root)
   const s = await sh(spec.seed, root, 120_000)
   if (s.code !== 0) { closeLogs(); return { kind: 'no_seed', why: `the seed command failed (code ${s.code})`, output: s.output } }
@@ -86,21 +93,22 @@ export async function startRecording(spec) {
     if (b.code !== 0) { closeLogs(); return { kind: 'no_build', why: `building its ${p.name} part failed (\`${p.build}\`, code ${b.code})`, output: b.output } }
   }
 
-  let app = await startApp(spec, { onLine })
+  let app = await startApp(spec, { onLine, group: true })
   if (!app.port) { await stopApp(app.kids); closeLogs(); return { kind: app.kind, why: app.why, output: app.output } }
   let target = app.port, down = false // `down`: during a reset, when there is no app to send a request to
 
   // The proxy: every request is piped to the app as it comes, and its reply back; a stream's line is written when its reply starts, the rest when it ends.
-  let seq = 0, inflight = 0, lastActivity = Date.now(), action = null
+  let seq = 0, inflight = 0, lastActivity = Date.now(), action = null, era = 0 // `era`: which log folder is open (cut): a call is written where it began, or not at all
   const busy = new Set()
   const server = http.createServer((req, res) => {
-    const call = { i: ++seq, at: Date.now(), method: req.method, path: req.url, action }, chunks = []
+    const call = { i: ++seq, at: Date.now(), method: req.method, path: req.url, action }, chunks = [], began = era
     inflight++; busy.add(call.i); lastActivity = Date.now()
     let done = false
     const finish = (extra) => {
       if (done) return; done = true
       if (busy.delete(call.i)) inflight--
       lastActivity = Date.now(); const end = Date.now()
+      if (began !== era) return // it began in an earlier scenario (a stream the last page left open, ended by this one's reset): not this recording's
       log('api', { ...call, ...extra, end, ms: end - call.at, body: chunks.length ? createHash('sha256').update(Buffer.concat(chunks)).digest('hex').slice(0, 16) : null })
     }
     req.on('data', (c) => { if (chunks.length < 1000) chunks.push(c) })
@@ -149,7 +157,7 @@ export async function startRecording(spec) {
     /** Stamps the start or end of an action. A start makes it the action later requests belong to. */
     mark(label, phase, extra = {}) {
       if (phase === 'start') action = ++marks
-      log('actions', { at: Date.now(), phase, label, action, ...extra })
+      log('actions', { at: Date.now(), phase, label, action, ...extra }); return action
     },
     /** Waits until no request is in flight and none has started for a while (at most SETTLE_MAX_MS), then snapshots. */
     async settleAndSnapshot(label) { // quiet counts from the action's end too: a page may send its request a moment after a click (a debounce)
@@ -165,6 +173,11 @@ export async function startRecording(spec) {
       rec.mark(label, 'end', err ? { ok: false, why: String(err.message ?? err).split('\n')[0].slice(0, 300) } : { ok: true })
       if (err) throw err
     },
+    /** From here on everything is written to `dir`, a folder of its own (made here): one scenario of many against the same app, with its own actions and
+     *  snapshots counted from the start. The caller resets next, so the folder's first snapshot is the seed. */
+    cut(dir) { closeLogs(); openLogs(dir); era++; snaps = 0; lastHash = null; marks = 0; action = null },
+    /** Something the caller's browser said that HQ didn't see itself (a console error the browser tools reported): one line in browser.jsonl. */
+    seen(o) { log('browser', { at: Date.now(), ...o, action }) },
     /** Console errors, uncaught errors and failed requests of a Playwright page the caller owns. */
     attach(page) {
       page.on('console', (m) => { if (m.type() === 'error' && !/^Failed to load resource/.test(m.text())) log('browser', { at: Date.now(), kind: 'console', text: m.text().slice(0, 500), action }) })
@@ -181,7 +194,7 @@ export async function startRecording(spec) {
       rec.mark('reset', 'start'); down = true
       await stopApp(app.kids, Object.values(app.ports ?? {}))
       clearState(spec.snapshot, root); copyState(spec.snapshot, seedDir, root)
-      const again = await startApp(spec, { ports: app.ports, onLine })
+      const again = await startApp(spec, { ports: app.ports, onLine, group: true })
       if (!again.port) { await stopApp(again.kids); rec.mark('reset', 'end', { ok: false, why: again.why }); throw new Error(`the app didn't start again after the reset: ${again.why}`) }
       app = again; target = again.port; down = false; lastHash = null
       const n = snapshot('reset'); rec.mark('reset', 'end', { ok: true }); return n

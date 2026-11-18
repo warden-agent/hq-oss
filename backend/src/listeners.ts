@@ -8,8 +8,10 @@ import { onTicketMerged } from './preview.ts'
 import { onAgentGone } from './launchhelper.ts'
 import { dropSetupChange, onMergedSetup, onSetupAgentGone } from './testsetup.ts'
 import { autoSoon } from './auto.ts'
+import { waitsOnQuestion } from './delivery.ts'
 import { startTurns } from './heavy.ts'
 import { checkPlan, onRetry } from './plancheck.ts'
+import { dropLateNotes } from './delivery.ts'
 
 const FINISHED_TICK_MS = Number(process.env.HQ_FINISHED_TICK_S ?? 60) * 1000 // the backstop for stopping finished engineers
 
@@ -26,10 +28,12 @@ export function startListeners(): void {
     onAgentGone(e.agentId) // a Launch helper that quit by itself
     onSetupAgentGone(e.agentId) // or a test setup helper
   })
-  /** An engineer's question was answered: its ticket goes back to what it was doing. */
+  /** An engineer's question was answered: once none is left open, its ticket goes back to what it was doing before the first (Bug 157). */
   bus.on('event:question.answered', (e: HqEvent) => {
     const t = typeof e.payload.ticket === 'string' ? getTicket(e.payload.ticket) : undefined
-    if (t?.status === 'awaiting_answer') setTicket(t.id, { status: t.prior_status ?? 'implementing', prior_status: null })
+    if (t?.status !== 'awaiting_answer' || waitsOnQuestion(t.id)) return
+    const back = t.prior_status && t.prior_status !== 'awaiting_answer' ? t.prior_status : 'implementing' // a ticket the bug left that way
+    setTicket(t.id, { status: back, prior_status: null })
   })
   for (const kind of ['hook.Stop', 'ticket.pr_ready', 'ticket.merged', 'question.answered', 'agent.stopped', 'agent.lost', 'hook.SessionEnd', 'attention.launch_failed',
     'attention.blocked', 'attention.stuck']) bus.on(`event:${kind}`, autoSoon)
@@ -37,6 +41,7 @@ export function startListeners(): void {
   // after the wait stopFinished gives it, and looks at every engineer, so it must not be what cuts another one's wait short (stopFinished checks).
   const leave = () => { setTimeout(stopFinished, FINISHED_STOP_MS + 50).unref() }
   for (const kind of ['hook.Stop', 'hook.SubagentStop', 'ticket.pr_ready', 'ticket.pr_open', 'agent.idle_fixed']) bus.on(`event:${kind}`, leave)
+  bus.on('event:ticket.pr_ready', (e: HqEvent) => dropLateNotes(e.agentId)) // before the turn that called open_pr ends (Bug 147)
   setInterval(stopFinished, FINISHED_TICK_MS).unref()
   bus.on('event:ticket.merged', onTicketMerged)
   bus.on('event:ticket.merged', onMergedSetup) // an engineer's change to the test setup applies with its ticket

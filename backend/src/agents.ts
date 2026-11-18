@@ -9,7 +9,7 @@ import { id, sha, shq } from './util.ts'
 import * as tmux from './tmux.ts'
 import { buildMcp, buildSettings, roleFlags, rolePromptPath, HOOK_HEADER_FILE, hookHeaderLine, type Role } from './roles.ts'
 import { ensureTrusted } from './trust.ts'
-import { resolveKind } from './attention.ts'
+import { resolveEndedAgent, resolveKind } from './attention.ts'
 import { checkClaude } from './claudecheck.ts'
 import { agentChanged } from './wake.ts'
 
@@ -19,7 +19,12 @@ export type Agent = {
   status: string; in_plan_mode: number; last_event_at: number | null; takeover_locked_until: number | null; mod_seen_at: number | null; last_gate_allow_at: number | null
   paused_reason: string | null; started_at: number; ended_at: number | null; exit_code: number | null; launch_prompt: string | null; display_name: string | null
   fresh_start_at: number | null; fresh_start_then: string | null; fresh_start_msg: string | null; interrupted_at: number | null; ended_why: string | null
+  /** Why a `blocked` agent is blocked (Bug 72): 'dialog', or 'api_error' (its turn ended with an API error). Read only while the status is `blocked`; any other status clears it (update, Bug 218). */
+  blocked_why: 'dialog' | 'api_error' | null
 }
+/** A dialog or menu is on its terminal (or HQ must assume so), so Enter would pick an option there: blocked by anything but an API error (Bug 72), or
+ *  paused on a usage limit. */
+export const onDialog = (a: Agent): boolean => a.status === 'paused' || (a.status === 'blocked' && a.blocked_why !== 'api_error')
 export const agentDir = (agentId: string): string => path.join(PATHS.agents, agentId)
 export const tmuxName = (agentId: string): string => `hq-${agentId}`
 export function getAgent(agentId: string): Agent | undefined { return one<Agent>('SELECT * FROM agents WHERE id = ?', agentId) }
@@ -34,11 +39,13 @@ export function liveAgents(): Agent[] { return q<Agent>("SELECT * FROM agents WH
 /** Writes agent columns (a key that isn't one is a type error, not a failed UPDATE at runtime). `shown`: fields the page shows that
  *  aren't columns (a hook's activity line), sent in the same patch (Bug 98). */
 export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>, shown: Record<string, unknown> = {}): void {
+  // Bug 218: every status change passes here, so an agent that isn't blocked any more loses why it was (the API showed a stale reason)
+  if (fields.status !== undefined && fields.status !== 'blocked' && !('blocked_why' in fields)) fields = { ...fields, blocked_why: null }
   const keys = Object.keys(fields) as (keyof typeof fields)[]
   if (keys.length) run(`UPDATE agents SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map((k) => fields[k] as never), agentId)
   if (fields.status === 'exited') shown = { ...shown, activity: null } // Bug 122: an agent that has ended is doing nothing, however it ended
   if (keys.length || Object.keys(shown).length) patch('agent', agentId, { ...fields, ...shown })
-  if (fields.status === 'exited') resolveKind('stuck', agentId) // Bug 114: every way an agent ends (Stop, lost, SessionEnd) passes here; its alert ends with it
+  if (fields.status === 'exited') resolveEndedAgent(agentId) // Bugs 114, 153: every way an agent ends (Stop, lost, SessionEnd) passes here; its alerts end with it
   if (keys.length) agentChanged(agentId, fields) // Bug 99: a waiting `next` looks again if delivery reads what changed
 }
 

@@ -69,9 +69,37 @@ export function cwdsOf(listing: string): Map<number, string> {
   }
   return cwds
 }
+/** ps's elapsed time, `[[dd-]hh:]mm:ss`, in ms (whole seconds, so a start worked out from it is up to a second late). */
+export function elapsedMs(etime: string): number {
+  const [days, clock] = etime.includes('-') ? etime.split('-') as [string, string] : ['0', etime]
+  const [s = 0, m = 0, h = 0] = clock.split(':').map(Number).reverse()
+  return (((Number(days) * 24 + h) * 60 + m) * 60 + s) * 1000
+}
 /** Process ids whose working folder is `dir` or inside it, from lsof's `-d cwd -Fpn` listing. */
 export function pidsUnder(listing: string, dir: string): number[] {
   return [...cwdsOf(listing)].filter(([, cwd]) => cwd === dir || cwd.startsWith(dir + path.sep)).map(([pid]) => pid)
+}
+/** Each process's listening TCP ports, from lsof's `-iTCP -sTCP:LISTEN -Fpn` listing (`n` lines: 127.0.0.1:3180, *:3180, [::1]:3180). */
+export function listenPorts(listing: string): Map<number, number[]> {
+  const ports = new Map<number, number[]>(); let pid = 0
+  for (const l of listing.split('\n')) {
+    if (l.startsWith('p')) pid = Number(l.slice(1))
+    else if (l.startsWith('n') && pid) {
+      const port = Number(/:(\d+)$/.exec(l)?.[1]); if (!port) continue
+      const had = ports.get(pid) ?? []; if (!had.includes(port)) ports.set(pid, [...had, port])
+    }
+  }
+  return ports
+}
+/** Bug 226: what listens on a TCP port from inside `dir` (a Launch helper's test servers), except `spare` groups and HQ's own. */
+export async function listenersUnder(dir: string, spare: number[] = []): Promise<{ pid: number; pgid: number; port: number }[]> {
+  const ports = listenPorts(await out('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-Fpn'])); if (!ports.size) return []
+  const keep = new Set([...spare, (await pgidOf(process.pid)) ?? -1]), found = []
+  for (const pid of pidsUnder(await out('lsof', ['-a', '-p', [...ports.keys()].join(','), '-d', 'cwd', '-Fpn']), dir)) {
+    const g = await pgidOf(pid); if (!g || keep.has(g)) continue
+    for (const port of ports.get(pid) ?? []) found.push({ pid, pgid: g, port })
+  }
+  return found
 }
 /** The processes still in process group `pgid` (pgrep -g leaves some out, so this reads ps). */
 export const groupPids = async (pgid: number): Promise<number[]> =>

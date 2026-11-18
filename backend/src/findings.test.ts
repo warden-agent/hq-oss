@@ -117,7 +117,7 @@ test('the next run replays what merged: a flag gone is ✓ fixed, a flag still t
   replayed = { ...rec('rep-1', dupRows), steps: fill.map(() => ({ ok: true })) } // still two POSTs
   const before = await F.beforeUiTest(repo(), 'run2', autoGen(repoDir)); assert.ok(before !== 'stopped'); assert.equal(replays, 1)
   // T-05 (P-1's ticket) is a UI finding with nothing code can check on the page: the tester retries it by its goal, with only its own words and steps
-  assert.deepEqual(before.retry.map((r) => [r.goal.slice(0, 4), r.what]), [['P-1:', 'Add shows nothing, so you press it again.']])
+  assert.deepEqual(before.retry.map((r) => [r.goal.slice(0, 4), r.what, r.own]), [['P-1:', 'Add shows nothing, so you press it again.', true]])
   const p3 = F.getFinding('r1', 'P-3')!; assert.deepEqual([p3.state, p3.strikes, p3.checks.at(-1)!.result, p3.checks.at(-1)!.how], ['new', 1, 'broken', 'replay'])
   ui = { scenarios: [{ scenario: { id: 's-01', kind: 'retry', title: 'Retry', goal: before.retry[0]!.goal }, steps: add, findings: [], recording: null, outcome: 'ok' }],
     findings: [{ id: 'U1', scenario: 's-02', kind: 'unclear_label', what: 'The button says "Go" but it adds the item, again.', expected: 'Add.',
@@ -161,6 +161,7 @@ test('a backend finding whose steps no longer fit: the tester redoes its own sce
   const b = await F.beforeUiTest(repo(), 'run7', autoGen(repoDir)); assert.ok(b !== 'stopped')
   const r = b.retry.find((x) => x.goal.startsWith(`${k.id}:`))!
   assert.equal(r.goal, `${k.id}: add "Dune, 2x" and see what happens`); assert.doesNotMatch(JSON.stringify(r), /parser|threw|handler|4xx/) // the checker's words stay out
+  assert.equal(r.own, false); assert.equal(r.expected, 'add "Dune, 2x" and see what happens') // not the tester's own finding: the scenario's goal is what the summary calls it
   recs.set('rec-9', rec('rec-9', [{ at: 1, source: 'api', text: 'POST /api/items → 400 (2ms)', flags: [] }]))
   ui = { scenarios: [{ scenario: { id: 's-01', kind: 'retry', title: 'Retry', goal: r.goal }, steps: add, findings: [], recording: 'rec-9', outcome: 'ok' }], findings: [] }
   await F.afterUiTest(repo(), 'run7', autoGen(repoDir))

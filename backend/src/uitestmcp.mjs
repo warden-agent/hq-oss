@@ -30,7 +30,9 @@ const finding = z.object({
   looked_for: looked.optional().describe('the element you were looking for, as the page text names it'),
 })
 s.registerTool('finish_scenario', {
-  description: 'End a scenario: its outcome, your notes on each hesitation, wrong click or backtrack, and its findings. Call it once per scenario.',
-  inputSchema: { id: z.string(), outcome: z.enum(['ok', 'problem', 'unspecified']), notes: z.array(z.string()), findings: z.array(finding) },
+  description: 'End a scenario: its outcome, your notes on each hesitation, wrong click or backtrack, its findings, and what you couldn\'t check. Call it once per scenario.',
+  inputSchema: { id: z.string(), outcome: z.enum(['ok', 'problem', 'unspecified', 'couldnt_test']), notes: z.array(z.string()), findings: z.array(finding),
+    couldnt_test: z.string().optional().describe('what the scenario needed that you can\'t do from this browser (change the clock, wait hours, get an email), '
+      + 'so you couldn\'t check it. Never a finding: a finding is about what the app did') },
 }, async (a) => { const r = await host('finish', { id: a.id, report: a }); return r.ok ? text('Recorded. Go on to the next scenario, or stop if this was the last.') : text(r.why, true) })
 await s.connect(new StdioServerTransport())

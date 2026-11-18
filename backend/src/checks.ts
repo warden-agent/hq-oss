@@ -10,8 +10,10 @@ type Cost = { at: number; ms: number; tokens: number; model: string }
 export type PlanCheck = { state: 'checking'; since: number } | ({ state: 'ok' } & Cost) | ({ state: 'sent_back'; findings: Finding[] } & Cost) | { state: 'unchecked'; at: number; why: string }
 /** How the check of a finished ticket's changes went, kept with the ticket (tickets.diff_check). `why`: what made HQ ask for a reader (its size, what git
  *  flagged). `ok`: nothing found. `sent_back`: these findings went to the engineer, once; the ticket merges on its next pass without another read.
- *  `unchecked`: the reader couldn't be asked, and why; the ticket merged on its tests. */
-export type DiffCheck = ({ state: 'ok'; why: string[] } & Cost) | ({ state: 'sent_back'; why: string[]; findings: Finding[] } & Cost) | { state: 'unchecked'; at: number; why: string[]; error: string }
+ *  `unchecked`: the reader couldn't be asked, and why; the ticket merged on its tests. `sha`: the commit it read, the one open_pr named (Bug 185: a later
+ *  open_pr's commit is read too); none on reads from before HQ kept it. */
+export type DiffCheck = (({ state: 'ok'; why: string[] } & Cost) | ({ state: 'sent_back'; why: string[]; findings: Finding[] } & Cost) | { state: 'unchecked'; at: number; why: string[];
+  error: string }) & { sha?: string }
 
 const parse = <T>(json: unknown): T | null => { try { return typeof json === 'string' && json ? JSON.parse(json) as T : null } catch { return null } }
 export const planCheckOf = (json: unknown): PlanCheck | null => { const c = parse<PlanCheck>(json); return c && typeof c.state === 'string' ? c : null }
@@ -41,11 +43,19 @@ export function planCheckWords(c: PlanCheck | null): Words | null {
   if (c.state === 'sent_back') return { text: 'A fresh reader checked its plan against the criteria and sent it back once:', tone: 'look', findings: c.findings }
   return { text: `Its plan was approved without a check: ${c.why}.`, tone: 'look', findings: [] }
 }
-/** A diff check in words, for the Ticket tab. */
-export function diffCheckWords(c: DiffCheck | null): Words | null {
+/** Why an engineer whose plan is open can't hand over now (Fresh start, Clear), in the backend's and the page's words alike. On auto it is HQ's plan check
+ *  that answers it, not the user (Bug 220). `clear`: said before a Clear, which stops that check unanswered. */
+export const planWaitsWhy = (key: string, hqChecks: boolean, clear = false): string => !hqChecks ? `${key}'s plan is waiting for your review. Answer it first.`
+  : clear ? `${key}'s plan waits for HQ's plan check, which the clear stops.` : `${key}'s plan waits for HQ's plan check.`
+/** A diff check in words, for the Ticket tab. `t`: its ticket. A read comes before HQ's last look at the branch, so a read ticket may not merge: one whose
+ *  branch moved goes back to building (Bug 207). Only a merged ticket whose read was of the commit it finished with (or a read from before HQ kept the commit)
+ *  says "before it merged"; any other says which commit was read. */
+export function diffCheckWords(c: DiffCheck | null, t: { status: string; finished_sha?: string | null }): Words | null {
   if (!c) return null
   const why = c.why.length ? ` (${c.why.join('; ')})` : ''
-  if (c.state === 'ok') return { text: `A fresh reader read its changes before it merged${why} and found nothing wrong.`, tone: 'ok', findings: [] }
+  const merged = t.status === 'merged' && (!c.sha || !t.finished_sha || c.sha === t.finished_sha)
+  const when = merged ? ' before it merged' : c.sha ? ` at commit ${c.sha.slice(0, 7)}` : ''
+  if (c.state === 'ok') return { text: `A fresh reader read its changes${when}${why} and found nothing wrong.`, tone: 'ok', findings: [] }
   if (c.state === 'sent_back') return { text: `A fresh reader read its changes${why} and sent it back once:`, tone: 'look', findings: c.findings }
-  return { text: `Nobody read its changes before it merged${why}: ${c.error}.`, tone: 'look', findings: [] }
+  return { text: `Nobody read its changes${when}${why}: ${c.error}.`, tone: 'look', findings: [] }
 }

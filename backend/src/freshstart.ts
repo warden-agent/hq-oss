@@ -6,10 +6,11 @@ import { CHOICES, DEFAULTS, ENGINEER_LIMIT, NOTE_CAP } from './config.ts'
 import { getSetting, now, one, q, run } from './db.ts'
 import { emit, patch } from './events.ts'
 import { attention, resolveKind } from './attention.ts'
-import { getAgent, liveAgents, stopAgent, update, type Agent } from './agents.ts'
+import { getAgent, liveAgents, onDialog, stopAgent, update, type Agent } from './agents.ts'
 import { interruptAndType, sendMessage } from './delivery.ts'
-import { autoOn, features, getRepo, getTicket, repoOfAgent, setTicket, tickets } from './records.ts'
-import { noteScope, readNote, saveNote } from './notes.ts'
+import { autoOn, features, getFeature, getRepo, getTicket, repoOfAgent, setTicket, tickets, type Feature } from './records.ts'
+import { planWaitsWhy } from './checks.ts'
+import { agentNote, HQ_NOTE_HEAD, noteScope, readNote, saveNote } from './notes.ts'
 import { resumeEngineer } from './tickets.ts'
 import { restartTpm } from './tpm.ts'
 import { maybeFinishClear } from './clear.ts'
@@ -32,12 +33,12 @@ export function freshStartBlocker(a: Agent): string | null {
   if (a.role !== 'tpm' && a.role !== 'engineer') return 'Only TPMs and engineers have fresh starts (an architect is new for every review).'
   if (a.status === 'exited') return `${name(a)} isn't running.`
   if (a.fresh_start_at) return `${name(a)} is already writing its handoff note.`
-  // HQ types the request after Escape: on a dialog or menu, Enter would pick whatever option is highlighted.
-  if (a.status === 'blocked' || a.status === 'paused') return `${name(a)} is waiting on a dialog in its terminal. Answer it first.`
+  // HQ types the request after Escape: on a dialog or menu, Enter would pick whatever option is highlighted. After an API error it sits at its prompt (Bug 72).
+  if (onDialog(a)) return `${name(a)} is waiting on a dialog in its terminal. Answer it first.`
   if (a.role === 'tpm') return null
   const t = a.ticket_id ? getTicket(a.ticket_id) : undefined
   if (!t) return `${name(a)} has no ticket.`
-  if (t.status === 'plan_review') return `${t.key}'s plan is waiting for your review. Answer it first.`
+  if (t.status === 'plan_review') return planWaitsWhy(t.key, autoOn(getFeature(t.feature_id)?.repo_id)) // on auto HQ's plan check answers it (Bug 220)
   if (!RESUMABLE.includes(t.status)) return `${t.key} is ${t.status}; there's nothing to hand over.`
   return null
 }
@@ -81,7 +82,8 @@ export async function completeFreshStart(agentId: string, by: 'note' | 'fallback
   finishing.add(agentId)
   const then: Then = a.fresh_start_then === 'park' || a.fresh_start_then === 'clear' ? a.fresh_start_then : 'continue'
   try {
-    if (by === 'fallback') saveNote(a, fallbackNote(a, why))
+    const kept = then === 'clear' && agentNote(noteScope(a) ?? '') // a Clear archives a real note from before rather than HQ's (Bug 73), not HQ's old one (Bug 196)
+    if (by === 'fallback' && !kept) saveNote(a, fallbackNote(a, why))
     const endedWhy = then === 'clear' ? 'cleared' : 'fresh_start' // what the Agents menu says it ended for (Bug 122), also when its session had already ended
     if (a.status !== 'exited') await stopAgent(a.id, endedWhy)
     update(a.id, { fresh_start_at: null, fresh_start_then: null, fresh_start_msg: null, ended_why: endedWhy })
@@ -102,7 +104,8 @@ function park(a: Agent): void {
 }
 /** The note HQ writes when the agent couldn't: where things stood, from HQ's records. Git facts reach the next engineer anyway. */
 export function fallbackNote(a: Agent, why: string): string {
-  const head = `(Written by HQ: the ${a.role === 'tpm' ? 'TPM' : 'engineer'} didn't leave a note${why ? `: ${why}` : ''}.)`
+  const w = why.trim(), stop = /[.!?…]$/.test(w) ? '' : '.' // reasons often end a sentence already (Bug 176: "Answer it first..")
+  const head = `${HQ_NOTE_HEAD}: the ${a.role === 'tpm' ? 'TPM' : 'engineer'} didn't leave a note${w ? `: ${w}` : ''}${stop})`
   if (a.role === 'tpm') return `${head}\nRely on PROJECT.md, the ticket list and the recent messages with the user.`
   const t = a.ticket_id ? getTicket(a.ticket_id) : undefined
   // Bug 101: the kind carries the tool ('hook.PreToolUse:Bash'). Helpers' calls (sub) are left out, or a helper's searches push
@@ -146,6 +149,12 @@ export function startFreshStartLoop(): void {
 
 /** Every ticket of the feature (at least one, not counting cancelled ones) is merged: its TPM has nothing left to coordinate. */
 export const featureDone = (fid: string): boolean => { const all = tickets(fid).filter((t) => t.status !== 'cancelled'); return all.length > 0 && all.every((t) => t.status === 'merged') }
+/** Where a feature stands, in its board box's words (frontend/src/board.ts featureView), not its stored status word: that stays
+ *  "planning" until it's cancelled, done or not (Bug 222). */
+export const featureState = (f: Feature): string => {
+  const all = tickets(f.id).filter((t) => t.status !== 'cancelled'), merged = all.filter((t) => t.status === 'merged').length
+  return featureDone(f.id) ? `✓ done · all ${all.length} merged` : f.status === 'cancelled' ? 'cancelled' : all.length ? `${merged}/${all.length} merged` : 'no tickets yet'
+}
 export const inRepo = (repoId: string): Set<string> => new Set(features().filter((f) => f.repo_id === repoId).map((f) => f.id))
 /** The repo's live TPM and engineers (the project TPM has no feature: Bug 52). */
 const workers = (repoId: string): Agent[] => liveAgents().filter((x) => (x.role === 'tpm' || x.role === 'engineer') && repoOfAgent(x) === repoId)
