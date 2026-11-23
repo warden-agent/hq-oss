@@ -5,15 +5,16 @@ import { useEffect, useMemo, useRef } from 'react'
 import type { State } from './api'
 import { liveEngineer, mergeActs } from './board'
 import { needsYou, newNeeds, titleFor, type Need } from './needs.ts'
+import { nextMover } from '../../backend/src/mover.ts'
 
 const notifyOk = (): boolean => typeof Notification !== 'undefined' && Notification.permission === 'granted'
 const away = (): boolean => document.visibilityState !== 'visible' || !document.hasFocus()
 
 /** What a finished ticket waits for, in every repo (the ⚠ menu's rule). */
-function mergeAct(all: State) {
+export function mergeAct(all: State) {
   return (t: any): 'merge' | 'fix' | null => {
     const f = all.features.find((x) => x.id === t.feature_id), r = all.repos.find((x) => x.id === f?.repo_id), base = r?.default_branch ?? 'main'
-    if (r?.auto_mode && !r.auto_stopped_why && !t.auto_parked_why) return null // auto mode handles it
+    if (r && nextMover(r, t) !== 'user') return null // auto mode handles it, or the project is being cleared and HQ refuses a merge (Bug 311)
     const acts = mergeActs(t, base, liveEngineer(t, all))
     return acts.some((a) => a.kind === 'fix') ? 'fix' : acts.length ? 'merge' : null
   }

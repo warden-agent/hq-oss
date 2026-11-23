@@ -81,10 +81,27 @@ export async function copyTree(from: string, to: string): Promise<void> {
 }
 
 /** HQ's own folders (plans, worktrees) never show up as changes in the repo: listed in its .git/info/exclude. */
-export async function excludeHqFolders(repoPath: string): Promise<void> {
-  const excl = await git(repoPath, ['rev-parse', '--git-path', 'info/exclude'])
-  const exclPath = path.isAbsolute(excl) ? excl : path.join(repoPath, excl)
+export const excludeHqFolders = (repoPath: string): Promise<void> => excludeLines(repoPath, ['.hq-plans/', '.claude/worktrees/'])
+/** Adds the lines its .git/info/exclude lacks (one file for the main checkout and all its worktrees: git keeps it in the shared folder). */
+async function excludeLines(checkout: string, lines: string[]): Promise<void> {
+  if (!lines.length) return
+  const excl = await git(checkout, ['rev-parse', '--git-path', 'info/exclude'])
+  const exclPath = path.isAbsolute(excl) ? excl : path.join(checkout, excl)
   fs.mkdirSync(path.dirname(exclPath), { recursive: true }); const cur = fs.existsSync(exclPath) ? fs.readFileSync(exclPath, 'utf8') : ''
-  const missing = ['.hq-plans/', '.claude/worktrees/'].filter((p) => !cur.split('\n').includes(p))
+  const missing = lines.filter((p) => !cur.split('\n').includes(p))
   if (missing.length) fs.appendFileSync(exclPath, (cur.endsWith('\n') || !cur ? '' : '\n') + missing.map((p) => `${p}\n`).join(''))
+}
+/** Bug 263: what the preview's installs leave in a checkout (apprun.ts installLeftovers: node_modules, Yarn 2+'s .pnp.cjs and install
+ *  state) never shows up as new files in it, so nobody commits them: listed in the repo's .git/info/exclude (this clone's own, never
+ *  committed), each only where the project's .gitignore doesn't cover it already and git tracks nothing there (a Yarn zero-install
+ *  project commits its .pnp.cjs and cache). `rels`: relative to the checkout. Returns the lines added. */
+export async function excludeLeftovers(checkout: string, rels: string[]): Promise<string[]> {
+  if (!rels.length) return []
+  const prefix = await git(checkout, ['rev-parse', '--show-prefix']), add: string[] = [] // a part's folder below the repo's top: anchored there
+  for (const f of rels) {
+    if (await git(checkout, ['check-ignore', '-q', f]).then(() => true, () => false)) continue
+    if (await git(checkout, ['ls-files', '--', f]) !== '') continue
+    add.push(`/${prefix}${f}`)
+  }
+  await excludeLines(checkout, add); return add
 }

@@ -5,7 +5,6 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, sh, type Hq } from './harness.ts'
 
 let hq: Hq
@@ -66,7 +65,7 @@ test('what it must not catch: a project with no tests HQ can find finishes as be
 
 /** Bug 194: HQ has kept what the worktree held after the last run of the test command (the engineer's next command comes after that). */
 const stateKept = (e: any) => waitFor('the run\'s worktree state', async () => {
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { readOnly: true })
+  const db = hq.db({ readOnly: true })
   try { return (db.prepare(`SELECT json_extract(payload, '$.tree') AS tree FROM events WHERE agent_id = ? AND json_extract(payload, '$.suite') IS NOT NULL
     ORDER BY id DESC LIMIT 1`).get(e.id) as { tree: string | null } | undefined)?.tree } finally { db.close() }
 })
@@ -96,7 +95,7 @@ test('Bug 194: a sed -i through Bash after the run asks for another run; reading
 
 /** Bug 213: what HQ kept on a Bash call's PreToolUse event (`before`: the worktree's state before the line started). */
 const keptBefore = (e: any, use: string) => {
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { readOnly: true })
+  const db = hq.db({ readOnly: true })
   try { return (db.prepare(`SELECT json_extract(payload, '$.before') AS b FROM events WHERE agent_id = ? AND kind = 'hook.PreToolUse:Bash'
     AND json_extract(payload, '$.use') = ?`).get(e.id, use) as { b: string | null } | undefined)?.b ?? null } finally { db.close() }
 }

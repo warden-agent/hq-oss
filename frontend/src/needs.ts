@@ -2,6 +2,7 @@
 // HQ's tab is in the background. Pure and self-contained, so the backend's test runner unit-tests it (src/needs.test.ts).
 
 import { FINISHED, readyTickets } from '../../backend/src/readiness.ts'
+import { nextMover } from '../../backend/src/mover.ts'
 
 type S = { repos: any[]; features: any[]; tickets: any[]; agents: any[]; reviews: any[]; attention: any[]; asks?: any[]; questions?: Question[]; settings?: Record<string, any>
   defaults?: Record<string, any>
@@ -74,14 +75,15 @@ export function yourTurn(s: S, repoId: string | null): Turn {
   const open = (s.asks ?? []).filter((a) => a.repo_id === repoId && !a.answered_at)
   const asks = open.map((a) => ({ id: a.id, question: String(a.question), choices: list(a.choices), action: !!a.action }))
   const going = new Set(open.map((a) => { try { return a.action ? String(JSON.parse(a.action).ticket) : '' } catch { return '' } })) // Bug 50: asked to remove it
-  const ready = s.features.filter((f) => f.repo_id === repoId && f.status !== 'cancelled').sort((a, b) => a.created_at - b.created_at)
-    .flatMap((f) => readyTickets(s.tickets.filter((t) => t.feature_id === f.id && !going.has(t.id)), list(f.merge_order)).map((t) => t.key))
   const cap = Number(s.settings?.concurrency_cap ?? s.defaults?.concurrency_cap ?? 2), r = s.repos?.find((x) => x.id === repoId)
-  const auto = !!r?.auto_mode && !r.auto_stopped_why // HQ starts them itself
+  // the user's to start (backend mover.ts): not on auto (HQ starts them), nor during a Clear (HQ refuses a start, Bug 311); a parked one is theirs (Bug 292)
+  const mine = (t: any): boolean => !r || nextMover(r, t) === 'user'
+  const ready = s.features.filter((f) => f.repo_id === repoId && f.status !== 'cancelled').sort((a, b) => a.created_at - b.created_at)
+    .flatMap((f) => readyTickets(s.tickets.filter((t) => t.feature_id === f.id && !going.has(t.id)), list(f.merge_order)).filter(mine).map((t) => t.key))
   const fids = new Set(s.features.filter((f) => f.repo_id === repoId).map((f) => f.id))
   const questions = s.tickets.filter((t) => fids.has(t.feature_id)).flatMap((t) => { const x = ticketQuestion(s, t)
     return x && x.to_target === 'user' ? [{ id: x.id, ticketId: t.id, key: String(t.key), text: firstLine(x.body), agentId: x.from_agent_id }] : [] })
-  return { asks, start: !auto && ready.length && (s.working ?? workingEngineers(s)) < cap ? ready : [], ...(r?.auto_mode ? { auto: true } : {}),
+  return { asks, start: ready.length && (s.working ?? workingEngineers(s)) < cap ? ready : [], ...(r?.auto_mode ? { auto: true } : {}),
     ...(questions.length ? { questions } : {}) }
 }
 /** "T1", "T1 and T2", "T1, T2 and T3". */
@@ -100,8 +102,9 @@ export const goodNews = (kind: string): boolean => kind === 'merged' || kind ===
   || kind.startsWith('repo_cleared:') || kind.startsWith('repo_testsetup_ok:') // Bug 251: a clean Clear, a checked test setup (their problems have kinds of their own)
 /** Plain information: nothing is wrong and nothing is asked, so neither red nor green (Bug 97: a newer Claude Code is installed, and HQ's agents stay put). */
 export const plainNews = (kind: string): boolean => kind === 'claude_newer'
-/** Notices about a whole project that need the user: they name their project in the kind. Auto mode's own, and a test command engineers can't run (Bug 107). */
-const autoNeeds = (k: string): boolean => /^(auto_stopped|auto_finished|test_cmd_proposed|test_cmd_refused):/.test(k)
+/** Notices about a whole project that need the user: they name their project in the kind. Auto mode's own, a test command engineers can't run (Bug 107),
+ *  and a Clear that left worktrees or whose TPM didn't start again (Bug 285; its good news, `repo_cleared:`, is green and doesn't count). */
+export const projectNeeds = (k: string): boolean => /^(auto_stopped|auto_finished|test_cmd_proposed|test_cmd_refused|repo_cleared_left|repo_clear_tpm):/.test(k)
 
 /** Everything that needs the user right now, oldest kind first: the TPM's questions and tickets ready to start (Bug 43), plans
  *  waiting for review, finished tickets waiting for their merge (or for Fix conflicts), then alerting notices. `mergeAct` says what a finished ticket waits for (board.ts mergeActs). */
@@ -134,7 +137,7 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
         : t.status === 'resolving' && t.fixing ? `${where(f.repo_id)}${t.key}'s tests aren't fixed yet and its engineer stopped: press Fix tests`
         : `${where(f.repo_id)}${t.key} clashes with ${ticketBase(s, t.id)}: press Fix conflicts` })
   }
-  for (const a of s.attention.filter((x) => !x.resolved_at && (ALERT_KINDS.has(x.kind) || autoNeeds(x.kind)))) {
+  for (const a of s.attention.filter((x) => !x.resolved_at && (ALERT_KINDS.has(x.kind) || projectNeeds(x.kind)))) {
     const t = s.tickets.find((x) => x.id === a.ticket_id), ag = s.agents.find((x) => x.id === a.agent_id)
     const repo = kindRepo(a.kind) ?? (t ? repoOf(t) : ag?.repo_id ?? feature(ag?.feature_id)?.repo_id ?? null)
     out.push({ key: `attention:${a.id}`, text: named(repo, String(a.detail ?? a.kind).slice(0, 160)), repoId: repo, ref: { attention: a.id } })

@@ -20,6 +20,7 @@ process.env.HOME = home; process.env.HQ_HOME = path.join(tmp, 'hq'); process.env
 const { bwrapArgs, detectTests, failReport, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase, testCombined, sweepTestWorktrees,
   testRunViews, testWorktree } = await import('./testrun.ts')
 const { db, migrate } = await import('./db.ts'); migrate(); void db
+const { bus } = await import('./events.ts')
 
 const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd,
   encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
@@ -65,12 +66,24 @@ const listen = (file: string): Promise<net.Server> => new Promise((resolve, reje
   const s = net.createServer((c) => c.end('reached')).once('error', (e: NodeJS.ErrnoException) => reject(e.code !== 'EINVAL' ? e
     : new Error(`can't listen on ${file}: its ${Buffer.byteLength(file)} bytes are likely too long for a socket's path (104 on macOS); run from a shorter folder`, { cause: e })))
   s.listen(file, () => resolve(s)) })
+// Bug 317: so on a Mac a socket whose path is too long is listened on and dialled through a short link to its folder (under /tmp, where the sandbox
+// has no rule of its own for sockets); the socket itself stays where it was. Not on Linux: a run there has its own /tmp, which would hide the link,
+// so the test would pass for the wrong reason. A deep checkout still fails there, saying why (Linux allows 108 bytes).
+const links: string[] = []; after(() => { for (const l of links) fs.rmSync(l, { recursive: true, force: true }) })
+const shortPath = (file: string): string => {
+  if (Buffer.byteLength(file) < 104 || process.platform !== 'darwin') return file
+  const l = fs.mkdtempSync(path.join(process.env.HQ_SHORT_TMPDIR ?? '/tmp', 'hq-sock-')); links.push(l)
+  fs.mkdirSync(path.dirname(file), { recursive: true }); fs.symlinkSync(path.dirname(file), path.join(l, 'to')); return path.join(l, 'to', path.basename(file))
+}
+/** What a socket answers outside the sandbox: each one the sandbox holds must be one a program could otherwise reach. */
+const reach = (file: string): Promise<string> => new Promise((resolve) => { let out = ''
+  net.connect(file).on('data', (b) => { out += String(b) }).on('end', () => resolve(out)).on('error', (e) => resolve(String(e))) })
 test('runSandboxed: another program\'s socket is out of reach, network on or off; the run\'s own works', boxed, async () => {
-  const d = dir({}), tmux = path.join(tmp, 'tmux.sock'), docker = path.join(home, '.docker', 'd.sock'), servers: net.Server[] = []
+  const d = dir({}), tmux = shortPath(path.join(tmp, 'tmux.sock')), docker = shortPath(path.join(home, '.docker', 'd.sock')), servers: net.Server[] = []
   const dial = (file: string, network: boolean) => runSandboxed(d, `node -e "require('net').connect(${JSON.stringify(JSON.stringify(file)).slice(1, -1)})
     .on('data',(b)=>console.log(String(b)))"`, { network, timeoutMs: 10_000 })
   try {
-    for (const file of [tmux, docker]) servers.push(await listen(file))
+    for (const file of [tmux, docker]) { servers.push(await listen(file)); assert.equal(await reach(file), 'reached', file) }
     for (const file of [tmux, docker]) for (const network of [false, true]) assert.doesNotMatch((await dial(file, network)).output, /reached/, `${file} network ${network}`)
   } finally { servers.forEach((s) => s.close()) }
   const own = await runSandboxed(d, `node -e "const s=require('net').createServer((c)=>c.end('here')).listen('own.sock',()=>require('net').connect('own.sock')
@@ -84,7 +97,8 @@ test('runSandboxed: `open` can\'t start a program outside the sandbox', { skip: 
     + '<key>CFBundlePackageType</key><string>APPL</string><key>LSBackgroundOnly</key><true/></dict></plist>')
   fs.writeFileSync(path.join(app, 'Contents', 'MacOS', 'run'), `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`, { mode: 0o755 })
   const r = await runSandboxed(dir({}), `open -g ${JSON.stringify(app)}`, { network: false, timeoutMs: 10_000 })
-  await new Promise((f) => setTimeout(f, 1500)); assert.equal(fs.existsSync(marker), false, `open: ${r.code} ${r.output}`)
+  await new Promise((f) => setTimeout(f, 1500)) // real-time: macOS starts an app some time after `open` has returned, and nothing shows that it won't
+  assert.equal(fs.existsSync(marker), false, `open: ${r.code} ${r.output}`)
 })
 
 test('bwrapArgs: what\'s hidden is mounted after what\'s writable, and only the install step has the network', () => {
@@ -271,7 +285,6 @@ test('Bug 89: auto off before the run has started (HQ still at its git steps) st
 })
 
 // Bug 106: the page is told about HQ's own test runs while they go: which project and ticket, what is tested, and whether the run is in line for its turn.
-const { bus } = await import('./events.ts')
 const told: { id: string; patch: Record<string, unknown> | null }[] = []
 bus.on('patch', (p: { entity: string; id: string; patch: Record<string, unknown> | null }) => { if (p.entity === 'test_run') told.push({ id: p.id, patch: p.patch }) })
 const states = (id: string) => told.filter((p) => p.id === id).map((p) => p.patch === null ? 'gone' : p.patch.state)

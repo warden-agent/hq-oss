@@ -2,9 +2,11 @@
 // to merge:"); shown alone that reads as cut off (Bug 124), so the box then adds a link to the rest. A reply that starts with a
 // markdown heading showed only the heading, a label with nothing said (Bug 229): the preview now goes on to the first line with
 // something in it and keeps the heading in front of it.
+import { mdInline } from './md.ts'
 
-/** A line of text without markdown marks: leading #, >, *, - and spaces, and ** or ` anywhere. */
-const plain = (l: string): string => l.replace(/^[#>*\-\s]+/, '').replace(/\*\*|`/g, '').trim()
+/** A line of text without markdown marks: leading #, >, *, - and spaces, ** anywhere, and the backticks of `code` (a lone ``` is text,
+ *  as in Md: Bug 283). */
+const plain = (l: string): string => mdInline(l.replace(/^[#>*\-\s]+/, '').replace(/\*\*/g, '')).map((p) => p.text).join('').trim()
 type Part = { kind: 'head' | 'item' | 'text' | 'code'; text: string }
 /** The parts of a reply, one per line, without bare structure: blank lines, code fences, rules (---, ***, ===, a table's |---|), list
  *  marks with nothing after them, and anything else without a letter or digit (a lone emoji, a lone >). Lines inside a fence are code. */

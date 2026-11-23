@@ -21,6 +21,7 @@ import { features, getRepo, removing, repoOfAgent, setTicket, tickets } from './
 import { syncDone } from './repos.ts'
 import { stopAutoTests, sweepTestWorktrees } from './testrun.ts'
 import { stopPlanChecks } from './plancheck.ts'
+import { stopChecksIn } from './hqcheck.ts'
 import { rememberGone, sweepNow } from './leftovers.ts'
 import { sleep } from './util.ts'
 
@@ -54,6 +55,7 @@ export async function removeRepo(repoId: string, landing: string | null = null):
     patch('repo', repoId, { auto_mode: 0, auto_stopped_why: null, auto_waiting: null })
     stopAutoTests(repo.path) // its test run ends now, with no result, and one waiting for its turn never starts (Bug 152)
     stopPlanChecks(repoId) // a reader checking one of its plans ends too, with nothing to say (Bug 177)
+    stopChecksIn(repoId, 'the project is being removed from HQ') // and the user's checks of its tickets (hqcheck.ts)
     await stopPreview(repoId).catch(() => {}) // also waits for a start or stop already under way
     stopFirstMap(repoId) // its checkout goes with the test worktrees below
     const p = row(repoId); if (p?.helper_agent_id || p?.helper_worktree) await finish(repoId, null, null).catch(() => {}) // only HQ's own scratch worktree goes

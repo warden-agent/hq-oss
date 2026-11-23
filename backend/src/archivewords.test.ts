@@ -57,6 +57,14 @@ test("the folder the dialogs name is the one Remove really writes", async () => 
   }
 })
 
+test('Bug 314: Clear says a Launch helper keeps going and that the app does not start again without an OK; with none it says nothing of one', async () => {
+  const repo = { id: 'r1', name: 'garden' }, s = state(repo, '~/.hq/archive')
+  const [plain] = await bodies(s, repo); assert.doesNotMatch(plain, /Claude keeps/)
+  s.previews = [{ id: 'r1', status: 'stopped', helper_agent_id: 'launch-x', helper_state: 'working' }]
+  const [helped] = await bodies(s, repo)
+  assert.match(helped, /Claude keeps working out how to start garden's app \(start steps aren't part of the board\); the app doesn't start again without your OK\.$/)
+})
+
 test('homeShort: only the home folder itself becomes ~', () => {
   assert.equal(homeShort('/Users/k/.hq/archive', '/Users/k'), '~/.hq/archive')
   assert.equal(homeShort('/Users/k', '/Users/k'), '~')

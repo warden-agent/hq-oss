@@ -6,6 +6,7 @@ let token = ''
 let pending = null
 let polling = false
 let followUp = false // Bug 135: an empty answer may be followed by one ask at once; each tick of the clock allows one more
+let atTool = false // Bug 297: the agent's own last model request asked for a tool (a turn that ends there ended on a refusal or an Escape, not an answer)
 let reports = [] // Bug 140: batch reports HQ hasn't answered yet: on their way, or `late` (HQ was away, most likely a restart)
 
 function post($, path, obj) {
@@ -19,6 +20,13 @@ function post($, path, obj) {
 function report($, obj) {
   reports.push(obj)
   return post($, 'event', obj).then((r) => { if (r) reports = reports.filter((x) => x !== obj); else obj.late = true })
+}
+// Bugs 297, 298: the start and end of the agent's own turn are reports too. While HQ is away the Stop hook of a turn that ends is
+// lost (the TPM's reply), and so is the sign of an Escape (HQ then hands its next batch to a prompt that drops it). Only the latest
+// turn's are kept: a turn that starts makes the late ones of the turn before it moot. HQ hears them before the mod's next ask.
+function turnStarted($, obj) {
+  reports = reports.filter((x) => x.kind !== 'turn.start' && x.kind !== 'turn.complete') // on their way too: one that fails now isn't sent again
+  return report($, obj)
 }
 async function sendLate($) {
   for (const obj of reports.filter((x) => x.late)) {
@@ -76,9 +84,14 @@ export function register(on) {
     if (name && name !== 'hq') return { refuse: 'HQ: only the hq mod may load in an HQ agent' }
     return next(e)
   })
-  on('turn.start', async ($, e, next) => { post($, 'event', { kind: 'turn.start', turnId: e.turnId, agentId: e.agentId || null }); return next(e) })
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId) post($, 'event', { kind: 'turn.start', turnId: e.turnId, agentId: e.agentId })
+    else { atTool = false; turnStarted($, { kind: 'turn.start', turnId: e.turnId, agentId: null }) }
+    return next(e)
+  })
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
+    if (!e.agentId) atTool = !!(result && result.toolUses && result.toolUses.length)
     // tools: what this request asked to run. HQ's model check needs it: the request that calls ExitPlanMode can be reported after the approval (Bug 105)
     post($, 'event', { kind: 'turn.step', model: e.model, agentId: e.agentId || null, usageModel: result && result.usage ? result.usage.model : null,
       tools: result && result.toolUses ? result.toolUses.map((u) => u.name) : [],
@@ -89,7 +102,11 @@ export function register(on) {
     // Bug 140: an interrupted turn drops a prompt submitted as it ended (Bug 110: the aborted turn.complete comes right after the
     // submit). HQ hears of neither while it is away, so a report still waiting for it says how the first turn to end after it ended.
     if (!e.agentId) for (const x of reports) if (x.kind === 'batch_submitted' && x.interrupted === undefined) x.interrupted = !!e.isAborted
-    post($, 'event', { kind: 'turn.complete', turnId: e.turnId, agentId: e.agentId || null, isAborted: !!e.isAborted, durationMs: e.durationMs, answer: String(e.answer || '').slice(0, 300) })
+    // Bug 346: a start HQ hasn't heard yet is of a turn that has ended now, so HQ doesn't show it working (this turn.complete comes after it)
+    if (!e.agentId) for (const x of reports) if (x.kind === 'turn.start' && x.turnId === e.turnId) x.over = true
+    const done = { kind: 'turn.complete', turnId: e.turnId, agentId: e.agentId || null, isAborted: !!e.isAborted, reason: e.reason || null, durationMs: e.durationMs }
+    if (e.agentId) post($, 'event', { ...done, answer: String(e.answer || '').slice(0, 300) })
+    else report($, { ...done, atTool, answer: String(e.answer || '').slice(0, 8000) }) // Bug 297: the whole answer, HQ's record of a reply whose Stop it missed
     return next(e)
   })
   on('session.measure', async ($, e, next) => {

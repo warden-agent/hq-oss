@@ -35,6 +35,9 @@ test('Bug 43: ask_user shows the question until a choice answers it, and the TPM
   assert.ok((await hq.mcp(tpm.id, 'ask_user', { question: '' })).isError)
 
   const ans = await hq.api(`asks/${a.id}/answer`, { answer: 'Follow the device' }); assert.equal(ans.status, 200, JSON.stringify(ans.json))
+  // Bug 286: the answer names the message it sent, so only the tab that answered takes it as its own (its Chat jumps to it)
+  const sent = (await hq.state()).messages.find((m: any) => m.id === ans.json.message_id)
+  assert.equal(sent?.from_id, 'user'); assert.equal(sent?.to_id, tpm.id); assert.match(sent?.body, /The user's answer: Follow the device/)
   assert.deepEqual(await asks(f), [])
   assert.match(await nextBatch(tpm.id), /You asked: "Should the app open dark, light, or follow the device\?"\nThe user's answer: Follow the device/)
   const again = await hq.api(`asks/${a.id}/answer`, { answer: 'Dark' }); assert.equal(again.status, 409); assert.match(again.json.error, /already answered/)
@@ -55,6 +58,7 @@ test('Bug 43: writing to the TPM answers its open questions; no TPM running mean
   const r = await hq.api(`asks/${open.id}/answer`, { answer: 'Yes' }); assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.deepEqual(await asks(f), [])
   const next = await waitFor('a new TPM', async () => { const id = (await hq.state()).repos.find((x: any) => x.id === f.repo_id).tpm_agent_id; return id !== tpm.id ? id : null })
+  assert.equal((await hq.state()).messages.find((m: any) => m.id === r.json.message_id)?.to_id, next, 'Bug 286: the message that started the new TPM')
   const b = await waitFor('its launch prompt', async () => (await hq.modNext(next)).batch)
   assert.match(b.text, /You are taking over as the TPM of project "ask-talk"/)
   assert.match(b.text, /The user's new message, verbatim:\n"""\nYou asked: "Ship it on Friday\?"\nThe user's answer: Yes\n"""/)

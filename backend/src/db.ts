@@ -188,7 +188,7 @@ UPDATE agents SET blocked_why = CASE WHEN NOT EXISTS (SELECT 1 FROM needs_attent
 // after it is unfinished again until open_pr names the new commit. NULL: finished before HQ kept it (HQ then tests the branch as it is).
 `ALTER TABLE tickets ADD COLUMN finished_sha TEXT;`,
 // Bug 145: agents' builds and full test runs that hold a turn (started_at set; until: when its command's own time limit has passed) or wait for one
-// (started_at NULL), so a restarted backend still counts them and keeps the line's order (heavy.ts). HQ's own test runs aren't kept: a restart ends them.
+// (started_at NULL), so a restarted backend still counts them and keeps the line's order (heavy.ts). Bug 312: HQ's own runs too, with agent_id '' (heavy.ts save).
 `CREATE TABLE turns (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, who TEXT NOT NULL, what TEXT NOT NULL, lane TEXT NOT NULL,
   asked_at INTEGER NOT NULL, started_at INTEGER, until INTEGER);`,
 // Bug 186: what the agent's box said the command was doing ("Running: npm test"), so a restarted backend shows it again. NULL: kept before this column.
@@ -213,6 +213,15 @@ UPDATE repos SET clear_tpm_was_on = 1 WHERE clearing_at IS NOT NULL AND EXISTS (
 // Bug 226 (migration 40 in fix round 3; 37–39 are Bugs 215, 219, 218): the ports in HQ's preview range a Launch helper was given for its test runs (JSON
 // list), so its test servers can't clash with another app on the machine and HQ's previews leave them alone. NULL: no helper, or one started before this.
 `ALTER TABLE previews ADD COLUMN helper_ports TEXT;`,
+// Bug 337: the line the agent's box shows ("Thinking", the tool it uses, "Waiting on: …"), kept as each patch says it (agents.ts keepLine), so a restarted
+// backend shows it again instead of nothing until the agent's next hook. NULL: no line (and agents from before this).
+`ALTER TABLE agents ADD COLUMN activity TEXT;`,
+// Bug 351 (migration 42 in fix round 7; 41 is Bug 337): HQ's first run of the steps the user OK'd for a Launch helper, by the run's `started_at`, saved with the run
+// itself, so a backend restart during that run can still tell the helper how it went. NULL: that run hasn't started yet (or no helper is trying one).
+`ALTER TABLE previews ADD COLUMN helper_run INTEGER;`,
+// Migration 43: "Have HQ test this" (hqcheck.ts): with auto mode off, the user's check of one finished ticket, kept with it (JSON, hqcheckrules.ts HqCheck) so the
+// button and the results survive a backend restart. NULL: never tested this way.
+`ALTER TABLE tickets ADD COLUMN hq_check TEXT;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

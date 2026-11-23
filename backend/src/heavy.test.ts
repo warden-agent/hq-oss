@@ -10,7 +10,7 @@ import type http from 'node:http'
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-heavy-')))
 process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_TURN_WAIT_S = '1'; process.env.HQ_TURN_BEAT_MS = '40'
 const { migrate, setSetting, q, run } = await import('./db.ts'); migrate()
-const { gateBash, heavyKind, laneMoved, programs, pump, release, saveTestCmds, startTurns, take, turns, withTurn } = await import('./heavy.ts')
+const { behindWords, gateBash, heavyKind, laneMoved, programs, pump, release, saveTestCmds, startTurns, take, turns, withTurn } = await import('./heavy.ts')
 const { bus, emit } = await import('./events.ts')
 const { validSetting, bashLimitMs, PATHS } = await import('./config.ts')
 const { heldKind } = await import('./heavykind.ts')
@@ -18,7 +18,14 @@ type Agent = import('./agents.ts').Agent
 after(() => fs.rmSync(tmp, { recursive: true, force: true }))
 startTurns()
 
-const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms))
+const tick = (ms: number) => new Promise((r) => setTimeout(r, ms))
+/** What an action set off has run: the turn queue hands a turn on at once, and whoever waited for it hears through a promise. Nothing here waits
+ *  for time (it used to be a 20 ms sleep). */
+const settled = () => new Promise((r) => setImmediate(r))
+/** Polls until `fn` holds, for something a timer of HQ's does (a limit passing). */
+async function until(what: string, fn: () => boolean, ms = 5000): Promise<void> {
+  for (const end = Date.now() + ms; !fn();) { if (Date.now() > end) throw new Error(`timed out waiting for ${what}`); await new Promise((r) => setTimeout(r, 5)) }
+}
 const turn = (id: string, o: Partial<{ agentId: string; lane: string; limitMs: number }> = {}) =>
   ({ id, who: id, what: 'tests' as const, agentId: o.agentId ?? null, lane: o.lane ?? 'main', limitMs: o.limitMs ?? Infinity })
 /** Everything given back, so each test starts with nobody running or waiting. */
@@ -58,33 +65,35 @@ test('one at a time, first come first served; the limit is the user\'s setting, 
   const order: string[] = [], ask = (id: string) => { const t = take(turn(id)); void t.got.then(() => order.push(id)); return t }
   const a = ask('a'), b = ask('b'), c = ask('c')
   assert.equal(a.waiting, false); assert.equal(b.waiting, true); assert.equal(c.waiting, true)
-  await tick(); assert.deepEqual(order, ['a']); assert.deepEqual(turns(), { running: ['a'], waiting: ['b', 'c'] })
-  release('a'); await tick(); assert.deepEqual(order, ['a', 'b']); assert.deepEqual(turns(), { running: ['b'], waiting: ['c'] })
-  release('nobody'); release('a'); await tick(); assert.deepEqual(turns(), { running: ['b'], waiting: ['c'] }) // given back twice, or never taken: nothing happens
-  const d = ask('d'); setSetting('heavy_at_once', 3); pump(); await tick()
+  await settled(); assert.deepEqual(order, ['a']); assert.deepEqual(turns(), { running: ['a'], waiting: ['b', 'c'] })
+  release('a'); await settled(); assert.deepEqual(order, ['a', 'b']); assert.deepEqual(turns(), { running: ['b'], waiting: ['c'] })
+  release('nobody'); release('a'); await settled(); assert.deepEqual(turns(), { running: ['b'], waiting: ['c'] }) // given back twice, or never taken: nothing happens
+  const d = ask('d'); setSetting('heavy_at_once', 3); pump(); await settled()
   assert.deepEqual(turns(), { running: ['b', 'c', 'd'], waiting: [] }); assert.equal(d.waiting, true)
-  assert.equal(ask('e').waiting, true); setSetting('heavy_at_once', 1); release('b'); release('c'); await tick() // lowered: nobody running is stopped, the next waits for room
-  assert.deepEqual(turns(), { running: ['d'], waiting: ['e'] }); release('d'); await tick(); assert.deepEqual(turns().running, ['e'])
+  assert.equal(ask('e').waiting, true); setSetting('heavy_at_once', 1); release('b'); release('c'); await settled() // lowered: nobody running is stopped, the next waits for room
+  assert.deepEqual(turns(), { running: ['d'], waiting: ['e'] }); release('d'); await settled(); assert.deepEqual(turns().running, ['e'])
   assert.equal(validSetting('heavy_at_once', 2), null); assert.match(validSetting('heavy_at_once', 0) ?? '', /at least 1/); assert.match(validSetting('heavy_at_once', 1.5) ?? '', /whole number/)
 })
 
 test('nothing waits for good: a turn ends with its command\'s time limit, and whoever has waited long enough goes ahead anyway', async () => {
   clear()
   const a = take(turn('a', { limitMs: 150 })), b = take(turn('b')); let got: { late: boolean } | null = null; void b.got.then((x) => { got = x })
-  assert.equal(a.waiting, false); await tick(60); assert.equal(got, null)
-  await tick(200); assert.deepEqual(got && { late: (got as { late: boolean }).late }, { late: false }) // a's end never came: its limit passed
+  assert.equal(a.waiting, false); await tick(60) // limit: a's turn has a 150 ms limit, and b must still be waiting well before it
+  assert.equal(got, null)
+  await until('b to get the turn', () => got !== null); assert.deepEqual(got && { late: (got as { late: boolean }).late }, { late: false }) // a's end never came: its limit passed
   const c = take(turn('c')); let late: boolean | null = null; void c.got.then((x) => { late = x.late })
-  await tick(1200); assert.equal(late, true); assert.deepEqual(turns(), { running: ['b', 'c'], waiting: [] }) // HQ_TURN_WAIT_S is 1 here: over the limit, but running
+  await until('c to go ahead anyway', () => late !== null); assert.equal(late, true)
+  assert.deepEqual(turns(), { running: ['b', 'c'], waiting: [] }) // HQ_TURN_WAIT_S is 1 here: over the limit, but running
   assert.equal(bashLimitMs(undefined), 120_000); assert.equal(bashLimitMs(5000), 5000); assert.equal(bashLimitMs(9e9), 600_000); assert.equal(bashLimitMs('x'), 120_000)
 })
 
 test('one that stops waiting leaves the line; HQ\'s own test run waits like anyone and gives its turn back even when it throws', async () => {
   clear()
   take(turn('a')); const b = take(turn('b')), c = take(turn('c')); let cGot = false; void c.got.then(() => { cGot = true })
-  b.drop(); assert.deepEqual(turns().waiting, ['c']); release('a'); await tick(); assert.equal(cGot, true); c.drop(); assert.deepEqual(turns(), { running: [], waiting: [] })
+  b.drop(); assert.deepEqual(turns().waiting, ['c']); release('a'); await settled(); assert.equal(cGot, true); c.drop(); assert.deepEqual(turns(), { running: [], waiting: [] })
   take(turn('eng')); const seen: string[] = []
   const run = withTurn("HQ's test of T-01", 'tests', async () => { seen.push('ran'); throw new Error('boom') }, () => seen.push('waits')) // Bug 106: it's told it has to wait
-  await tick(); assert.deepEqual(seen, ['waits']); assert.deepEqual(turns(), { running: ['eng'], waiting: ["HQ's test of T-01"] })
+  await settled(); assert.deepEqual(seen, ['waits']); assert.deepEqual(turns(), { running: ['eng'], waiting: ["HQ's test of T-01"] })
   release('eng'); await assert.rejects(run, /boom/); assert.deepEqual(seen, ['waits', 'ran']); assert.deepEqual(turns(), { running: [], waiting: [] })
   assert.equal(await withTurn('free', 'build', async () => 7, () => assert.fail('nobody to wait for')), 7)
   const kinds = q<{ kind: string; payload: string }>("SELECT kind, payload FROM events WHERE kind LIKE 'turns.%' ORDER BY id").map((e) => [e.kind, JSON.parse(e.payload).who])
@@ -106,19 +115,19 @@ test('an engineer\'s command: held at its hook until its turn, which its end, it
   assert.equal(gateBash(agent('b'), cmd('u2', 'git status'), conn(), answer), false); assert.equal(gateBash(agent('b'), cmd('u3', 'npm test', { background: true }), conn(), answer), false)
   assert.equal(gateBash(agent('b'), cmd('u4', 'npm test', { plan: true }), conn(), answer), false); assert.equal(gateBash(agent('t', 'tpm'), cmd('u5'), conn(), answer), false)
   assert.equal(gateBash(agent('b'), cmd('u6', 'npm run build'), conn(), answer), true) // held
-  assert.deepEqual(turns(), { running: ['eng a'], waiting: ['eng b'] }); assert.deepEqual(patches.at(-1), { entity: 'agent', id: 'b', patch: { activity: 'Waiting its turn to build' } })
-  await tick(); assert.equal(answered, 0)
-  emit({ agentId: 'a', source: 'hook', kind: 'hook.PostToolUse:Bash', payload: { use: 'u1' } }); await tick()
+  assert.deepEqual(turns(), { running: ['eng a'], waiting: ['eng b'] }); assert.deepEqual(patches.at(-1), { entity: 'agent', id: 'b', patch: { activity: 'Waiting its turn to build behind eng a' } })
+  await settled(); assert.equal(answered, 0)
+  emit({ agentId: 'a', source: 'hook', kind: 'hook.PostToolUse:Bash', payload: { use: 'u1' } }); await settled()
   assert.equal(answered, 1); assert.deepEqual(began, ['u6']); assert.deepEqual(patches.at(-1), { entity: 'agent', id: 'b', patch: { activity: 'Running: npm run build' } })
   // b's turn ends without HQ hearing its command end (a lost hook): its own turns come back, a helper's command of its doesn't
   assert.equal(gateBash(agent('c'), cmd('u7', 'npm test', { lane: 'helper-1' }), conn(), answer), true); assert.equal(gateBash(agent('a'), cmd('u8'), conn(), answer), true)
-  emit({ agentId: 'b', source: 'hook', kind: 'hook.Stop', payload: {} }); await tick(); assert.deepEqual(turns(), { running: ['eng c'], waiting: ['eng a'] }); assert.equal(answered, 2)
-  emit({ agentId: 'c', source: 'hook', kind: 'hook.Stop', payload: {} }); await tick(); assert.equal(answered, 2) // c's own turn ended; its helper still runs the tests
-  emit({ agentId: 'c', source: 'system', kind: 'agent.stopped', payload: {} }); await tick(); assert.equal(answered, 3); assert.deepEqual(turns(), { running: ['eng a'], waiting: [] })
+  emit({ agentId: 'b', source: 'hook', kind: 'hook.Stop', payload: {} }); await settled(); assert.deepEqual(turns(), { running: ['eng c'], waiting: ['eng a'] }); assert.equal(answered, 2)
+  emit({ agentId: 'c', source: 'hook', kind: 'hook.Stop', payload: {} }); await settled(); assert.equal(answered, 2) // c's own turn ended; its helper still runs the tests
+  emit({ agentId: 'c', source: 'system', kind: 'agent.stopped', payload: {} }); await settled(); assert.equal(answered, 3); assert.deepEqual(turns(), { running: ['eng a'], waiting: [] })
   // the one waiting is interrupted (Esc, a fresh start): Claude Code drops the hook, and its place goes to the next
   const gone = conn(); assert.equal(gateBash(agent('d'), cmd('u9'), gone, answer), true); assert.equal(gateBash(agent('e'), cmd('u10'), conn(), answer), true)
   Object.assign(gone, { destroyed: true }); gone.emit('close'); assert.deepEqual(turns().waiting, ['eng e'])
-  emit({ agentId: 'a', source: 'hook', kind: 'hook.PostToolUseFailure:Bash', payload: { use: 'u8' } }); await tick()
+  emit({ agentId: 'a', source: 'hook', kind: 'hook.PostToolUseFailure:Bash', payload: { use: 'u8' } }); await settled()
   assert.equal(answered, 4); assert.deepEqual(turns(), { running: ['eng e'], waiting: [] })
   emit({ agentId: 'e', source: 'hook', kind: 'hook.SessionEnd', payload: { reason: 'clear' } }); assert.deepEqual(turns().running, ['eng e']) // /clear: the session goes on
   emit({ agentId: 'e', source: 'hook', kind: 'hook.SessionEnd', payload: { reason: 'exit' } }); assert.deepEqual(turns().running, [])
@@ -131,16 +140,42 @@ test('an engineer\'s command: held at its hook until its turn, which its end, it
   assert.equal(gateBash(agent('h'), cmd('u11', 'npm test && git push'), conn(), answer), false); assert.equal(gateBash(agent('i'), cmd('u12'), conn(), answer), true)
   laneMoved('h', 'helper-9'); laneMoved('i', 'main'); assert.deepEqual(turns().running, ['eng h']); assert.deepEqual(turns().waiting, [])
   assert.equal(gateBash(agent('i'), cmd('u13', 'npm test', { lane: 'helper-2' }), conn(), answer), true)
-  laneMoved('h', 'main'); await tick(); assert.deepEqual(turns(), { running: ['eng i'], waiting: [] }); laneMoved('i', 'main'); assert.deepEqual(turns().running, ['eng i'])
+  laneMoved('h', 'main'); await settled(); assert.deepEqual(turns(), { running: ['eng i'], waiting: [] }); laneMoved('i', 'main'); assert.deepEqual(turns().running, ['eng i'])
   laneMoved('i', 'helper-2'); assert.deepEqual(turns().running, [])
   // while it waits its box keeps saying so (a page opened meanwhile has nothing stored to show); once it's out of the line, by any road, that stops
   take(turn('x')); assert.equal(gateBash(agent('j'), cmd('u14'), conn(), answer), true)
   type Said = { id: string; patch: { activity?: string } }
-  const said = () => patches.filter((p) => (p as Said).id === 'j' && (p as Said).patch.activity === 'Waiting its turn to run tests').length
-  const before = said(); await tick(150); assert.ok(said() >= before + 2, 'said again while waiting')
-  const n = answered; emit({ agentId: 'j', source: 'system', kind: 'agent.lost', payload: {} }); const then = said(); await tick(150); assert.equal(said(), then, 'and not after it left')
+  const said = () => patches.filter((p) => (p as Said).id === 'j' && (p as Said).patch.activity === 'Waiting its turn to run tests behind x').length
+  const before = said(); await until('its box to say so twice more', () => said() >= before + 2)
+  const n = answered; emit({ agentId: 'j', source: 'system', kind: 'agent.lost', payload: {} }); const then = said()
+  await tick(150) // limit: its box said so every 40 ms while it waited (HQ_TURN_BEAT_MS here); three of those go by
+  assert.equal(said(), then, 'and not after it left')
   assert.equal(answered, n + 1, 'a hook still held is answered when HQ takes it out of the line, so nothing hangs on it')
   assert.equal(q<{ n: number }>("SELECT COUNT(*) n FROM events WHERE kind = 'turns.left' AND agent_id = 'j'")[0]!.n, 1); release('x')
+})
+
+test('Bug 289: whoever waits hears behind whom, each time that changes: an engineer\'s box says it, HQ\'s own run is told; nobody hears the same twice', async () => {
+  clear()
+  const said: string[] = [], hqHeard: string[][] = []
+  const onPatch = (p: { entity: string; id: string; patch: { activity?: string } | null }) => { if (p.entity === 'agent' && p.id === 'w2') said.push(String(p.patch?.activity)) }
+  bus.on('patch', onPatch)
+  try {
+    take(turn('x')); let answered = 0
+    assert.equal(gateBash(agent('w2'), cmd('v1'), conn(), () => { answered++ }), true)
+    const hqRun = withTurn("HQ's test of T-01", 'tests', async () => 'ran', (b) => hqHeard.push(b))
+    assert.deepEqual(said, ['Waiting its turn to run tests behind x']); assert.deepEqual(hqHeard, [['x']])
+    take(turn('y')) // one more in the line: nobody ahead changed, so nobody is told again
+    assert.deepEqual(said.length, 1); assert.deepEqual(hqHeard.length, 1)
+    release('x'); await settled() // w2 goes first; HQ's run now waits behind it
+    assert.equal(answered, 1); assert.deepEqual(said.at(-1), 'Running: npm test'); assert.deepEqual(hqHeard, [['x'], ['eng w2']])
+    emit({ agentId: 'w2', source: 'hook', kind: 'hook.PostToolUse:Bash', payload: { use: 'v1' } }); assert.equal(await hqRun, 'ran')
+    assert.deepEqual(hqHeard, [['x'], ['eng w2']], 'its turn came: it waits for nobody, and is told nothing more')
+    assert.deepEqual(turns(), { running: ['y'], waiting: [] }); release('y')
+    const w = q<{ payload: string }>("SELECT payload FROM events WHERE kind = 'turns.waiting' AND agent_id = 'w2'").map((e) => JSON.parse(e.payload).behind)
+    assert.deepEqual(w, [['x']]) // the Events tab's words come from this (eventtext.ts)
+  } finally { bus.off('patch', onPatch) }
+  assert.equal(behindWords(['a']), 'a'); assert.equal(behindWords(['a', 'b']), 'a and b'); assert.equal(behindWords(['a', 'b', 'c', 'd']), 'a and 3 more')
+  assert.equal(behindWords([]), ''); assert.equal(behindWords(undefined), ''); assert.equal(behindWords('a'), '')
 })
 
 test('Bug 112: what the Bash hook goes by while HQ is down: the same rules, and each project\'s test command in a file HQ keeps whole', () => {

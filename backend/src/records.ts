@@ -48,6 +48,7 @@ export type Ticket = {
   criteria: string // JSON criteria.ts Criterion[]: what the finished ticket must do, as a list HQ can check; '[]' for a ticket with none
   proof: string | null // JSON criteria.ts Proof, set at open_pr: the test named for each criterion and what git flagged; null until it's finished once
   diff_check: string | null // JSON diffcheck.ts DiffCheck: how auto mode's reader of its changes answered before the merge; null when nothing read them
+  hq_check: string | null // JSON hqcheckrules.ts HqCheck: the user's "Have HQ test this" (auto mode off), its latest; null: never tested that way
   finished_sha: string | null // Bug 143: the branch's commit at its last open_pr, the one auto mode tests and merges; null on tickets finished before HQ kept it
   parked_at: number | null; created_at: number; updated_at: number
 }
@@ -69,11 +70,7 @@ export const localOnly = (repo: Repo): boolean => repo.kind === 'github' && repo
 export const syncBlocks = (repo: Repo): boolean => repo.kind === 'github' && !localOnly(repo) && !repo.sync_ok
 /** Whether the project runs on auto mode. */
 export const autoOn = (repoId: string | null | undefined): boolean => !!repoId && !!one<{ x: number }>('SELECT 1 AS x FROM repos WHERE id = ? AND auto_mode = 1', repoId)
-/** Bugs 193, 209, 246: HQ moves tickets on by itself (starts, tests and merges them): auto mode is on and not stopped. While it is stopped the user does,
- *  with the board's buttons, until Resume, and what HQ tells the TPM and the user says so. */
-export const autoGoing = (repo: Repo): boolean => !!repo.auto_mode && !repo.auto_stopped_why
-/** HQ moves this ticket on by itself: auto mode is going (autoGoing) and hasn't parked it. Otherwise the user does. */
-export const hqMoves = (repo: Repo, t: Ticket): boolean => autoGoing(repo) && !t.auto_parked_why
+export { autoGoing, hqMoves } from './mover.ts' // who moves a ticket on next: one rule, the board's too (Bug 292)
 export const repos = (): Repo[] => q<Repo>('SELECT * FROM repos ORDER BY created_at')
 export const getRepo = (repoId: string): Repo | undefined => one<Repo>('SELECT * FROM repos WHERE id = ?', repoId)
 /** Repos on their way out of HQ (remove.ts). In memory, not clearing_at: the fresh-start sweep finishes any clear it finds, and that changes the folder. */

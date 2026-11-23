@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { onAsk, useBusy, type StopAsk } from './board'
-import { api, askUntilAnswered, errBody, errText, onError } from './api'
+import { api, askUntilAnswered, errBody, errText, onError, withError, type ErrMsg } from './api'
 import { projectSlug } from '../../backend/src/projectname.ts'
 import { clock } from './testruns.ts'
 import { mdBlocks, mdInline } from './md.ts'
@@ -22,8 +22,9 @@ export function Elapsed({ since }: { since: number }) {
 /** An agent's message as it means it: **bold** and `code` shown as such, "## Heading" lines in bold and ``` fences as code blocks (Bug 256),
  *  not raw markdown. A code block wraps its long lines, so nothing in it is hidden off to the side and the page never scrolls sideways. */
 export function Md({ text }: { text: string }) {
+  const code = (t: string, key: number) => <code key={key} className="rounded bg-zinc-950/60 px-0.5 text-[0.95em]">{t}</code>
   const inline = (line: string) => mdInline(line).map((p, i) => p.kind === 'bold' ? <strong key={i}>{p.text}</strong>
-    : p.kind === 'code' ? <code key={i} className="rounded bg-zinc-950/60 px-0.5 text-[0.95em]">{p.text}</code> : p.text)
+    : p.kind === 'code' ? p.bold ? <strong key={i}>{code(p.text, i)}</strong> : code(p.text, i) : p.text)
   return <div className="whitespace-pre-wrap break-words">{mdBlocks(text).map((b, i) => b.kind === 'code'
     ? <pre key={i} className="my-0.5 whitespace-pre-wrap rounded border border-zinc-700/70 bg-zinc-950/60 px-1.5 py-1 font-mono text-[0.95em] [overflow-wrap:anywhere]">
       {b.lines.join('\n') || '\u00a0'}</pre>
@@ -31,10 +32,12 @@ export function Md({ text }: { text: string }) {
 }
 /** Text with its URLs turned into short links (attention items carry "Create PR" links that are too long to show). */
 export const Linked = ({ text }: { text: string }) => <>{String(text).split(/(https?:\/\/\S+)/).map((p, i) => /^https?:\/\//.test(p) ? <a key={i} className="text-indigo-300 underline" href={p} target="_blank" rel="noreferrer">open ↗</a> : p)}</>
-/** A small action button: disabled while its request runs, so a double-click sends one request; errors are shown. */
-export function ActBtn({ label, busyLabel, run, primary, disabled, title }: { label: string; busyLabel?: string; run: () => Promise<unknown>; primary?: boolean; disabled?: boolean; title?: string }) {
+/** A small action button: disabled while its request runs, so a double-click sends one request; errors are shown. `ask`: HQ's dialog
+ *  before `run` (false: cancelled); the button keeps its own label while the dialog is up (Bug 315). */
+export function ActBtn({ label, busyLabel, run, ask, primary, disabled, title }: { label: string; busyLabel?: string; run: () => Promise<unknown>
+  ask?: () => Promise<boolean>; primary?: boolean; disabled?: boolean; title?: string }) {
   const [busy, go] = useBusy()
-  return <button className={`btn-sm nopan ${primary ? 'btn-primary' : ''}`} disabled={disabled || busy} title={title} onClick={() => go(run)}>{busy ? busyLabel ?? label : label}</button>
+  return <button className={`btn-sm nopan ${primary ? 'btn-primary' : ''}`} disabled={disabled || busy} title={title} onClick={() => go(run, ask)}>{busy ? busyLabel ?? label : label}</button>
 }
 /** A button with a dropdown under it. Closes on a click elsewhere (pointerdown: the graph swallows mousedown) or Escape. */
 export function Menu({ label, title, className = 'btn', align = 'right', children }: { label: React.ReactNode; title?: string; className?: string; align?: 'left' | 'right'; children: (close: () => void) => React.ReactNode }) {
@@ -63,10 +66,15 @@ export function Menu({ label, title, className = 'btn', align = 'right', childre
   </div>
 }
 /** Errors from actions (showError), newest first, so it's the oldest that scrolls out of view; each with ×, at most three at a time. Replaces alert(). In the page's
- *  flow under the top bar, so it pushes the board down and never sits over a control, and menus open over it (Bug 56). No timer: a long refusal could go before it's read. */
+ *  flow under the top bar, so it pushes the board down and never sits over a control, and menus open over it (Bug 56). No timer: a long refusal could go before it's read.
+ *  The same words again are one bar, not two (Bug 267); a bar goes once its request works or HQ answers again (Bug 278, api.ts showError), or once what it
+ *  was about has gone or come right (Bug 305, api.ts outdatedBar). */
 export function ErrorBar() {
-  const [msgs, setMsgs] = useState<{ id: number; text: string }[]>([]); const n = useRef(0)
-  useEffect(() => { onError((text) => setMsgs((m) => [...m.slice(-2), { id: ++n.current, text }])); return () => onError(null) }, [])
+  const [msgs, setMsgs] = useState<ErrMsg[]>([]); const n = useRef(0)
+  useEffect(() => {
+    onError({ add: (m) => { const id = ++n.current; setMsgs((x) => withError(x, { ...m, id })) }, clear: (gone) => setMsgs((x) => x.some(gone) ? x.filter((y) => !gone(y)) : x) })
+    return () => onError(null)
+  }, [])
   if (!msgs.length) return null
   return <div className="mx-auto my-1 flex max-h-[30vh] w-[640px] max-w-[90vw] flex-col gap-1 overflow-y-auto" role="alert">{[...msgs].reverse().map((m) =>
     <div key={m.id} className="flex items-start gap-2 rounded-md border border-rose-500/50 bg-rose-950 px-3 py-2 text-xs text-rose-200 shadow-xl">

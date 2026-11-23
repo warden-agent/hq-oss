@@ -75,14 +75,15 @@ export function clearStalled(ticketId: string): void { for (const k of ['fix_sta
 export function keepTestsFailed(t: Ticket, failed: Failed): void {
   run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
     `ticket:${t.id}`, 'tests_failed',
-    JSON.stringify({ test: failed.test, output: failed.output, earlier: failed.earlier, hung: !!failed.hung, unproven: !!failed.unproven, look: !!failed.look, review: !!failed.review }), now())
+    JSON.stringify({ test: failed.test, output: failed.output, earlier: failed.earlier, hung: !!failed.hung, unproven: !!failed.unproven, look: !!failed.look, review: !!failed.review,
+      asked: !!failed.asked, tester: !!failed.tester }), now())
 }
 /** That kept failure; `test` (the project's command) and a note stand in for it if it's gone. */
 export function testsFailed(t: Ticket, test: string | null): Failed {
   const kept = j<Partial<Failed> | null>(one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'tests_failed'", `ticket:${t.id}`)?.text ?? null, null)
   return { kind: 'fail', test: kept?.test ?? test ?? 'the tests', output: kept?.output ?? "(HQ doesn't have what they printed any more: run them to see.)",
     earlier: kept?.earlier ?? '', hung: kept?.hung ?? t.fixing === 'tests_hung', ...(kept?.unproven ? { unproven: true } : {}), ...(kept?.look ?? t.fixing === 'look' ? { look: true } : {}),
-    ...(kept?.review ?? t.fixing === 'review' ? { review: true } : {}) }
+    ...(kept?.review ?? t.fixing === 'review' ? { review: true } : {}), ...(kept?.asked ? { asked: true } : {}), ...(kept?.tester ? { tester: true } : {}) }
 }
 
 /** How the step that calls open_pr again ends. A ticket with acceptance criteria named a test for each when it finished: open_pr takes those again when
@@ -92,18 +93,22 @@ const again = (t: Ticket): string => criteriaOf(t).length ? ' (leave `tests` out
  *  that never finished is told as one: the engineer looks for what waits forever, not for a failure that wasn't printed (Bug 82). */
 export function fixTestsText(o: { t: Ticket; base: string; failed: Failed; launch?: { worktree: string } }): string {
   const { t, base, failed: r } = o
+  // `asked`: the user had HQ test it (hqcheck.ts, auto mode off) and sent it back: HQ merges nothing by itself then, so "HQ didn't merge it" would be untrue
+  const didnt = r.asked ? 'so the user sent it back to you' : "so HQ didn't merge it"
   const intro = o.launch ? `You are the engineer for ticket ${t.key} (${t.size}): ${t.title}. Its work is committed on branch ${t.branch}`
     + ` in your worktree ${o.launch.worktree}; call get_ticket for its spec and the handoff so far.\n\n` : ''
-  const what = r.review ? `${t.branch} merged with ${base} passes its tests, but a fresh reader of your changes found problems, so HQ didn't merge it. The reader saw only the`
+  const what = r.review ? `${t.branch} merged with ${base} passes its tests, but a fresh reader of your changes found problems, ${didnt}. The reader saw only the`
     + ` ticket's acceptance criteria, your changes against ${base} and what the tests printed.`
-    : r.look ? `${t.branch} merged with ${base} passes its tests, but the app has problems when HQ opens it with your ticket merged in, so HQ didn't merge it.`
-    : r.unproven ? `${t.branch} merged with ${base} passes \`${r.test}\`, but that run didn't run every test you named for the ticket's criteria, so HQ didn't merge it.`
+    : r.tester ? `${t.branch} merged with ${base} passes its tests, but HQ's UI tester found problems when it used the app in a browser, as a person would, with your`
+    + ` ticket merged in, ${didnt}.`
+    : r.look ? `${t.branch} merged with ${base} passes its tests, but the app has problems when HQ opens it with your ticket merged in, ${didnt}.`
+    : r.unproven ? `${t.branch} merged with ${base} passes \`${r.test}\`, but that run didn't run every test you named for the ticket's criteria, ${didnt}.`
     : r.hung ? `${t.branch} merged with ${base} never finished its tests: HQ stopped \`${r.test}\` after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)}`
-    + " minutes, so HQ didn't merge it. Something waits forever (a test, a server or a timer that never ends), maybe only next to what another ticket merged first."
-    + ' What it printed:' : `${t.branch} merged with ${base} fails its tests, so HQ didn't merge it. Another ticket may have merged first. \`${r.test}\` said:`
+    + ` minutes, ${didnt}. Something waits forever (a test, a server or a timer that never ends), maybe only next to what another ticket merged first.`
+    + ' What it printed:' : `${t.branch} merged with ${base} fails its tests, ${didnt}. Another ticket may have merged first. \`${r.test}\` said:`
   const steps = [`git merge --no-edit ${base} (merge, never rebase, never push).`, r.review
-    ? `Fix what the reader found, keeping your ticket's work and what is on ${base}. If a finding is wrong, say why in your handoff instead of changing the code: this read`
-      + ' happens once, and your next open_pr is merged on its tests. Then run the tests.'
+    ? `Fix what the reader found, keeping your ticket's work and what is on ${base}. If a finding is wrong, say why in your handoff instead of changing the code`
+      + `${r.asked ? '' : ': this read happens once, and your next open_pr is merged on its tests'}. Then run the tests.`
     : r.look
     ? `Fix what the report above shows, keeping your ticket's work and what is on ${base}. A real browser can't start in your session: go by the report, by what the`
       + ' app prints when you start it, and by what its server answers (curl). Then run the tests.'

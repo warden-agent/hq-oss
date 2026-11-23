@@ -17,7 +17,8 @@ import { ensureFresh } from './repos.ts'
 import { mergeBase } from './conflicts.ts'
 import { excludeHqFolders, listWorktrees, seedPackages } from './worktrees.ts'
 import { checkRecipe, commandRecipe, detectCommand, PREVIEW_PORTS, refusedWords, sameCommands, strayPorts, testPorts, type Recipe, type Refusal } from './apprun.ts'
-import { helperPorts, helperPortsHeld, PortTaken, previewSession, previewView, row, save, serial, startPreview, stopPreview } from './preview.ts'
+import { helperPorts, helperPortsHeld, PortTaken, previewSession, previewView, row, save, serial, startPreview, stopPreview,
+  stoppedByStop, takeRestart } from './preview.ts'
 import { killUnder, listenersUnder, pgidOf } from './procs.ts'
 import { sendMessage } from './delivery.ts'
 import { q } from './db.ts'
@@ -78,7 +79,7 @@ async function startOne(repoId: string, why: 'first' | 'fix', ticket: string | n
   const tk = triedTicket(repoId, ticket ?? (why === 'fix' ? cur?.ticket_id ?? null : null))
   if (live(cur?.helper_agent_id ?? null)) { if (tk) save(repoId, { helper_ticket_id: tk.id }); return previewView(repo0) } // already on it
   const repo = await ensureFresh(repoId)
-  const output = why === 'fix' && !reason ? await tmux.capturePane(previewSession(repoId), 80) : '' // refused steps never ran: no output of theirs
+  const output = why === 'fix' && !reason ? await tmux.paneOutput(previewSession(repoId), 80) : '' // refused steps never ran: no output of theirs
   if (cur?.helper_worktree) await removeWorktree(repo.path, cur.helper_worktree) // a "Not now" or a lost helper's
   if (repo.empty && !tk) { // Bug 67: a helper would spend tokens finding that out. A ticket to try has files of its own, even on an empty main (Bug 46)
     resolveKind(notice(repoId), null)
@@ -132,14 +133,15 @@ export async function launchWithoutRecipe(repoId: string, ticket: string | null 
 }
 
 /** The helper is done (or gone): stop it, stop its leftover test servers, delete its worktree. `state`/`note` are what the
- *  preview pane says next (null: nothing to say). */
-export async function finish(repoId: string, state: string | null, note: string | null): Promise<void> {
+ *  preview pane says next (null: nothing to say). `why`: for its Events tab, when the pane says nothing. */
+export async function finish(repoId: string, state: string | null, note: string | null, why: 'app_stopped' | null = null): Promise<void> {
   const p = row(repoId); const repo = getRepo(repoId); if (!p || !repo) return
+  if (p.helper_agent_id) answered.delete(p.helper_agent_id)
   const ticket = state === 'needs_ok' ? {} : { helper_ticket_id: null } // steps still to OK keep their ticket
   save(repoId, { helper_agent_id: null, helper_worktree: null, helper_state: state, helper_note: note, helper_ports: null, ...ticket })
   if (live(p.helper_agent_id)) await stopAgent(p.helper_agent_id!, 'launch helper done').catch(() => {})
   if (p.helper_worktree) await removeWorktree(repo.path, p.helper_worktree)
-  emit({ agentId: p.helper_agent_id, source: 'system', kind: 'launch.helper_done', payload: { repo: repo.name, state, note } })
+  emit({ agentId: p.helper_agent_id, source: 'system', kind: 'launch.helper_done', payload: { repo: repo.name, state, note, ...(why ? { why } : {}) } })
 }
 
 /** HQ's own scratch worktree: nothing in it is the user's, so it's removed even with changes, along with what still runs there. */
@@ -153,7 +155,7 @@ async function removeWorktree(repoPath: string, wt: string): Promise<void> {
 
 type Result = { ok: true; text: string } | { ok: false; text: string }
 /** save_launch: check the recipe, keep it as a draft for the user's OK (or run it at once when its commands are the ones they
- *  already OK'd), and tell the helper what happens next. */
+ *  already OK'd and heldBack finds nothing against it), and tell the helper what happens next. */
 export async function saveLaunch(agent: Agent, input: unknown): Promise<Result> {
   const gone = { ok: false, text: 'HQ is not waiting for start steps from you any more. Stop here.' } as const
   const repoId = repoOf(agent.id), p0 = repoId ? row(repoId) : undefined, repo = repoId ? getRepo(repoId) : undefined
@@ -174,12 +176,38 @@ export async function saveLaunch(agent: Agent, input: unknown): Promise<Result> 
   save(repoId, { draft_recipe: JSON.stringify(checked.recipe), helper_saves: saves })
   emit({ agentId: agent.id, source: 'system', kind: 'launch.saved', payload: { repo: repo.name, saves, recipe: checked.recipe } })
   if (sameCommands(parse(p.recipe), checked.recipe)) { // nothing new to OK (only the notes changed)
-    void approve(repoId).catch(() => {})
-    return { ok: true, text: 'Saved. These are the commands the user already OK\'d, so HQ runs them now. End your turn; HQ messages you the result.' }
+    const why = heldBack(repoId)
+    if (!why) {
+      void approve(repoId).catch(() => {})
+      return { ok: true, text: 'Saved. These are the commands the user already OK\'d, so HQ runs them now. End your turn; HQ messages you the result.' }
+    }
+    save(repoId, { helper_state: 'needs_ok', helper_note: `${HELD} ${why}.` })
+    tellUser(repoId, `${repo.name}: ${HELD} ${why}. OK them in the preview to run them.`)
+    return { ok: true, text: `Saved. These are the commands the user already OK'd, but HQ doesn't run them by itself now: ${why}. HQ asks the user to OK them `
+      + 'again. End your turn; if they run them, HQ messages you the result.' }
   }
-  save(repoId, { helper_state: 'needs_ok' })
+  save(repoId, { helper_state: 'needs_ok', helper_note: null })
   tellUser(repoId, `${repo.name}: Claude worked out how to start the app. Check its steps and OK them in the preview.`)
   return { ok: true, text: 'Saved. HQ is showing the user your commands for an OK. End your turn now; the result of the real run comes to you as a message.' }
+}
+
+/** What the user reads when a helper's save only repeats the steps they OK'd and HQ holds it for their OK (Bugs 300, 329). */
+const HELD = 'Claude saved the steps you OK\'d again, unchanged. HQ didn\'t start the app by itself:'
+/** Bugs 300, 329: when a helper saves the commands the user already OK'd, HQ runs them by itself only while that surprises no one: this app's run is
+ *  still on or ended by itself (crashed: "Ask Claude to fix it"), and no other project's app is on (one app at a time, PR #25). A stopped app may
+ *  have been stopped by the user after the OK, or for another app; the UI's own OK asks the one-app question first. Otherwise the steps wait for
+ *  the user's OK like new ones (why, in words; null: run them now). The owner's call: stopping the other app instead would go here. */
+export function heldBack(repoId: string): string | null {
+  const other = q<{ id: string }>("SELECT id FROM previews WHERE id != ? AND status IN ('starting', 'running')", repoId).map((x) => getRepo(x.id)).find(Boolean)
+  if (other) return `${other.name}'s app is running, and only one app runs at a time`
+  if ((row(repoId)?.status ?? 'stopped') === 'stopped') return 'it is stopped'
+  return null
+}
+/** Bugs 300, 329: a held draft only repeats the OK'd steps, so once its helper goes there is nothing new to OK: it is dropped and the steps on file
+ *  stay (else the top bar would keep asking to OK them). True when it was. */
+function dropRepeat(repoId: string): boolean {
+  const p = row(repoId); if (!p?.draft_recipe || !sameCommands(parse(p.recipe), parse(p.draft_recipe))) return false
+  save(repoId, { draft_recipe: null }); return true
 }
 
 /** Bug 226: a test server of the helper's on a port HQ didn't give it (nor one the recipe fixes) may have been another app answering, and holds a port
@@ -204,7 +232,7 @@ export async function approve(repoId: string): Promise<ReturnType<typeof preview
   if (!p.draft_recipe) throw new Error('No start steps are waiting for your OK.')
   resolveKind(notice(repoId), null)
   const helper = live(p.helper_agent_id)
-  save(repoId, { recipe: p.draft_recipe, draft_recipe: null, helper_state: helper ? 'trying' : null, helper_note: null })
+  save(repoId, { recipe: p.draft_recipe, draft_recipe: null, helper_state: helper ? 'trying' : null, helper_note: null, helper_run: null }) // its run is to come
   emit({ agentId: null, source: 'ui', kind: 'launch.approved', payload: { repo: repo.name } })
   void tryRun(repoId).catch((e) => emit({ agentId: null, source: 'system', kind: 'preview.error', payload: { repo: repo.name, error: String(e) } }))
   return previewView(repo)
@@ -214,7 +242,7 @@ export async function approve(repoId: string): Promise<ReturnType<typeof preview
 export async function dismiss(repoId: string): Promise<ReturnType<typeof previewView>> {
   const p = row(repoId), repo = getRepo(repoId); if (!p || !repo) throw new Error('unknown repo')
   resolveKind(notice(repoId), null)
-  await finish(repoId, p.draft_recipe ? 'needs_ok' : null, null)
+  await finish(repoId, !dropRepeat(repoId) && p.draft_recipe ? 'needs_ok' : null, null)
   return previewView(repo)
 }
 
@@ -227,21 +255,28 @@ async function tryRun(repoId: string): Promise<void> {
     const pane = await tmux.panePid(helper.tmux_session), group = pane ? await pgidOf(pane) : null // the helper itself stays
     await killUnder(p.helper_worktree, group ? [group] : [])
   }
-  const tk = triedTicket(repoId, p.helper_ticket_id), where = tk ? `${tk.key}'s version` : 'the user\'s checkout'
+  const tk = triedTicket(repoId, p.helper_ticket_id)
   let started: Awaited<ReturnType<typeof startPreview>>
-  try { started = await startPreview(repoId, 'the first run of the start steps you OK\'d', { ticket: tk?.id ?? null }) } catch (e) {
+  try { started = await startPreview(repoId, 'the first run of the start steps you OK\'d', { ticket: tk?.id ?? null, helperRun: true }) } catch (e) {
     if (e instanceof PortTaken) { // the user's own server, not a bad recipe: no save is used up, and the helper is done
       if (helper) sendMessage({ channel: 'dm', from: 'hq', to: helper.id, reason: 'fyi', body: `HQ didn't run it: ${e.message} That's the user's to sort out, not your steps. Stop here.` })
       await finish(repoId, 'port_taken', e.message); return
     }
     return tell(repoId, helper, `HQ couldn't start it: ${(e as Error).message}`)
   }
-  const end = Date.now() + RUN_WAIT_MS
+  return followRun(repoId, helper, started.started_at)
+}
+/** Waits for the run that started at `since` to answer, crash or time out (3 minutes from its start), and tells the helper how it went. */
+async function followRun(repoId: string, helper: Agent | undefined, since: number | null): Promise<void> {
+  const end = (since ?? Date.now()) + RUN_WAIT_MS
   let cur = row(repoId); if (!cur) return
-  while (cur.status === 'starting' && cur.started_at === started.started_at && Date.now() < end) { await sleep(1000); cur = row(repoId); if (!cur) return } // removed from HQ
-  if (cur.started_at !== started.started_at) return // restarted or stopped by someone else meanwhile: that run's outcome is theirs
-  const out = (await tmux.capturePane(previewSession(repoId), 60)).trimEnd().split('\n').slice(-40).join('\n')
+  const tk = triedTicket(repoId, cur.helper_ticket_id), where = tk ? `${tk.key}'s version` : 'the user\'s checkout'
+  while (cur.status === 'starting' && cur.started_at === since && Date.now() < end) { await sleep(1000); cur = row(repoId); if (!cur) return } // removed from HQ
+  if (since && stoppedByStop(repoId, since)) return stoppedRun(repoId, helper) // Bug 332: even if started again since
+  if (cur.started_at !== since) return // restarted or stopped by someone else meanwhile: that run's outcome is theirs
+  const out = (await tmux.paneOutput(previewSession(repoId), 60)).split('\n').slice(-40).join('\n') // its last lines, not the dead pane's blank ones (Bug 302)
   if (cur.status === 'running') {
+    if (helper && since) answered.set(helper.id, { since, recipe: cur.recipe }) // Bug 332: what launch_ok may confirm
     return tell(repoId, helper, `Real run on ${where}: the page answered at ${cur.url}. Last output:\n${out}\n\n`
       + 'If this looks right, call launch_ok. If the output shows an error or a missing setting, fix the steps and call save_launch again.')
   }
@@ -249,9 +284,21 @@ async function tryRun(repoId: string): Promise<void> {
   const what = cur.status === 'starting' ? `no page answered on port ${cur.port} within ${RUN_WAIT_MS / 60_000} minutes` : `it ${cur.detail ?? cur.status}`
   tell(repoId, helper, `Real run on ${where}: ${what}. Last output:\n${out}\n\nFix the steps and call save_launch again.`)
 }
+/** Bug 332: a Stop ended HQ's first run of the OK'd steps before it answered (the user's Stop, or the one-app dialog's, or a Clear). The user's Stop
+ *  wins: nothing showed the steps are wrong, so the helper isn't asked to fix them (it only saved the same ones again, and the OK card came back for
+ *  nothing). It goes, as after launch_ok, with nothing to say in the pane, and the OK'd steps stay for the next Launch; if they fail then, the App
+ *  tab's "Ask Claude to fix it" or ⚙ brings a helper back. */
+async function stoppedRun(repoId: string, helper: Agent | undefined): Promise<void> {
+  if (!helper || row(repoId)?.helper_agent_id !== helper.id || !live(helper.id)) return // as tell(): OK'd with no helper, or stopped meanwhile
+  await finish(repoId, null, null, 'app_stopped')
+}
+/** Bug 332: per helper, the run HQ told it answered ("call launch_ok") and the recipe it ran. Kept in memory, as tryRun's wait is. */
+const answered = new Map<string, { since: number; recipe: string | null }>()
+
 function tell(repoId: string, helper: Agent | undefined, body: string): void {
   if (!getRepo(repoId)) return
   if (!helper) return // OK'd from ⚙ after "Not now": the pane shows how it went
+  if (row(repoId)?.helper_agent_id !== helper.id || !live(helper.id)) return // stopped during the run (Bug 276): it isn't "working" again
   save(repoId, { helper_state: 'working' })
   sendMessage({ channel: 'dm', from: 'hq', to: helper.id, reason: 'fyi', body })
 }
@@ -261,9 +308,11 @@ export function launchOk(agent: Agent): Result {
   const repoId = repoOf(agent.id); if (!repoId) return { ok: false, text: 'HQ is not waiting on you any more. Stop here.' }
   const p = row(repoId)!
   if (p.helper_state === 'needs_ok' || p.draft_recipe) return { ok: false, text: 'Your last steps are still waiting for the user\'s OK. End your turn and wait.' }
-  if (!p.recipe || p.status !== 'running') return { ok: false, text: 'HQ has no working run of your steps yet. Save them with save_launch and wait for HQ\'s message.' }
+  // Bug 332: the page answered and HQ told the helper so, then a Stop ended that run: the user's Stop isn't the steps failing
+  const a = answered.get(agent.id), stopped = !!a && a.recipe === p.recipe && stoppedByStop(repoId, a.since)
+  if (!p.recipe || (p.status !== 'running' && !stopped)) return { ok: false, text: 'HQ has no working run of your steps yet. Save them with save_launch and wait for HQ\'s message.' }
   setTimeout(() => { void finish(repoId, null, null) }, 1500) // let this answer reach the session first
-  return { ok: true, text: 'Done. HQ ends this session now; do nothing else.' }
+  return { ok: true, text: `Done.${p.status !== 'running' ? ' The user stopped the app after it answered; HQ keeps your steps.' : ''} HQ ends this session now; do nothing else.` }
 }
 
 /** report_cant_start: the app can't run here (it needs Docker, a database server, a key). The user hears why, in its words. */
@@ -275,18 +324,42 @@ export function cantStart(agent: Agent, reason: string): Result {
   return { ok: true, text: 'Told the user. HQ ends this session now.' }
 }
 
-/** A helper that exited by itself or was lost: the repo stops waiting on it. */
-export function onAgentGone(agentId: string | null): void {
+/** Bug 351: on backend start (after the start-up leftover look, before resumeRestarts), a live helper still waiting to hear how HQ's first run of its
+ *  OK'd steps went: tryRun's wait was only in memory, so the helper was never told and the pane said "Running Claude's steps…" until Stop Claude.
+ *  A run that hadn't started, or that the last backend was in the middle of starting, starts again; a Stop that ended it (the last backend's, or the
+ *  one recoverPreviews finished) lets the helper go as Bug 332's does; else the run is followed again: still starting, it's watched until it answers,
+ *  crashes or times out; answered or crashed, the helper hears so at once. */
+export function resumeTries(): void {
+  for (const p of q<{ id: string }>("SELECT id FROM previews WHERE helper_state = 'trying' AND helper_agent_id IS NOT NULL")) {
+    const cur = row(p.id), helper = live(cur?.helper_agent_id ?? null), repo = getRepo(p.id); if (!cur || !helper || !repo) continue // recoverHelpers ended it
+    const again = takeRestart(p.id) || !cur.helper_run // its run hadn't started, or the last backend was starting it
+    emit({ agentId: helper.id, source: 'system', kind: 'launch.run_resumed', payload: { repo: repo.name, status: cur.status, again } })
+    const fail = (e: unknown) => emit({ agentId: null, source: 'system', kind: 'preview.error', payload: { repo: repo.name, error: String(e) } })
+    if (again) { void tryRun(p.id).catch(fail); continue }
+    if (cur.status === 'stopped' && !cur.detail) { void stoppedRun(p.id, helper).catch(fail); continue } // a Stop's row says nothing more
+    void followRun(p.id, helper, cur.started_at).catch(fail)
+  }
+}
+
+/** A helper that exited by itself, was lost, or was stopped outside this file (Bug 276: its Agent tab's Stop): the repo stops
+ *  waiting on it, its test ports go back and its worktree goes. `stoppedWhy`: the stop's reason, when it was stopped. finish()
+ *  clears the row before it stops a helper itself, so those stops (and a stray's) don't come back here. */
+export function onAgentGone(agentId: string | null, stoppedWhy: string | null = null): void {
   const repoId = agentId ? repoOf(agentId) : null; if (!repoId) return
+  if (dropRepeat(repoId)) { void finish(repoId, null, null); return } // it only repeated the OK'd steps: nothing to wait for
   const p = row(repoId)!
-  void finish(repoId, p.draft_recipe ? 'needs_ok' : 'failed', p.draft_recipe ? null : 'Claude stopped before it finished.')
+  if (p.draft_recipe) { void finish(repoId, 'needs_ok', null); return } // its steps still wait for the user's OK, as after "Not now"
+  // Bug 299 (the owner's call): the user's own Stop leaves no banner, as the pane's "Stop Claude" doesn't; only a helper that ended by itself says so
+  if (stoppedWhy === 'user') { void finish(repoId, null, null); return }
+  void finish(repoId, 'failed', 'Claude stopped before it finished.')
 }
 
 /** On backend start, after agents are recovered: helpers that didn't survive the restart are finished, and helper worktrees
  *  nobody owns (HQ stopped mid-job) are removed. */
 export async function recoverHelpers(repos: Repo[]): Promise<void> {
   for (const p of q<{ id: string; helper_agent_id: string }>('SELECT id, helper_agent_id FROM previews WHERE helper_agent_id IS NOT NULL')) {
-    if (!live(p.helper_agent_id)) await finish(p.id, row(p.id)?.draft_recipe ? 'needs_ok' : 'failed', 'HQ restarted while Claude was working it out.')
+    if (!live(p.helper_agent_id) && dropRepeat(p.id)) await finish(p.id, null, null) // it only repeated the OK'd steps
+    else if (!live(p.helper_agent_id)) await finish(p.id, row(p.id)?.draft_recipe ? 'needs_ok' : 'failed', 'HQ restarted while Claude was working it out.')
   }
   for (const repo of repos) await sweepStrays(repo)
 }

@@ -1,21 +1,22 @@
 // Fresh start: an agent stops, leaves a handoff note, and its session ends; a new session takes over from the note, at once or
 // when the user presses Resume. Asked by a click (interrupts at once), at the context limit (after the current step), for every
-// agent of a repo the user switches away from (parked until they come back), or when the user clears the repo (clear.ts: an
-// engineer's note goes to the archive and nobody takes over; the project's TPM comes back after the clear, Bug 52).
+// agent of a repo the user switches away from ('switch': parked until they come back), or when the user clears the repo (clear.ts: an
+// engineer's note goes to the archive and nobody takes over; the project's TPM comes back after the clear, Bug 52). Bug 308: the
+// request, the Events lines (eventtext.ts) and the box (api.ts noteLine) say which of these it is: only some are a fresh start.
 import { CHOICES, DEFAULTS, ENGINEER_LIMIT, NOTE_CAP } from './config.ts'
 import { getSetting, now, one, q, run } from './db.ts'
 import { emit, patch } from './events.ts'
 import { attention, resolveKind } from './attention.ts'
 import { getAgent, liveAgents, onDialog, stopAgent, update, type Agent } from './agents.ts'
-import { interruptAndType, sendMessage } from './delivery.ts'
-import { autoOn, features, getFeature, getRepo, getTicket, repoOfAgent, setTicket, tickets, type Feature } from './records.ts'
+import { interruptAndType, sendMessage, type Message } from './delivery.ts'
+import { autoOn, features, getFeature, getRepo, getTicket, repoOfAgent, setTicket, tickets } from './records.ts'
 import { planWaitsWhy } from './checks.ts'
 import { agentNote, HQ_NOTE_HEAD, noteScope, readNote, saveNote } from './notes.ts'
 import { resumeEngineer } from './tickets.ts'
 import { restartTpm } from './tpm.ts'
 import { maybeFinishClear } from './clear.ts'
 
-export type Then = 'continue' | 'park' | 'clear'
+export type Then = 'continue' | 'park' | 'switch' | 'clear'
 const RESUMABLE = ['planning', 'implementing', 'awaiting_answer', 'resolving']
 const TIMEOUT_MS = Number(process.env.HQ_FRESH_START_TIMEOUT_S ?? 180) * 1000 // after the request reached the agent
 const NEVER_MS = Number(process.env.HQ_FRESH_START_NEVER_S ?? 900) * 1000 // the request never reached it
@@ -43,11 +44,22 @@ export function freshStartBlocker(a: Agent): string | null {
   return null
 }
 
+/** Bug 308: why this session ends and what follows its note, in the request's first words. Only 'continue' and 'park' are a fresh start: a
+ *  switch of projects waits for the user to come back, and a Clear ends an engineer's work with nobody taking over. */
+function whyEnding(a: Agent, then: Then): string {
+  if (then === 'clear') return a.role === 'tpm' ? 'The user is clearing this project\'s board from HQ: every ticket goes, and this session is ending. '
+    + 'A new TPM session starts after the clear with your note and what has been built, so it keeps the project\'s memory but not the old tickets.'
+    : 'The user is clearing this project from HQ: this session is ending, and no new session takes over now. '
+    + 'Your note is archived for whoever picks the work up later, so make it stand on its own.'
+  if (then === 'switch') return 'The user switched to another project in HQ: this session is ending, and a new one takes over from your note '
+    + 'when they come back to this one.'
+  return `Fresh start: this session is ending so that a new one can take over with a clean context${then === 'park' ? ' when the user presses Resume' : ''}.`
+}
 function requestText(a: Agent, interrupted: boolean, then: Then): string {
   const cap = NOTE_CAP[a.role as 'tpm' | 'engineer'].toLocaleString('en-US')
-  const head = 'Fresh start: this session is ending so that a new one can take over with a clean context. Stop what you are doing now. '
-    + "Don't finish the step, run more commands, edit files or commit. "
-    + `Call write_handoff_note once with a note of at most ${cap} characters for the ${a.role === 'tpm' ? 'TPM' : 'engineer'} who takes over, under these headings:\n`
+  const reader = then === 'clear' && a.role !== 'tpm' ? 'whoever picks the work up later' : `the ${a.role === 'tpm' ? 'TPM' : 'engineer'} who takes over`
+  const head = `${whyEnding(a, then)} Stop what you are doing now. Don't finish the step, run more commands, edit files or commit. `
+    + `Call write_handoff_note once with a note of at most ${cap} characters for ${reader}, under these headings:\n`
   const body = a.role === 'tpm' && then === 'clear'
     ? ['## What the user wants from this project (in their words)', '## Decisions so far', '## Watch out (things the next TPM would get wrong)',
       "Don't list tickets or what's in flight: the user is clearing the board. HQ gives the next TPM what has been built."].join('\n')
@@ -56,15 +68,16 @@ function requestText(a: Agent, interrupted: boolean, then: Then): string {
       "Don't list tickets or their statuses: HQ gives the next TPM those."].join('\n')
     : ['## Where I stopped (what you were in the middle of; any half-edited file; are the tests passing or failing)', '## Done', '## Left to do',
       '## Watch out (quirks of this code, approaches that failed, design intent)', "Don't list changed files: HQ gives the next engineer the git status."].join('\n')
-  const why = interrupted ? 'HQ interrupted your last step for this; nobody rejected it, so don\'t note it as rejected.\n' : ''
-  const cleared = then !== 'clear' ? '' : a.role === 'tpm' ? 'The user is clearing this project\'s board from HQ: every ticket goes. A new TPM session '
-    + 'starts after the clear with your note and what has been built, so it keeps the project\'s memory but not the old tickets.\n'
-    : 'The user is clearing this project from HQ: no new session takes over now. Your note is archived for whoever picks the work up later, so make it stand on its own.\n'
-  return `${why}${cleared}${head}${body}\nShort bullets. After it is saved, do nothing else: HQ ends this session.`
+  const why = interrupted ? INTERRUPTED : ''
+  return `${why}${head}${body}\nShort bullets. After it is saved, do nothing else: HQ ends this session.`
 }
+const INTERRUPTED = 'HQ interrupted your last step for this; nobody rejected it, so don\'t note it as rejected.\n'
+/** The first words of a request that replaces one already in the agent's terminal (Bug 338). */
+const REPLACES = 'This replaces HQ\'s earlier request for your handoff note: what happens after it has changed.\n'
 
 /** Asks `agentId` for its handoff note. `now` interrupts what it is doing; `after_turn` waits for the current step to end.
- *  `then`: a new session takes over as soon as the note is in (continue), or the work waits for Resume (park). */
+ *  `then`: a new session takes over as soon as the note is in (continue), the work waits for Resume (park) or for the user to come back to the
+ *  project (switch), or the project is being cleared (clear). */
 export async function freshStart(agentId: string, o: { how: 'now' | 'after_turn'; then: Then }): Promise<void> {
   const a = getAgent(agentId); if (!a) throw new Error('unknown agent')
   const why = freshStartBlocker(a); if (why) throw new Error(why)
@@ -72,7 +85,44 @@ export async function freshStart(agentId: string, o: { how: 'now' | 'after_turn'
   const m = sendMessage({ repoId: a.repo_id, featureId: a.feature_id, channel: 'dm', from: 'hq', to: a.id, reason: 'fresh_start', body: requestText(a, o.how === 'now', o.then) })
   update(a.id, { fresh_start_msg: m.id })
   if (o.how === 'now') { update(a.id, { takeover_locked_until: 0 }); await interruptAndType(a, m) } // after_turn: the mod delivers it
-  emit({ agentId: a.id, source: 'system', kind: 'fresh_start.requested', payload: { how: o.how, then: o.then } })
+  emit({ agentId: a.id, source: 'system', kind: 'fresh_start.requested', payload: { how: o.how, then: o.then, role: a.role } }) // role: Bug 308's words
+}
+
+/** Bug 338: an open fresh start now ends another way (the user clears the project while it writes its note): its `then` changes, and so
+ *  do the request's words (a TPM's note for a Clear has its own headings). A request not handed out yet is rewritten. One already in its
+ *  terminal is replaced by a new one, typed the same way (Escape, then the line), unless the note is in or its session has ended. On a
+ *  dialog nothing is typed: the new request waits for the mod, like an `after_turn` one. Only the current request is ever handed out. */
+export async function retarget(agentId: string, then: Then): Promise<void> {
+  const a = getAgent(agentId); if (!a?.fresh_start_at || a.fresh_start_then === then) return
+  update(a.id, { fresh_start_then: then }); await retell(a.id)
+}
+/** Gives an agent writing its note the request for the `fresh_start_then` it has now (retarget, or parkRepo, which marks first and types after). */
+async function retell(agentId: string): Promise<void> {
+  const a = getAgent(agentId); if (!a?.fresh_start_at) return
+  const then = thenOf(a)
+  const old = a.fresh_start_msg ? one<Message>('SELECT * FROM messages WHERE id = ?', a.fresh_start_msg) : undefined
+  const told = { then, role: a.role, again: true } // Events: "Asked again for its handoff note: …"
+  if (old && !old.delivered_at) { // its first words stay: whether it replaces one in its terminal, whether HQ interrupted it
+    const lead = old.body.startsWith(REPLACES) ? REPLACES : '', body = `${lead}${requestText(a, old.body.startsWith(INTERRUPTED, lead.length), then)}`
+    run('UPDATE messages SET body = ? WHERE id = ? AND delivered_at IS NULL', body, old.id); patch('message', old.id, { body })
+    emit({ agentId: a.id, source: 'system', kind: 'fresh_start.requested', payload: { how: 'after_turn', ...told } }); return
+  }
+  if (a.status === 'exited' || noteIn(a)) return // the sweep writes HQ's note / completeFreshStart ends it: nothing more to ask
+  const m = sendMessage({ repoId: a.repo_id, featureId: a.feature_id, channel: 'dm', from: 'hq', to: a.id, reason: 'fresh_start',
+    body: `${REPLACES}${requestText(a, true, then)}` })
+  update(a.id, { fresh_start_msg: m.id }) // the sweep's time limit counts from this one; the old one is never handed out again (delivery.ts)
+  const typed = !onDialog(a) // Enter on a dialog would pick its highlighted option (freshStartBlocker)
+  if (typed) {
+    update(a.id, { takeover_locked_until: 0 })
+    // its terminal gone: no throw into the Clear that asked; the agent ends, and the sweep writes HQ's note
+    await interruptAndType(a, m).catch((e) => emit({ agentId: a.id, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
+  }
+  emit({ agentId: a.id, source: 'system', kind: 'fresh_start.requested', payload: { how: typed ? 'now' : 'after_turn', ...told } })
+}
+/** Whether the agent's note is in since its fresh start was asked for. */
+function noteIn(a: Agent): boolean {
+  const scope = noteScope(a); if (!scope || !a.fresh_start_at) return false
+  return (one<{ updated_at: number }>("SELECT updated_at FROM docs WHERE scope = ? AND key = 'note'", scope)?.updated_at ?? 0) >= a.fresh_start_at
 }
 
 const finishing = new Set<string>()
@@ -80,24 +130,38 @@ const finishing = new Set<string>()
 export async function completeFreshStart(agentId: string, by: 'note' | 'fallback', why = ''): Promise<void> {
   const a = getAgent(agentId); if (!a?.fresh_start_at || finishing.has(agentId)) return
   finishing.add(agentId)
-  const then: Then = a.fresh_start_then === 'park' || a.fresh_start_then === 'clear' ? a.fresh_start_then : 'continue'
+  let then = thenOf(a)
   try {
     const kept = then === 'clear' && agentNote(noteScope(a) ?? '') // a Clear archives a real note from before rather than HQ's (Bug 73), not HQ's old one (Bug 196)
     if (by === 'fallback' && !kept) saveNote(a, fallbackNote(a, why))
-    const endedWhy = then === 'clear' ? 'cleared' : 'fresh_start' // what the Agents menu says it ended for (Bug 122), also when its session had already ended
+    // what the Agents menu says it ended for (Bug 122), also when its session had already ended; a switch parks its work (Bug 308)
+    let endedWhy = why_(then)
     if (a.status !== 'exited') await stopAgent(a.id, endedWhy)
+    // Bug 350: the user came back to the project (or left it) while its session ended: a switch's parking and a fresh start's new session
+    // swap (resumeRepo, parkRepo). Only those two: a Clear's note was settled above.
+    const after = thenOf(getAgent(a.id) ?? a); if (after !== then && SWAPS.includes(then) && SWAPS.includes(after)) { then = after; endedWhy = why_(then) }
     update(a.id, { fresh_start_at: null, fresh_start_then: null, fresh_start_msg: null, ended_why: endedWhy })
     for (const kind of ['context_high', 'stuck', 'agent_exited', 'engineer_exited']) resolveKind(kind, a.id)
-    emit({ agentId: a.id, source: 'system', kind: 'fresh_start.done', payload: { by, then, why } })
+    emit({ agentId: a.id, source: 'system', kind: 'fresh_start.done', payload: { by, then, why, role: a.role } })
     if (then === 'clear') { const repoId = repoOfAgent(a); if (repoId) void maybeFinishClear(repoId).catch(() => {}); return }
-    if (then === 'park') return park(a)
-    try { if (a.role === 'tpm') await restartTpm(a.repo_id!, { why: 'fresh_start' }); else await resumeEngineer(a.ticket_id!, { replace: true }) } catch (e) {
+    if (then === 'park' || then === 'switch') return park(a)
+    const repoId = repoOfAgent(a) ?? '', before = moves.get(repoId)?.n // Bug 339: a switch away while the new session starts parks it after all
+    try {
+      const next = a.role === 'tpm' ? await restartTpm(a.repo_id!, { why: 'fresh_start' }) : await resumeEngineer(a.ticket_id!, { replace: true })
+      const m = moves.get(repoId)
+      if (m?.away && m.n !== before) {
+        await parkStarted(next).catch((e) => emit({ agentId: next.id, source: 'system', kind: 'backend.error', payload: { server: 'park', error: String(e) } }))
+      }
+    } catch (e) {
       park(a)
       attention('fresh_start_failed', `${name(a)} saved its note, but the new session didn't start: ${(e as Error).message} Press Resume to try again.`,
         { agentId: a.id, ticketId: a.ticket_id })
     }
   } finally { finishing.delete(agentId) }
 }
+const thenOf = (a: Agent): Then => (['park', 'switch', 'clear'] as const).find((x) => x === a.fresh_start_then) ?? 'continue'
+const SWAPS: Then[] = ['switch', 'continue']
+const why_ = (then: Then): string => then === 'clear' ? 'cleared' : then === 'switch' ? 'parked' : 'fresh_start'
 function park(a: Agent): void {
   if (a.role === 'engineer' && a.ticket_id) setTicket(a.ticket_id, { parked_at: now() })
   else if (a.role === 'tpm' && a.repo_id) { const t = now(); run('UPDATE repos SET tpm_parked_at = ? WHERE id = ?', t, a.repo_id); patch('repo', a.repo_id, { tpm_parked_at: t }) }
@@ -131,9 +195,7 @@ export function checkContext(a: Agent, tokens: number | null | undefined): void 
  *  died, never answered within the timeout after the request reached them, or never got the request at all. */
 export function sweepFreshStarts(): void {
   for (const a of q<Agent>('SELECT * FROM agents WHERE fresh_start_at IS NOT NULL')) {
-    const scope = noteScope(a)
-    const noted = scope ? one<{ updated_at: number }>("SELECT updated_at FROM docs WHERE scope = ? AND key = 'note'", scope)?.updated_at ?? 0 : 0
-    if (noted >= a.fresh_start_at!) { void completeFreshStart(a.id, 'note'); continue }
+    if (noteIn(a)) { void completeFreshStart(a.id, 'note'); continue }
     if (a.status === 'exited') { void completeFreshStart(a.id, 'fallback', 'its session ended first'); continue }
     const acked = a.fresh_start_msg ? one<{ ack_at: number | null }>('SELECT ack_at FROM messages WHERE id = ?', a.fresh_start_msg)?.ack_at ?? null : null
     if (acked && now() - acked > TIMEOUT_MS) void completeFreshStart(a.id, 'fallback', `none came within ${Math.round(TIMEOUT_MS / 60000)} minutes`)
@@ -152,13 +214,23 @@ export const inRepo = (repoId: string): Set<string> => new Set(features().filter
 const workers = (repoId: string): Agent[] => liveAgents().filter((x) => (x.role === 'tpm' || x.role === 'engineer') && repoOfAgent(x) === repoId)
 /** Switching away from a repo: every TPM and engineer in it leaves a note and stops, parked until the user comes back. Engineers
  *  whose plan waits for the user's review stay (they're idle and their context isn't growing). */
-export async function parkRepo(repoId: string): Promise<{ parked: string[]; left: string[]; stopped: string[] }> {
+export const parkRepo = (repoId: string): Promise<{ parked: string[]; left: string[]; stopped: string[] }> => inTurn(repoId, () => parkNow(repoId))
+async function parkNow(repoId: string): Promise<{ parked: string[]; left: string[]; stopped: string[] }> {
   const parked: string[] = [], left: string[] = [], stopped: string[] = []
   if (autoOn(repoId)) return { parked, left, stopped } // a project on auto keeps running while the user looks elsewhere
-  for (const a of workers(repoId)) {
+  // Already writing a note: a fresh start whose new session would start at once waits for the user to come back instead (Bug 339). Marked
+  // for all of them first, with no wait in between: asking the others takes a few seconds each, and a note in meanwhile must find it
+  // (its words follow below, retell). A Clear's stays a Clear's, and one waiting for Resume is parked anyway.
+  const moved = new Set(workers(repoId).filter((a) => a.fresh_start_at && a.fresh_start_then === 'continue').map((a) => a.id))
+  for (const id of moved) update(id, { fresh_start_then: 'switch' })
+  move(repoId, true)
+  for (const { id } of workers(repoId)) {
+    const a = getAgent(id); if (!a) continue // read again: the one before can take a while (a note may be in, its session ended and parked)
+    if (moved.has(a.id)) { if (a.fresh_start_at && a.fresh_start_then === 'switch') await retell(a.id); parked.push(name(a)); continue }
+    if (a.status === 'exited') continue
     if (a.fresh_start_at) { parked.push(name(a)); continue }
     const why = freshStartBlocker(a); if (why) { left.push(`${name(a)}: ${why}`); continue }
-    await freshStart(a.id, { how: 'now', then: 'park' }); parked.push(name(a))
+    await freshStart(a.id, { how: 'now', then: 'switch' }); parked.push(name(a))
   }
   emit({ agentId: null, source: 'ui', kind: 'repo.parked', payload: { repo: repoId, parked, left, stopped } })
   return { parked, left, stopped }
@@ -172,10 +244,40 @@ export async function freshStartAll(repoId: string, then: Then): Promise<{ start
   }
   return { started, skipped }
 }
-/** Coming back to a repo: parked TPMs start again from their notes, and parked engineers up to the parallel limit. */
-export async function resumeRepo(repoId: string): Promise<{ resumed: string[]; waiting: string[] }> {
+/** Bug 350: a repo's park and resume run one after the other, in the order asked. A switch away asks each agent in turn for its note
+ *  (a few seconds each), so a switch straight back used to look for the parked work while the park was still asking. */
+const turns = new Map<string, Promise<unknown>>()
+/** Bug 339: each park and resume of a repo, counted, and whether the last was a park: a fresh start's new session that was still starting
+ *  when a switch away came is parked after all (completeFreshStart). In memory: a restart ends every start in flight. */
+const moves = new Map<string, { n: number; away: boolean }>()
+const move = (repoId: string, away: boolean): void => { moves.set(repoId, { n: (moves.get(repoId)?.n ?? 0) + 1, away }) }
+/** The new session `next` of a fresh start began starting before the user switched away from its project: it stops at once and its work is
+ *  parked, from the note the session before wrote. Unless the switch has asked it for a note of its own already. */
+async function parkStarted(next: Agent): Promise<void> {
+  const a = getAgent(next.id); if (!a || a.status === 'exited' || a.fresh_start_at) return
+  await stopAgent(a.id, 'parked'); park(a)
+}
+function inTurn<T>(repoId: string, fn: () => Promise<T>): Promise<T> {
+  const p = (turns.get(repoId) ?? Promise.resolve()).catch(() => {}).then(fn)
+  turns.set(repoId, p); void p.catch(() => {}).finally(() => { if (turns.get(repoId) === p) turns.delete(repoId) })
+  return p
+}
+/** Agents of the repo writing the note a switch away asked for (Bug 350), also those whose session has ended since (the sweep writes
+ *  HQ's note for them). */
+export const switchNotes = (repoId: string): Agent[] => q<Agent>("SELECT * FROM agents WHERE fresh_start_at IS NOT NULL AND fresh_start_then = 'switch'")
+  .filter((a) => repoOfAgent(a) === repoId)
+/** Coming back to a repo: parked TPMs start again from their notes, and parked engineers up to the parallel limit. An agent still
+ *  writing the switch's note (the user came straight back, Bug 350) is told a new session takes over from it as soon as it's in: a
+ *  fresh start's "continue", in its terminal too (retarget). Parking it there and then would leave the work parked with nobody to resume it. */
+export const resumeRepo = (repoId: string): Promise<{ resumed: string[]; waiting: string[] }> => inTurn(repoId, () => resumeNow(repoId))
+async function resumeNow(repoId: string): Promise<{ resumed: string[]; waiting: string[] }> {
   const resumed: string[] = [], waiting: string[] = []
+  move(repoId, false)
   if (getRepo(repoId)?.clearing_at) return { resumed, waiting } // its work is being archived, not picked up
+  for (const a of switchNotes(repoId)) { // read again: the one before can take a while, and a Clear's request stays a Clear's
+    if (getAgent(a.id)?.fresh_start_then !== 'switch') continue
+    await retarget(a.id, 'continue'); resumed.push(`${name(a)} (from its note)`)
+  }
   if (getRepo(repoId)?.tpm_parked_at) {
     try { await restartTpm(repoId, { why: 'resume' }); resumed.push('TPM') } catch (e) { waiting.push(`TPM: ${(e as Error).message}`) }
   }

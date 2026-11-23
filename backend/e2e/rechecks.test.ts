@@ -44,14 +44,19 @@ if ! go after; then exec '${tmux}' "$@"; fi
 `, { mode: 0o755 })
   // the frozen-run check's \`ps\` (bgruns.ts PS_ARGS): with \`after.ps\` there, the next one runs and then waits until the test lets it go
   fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/sh
-if [ "$*" = "-axo pid=,ppid=,pgid=,etime=,time=" ] && mv '${flags}/after.ps' '${flags}/taken.ps' 2>/dev/null; then
+if [ "$*" = "-axo pid=,ppid=,pgid=,time=,lstart=" ] && mv '${flags}/after.ps' '${flags}/taken.ps' 2>/dev/null; then
   '${ps}' "$@"; s=$?; : > '${flags}/held.after.ps'; while [ -e '${flags}/taken.ps' ]; do sleep 0.05; done; exit $s
 fi
 exec '${ps}' "$@"
 `, { mode: 0o755 })
-  hq = await startHq({ env: { PATH: `${bin}:${process.env.PATH}`, HQ_STUCK_TICK_S: '1', HQ_IDLE_FIX_S: '2', HQ_FAKE_IDLE_SCREEN: '1' } })
-  await hq.api('settings', { key: 'concurrency_cap', value: 20 }); await hq.api('settings', { key: 'bg_stall_min', value: 0.1 }) // 6 s
+  hq = await start()
 })
+/** A test HQ that looks at its agents every second, through the stand-in `tmux` and `ps`. */
+async function start(env: Record<string, string> = {}): Promise<Hq> {
+  const h = await startHq({ env: { PATH: `${bin}:${process.env.PATH}`, HQ_STUCK_TICK_S: '1', ...env } })
+  await h.api('settings', { key: 'concurrency_cap', value: 20 }); await h.api('settings', { key: 'bg_stall_min', value: 0.1 }) // 6 s
+  return h
+}
 after(async () => {
   fs.rmSync(flags, { recursive: true, force: true }); for (const p of pids) try { process.kill(-p, 'SIGKILL') } catch { /* gone */ }
   await hq?.stop(); fs.rmSync(bin, { recursive: true, force: true })
@@ -90,6 +95,19 @@ async function stayedStopped(a: any): Promise<string[]> {
   assert.equal(ks.filter((k) => k === 'agent.stopped').length, 1); assert.deepEqual(ks.filter((k) => k === 'agent.missing' || k === 'agent.lost'), [], ks.join(' '))
   assert.deepEqual(await alerts(a, 'agent_exited'), []); return ks
 }
+/** Bug 327: HQ is stopping `a` right now (Bug 104): the stop's `kill-session` waits, so the agent is not exited yet, until the returned
+ *  function lets it go and the stop ends. A look that goes on with the agent it read before its wait, instead of reading it again, acts on
+ *  this one: nothing else stops it then (a stop that has ended has resolved the agent's notices, and those notices refuse an ended agent). */
+async function stopping(a: any): Promise<() => Promise<void>> {
+  hold('before', 'kill-session', a); const res = hq.api(`agents/${a.id}/stop`, {})
+  await waitFor('the stop to reach its terminal', () => held('before', 'kill-session', a), 15_000)
+  return async () => { letGo('before', 'kill-session', a); assert.equal((await res).status, 200); assert.equal((await agentOf(a)).status, 'exited') }
+}
+/** Bug 327: what the stand-in `tmux` was asked about `a`'s terminal after HQ's stop killed it. A look that read the agent again leaves it alone. */
+function asksAfterStop(a: any): string[] {
+  const ls = fs.readFileSync(log, 'utf8').split('\n'), i = ls.lastIndexOf(`kill-session.${a.tmux_session}`); assert.ok(i >= 0, 'the stop killed its terminal')
+  return ls.slice(i + 1).filter((l) => l.endsWith(`.${a.tmux_session}`))
+}
 
 /** An agent with a dialog open, answered with no hook (denied, say: Bug 62): its status file says it's idle. The first look that finds the
  *  dialog gone goes through; the second, the one that clears it, waits in `tmux`, and `during` runs while it waits. */
@@ -99,13 +117,23 @@ async function secondDialogLook(a: any, during: () => Promise<void>): Promise<vo
   try { await waitFor('the second look at its screen', () => held('before', 'capture-visible', a), 15_000); await during() } finally { letGo('before', 'capture-visible', a) }
 }
 
-test('Bug 138: an agent HQ stops while the dialog check looks at its screen stays stopped', async () => {
-  const a = await tpm(), next = await tpm()
-  await secondDialogLook(a, () => stop(a))
-  await movedOn(next)
-  const ks = await stayedStopped(a); assert.ok(!ks.includes('agent.dialog_cleared'), ks.join(' '))
-  assert.equal((await agentOf(next)).status, 'working')
-})
+// Bug 327: stopped, the look's dialog notices went with it (clearDialogs reads them again); still being stopped, only the look's own re-read
+// (stuck.ts dialogSweep, `live`) keeps it from clearing the dialog and setting the agent idle under the stop.
+const hasStopped = { stopped: 'has stopped', stopping: 'is still stopping' } as const
+for (const how of ['stopped', 'stopping'] as const) {
+  test(`Bug 138: an agent HQ ${hasStopped[how]} when the dialog check's look at its screen ends stays stopped`, async () => {
+    const a = await tpm(), next = await tpm()
+    let end = async () => {}
+    try {
+      await secondDialogLook(a, async () => { if (how === 'stopped') await stop(a); else end = await stopping(a) })
+      await movedOn(next)
+      if (how !== 'stopped') { assert.equal((await agentOf(a)).status, 'blocked'); assert.equal((await alerts(a, 'dialog')).length, 1, 'the look left its dialog alone') }
+    } finally { await end() }
+    const ks = await stayedStopped(a); assert.ok(!ks.includes('agent.dialog_cleared'), ks.join(' '))
+    if (how === 'stopped') assert.deepEqual(asksAfterStop(a), [])
+    assert.equal((await agentOf(next)).status, 'working') // and only that one: nothing in this HQ sets a quiet agent idle (Bug 326)
+  })
+}
 
 for (const [what, words] of [['a new dialog', 'Allow that as well?'], ['the same dialog again', 'Allow this?']]) {
   test(`Bug 151: ${what} opening while the check looks at the screen is not cleared, and the agent stays blocked`, async () => {
@@ -121,7 +149,10 @@ for (const [what, words] of [['a new dialog', 'Allow that as well?'], ['the same
   })
 }
 
-test('Bug 138: an engineer HQ stops while the check runs `ps` for its frozen run gets no new "frozen" notice', async () => {
+// Bug 327: stopped, attention() refuses a notice for an ended agent (Bug 153); still being stopped, after the user dismissed the notice, only the
+// re-read after `ps` (stuck.ts runSweep) keeps it from coming back until the stop ends.
+for (const how of ['stopped', 'stopping'] as const) test(`Bug 138: an engineer HQ ${hasStopped[how]} when the check's \`ps\` for its frozen run ends gets \
+no new "frozen" notice`, async () => {
   const eng = await engineer(), next = await tpm()
   // what a real engineer did (bgruns.test.ts): a test run with a time limit that Claude Code moved to the background, then the turn ended
   const use = 'toolu_frozen', command = 'npm run test-backend', input = { command, timeout: 600000 }
@@ -132,13 +163,22 @@ test('Bug 138: an engineer HQ stops while the check runs `ps` for its frozen run
     tool_response: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'btfrozen', timedOutAfterMs: 600000 } })
   await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'The run is still going.' })
   await waitFor('the frozen run notice', async () => (await alerts(eng, 'bg_stalled')).length > 0, 30_000)
-  fs.writeFileSync(path.join(flags, 'after.ps'), '')
+  fs.rmSync(path.join(flags, 'held.after.ps'), { force: true }); fs.writeFileSync(path.join(flags, 'after.ps'), '')
+  let end = async () => {}
   try {
-    await waitFor('the check to run ps', () => fs.existsSync(path.join(flags, 'held.after.ps')), 15_000)
-    await stop(eng); assert.deepEqual(await alerts(eng, 'bg_stalled'), [], 'the stop cleared it')
-  } finally { for (const f of ['after.ps', 'taken.ps']) fs.rmSync(path.join(flags, f), { force: true }) }
-  await movedOn(next)
-  assert.deepEqual(await alerts(eng, 'bg_stalled'), []); const ks = await stayedStopped(eng); assert.ok(!ks.includes('bg.stop_failed'))
+    try {
+      await waitFor('the check to run ps', () => fs.existsSync(path.join(flags, 'held.after.ps')), 15_000)
+      if (how === 'stopped') { await stop(eng); assert.deepEqual(await alerts(eng, 'bg_stalled'), [], 'the stop cleared it') } else {
+        const [open] = await alerts(eng, 'bg_stalled'); assert.equal((await hq.api(`attention/${open.id}/resolve`, {})).status, 200) // the user dismissed it
+        end = await stopping(eng)
+      }
+    } finally { for (const f of ['after.ps', 'taken.ps']) fs.rmSync(path.join(flags, f), { force: true }) }
+    await movedOn(next)
+    assert.deepEqual(await alerts(eng, 'bg_stalled'), [])
+  } finally { await end() }
+  const ks = await stayedStopped(eng); assert.ok(!ks.includes('bg.stop_failed'))
+  assert.equal(ks.filter((k) => k === 'attention.bg_stalled').length, 1, ks.join(' ')) // not raised again, not even for a moment
+  if (how === 'stopped') assert.deepEqual(asksAfterStop(eng), [])
 })
 
 test('Bug 138: an engineer HQ stops while the check looks at its screen gets no "idle" notice', async () => {
@@ -154,14 +194,32 @@ test('Bug 138: an engineer HQ stops while the check looks at its screen gets no 
       await stop(eng); assert.deepEqual(await alerts(eng, 'engineer_idle'), [], 'the stop cleared it')
     } finally { letGo('after', 'capture-history', eng) }
     await movedOn(next)
-    assert.deepEqual(await alerts(eng, 'engineer_idle'), []); await stayedStopped(eng)
+    assert.deepEqual(await alerts(eng, 'engineer_idle'), []); await stayedStopped(eng); assert.deepEqual(asksAfterStop(eng), [])
   } finally { await hq.api('settings', { key: 'stuck_idle_min', value: 45 }) }
 })
 
+// Bug 326: this test has an HQ of its own, so it is the file's last. It needs Bug 25's idle fix after 2 s and Claude Code's idle prompt on every
+// screen, and with those HQ sets each working agent idle a few seconds after it starts. The tests above used to share that HQ, and the first
+// one's "the next agent is still working" then held only when no look of HQ's fell between that agent's start and the test's dialog.
+// One HQ at a time: the stand-in `tmux` tells the idle look from the look before it by the last line of the one log.
 test('Bug 138: a working agent HQ stops while the check reads its idle screen is not set back to idle', async () => {
+  await hq.stop(); hq = await start({ HQ_IDLE_FIX_S: '2', HQ_FAKE_IDLE_SCREEN: '1' })
   const a = await tpm(), next = await tpm() // working, and its screen shows Claude Code's idle prompt: a Stop hook was missed (Bug 25)
   hold('after', 'capture-idle', a, 1) // the first look at the idle prompt goes through; the second, the one that sets it idle, waits
   try { await waitFor('the second look at its idle screen', () => held('after', 'capture-idle', a), 20_000); await stop(a) } finally { letGo('after', 'capture-idle', a) }
   await movedOn(next)
   const ks = await stayedStopped(a); assert.ok(!ks.includes('agent.idle_fixed'), ks.join(' '))
+})
+
+// Bug 327: the re-read after the look for a changed screen (stuck.ts tick, after `paneHash`). The one after the idle look catches the same stop, so
+// without it nothing shows but one more look: HQ still takes the stopped agent for working and reads its screen for the idle prompt.
+test('Bug 138: a working agent HQ stops while the check reads its screen for a change is not looked at again', async () => {
+  const a = await tpm(), next = await tpm()
+  hold('after', 'capture-idle', a) // the first look at its idle prompt waits; the next look's read for a changed screen is the one held
+  try {
+    await waitFor('the first look at its idle screen', () => held('after', 'capture-idle', a), 20_000); hold('after', 'capture-history', a)
+  } finally { letGo('after', 'capture-idle', a) }
+  try { await waitFor('the next look at its screen', () => held('after', 'capture-history', a), 15_000); await stop(a) } finally { letGo('after', 'capture-history', a) }
+  await movedOn(next)
+  const ks = await stayedStopped(a); assert.ok(!ks.includes('agent.idle_fixed'), ks.join(' ')); assert.deepEqual(asksAfterStop(a), [])
 })

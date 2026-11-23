@@ -23,8 +23,8 @@ export type UiFinding = { id: string; scenario: string; kind: FindingKind; what:
 export type LogEntry = { at: number; ms: number; tool: string; step?: Step[]; ok: boolean; note?: string }
 /** How a scenario went. `ok`: it did what the map and criteria say, with nothing worth a finding. `problem`: one finding or more. `unspecified`: neither the
  *  map nor the criteria say what should happen, so there is no verdict. `couldnt_test`: it needs something no one can do from a browser (change the clock,
- *  wait hours, get an email), so there is no verdict either, and nothing to fix (Bug 223); `why` says what. `not_run`: the session ended before it began, or
- *  before it finished. */
+ *  wait hours, get an email), so there is no verdict either, and nothing to fix (Bug 223); `why` says what (on `ok` too: a part it couldn't check, Bug 260).
+ *  `not_run`: the session ended before it began, or before it finished. */
 export type Outcome = 'ok' | 'problem' | 'unspecified' | 'couldnt_test' | 'not_run'
 export type ScenarioResult = { scenario: Scenario; outcome: Outcome; why?: string; steps: Step[]; log: LogEntry[]; findings: UiFinding[]; notes: string[];
   recording: string | null }
@@ -93,7 +93,7 @@ export function knownCriterion(c: unknown, ids: string[]): string | null {
  *  lists, where a model also writes them (Bug 257). Only names knownCriterion knows are kept, so a pass check written in place of an id is dropped. */
 function namedIn(s: Record<string, unknown>): unknown[] {
   const listed = [s.about, s.criteria].flatMap((l) => Array.isArray(l) ? l : [])
-  const tags = [s.title, s.goal, ...listed].flatMap((t) => [...String(t ?? '').matchAll(/\[([^\[\]]{1,80})\]/g)].map((m) => m[1]!))
+  const tags = [s.title, s.goal, ...listed].flatMap((t) => [...String(t ?? '').matchAll(/\[([^[\]]{1,80})\]/g)].map((m) => m[1]!))
   return [...listed, ...tags].flatMap((c) => String(c ?? '').split(/[,;]/)) // "T-03 A1, T-03 A2" names two
 }
 /** The scenarios HQ keeps of a planning answer: at most `n`, each with a kind, a title and a goal, none the same as another; then numbered. `retry` scenarios
@@ -293,7 +293,7 @@ export function stepOf(code: string, origin: string): Step | null {
   const loc = elementOf(m[1]!)
   const arg = m[3]!.trim(), lit = literal(arg), arr = arg.startsWith('[') ? literal(arg.slice(1).trim()) : null
   const value = lit?.[0] ?? arr?.[0]
-  return { action: ACTIONS[m[2]!]!, ...(loc ?? {}), ...(value !== undefined ? { value } : {}), code: c }
+  return { action: ACTIONS[m[2]!]!, ...loc, ...(value !== undefined ? { value } : {}), code: c }
 }
 /** The steps a browser tool's answer says it ran: the lines of its "Ran Playwright code" block. */
 export function stepsOf(answer: string, origin: string): Step[] {
@@ -326,7 +326,7 @@ export function keepReport(raw: unknown, s: Scenario, steps: Step[][], pages: { 
   const r = (raw && typeof raw === 'object' ? raw : {}) as Said
   const notes = (Array.isArray(r.notes) ? r.notes : []).map((n) => line(n, 200)).filter(Boolean).slice(0, 8)
   const findings: UiFinding[] = [], cant: string[] = [] // what the tester couldn't try, in its words (Bug 223)
-  const said = String(r.outcome ?? ''), untested = said === 'couldnt_test', told = line(r.couldnt_test, 300)
+  const said = String(r.outcome ?? ''), untested = said === 'couldnt_test', told = filled(line(r.couldnt_test, 300))
   for (const f of Array.isArray(r.findings) ? r.findings as Record<string, unknown>[] : []) {
     const kind = String(f?.kind ?? '') as FindingKind, what = line(f?.what, 400), expected = line(f?.expected, 300)
     // No verdict, so nothing to fix: what it wrote as a finding anyway is kept as a note
@@ -340,13 +340,18 @@ export function keepReport(raw: unknown, s: Scenario, steps: Step[][], pages: { 
     findings.push({ id: '', scenario: s.id, kind, what, expected, steps: steps.slice(0, at).flat(), ...(criterion ? { criterion } : {}), ...(expect ? { expect } : {}) })
   }
   const why = told || cant[0] || ''
-  if (!findings.length && (untested || cant.length)) {
+  // Bug 260: a "problem" with no finding HQ keeps but its couldnt_test filled in ("I could not change the clock…") is that: it couldn't test it
+  if (!findings.length && (untested || cant.length || (told && said === 'problem'))) {
     return { outcome: 'couldnt_test', why: why || 'the tester couldn\'t try it from the browser', findings, notes: [...notes, ...cant.filter((c) => c !== why)].slice(0, 8) }
   }
   if (why) notes.push(`Couldn't check: ${why}`) // a real finding, and something it couldn't try: the finding is the verdict
   if (!findings.length && said === 'problem') return { outcome: 'unspecified', why: 'the tester saw a problem but reported no finding HQ could keep', findings, notes }
+  // "ok" with something it couldn't check: still fine, and the summary's line says what wasn't checked (Bug 260)
+  if (!findings.length && said !== 'unspecified' && why) return { outcome: 'ok', why, findings, notes }
   return { outcome: findings.length ? 'problem' : said === 'unspecified' ? 'unspecified' : 'ok', findings, notes }
 }
+/** A couldnt_test that says nothing ("none", "N/A", "-"): as if left out, so a "problem" with it is still one HQ couldn't keep. */
+const filled = (s: string): string => /^(?:n\/?a|none|nothing|no|null|nil|-+|—|–)\.?$/i.test(s) ? '' : s
 /** Numbers every finding of the run in order (U1, U2…). */
 export const numbered = (all: UiFinding[]): UiFinding[] => all.map((f, i) => ({ ...f, id: `U${i + 1}` }))
 
@@ -383,7 +388,7 @@ export function uiTestLines(u: UiTest | null): string[] {
   const head = `- ${things(u.scenarios.length, 'scenario')}: ${by('ok').length} fine, ${things(u.findings.length, 'finding')}, ${by('unspecified').length} unspecified`
     + `${by('couldnt_test').length ? `, ${by('couldnt_test').length} couldn't test` : ''}${by('not_run').length ? `, ${by('not_run').length} not run` : ''}`
   const title = (id: string) => u.scenarios.find((s) => s.id === id)?.title ?? id
-  const verdict = (s: typeof u.scenarios[number]): string => s.outcome === 'ok' ? 'fine'
+  const verdict = (s: typeof u.scenarios[number]): string => s.outcome === 'ok' ? `fine${s.why ? `, but it couldn't check from a browser: ${s.why}` : ''}`
     : s.outcome === 'unspecified' ? `no verdict (${s.why ?? 'the map and criteria don\'t say what should happen'})`
     // Not a finding (Bug 223): no verdict on what it's about, and nothing to fix
     : s.outcome === 'couldnt_test' ? `couldn't test it from a browser, so ${s.criteria?.length ? `${s.criteria.join(', ')} ${s.criteria.length === 1 ? 'has' : 'have'}`

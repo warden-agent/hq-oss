@@ -75,6 +75,18 @@ export function elapsedMs(etime: string): number {
   const [s = 0, m = 0, h = 0] = clock.split(':').map(Number).reverse()
   return (((Number(days) * 24 + h) * 60 + m) * 60 + s) * 1000
 }
+/** Bug 319: how HQ asks ps when a process began: `lstart`, the date itself (last in the fields: it holds spaces), never "now less the elapsed
+ *  time", which was late by however long ps took to answer (up to 2.8 s on a busy Mac). Read in English (macOS prints it in the user's language)
+ *  and in UTC (no daylight-saving hour that comes twice), on a Mac and on Linux (procps prints `%a %b %e %H:%M:%S %Y` too). */
+export const psEnv = (): NodeJS.ProcessEnv => ({ ...process.env, LC_ALL: 'C', TZ: 'UTC0' })
+const MONTHS = 'JanFebMarAprMayJunJulAugSepOctNovDec'
+/** ps's `lstart` read with psEnv, as its fields (`Fri Nov  6 22:45:58 2026`), in ms; NaN when it isn't one (a `-`). Whole seconds, cut down:
+ *  up to a second early on a Mac, up to two on Linux (whose boot time is whole seconds too), never late. */
+export function lstartMs(f: string[]): number {
+  const [, mon = '', day, clock = '', year] = f, m = MONTHS.indexOf(mon), [h, min, s] = clock.split(':').map(Number)
+  if (f.length !== 5 || mon.length !== 3 || m % 3 || clock.split(':').length !== 3) return NaN
+  return Date.UTC(Number(year), m / 3, Number(day), h, min, s)
+}
 /** Process ids whose working folder is `dir` or inside it, from lsof's `-d cwd -Fpn` listing. */
 export function pidsUnder(listing: string, dir: string): number[] {
   return [...cwdsOf(listing)].filter(([, cwd]) => cwd === dir || cwd.startsWith(dir + path.sep)).map(([pid]) => pid)

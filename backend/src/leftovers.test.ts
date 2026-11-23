@@ -8,7 +8,8 @@ import { execFileSync, spawn } from 'node:child_process'
 
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-leftovers-')))
 process.env.HQ_HOME = path.join(tmp, 'hq')
-const { bashBegan, bashEnded, busySince, inHq, leftoverGroups, parsePs, readBackCommands, rootsToAsk, stopLeftovers, sweepAgentTmp } = await import('./leftovers.ts')
+const { bashBegan, bashEnded, busySince, inHq, leftoverGroups, markFor, marksOf, parsePs, readBackCommands, readPs, rootsToAsk, runCandidates, runsLeft, stopLeftovers,
+  sweepAgentTmp } = await import('./leftovers.ts')
 const { AGENT_TMP, agentTmpDir } = await import('./config.ts')
 const { cwdsOf } = await import('./procs.ts')
 const { migrate, run } = await import('./db.ts'); migrate()
@@ -111,9 +112,9 @@ test('Bug 100: a command\'s end says when it began, so the look after it asks on
 
   const at = (pid: number, age: number, o: Partial<{ ppid: number; tty: string; stat: string }> = {}) =>
     ({ pid, ppid: o.ppid ?? 1, pgid: pid, uid: 501, tty: o.tty ?? '??', stat: o.stat ?? 'S', start: NOW - age * 1000 })
-  const procs = [at(1, 99_999, { ppid: 0 }), at(10, 3), at(11, 9), at(12, 30), at(13, 3, { tty: 'ttys001' }), at(14, 3, { ppid: 13 }), at(15, 3, { stat: 'Z' })]
+  const procs = [at(1, 99_999, { ppid: 0 }), at(10, 4), at(11, 9), at(12, 30), at(13, 3, { tty: 'ttys001' }), at(14, 3, { ppid: 13 }), at(15, 3, { stat: 'Z' })]
   assert.deepEqual(rootsToAsk(procs), [10, 11, 12]) // a full look: every orphan with no terminal
-  // the command began 10 s ago: what it can have left began after that, or up to 2 s before (ps rounds to the second); an older
+  // the command began 10 s ago: what it can have left began after that, or up to 3 s before (ps's whole seconds, up to 2 s early on Linux); an older
   // orphan (another command's, a daemon of the user's) isn't asked about, nor one with a terminal, a live parent, or a zombie
   assert.deepEqual(rootsToAsk(procs, NOW - 10_000), [10, 11]); assert.deepEqual(rootsToAsk(procs, NOW - 12_500), [10, 11])
   assert.deepEqual(rootsToAsk(procs, NOW), []) // nothing new: no lsof at all
@@ -129,16 +130,31 @@ test('never: a terminal anywhere in the tree (tmux, the user\'s shells), HQ itse
 })
 
 test('ps and lsof listings: fixed fields, start times, Linux\'s "?" and " (deleted)"', () => {
-  assert.deepEqual(parsePs(' 12   1  12 501 ??  Ss   08-10:55:43\n13 12 12 501 ? R+ 01:02:03\n14 13 14 501 ?? S 00:07\n15 1 15 501 ?? Z -\nbad line\n', NOW), [
-    { pid: 12, ppid: 1, pgid: 12, uid: 501, tty: '??', stat: 'Ss', start: NOW - (((8 * 24 + 10) * 60 + 55) * 60 + 43) * 1000 },
-    { pid: 13, ppid: 12, pgid: 12, uid: 501, tty: '?', stat: 'R+', start: NOW - 3723_000 }, { pid: 14, ppid: 13, pgid: 14, uid: 501, tty: '??', stat: 'S', start: NOW - 7000 },
-    { pid: 15, ppid: 1, pgid: 15, uid: 501, tty: '??', stat: 'Z', start: NOW }]) // no time given: counted as new
+  const listing = ' 12   1  12 501 ??  Ss   Sun Nov  1 10:05:59 2026    \n13 12 12 501 ? R+ Fri Nov 20 22:45:58 2026\n15 1 15 501 ?? Z -\nbad line\n'
+  const rows = [{ pid: 12, ppid: 1, pgid: 12, uid: 501, tty: '??', stat: 'Ss', start: Date.UTC(2026, 10, 1, 10, 5, 59) },
+    { pid: 13, ppid: 12, pgid: 12, uid: 501, tty: '?', stat: 'R+', start: Date.UTC(2026, 10, 20, 22, 45, 58) },
+    { pid: 15, ppid: 1, pgid: 15, uid: 501, tty: '??', stat: 'Z', start: NOW }] // no date given: counted as new
+  assert.deepEqual(parsePs(listing, NOW), rows)
+  assert.deepEqual(parsePs(listing, NOW + 2800), rows.map((r) => r.pid === 15 ? { ...r, start: NOW + 2800 } : r), 'Bug 319: read later, the same dates')
   const cwds = cwdsOf(`p12\nfcwd\nn${wt('SHOP-13')} (deleted)\np13\nfcwd\nn/x\n`)
   assert.equal(cwds.get(12), wt('SHOP-13')); assert.deepEqual(inHq(dirs, cwds.get(12)!), { name: 'SHOP-13', busy: 0, app: null }); assert.equal(inHq(dirs, cwds.get(13)!), null)
 })
 
+// Bug 319: a slow ps (2.8 s in the middle of the whole e2e suite) made every date late by as much, and an older leftover passed for the next command's own
+test('for real: a process is dated when it began, however long ps takes to answer', async () => {
+  const bin = fs.mkdtempSync(path.join(tmp, 'slow-ps-')), real = execFileSync('sh', ['-c', 'command -v ps']).toString().trim(), was = process.env.PATH
+  fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/sh\nout=$('${real}' "$@"); s=$?; sleep 2; printf '%s\\n' "$out"; exit $s\n`, { mode: 0o755 })
+  const t0 = Date.now(), p = spawn('sleep', ['30'], { stdio: 'ignore' }), t1 = Date.now()
+  try {
+    process.env.PATH = `${bin}:${was}`
+    const asked = Date.now(), { procs } = await readPs(), took = Date.now() - asked
+    assert.ok(took >= 2000, `the stand-in ps took ${took} ms`)
+    const start = procs.find((x) => x.pid === p.pid)?.start ?? NaN
+    assert.ok(start <= t1 && start > t0 - 2000, `began between ${t0} and ${t1}, dated ${start} (${start - t1} ms after)`)
+  } finally { process.env.PATH = was; p.kill('SIGKILL') }
+})
+
 // Bug 77: on main the app runs in the project's own folder, so a run's leftovers are known by the mark they inherited, not by where they work
-const { markFor, marksOf, runCandidates, runsLeft } = await import('./leftovers.ts')
 test("a finished preview run's orphans are leftovers; a running app's, another HQ's, the user's own and ones in another project are not", () => {
   const was = markFor('repo-a', 1000), on = markFor('repo-a', 2000)
   const runs = new Map([['repo-a', { name: 'garden', roots: ['/p/garden'], live: on }], ['repo-b', { name: 'site', roots: ['/p/site', '/link/site'], live: null }]])
@@ -165,8 +181,8 @@ test('for real: the mark a program inherited is read back from it, here and on L
   const child = spawn('sh', ['-c', `"${process.execPath}" -e "setInterval(() => {}, 1e6)" -- via-a-shell & wait`], { env, detached: true, stdio: 'ignore' })
   const plain = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e6)'], { detached: true, stdio: 'ignore' })
   after(() => { for (const p of [marked, child, plain]) try { process.kill(-p.pid!, 'SIGKILL') } catch { /* gone */ } })
-  await new Promise((r) => setTimeout(r, 500))
-  const inner = Number(execFileSync('ps', ['-axo', 'pid=,ppid=']).toString().split('\n').map((l) => l.trim().split(/\s+/)).find((f) => Number(f[1]) === child.pid)?.[0] ?? 0)
+  const childOf = () => Number(execFileSync('ps', ['-axo', 'pid=,ppid=']).toString().split('\n').map((l) => l.trim().split(/\s+/)).find((f) => Number(f[1]) === child.pid)?.[0] ?? 0)
+  let inner = 0; for (const end = Date.now() + 10_000; !(inner = childOf());) { assert.ok(Date.now() < end, 'the shell never started its child'); await new Promise((r) => setTimeout(r, 20)) }
   const gone = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' }); await new Promise((r) => gone.once('exit', r)) // one that ended between the look and the question
   const marks = await marksOf([marked.pid!, inner, plain.pid!, gone.pid!])
   assert.equal(marks.get(marked.pid!), mark); assert.equal(marks.get(inner), mark, 'a grandchild, through a shell'); assert.equal(marks.has(plain.pid!), false)

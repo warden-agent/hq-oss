@@ -3,6 +3,7 @@
 import { q } from './db.ts'
 import { getAgent } from './agents.ts'
 import { getFeature, getRepo, getTicket } from './records.ts'
+import { behindWords } from './heavy.ts'
 
 export type EventLine = { id: number; at: number; agentId: string | null; text: string }
 
@@ -17,6 +18,9 @@ const hidden = (kind: string): boolean => HIDDEN.some((p) => p.endsWith('*') ? k
 /** Bug 201: why a background run ended (bgruns.ts endRuns), in plain words. */
 const BG_WHY: Record<string, string> = { done: 'it finished', gone: 'its process is gone', stopped: 'HQ stopped it', session: 'its Claude Code session ended',
   'agent.stopped': 'the agent was stopped', 'agent.lost': 'its terminal is gone' }
+/** Bug 289: what an agent still waits on once its turn ended (hooks.ts stillOn: "Subagent: …" or bgruns.ts "Waiting on: …"), after its turn's line. */
+const still = (on: unknown): string => { const s = one(on, 120); if (!s) return ''
+  return s.startsWith('Waiting on: ') ? ` · still waiting on ${s.slice(12)}` : s.startsWith('Subagent: ') ? ` · its helper still runs: ${s.slice(10)}` : ` · still: ${s}` }
 const VERDICT: Record<string, string> = { approve: 'approved', revise: 'sent back to revise', reject: 'rejected' }
 const one = (v: unknown, n = 140): string => { const s = String(v ?? '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s }
 /** A field of a tool's input. hooks.ts keeps the input as JSON cut at 300 characters, so it often won't parse: then the field is read up to the cut. */
@@ -64,6 +68,9 @@ const cameBack = (p: Record<string, unknown>): string => `${keyOf(p.ticket, p.ke
   : BACK[String(p.why)] ?? (p.hung ? BACK.tests_hung : "HQ's check before merging found something to fix")}`
 
 /** One plain line for an event, or null when the Events tab leaves it out. */
+/** Why HQ didn't type a message (message.held): it goes to the agent the usual way instead. 'screen' and 'status' after a restart (Bug 296). */
+const HELD: Record<string, string> = { draft: ': there was half-typed text in its prompt box', screen: ": its terminal didn't show its waiting prompt",
+  status: ': it was waiting on a dialog or a plan review' }
 export function eventLine(kind: string, payload: Record<string, unknown>): string | null {
   if (hidden(kind)) return null
   const p = payload, [what, tool = ''] = kind.split(':') as [string, string?]
@@ -72,7 +79,8 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'hook.PreToolUse': return helper + toolLine(tool, p.input)
     case 'hook.PostToolUseFailure': return helper + (p.is_interrupt ? `${tool} stopped (interrupted)` : `${tool} failed: ${one(p.error, 300)}`)
     case 'hook.UserPromptSubmit': return prompt(String(p.prompt ?? ''))
-    case 'hook.Stop': return p.last ? `Turn ended: ${one(p.last, 300)}` : 'Turn ended'
+    case 'hook.Stop': { const what = p.away ? 'Turn ended while HQ was down' : 'Turn ended' // Bug 297: its Stop hook was lost, the mod said so later
+      return p.last ? `${what}: ${one(p.last, 300)}` : what }
     case 'hook.StopFailure': return `Turn failed: ${one(p.error)}`
     case 'hook.SessionStart': return `Claude Code started${p.source ? ` (${p.source})` : ''}`
     case 'hook.SessionEnd': return `Claude Code ended${p.reason ? ` (${p.reason})` : ''}`
@@ -83,7 +91,9 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'hook.TaskCreated': return `New task: ${one(p.task, 100)}`
     case 'hook.TaskCompleted': return `Task done: ${one(p.task, 100)}`
     case 'message.sent': return `Sent a message to ${nameOf(p.to)}`
-    case 'message.typed': return 'HQ typed a message into its terminal'
+    case 'message.typed': return p.finished ? 'HQ typed the rest of a message into its terminal after its restart (its first part was already in)' // Bug 331
+      : `HQ typed a message into its terminal${p.again ? ' after its restart' : ''}`
+    case 'message.cut_short': return 'HQ restarted while it was typing a message into its terminal: it types it again' // Bug 296
     case 'message.dropped': return 'HQ dropped its unread note of the new test command: the ticket was finished' // Bug 147
     case 'ask.opened': return `Asked you: ${one(p.question)}`
     case 'gate.review_opened': return `Its plan waits for review${Number(p.round) > 1 ? ` (round ${p.round})` : ''}`
@@ -103,30 +113,37 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
       return n ? `HQ's plan check found ${n === 1 ? 'a problem' : `${n} problems`} with its plan` : 'HQ\'s plan check found nothing wrong with its plan' }
     case 'plan_check.failed': return `HQ's plan check couldn't run: ${one(p.why)}`
     case 'tpm.started': return "Took over as the project's TPM"
-    case 'fresh_start.requested': return 'Asked to save a note and start fresh'
-    case 'fresh_start.done': return 'Started fresh from its note'
+    case 'fresh_start.requested': return `Asked ${p.again ? 'again ' : ''}for its handoff note: ${noteFor(p)}` // Bug 308: which case; 338: in new words
+    case 'fresh_start.done': return `Its session ended: ${noteDone(p)}`
     case 'takeover.input': return 'You typed in its terminal'
     case 'launch.helper_started': return 'Started working out how to launch the app'
     case 'launch.saved': return 'Saved how to launch the app'
     case 'launch.test_port': return `HQ stopped its test server on port ${list(p.ports)}: not one HQ gave it for tests (${list(p.given)}), so it could clash with `
       + 'another app. Its save was refused'
-    case 'launch.helper_done': return 'Done with the launch steps'
+    case 'launch.helper_done': return p.why === 'app_stopped' ? 'Done with the launch steps: the app was stopped before it answered; the steps you OK\'d stay' // Bug 332
+      : 'Done with the launch steps'
+    case 'launch.run_resumed': return `HQ restarted during the first run of the steps you OK'd: ${p.again ? 'it runs them again' : 'it picks that run up again'}` // Bug 351
     case 'agent.launched': return `Started${p.model ? ` (${p.model})` : ''}`
     case 'agent.stopped': return `Stopped${p.reason ? `: ${one(p.reason, 100)}` : ''}`
     case 'agent.lost': return 'Its terminal is gone'
     case 'agent.interrupted': return p.why === 'not_acked' ? "Interrupted: it didn't take HQ's messages" : 'Interrupted (Escape)'
+    case 'agent.turn_over': return `Turn ended: Escape or No on a question on its screen${still(p.still)}` // Bug 289: no Stop hook came, so no "Turn ended" line
     case 'agent.missing': return "HQ can't find its terminal"
     case 'agent.recovered': return 'Its terminal is back'
     case 'agent.hq_back': return 'Told that HQ is back'
     case 'agent.idle_fixed': return 'Shown as idle: it had been quiet a while'
+    case 'agent.turn_started_away': return 'Its turn started while HQ was down: shown as working' // Bug 346
+    case 'agent.turn_ended_away': return `Its turn ended while HQ was down: shown as ${p.status === 'working' ? 'still working on what it left running' : 'idle'}`
     case 'agent.dialog_cleared': return 'A question on its screen was answered'
     case 'urgent.interrupt': return 'You interrupted it with a message'
     case 'question.answered': return 'Its question was answered'
-    case 'turns.waiting': return `Waiting its turn for ${one(p.what, 80) || 'a build or test run'}`
-    case 'turns.started': return `Its turn: ${one(p.what, 80) || 'a build or test run'} started${p.waitedS ? ` after ${p.waitedS} s` : ''}`
+    case 'turns.waiting': { const b = behindWords(p.behind) // Bug 289: behind whom. Bug 309: HQ's own run, on its ticket's engineer's tab, by its name
+      return `${p.hq ? `${one(p.who, 80)} waits its turn` : `Waiting its turn for ${one(p.what, 80) || 'a build or test run'}`}${b ? ` behind ${one(b, 120)}` : ''}` }
+    case 'turns.started': return p.hq ? `${one(p.who, 80)} started${p.waitedS ? ` after waiting ${p.waitedS} s` : ''}`
+      : `Its turn: ${one(p.what, 80) || 'a build or test run'} started${p.waitedS ? ` after ${p.waitedS} s` : ''}`
     case 'turns.left': return `Done with its turn (${one(p.what, 80)})`
     case 'bg.started': return `Left running in the background: ${one(p.command ?? p.task, 100)}`
-    case 'bg.ended': return `Background run ended${p.why ? ` (${BG_WHY[String(p.why)] ?? String(p.why)})` : ''}`
+    case 'bg.ended': return `Background run ended${p.command ? `: ${one(p.command, 100)}` : ''}${p.why ? ` (${BG_WHY[String(p.why)] ?? String(p.why)})` : ''}` // Bug 289: which
     case 'bg.stopped': { const n = Array.isArray(p.tasks) ? p.tasks.length : 1, cmds = Array.isArray(p.commands) ? p.commands.map((c) => one(c, 100)).join(', ') : '' // Bug 201
       return `${p.by === 'user' ? 'You' : p.by === 'auto' ? 'Auto mode' : 'HQ'} stopped ${n > 1 ? `${n} frozen background runs` : 'its frozen background run'}`
         + `${cmds ? `: ${cmds}` : ''}${p.minutes ? ` (no CPU, no output for ${p.minutes} min)` : ''}` }
@@ -135,7 +152,7 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'hook.error': return `HQ hit an error reading one of its hooks: ${one(p.error)}`
     case 'dialog.look_error': return `HQ couldn't look at its screen for an open question: ${one(p.error)}`
     case 'dialog.still_open': return 'A question on its screen still looks open: HQ keeps checking'
-    case 'message.held': return `HQ held a message back${p.why === 'draft' ? ': there was half-typed text in its prompt box' : ''}`
+    case 'message.held': return `HQ held a message back${HELD[String(p.why)] ?? ''}`
     case 'gate.allow_stored': return 'Sent a plan HQ had already approved: let through'
     case 'gate.pending_answered': return 'HQ told it its plan still waits for review'
     case 'gate.reattached': return `Asked about its plan again${Number(p.round) > 1 ? ` (round ${p.round})` : ''}: it still waits for review`
@@ -155,10 +172,18 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'ticket.pr_open': return `Opened a pull request for ${keyOf(p.ticket, p.key)}`
     case 'ticket.pr_refused': return `HQ didn't take ${keyOf(p.ticket, p.key)} as finished (open pr): ${one(p.why, 600)}` // Bug 248
     case 'ticket.pr_ready': return `${keyOf(p.ticket, p.key)} is ready to merge`
+    case 'ticket.merge_started': return `HQ began merging ${keyOf(p.ticket, p.key)}`
     case 'ticket.merged_by_hq': return `HQ merged ${keyOf(p.ticket, p.key)}`
     case 'ticket.merged': return `${keyOf(p.ticket, p.key)} is in ${baseOf(p.ticket)}`
     case 'ticket.merge_refused': return `HQ didn't merge ${keyOf(p.ticket, p.key)}${p.why ? `: ${one(p.why, 100)}` : ''}`
     case 'ticket.fix_tests': return cameBack(p)
+    // "Have HQ test this" (hqcheck.ts): the user's check of a ticket, with auto mode off
+    case 'check.started': return `You had HQ test ${keyOf(p.ticket, p.key)}`
+    case 'check.ended': return p.state === 'pass' ? `HQ's test of ${keyOf(p.ticket, p.key)}: everything passed`
+      : p.state === 'fail' ? `HQ's test of ${keyOf(p.ticket, p.key)} found a problem (View results on its box)`
+      : p.state === 'stopped' ? `HQ's test of ${keyOf(p.ticket, p.key)} stopped${p.why ? `: ${one(p.why, 200)}` : ''}`
+      : `HQ couldn't finish testing ${keyOf(p.ticket, p.key)}${p.why ? `: ${one(p.why, 200)}` : ''}`
+    case 'check.sent': return `You sent what HQ's test of ${keyOf(p.ticket, p.key)} found to its engineer`
     case 'ticket.fix_conflicts': return p.clean ? `${keyOf(p.ticket, p.key)} merges cleanly now` : `${keyOf(p.ticket, p.key)} came back: merge conflicts`
     case 'ticket.deps_changed': return `${keyOf(p.ticket, p.key)} now waits on ${(p.depends_on as string[] | undefined)?.join(', ') || 'nothing'}`
     case 'auto.tested': return `HQ tested ${keyOf(p.ticket, p.key)} before merging: ${({ pass: 'the tests pass', fail: 'the tests fail', no_tests: 'no tests to run',
@@ -206,4 +231,20 @@ export function agentEvents(agentId: string, limit = 300): EventLine[] {
     let p: Record<string, unknown> = {}; try { p = JSON.parse(r.payload) as Record<string, unknown> } catch { /* a bad row still gets its kind */ }
     const text = eventLine(r.kind, p); return text ? [{ id: r.id, at: r.created_at, agentId, text }] : []
   })
+}
+
+/** Bug 308: what follows an agent's handoff note, by its fresh start's `then` (freshstart.ts). Only 'continue' and 'park' are a fresh start: a
+ *  Clear stops an engineer with nobody taking over (the project's TPM comes back after it), a switch of projects waits for the user to come back.
+ *  Rows from before Bug 308 have no `role`: a Clear's words then fit both. */
+function noteFor(p: Record<string, unknown>): string {
+  if (p.then === 'clear') return `you are clearing the project. ${p.role === 'tpm' ? 'A new TPM takes over from it after the clear'
+    : p.role === 'engineer' ? 'Nobody takes over: the note is archived' : 'An engineer\'s note is archived; a TPM\'s is read by the new TPM after the clear'}`
+  if (p.then === 'switch') return 'you switched to another project. A new session takes over from it when you come back'
+  return `a fresh start. A new session takes over from it${p.then === 'park' ? ' when you press Resume' : ''}`
+}
+function noteDone(p: Record<string, unknown>): string {
+  if (p.then === 'clear') return `the project is being cleared. ${p.role === 'tpm' ? 'A new TPM takes over from its note after the clear'
+    : p.role === 'engineer' ? 'Nobody takes over: its note is archived' : 'Its note is archived'}`
+  if (p.then === 'switch') return 'you switched to another project. Its work waits until you come back'
+  return p.then === 'park' ? 'a fresh start. Its work waits until you press Resume' : 'a fresh start. A new session takes over from its note'
 }

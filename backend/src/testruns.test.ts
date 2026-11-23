@@ -21,6 +21,17 @@ test('Bug 106: a run in words: "it" on its ticket\'s box, the ticket named in th
   assert.equal(words('ticket', 'running', null).bar, 'HQ is testing a ticket on main', 'its ticket went meanwhile (Clear)')
   assert.equal(runWords({ what: 'ticket', state: 'running' }, 'T-1', 'develop').box, 'HQ is testing it on develop')
 })
+test('Bug 289: a run in line says behind whom, on its box and in the top bar; a running one, or one with nobody named, says what it said before', () => {
+  const r = (what: 'ticket' | 'main' | 'command' | 'tester', behind?: string[], state: 'running' | 'waiting' = 'waiting') => runWords({ what, state, behind }, 'SHOP-2', 'main')
+  assert.deepEqual(r('ticket', ['eng SHOP-1']), { box: "HQ's test is waiting its turn behind eng SHOP-1", bar: "HQ's test of SHOP-2 is waiting its turn behind eng SHOP-1" })
+  assert.equal(r('main', ['eng SHOP-1', "HQ's test of SHOP-3"]).bar, "HQ's test of main without SHOP-2 is waiting its turn behind eng SHOP-1 and HQ's test of SHOP-3")
+  assert.equal(r('tester', ['a', 'b', 'c']).box, "HQ's tester is waiting its turn behind a and 2 more")
+  assert.deepEqual(r('command', ['eng SHOP-1']), { box: 'HQ is waiting its turn to try its new test command behind eng SHOP-1',
+    bar: "HQ is waiting its turn to try SHOP-2's new test command behind eng SHOP-1" })
+  assert.deepEqual(r('ticket', ['eng SHOP-1'], 'running'), { box: 'HQ is testing it on main', bar: 'HQ is testing SHOP-2 on main' })
+  assert.equal(r('command', ['eng SHOP-1'], 'running').box, 'HQ is trying its new test command')
+  assert.equal(r('ticket', []).box, "HQ's test is waiting its turn"); assert.equal(r('ticket').box, "HQ's test is waiting its turn") // a page from before the field
+})
 test('Bug 106: each project sees its own runs, and a state from before this field is left as it is', () => {
   const s = { repos: [], features: [], tickets: [], agents: [], reviews: [], attention: [], messages: [] }
   const runs = [{ id: 'a', repo_id: 'r1' }, { id: 'b', repo_id: 'r2' }, { id: 'c', repo_id: 'r1' }]
@@ -36,7 +47,7 @@ test('Bug 126: a merged ticket says what HQ ran on it first and how it ended, an
     long: "HQ's tests passed on main with it merged in, before it merged · 412 passed, 6 skipped · 8 s" })
   assert.equal(words(JSON.stringify({ ...pass, counts: null, ms: 125_000 }))!.long, "HQ's tests passed on main with it merged in, before it merged · 2 min 5 s", 'no counts: none made up')
   assert.deepEqual(words(JSON.stringify({ ran: 'none', by: 'user', at: 1 })), { box: 'no HQ test', passed: false,
-    long: 'You merged it with Merge, which runs no tests: HQ did not test it as it merged (only auto mode tests before it merges).' })
+    long: 'You merged it with Merge, which runs no tests: HQ did not test this version as it merged (Have HQ test this, or auto mode, tests before a merge).' })
   assert.equal(words(JSON.stringify({ ran: 'none', by: 'outside', at: 1 }))!.long, 'It was merged outside HQ, so HQ did not test it as it merged.')
   assert.equal(words(null), null, 'merged before HQ kept a record: not "no tests", which may be untrue')
   assert.equal(words('{not json'), null); assert.equal(words('{"ran":"maybe"}'), null)

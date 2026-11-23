@@ -1,6 +1,8 @@
 import type { TestRun } from './testruns.ts'
-import { hqAnswersPlan, type Question } from './needs.ts'
+import { hqAnswersPlan, workingEngineers, type Question } from './needs.ts'
 import { planCheckOf } from '../../backend/src/checks.ts'
+import { LIMIT_REACHED } from '../../backend/src/readiness.ts'
+import { sendHere } from './atend.ts'
 export type Agent = Record<string, any> & { id: string; role: string; status: string }
 /** A project's feature map as the page gets it (backend mapstore.ts MapView). */
 export type MapView = { id: string; text: string; by: { at: number; by: string } | null; pending: { ticket: string; key: string; screens: string; unchanged: boolean }[]
@@ -20,11 +22,17 @@ export type State = { autoRuns?: any[]; findings?: any[];
   archive?: string
   /** Engineers working in every repo (forRepo sets it: the parallel limit counts them all). */
   working?: number }
+/** A failed api() call names the request (`path`), so its red bar can go once the same request works (Bug 278). */
 export async function api<T = any>(path: string, body?: unknown): Promise<T> {
   const r = await fetch(`/api/${path}`, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined })
-  if (!r.ok) throw new Error(await r.text())
+    .catch((e: Error) => { throw Object.assign(e, { path }) }) // a TypeError still: nothing answered
+  clearErrors((m) => !!m.away || (r.ok && m.from === path)) // HQ answered, so "Can't reach HQ" is out of date; and this request worked this time
+  if (!r.ok) throw Object.assign(new Error(await r.text()), { path })
   return r.json()
 }
+/** A choice on a TPM's question (Your turn). HQ names the message it sent the TPM, so this tab's Chat takes it as its own (Bug 286). */
+export const answerAsk = (askId: string, answer: string): Promise<{ message_id?: string }> =>
+  sendHere(() => api<{ message_id?: string }>(`asks/${askId}/answer`, { answer }), (r) => r.message_id)
 /** A box's first question to HQ, which may be restarting as the box opens (Bug 51, Bug 64): asks again while nothing answers (a TypeError), and stops at any answer,
  *  because a refusal won't change by asking again. `away` says whether HQ is out of reach right now. Returns a stop function, so it can be an effect's whole body. */
 export function askUntilAnswered<T = any>(path: string, on: { away: (is: boolean) => void; answer: (r: T) => void; refused: (e: Error) => void }, everyMs = 1500): () => void {
@@ -102,16 +110,30 @@ export function planWait(s: PlanState, ticketId: string, review: { round: number
   const c = planCheckOf(review.plan_check)
   return c?.state === 'checking' ? { text: 'HQ is checking its plan against its criteria', hq: true, since: c.since } : { text: "its plan waits for HQ's check", hq: true, since: null }
 }
-/** planWait for an agent at the plan gate: its ticket's open review. */
-export const agentPlanWait = (a: Agent, s: PlanState) => planWait(s, String(a.ticket_id ?? ''), s.reviews.find((r) => r.ticket_id === a.ticket_id && r.status === 'open') ?? null)
+const NOTE_FOR: Record<string, string> = { clear: 'clearing the project', switch: 'you switched projects' }
+/** Bug 287: asked for its handoff note (a Fresh start, or a Clear) and writing it: the line its box and its Agents card both show. What it did before
+ *  (planning, revising a plan sent back) has stopped, so no other word says that meanwhile. Bug 308: it says what the note is for (freshstart.ts
+ *  `fresh_start_then`): a Clear or a switch of projects is no fresh start (no new session takes over when the note is in). */
+export const noteLine = (a: Agent): string | null => a.status !== 'exited' && a.fresh_start_at
+  ? `${NOTE_FOR[String(a.fresh_start_then)] ?? 'fresh start'} · writing its handoff note…` : null
+/** Bugs 234, 287: an agent at the plan gate whose review has closed: what the answer was (`text`: its box's and Agents card's words, `pill`); or, once it was
+ *  asked for its handoff note in that gap (a Clear, a Fresh start), at work on that, as any agent writing its note (noteLine says so). */
+const gateClosed = (a: Agent, s: PlanState): { text: string; pill: string } => noteLine(a) ? { text: 'working', pill: 'working' }
+  : planAnswered(s, String(a.ticket_id ?? ''))
+/** planWait for an agent at the plan gate: its ticket's open review; with none, gateClosed's words. */
+export function agentPlanWait(a: Agent, s: PlanState): ReturnType<typeof planWait> {
+  const w = planWait(s, String(a.ticket_id ?? ''), s.reviews.find((r) => r.ticket_id === a.ticket_id && r.status === 'open') ?? null)
+  return w.closed ? { ...w, text: gateClosed(a, s).text } : w
+}
 /** Bug 179: the Agents menu's line under a running agent: on a dialog, that it waits on one (as its box says); at the plan gate, whom its plan waits on
- *  (Bug 216); else its activity line. A usage pause says nothing here: its pill says "paused". */
+ *  (Bug 216); else its activity line. A usage pause says nothing here: its pill says "paused". Writing its handoff note in the gap after its review closed:
+ *  nothing here, the card's noteLine says it (Bug 287). */
 export const menuActivity = (a: Agent, s: PlanState): string | null => a.status === 'blocked' && onDialog(a) ? `${agentWord(a)} in its terminal`
-  : a.status === 'plan_review' ? agentPlanWait(a, s).text : liveActivity(a)
+  : a.status === 'plan_review' ? (() => { const w = agentPlanWait(a, s); return w.closed && noteLine(a) ? null : w.text })() : liveActivity(a)
 /** Bug 234: the status an agent's pill and box border are coloured by. At the gate with its review closed it is at work on the answer, not waiting on
  *  anyone: coloured as working, not in the plan gate's amber ("for you"). */
 export const shownStatus = (a: Agent, s: PlanState): string => a.status === 'plan_review' && agentPlanWait(a, s).closed ? 'working' : a.status
-const gatePill = (a: Agent, s: PlanState): string => { const w = agentPlanWait(a, s); return w.closed ? planAnswered(s, String(a.ticket_id ?? '')).pill : w.hq ? 'plan check' : 'plan for you' }
+const gatePill = (a: Agent, s: PlanState): string => { const w = agentPlanWait(a, s); return w.closed ? gateClosed(a, s).pill : w.hq ? 'plan check' : 'plan for you' }
 /** Bug 216: an agent's status pill, in words (the status itself is the pill's colour): never a raw status word such as `plan_review`. At the plan gate it reads
  *  as its ticket's pill does. */
 export const agentPill = (a: Agent, s: PlanState): string => apiErrored(a) ? 'API error' : a.status === 'plan_review' ? gatePill(a, s)
@@ -162,10 +184,43 @@ export const errText = (e: Error): string => {
 }
 /** The rest of what a refused request sent back, beyond the `error` that errText reads. */
 export const errBody = (e: Error): Record<string, any> => { try { return JSON.parse(e.message) } catch { return {} } }
-let errorSink: ((msg: string) => void) | null = null
-/** Shows an error in the bar under the top bar (ErrorBar in ui.tsx), instead of alert(). */
-export function showError(msg: string): void { if (errorSink) errorSink(msg); else console.error(msg) }
-export function onError(sink: ((msg: string) => void) | null): void { errorSink = sink }
+/** One red bar: its words, the request that failed (`from`), and whether it failed because nothing answered (`away`). */
+export type ErrMsg = { id: number; text: string; from?: string; away?: boolean }
+type ErrSink = { add: (m: Omit<ErrMsg, 'id'>) => void; clear: (gone: (m: ErrMsg) => boolean) => void }
+let errorSink: ErrSink | null = null
+/** Shows an error in the bar under the top bar (ErrorBar in ui.tsx), instead of alert(). Pass a failed api() call's Error itself, so the bar
+ *  goes when that request next works, or, for "Can't reach HQ", once HQ answers again (Bug 278). Text alone stays until its ×. */
+export function showError(e: Error | string): void {
+  const m = typeof e === 'string' ? { text: e } : { text: errText(e), from: (e as { path?: string }).path, away: e instanceof TypeError }
+  if (errorSink) errorSink.add(m); else console.error(m.text)
+}
+/** Takes away the bars `gone` picks. */
+export function clearErrors(gone: (m: ErrMsg) => boolean): void { errorSink?.clear(gone) }
+export function onError(sink: ErrSink | null): void { errorSink = sink }
+/** The bars after `m` comes: the same words again replace the bar that has them (Bug 267: two refusals, one bar), newest last, at most `max`. */
+export const withError = (bars: ErrMsg[], m: ErrMsg, max = 3): ErrMsg[] => [...bars.filter((b) => b.text !== m.text), m].slice(-max)
+/** Bug 305: the list in HQ's state that holds what a request is about (`tickets/T1/make-pr` is about ticket T1). Every kind a bar can come from
+ *  (Bug 353: `features/F1/cancel`, a ✕ refused during a Clear); auto-runs/…/undo and repos/…/findings/… show their refusals in their own dialogs. */
+const ABOUT: Record<string, keyof State> = { tickets: 'tickets', features: 'features', reviews: 'reviews', asks: 'asks', attention: 'attention', repos: 'repos',
+  agents: 'agents', previews: 'previews' }
+/** Requests that get a project's app running (Start, Back to main, Try it, OK run these, Use this port, Ask Claude to work it out). */
+const STARTS = ['start', 'approve', 'free-port', 'setup']
+const running = (s: Pick<State, 'previews'> | null, id: string): boolean => !!s?.previews?.find((p) => p.id === id && p.status === 'running')
+/** Free parallel slots: the limit less the engineers working in every project (scheduler.ts canLaunch, which counts the same ones). */
+const freeSlots = (s: Pick<State, 'settings' | 'defaults' | 'agents' | 'tickets'>): number =>
+  Number(s.settings.concurrency_cap ?? s.defaults.concurrency_cap ?? 2) - workingEngineers(s)
+/** Bug 305: whether bar `m` has outlived what it was about, now that HQ's whole state went from `before` to `now` (App.tsx asks at each change):
+ *  the ticket, feature, review, question, notice, project or agent its request was about is gone (a Clear, a Remove); a request to start a project's app,
+ *  once that app reaches running (another tab's Start, OK run these); "Parallel limit reached", once a slot is free (the limit raised, an engineer done).
+ *  Anything else stays until its request works (Bug 278) or its ×. */
+export function outdatedBar(m: ErrMsg, before: State | null, now: State): boolean {
+  if (m.text.startsWith(LIMIT_REACHED)) return !!before && freeSlots(before) <= 0 && freeSlots(now) > 0
+  const [kind = '', raw, action] = (m.from ?? '').split('/'), list = ABOUT[kind]
+  if (!list || !raw || !action) return false // repos/pick, settings: about nothing that can go
+  const id = decodeURIComponent(raw), has = (s: State | null) => ((s?.[list] as { id: string }[] | undefined) ?? []).some((x) => x.id === id)
+  if (has(before) && !has(now)) return true // gone just now: a row the page hasn't had yet (a new project's app) isn't "gone"
+  return kind === 'previews' && STARTS.includes(action) && !running(before, id) && running(now, id)
+}
 export type WsMsg = { type: 'snapshot'; data: State } | { type: 'patch'; entity: string; id: string; patch: Record<string, any> | null } | { type: 'event'; event: any } | { type: 'term'; agentId: string; data: string } | { type: 'term.exit'; agentId: string }
 export function connectWs(onMsg: (m: WsMsg) => void, onOpen?: (ws: WebSocket) => void): WebSocket {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'

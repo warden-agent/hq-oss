@@ -17,10 +17,6 @@ after(() => { for (const f of ends) f(); fs.rmSync(tmp, { recursive: true, force
 const freePort = (): Promise<number> => new Promise((resolve) => {
   const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = (s.address() as net.AddressInfo).port; s.close(() => resolve(p)) })
 })
-const until = async <T>(what: string, fn: () => T | undefined | false, ms = 5000): Promise<T> => {
-  const end = Date.now() + ms
-  for (;;) { const v = fn(); if (v) return v; if (Date.now() > end) throw new Error(`timed out waiting for ${what}`); await new Promise((r) => setTimeout(r, 20)) }
-}
 const ALLOW = JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } })
 const REQUEST = JSON.stringify({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'npm test' } })
 

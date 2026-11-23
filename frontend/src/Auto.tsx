@@ -107,13 +107,15 @@ export function AutoDialog({ all }: { all: State }) {
 
 function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; onClose: () => void; all: State }) {
   const [busy, go] = useBusy(), [err, setErr] = useState('') // shown in this box: the page's error strip is behind it
+  const [asking, setAsking] = useState(false) // Undo's are-you-sure is up: the button reads "Undoing…" only once the user says yes (Bug 341)
   const base = all.repos.find((r) => r.id === run.repo_id)?.default_branch ?? 'main'
-  const undo = () => go(async () => { setErr(''); if (await undoConfirm(name)) await api(`auto-runs/${run.id}/undo`, {}).then(onClose, (e: Error) => setErr(errText(e))) })
-  useEffect(() => { // busy: Undo's are-you-sure is up, and its Escape is only for that
-    const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onClose() }
+  const sure = async () => { setErr(''); setAsking(true); try { return await undoConfirm(name) } finally { setAsking(false) } }
+  const undo = () => go(() => api(`auto-runs/${run.id}/undo`, {}).then(onClose, (e: Error) => setErr(errText(e))), sure)
+  useEffect(() => { // the are-you-sure's Escape is only for that; while the undo runs this box stays
+    const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy && !asking) onClose() }
     document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
   })
-  return <Backdrop onClose={onClose} canClose={!busy} z="z-[80]">{/* under HQ's dialog: Undo's are-you-sure opens on top */}
+  return <Backdrop onClose={onClose} canClose={!busy && !asking} z="z-[80]">{/* under HQ's dialog: Undo's are-you-sure opens on top */}
     <div role="dialog" aria-modal="true" aria-label={`What auto mode did in ${name}`}
       className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-300 shadow-xl">
       <div className="break-words text-sm font-medium text-zinc-100">What auto mode did in {name}</div>
@@ -121,8 +123,9 @@ function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; on
       <Findings all={all.findings ?? []} repoId={run.repo_id} />
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex flex-wrap justify-end gap-1.5">{(run.status === 'finished' || run.status === 'off') && run.start_sha && run.end_sha !== run.start_sha
-        && <button className="btn" disabled={busy} title={`Put ${base} back where this run started. The work stays on its branches.`} onClick={undo}>{busy ? 'Undoing…' : 'Undo this run'}</button>}
-        <button className="btn btn-primary" autoFocus disabled={busy} onClick={onClose}>Close</button></div>
+        && <button className="btn" disabled={busy || asking} title={`Put ${base} back where this run started. The work stays on its branches.`}
+          onClick={undo}>{busy ? 'Undoing…' : 'Undo this run'}</button>}
+        <button className="btn btn-primary" autoFocus disabled={busy || asking} onClick={onClose}>Close</button></div>
     </div>
   </Backdrop>
 }

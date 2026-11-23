@@ -130,6 +130,35 @@ test('Bug 223: a scenario the tester couldn\'t try from the browser is "couldn\'
   assert.equal(keepReport({ outcome: 'ok', couldnt_test: 'Waiting a day for the reminder.' }, G, [], [], []).notes.at(-1), 'Couldn\'t check: Waiting a day for the reminder.')
 })
 
+test('Bug 260: a "problem" with no finding but couldnt_test filled in is "couldn\'t test", with its words; an "ok" one says what it couldn\'t check', () => {
+  const G: Scenario = { id: 's-01', kind: 'basic', title: 'Greeting against the clock', goal: 'See Good morning before noon.', criteria: ['GREET-1 A1'] }
+  const clock = 'I could not change the clock to see the morning greeting; it is afternoon here.'
+  // What the real Haiku run said: "problem", no findings, couldnt_test filled in
+  const haiku = keepReport({ outcome: 'problem', notes: ['Saw Good afternoon'], findings: [], couldnt_test: clock }, G, [], [], ['GREET-1 A1'])
+  assert.deepEqual(haiku, { outcome: 'couldnt_test', why: clock, findings: [], notes: ['Saw Good afternoon'] })
+  // Its only finding one HQ can't keep (an unknown kind): the same
+  assert.equal(keepReport({ outcome: 'problem', findings: [{ kind: 'nope', what: 'Something odd here.' }], couldnt_test: clock }, G, [], [], []).outcome, 'couldnt_test')
+  // Not caught: a real finding beside it stays the verdict; a couldnt_test that says nothing leaves "problem" with nothing kept as before
+  const real = { kind: 'broken', at_step: 1, what: 'The greeting says Good evening at 3 pm.', expected: 'Good afternoon' }
+  assert.deepEqual(keepReport({ outcome: 'problem', findings: [real], couldnt_test: clock }, G, [[nav]], [], []).outcome, 'problem')
+  for (const empty of ['', '  ', 'N/A', 'none', 'None.', 'n/a', '-', '—', 'nothing']) {
+    const k = keepReport({ outcome: 'problem', findings: [], couldnt_test: empty }, G, [], [], [])
+    assert.deepEqual([k.outcome, k.why, k.notes], ['unspecified', 'the tester saw a problem but reported no finding HQ could keep', []], JSON.stringify(empty))
+    assert.deepEqual(keepReport({ outcome: 'ok', couldnt_test: empty }, G, [], [], []), { outcome: 'ok', findings: [], notes: [] }, JSON.stringify(empty))
+  }
+  // "ok" with something it couldn't check stays fine, and carries what: the summary line says it; "unspecified" keeps its own verdict
+  const ok = keepReport({ outcome: 'ok', couldnt_test: 'Waiting a day for the reminder.' }, G, [], [], [])
+  assert.deepEqual([ok.outcome, ok.why], ['ok', 'Waiting a day for the reminder.'])
+  assert.deepEqual(keepReport({ outcome: 'unspecified', couldnt_test: clock }, G, [], [], []).outcome, 'unspecified')
+  const u: UiTest = { at: 1, state: 'done', model: 'haiku', tokens: 1, cost_usd: 0, ms: 1, sessions: 1, findings: [], scenarios: [
+    { id: 's-01', kind: 'basic', title: G.title, actions: 2, criteria: G.criteria, outcome: haiku.outcome, why: haiku.why },
+    { id: 's-02', kind: 'basic', title: 'Reminder', actions: 3, outcome: ok.outcome, why: ok.why }] }
+  assert.deepEqual(uiTestLines(u), ['- 2 scenarios: 1 fine, 0 findings, 0 unspecified, 1 couldn\'t test',
+    `- s-01 Greeting against the clock: couldn't test it from a browser, so GREET-1 A1 has no verdict here (${clock})`,
+    '- s-02 Reminder: fine, but it couldn\'t check from a browser: Waiting a day for the reminder.'])
+  assert.ok(!uiTestLines(u).some((l) => /no verdict \(the tester saw a problem/.test(l)))
+})
+
 test('what counts as "couldn\'t try it from the browser" in a finding\'s words: the machine\'s clock, never what the app does with time', () => {
   for (const w of ['I couldn\'t change the clock to check the morning greeting', 'I can’t set the system clock to the morning', 'There is no way to fake the current time',
     'Unable to change the browser\'s time zone', 'I could not adjust the time of day', 'Cannot move my clock forward to the afternoon', 'couldnt change the device time']) {

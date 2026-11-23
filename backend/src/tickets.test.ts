@@ -13,8 +13,8 @@ migrate()
 const { addFeature, createTicket, cancelFeature, cancelTicket, hqOpened, withTpmText } = await import('./tickets.ts')
 const { restartTpm } = await import('./tpm.ts')
 const { tpmPrompt } = await import('./handover.ts')
-const { writeFeatureMd, tpmWorkspace } = await import('./projectmd.ts')
-const { getFeature, getRepo, getTicket, tickets } = await import('./records.ts')
+const { writeFeatureMd, writeRepoMd, tpmWorkspace } = await import('./projectmd.ts')
+const { getFeature, getRepo, getTicket, setTicket, tickets } = await import('./records.ts')
 const { mergeTicket } = await import('./mergewatch.ts')
 const { nextWorkerSlot, releaseSlot, slotBasesNow } = await import('./slots.ts')
 const SLOT_BASES = slotBasesNow()
@@ -109,7 +109,7 @@ test('Bug 193: on auto, the TPM\'s briefing says HQ starts, checks, tests and me
   assert.match(off, /X-1 \(S\) Ready: ready to start \(the user starts it from HQ\)\n/)
   assert.match(off, /X-2 \(S\) Plan: its plan waits for the user's review\n/)
   assert.match(off, /X-3 \(S\) Local: finished; waits for the user to merge it\n/)
-  assert.match(off, /X-4 \(S\) Pushed: finished and pushed; its PR still needs opening\n/)
+  assert.match(off, /X-4 \(S\) Pushed: finished and pushed; the user tries it, then merges it or makes a PR from HQ\n/)
   assert.match(off, /X-5 \(S\) Open: finished; PR #7 waits for the user's merge\n/)
   assert.match(off, /X-6 \(S\) Parked: finished; waits for the user to merge it\n/) // parked means nothing with auto off
   assert.doesNotMatch(off, /HQ starts it|HQ tests|HQ checks its plan|parked/)
@@ -129,6 +129,18 @@ test('Bug 193: on auto, the TPM\'s briefing says HQ starts, checks, tests and me
   assert.match(master, /X-4 \(S\) Pushed: finished and pushed; HQ tests it on master, opens its PR and merges it\n/)
   assert.match(master, /X-5 \(S\) Open: finished; HQ tests PR #7 on master and merges it\n/)
   assert.doesNotMatch(master.replace(/X-6 [^\n]*/, ''), /\bmain\b/) // X-6's parked reason is HQ's own text from the test data
+})
+
+test("Bug 301: a ticket whose PR was closed on GitHub says so on the TPM's board, and who opens a new one", () => {
+  const base = { feature_id: 'f9', size: 'S', deps: '[]', go_ahead: 0, auto_parked_why: null, branch: null, pr_state: 'closed', pr_number: 9 } as const
+  const board = [{ ...base, key: 'X-1', title: 'Ready', status: 'pr_ready' }, { ...base, key: 'X-2', title: 'Open', status: 'pr_open' }] as never[]
+  const brief = (r: object) => tpmPrompt({ ...getRepo('r1')!, ...r } as never, { ws: '/ws', previous: null, messages: [], board: [{ f: { title: 'Nine', handle: 'F-9' } as never, tickets: board }] })
+  const off = brief({ auto_mode: 0 }), on = brief({ auto_mode: 1 })
+  for (const k of ['X-1 \\(S\\) Ready', 'X-2 \\(S\\) Open']) {
+    assert.match(off, new RegExp(`${k}: finished and pushed; PR #9 was closed on GitHub without merging, so it waits for the user: Merge or Make PR opens a new one\\n`))
+    assert.match(on, new RegExp(`${k}: finished and pushed; PR #9 was closed on GitHub without merging, so HQ opens a new PR and merges it\\n`))
+  }
+  assert.doesNotMatch(off + on, /PR #9 waits for the user's merge|HQ tests PR #9|its PR still needs opening/)
 })
 
 test("Bug 243: a finished ticket that conflicts with main says so on the TPM's board, with its files and who presses Fix conflicts", () => {
@@ -231,7 +243,8 @@ test('Worker slots: ports never overlap, and a slot whose agent is gone is free 
   assert.notEqual(f.idx, g.idx); assert.notEqual(f.env.HQ_PORT_BASE, g.env.HQ_PORT_BASE)
   // every block in use: a plain refusal, nothing written
   const before = q('SELECT * FROM worker_slots').length
-  await assert.rejects(nextWorkerSlot('eng-h', async () => true), /No free ports for another engineer: HQ's engineer ports \d+–\d+ are all in use \(by its engineers or other programs\)\./)
+  await assert.rejects(nextWorkerSlot('eng-h', async () => true),
+    /No free ports for another engineer: HQ's engineer ports \d+–\d+ are all in use \(by its engineers, its own test runs or other programs\)\./)
   assert.equal(q('SELECT * FROM worker_slots').length, before)
 })
 
@@ -244,6 +257,23 @@ test('Cancel: a merged ticket refuses; a cancelled one stays cancelled', async (
   assert.deepEqual(await cancelTicket('t10', { tell: false }), { key: 'APP-10', stopped: null })
 })
 
+test('Bug 347: ✕ on a ticket or a feature is refused while its project is cleared or removed, and goes through after', async () => {
+  const { removing } = await import('./records.ts')
+  const f = addFeature('r1', 'Bug 347 list', 'a list'), a = createTicket(f.id, { title: 'one', size: 'S', spec: 'x' })
+  const g = addFeature('r2', 'Bug 347 other', 'another project'), b = createTicket(g.id, { title: 'two', size: 'S', spec: 'x' })
+  run('UPDATE repos SET clearing_at = ? WHERE id = ?', Date.now(), 'r1')
+  try {
+    await assert.rejects(cancelTicket(a.id, { tell: false }), { message: "demo is being cleared; wait until it's done." })
+    await assert.rejects(cancelFeature(f.id), { message: "demo is being cleared; wait until it's done." })
+    assert.equal(getTicket(a.id)!.status, 'queued'); assert.equal(getFeature(f.id)!.status, 'planning')
+    assert.equal((await cancelTicket(b.id, { tell: false })).key, b.key, 'another project is not being cleared: its ✕ goes through')
+  } finally { run('UPDATE repos SET clearing_at = NULL WHERE id = ?', 'r1') }
+  removing.add('r1')
+  try { await assert.rejects(cancelTicket(a.id, { tell: false }), { message: 'demo is being removed from HQ.' }) } finally { removing.delete('r1') }
+  assert.equal((await cancelTicket(a.id, { tell: false })).key, a.key); assert.equal(getTicket(a.id)!.status, 'cancelled')
+  await cancelFeature(f.id); assert.equal(getFeature(f.id)!.status, 'cancelled')
+})
+
 test('Bug 250: a feature\'s file says where it stands in the board\'s words, not its stored "planning", and is rewritten when cancelled', async () => {
   const status = (f: { handle: string | null }) => /^status: (.*)$/m.exec(fs.readFileSync(path.join(tpmWorkspace('r1'), 'features', `${f.handle}.md`), 'utf8'))?.[1]
   const f = addFeature('r1', 'Bug 250 list', 'a list'); assert.equal(status(f), 'no tickets yet')
@@ -253,6 +283,44 @@ test('Bug 250: a feature\'s file says where it stands in the board\'s words, not
   assert.equal(status(f), '1/2 merged'); assert.equal(getFeature(f.id)!.status, 'planning', 'the stored word is unchanged: only the file\'s words moved')
   await cancelFeature(f.id)
   assert.equal(status(f), 'cancelled · 1 merged before that', 'rewritten after the feature itself was marked cancelled, not "done" for its merged part')
+})
+
+test('Bug 269: every change a ticket\'s row shows rewrites its feature\'s file; changes it doesn\'t show, and rewrites that change nothing, write nothing', () => {
+  const f = addFeature('r1', 'Bug 269 list', 'a list'), file = path.join(tpmWorkspace('r1'), 'features', `${f.handle}.md`)
+  const project = path.join(tpmWorkspace('r1'), 'PROJECT.md')
+  const a = createTicket(f.id, { title: 'one', size: 'S', spec: 'x' }), b = createTicket(f.id, { title: 'two', size: 'S', spec: 'x' })
+  const row = (k: string) => new RegExp(`^\\| ${k} \\| S \\| (\\w+) \\|`, 'm').exec(fs.readFileSync(file, 'utf8'))?.[1]
+  assert.equal(row(a.key), 'queued')
+  for (const status of ['planning', 'plan_review', 'implementing', 'pr_ready', 'pr_open', 'awaiting_answer'] as const) {
+    setTicket(a.id, { status }); assert.equal(row(a.key), status, `${status} is in the file at once`)
+    assert.match(fs.readFileSync(project, 'utf8'), new RegExp(`- ${a.key} \\(S\\) one: ${status}`), 'and on PROJECT.md\'s board')
+  }
+  setTicket(a.id, { title: 'one, renamed', spec: 'a new spec' }); assert.match(fs.readFileSync(file, 'utf8'), /### T-\d+: one, renamed\na new spec/)
+  const writes: string[] = [], real = fs.writeFileSync
+  fs.writeFileSync = ((p: fs.PathOrFileDescriptor, ...rest: never[]) => { writes.push(String(p)); return (real as (...x: unknown[]) => void)(p, ...rest) }) as typeof fs.writeFileSync
+  try {
+    setTicket(a.id, { go_ahead: 1 }); setTicket(a.id, { handoff_updated_at: Date.now(), proof: '{}', parked_at: 1 }); setTicket(b.id, { auto_tries: 2 })
+    assert.deepEqual(writes, [], 'fields the file doesn\'t show (what hooks and auto mode touch) write nothing')
+    setTicket(a.id, { status: 'awaiting_answer' }); setTicket(b.id, { status: 'queued', deps: b.deps })
+    assert.deepEqual(writes, [], 'a status set again to what it is renders the same file, so nothing is written')
+    setTicket(b.id, { status: 'planning' }); assert.deepEqual(writes.map((w) => path.basename(w)).sort(), [`${f.handle}.md`, 'PROJECT.md'].sort())
+  } finally { fs.writeFileSync = real }
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/^(\| T-\d+ \| S \| )awaiting_answer/m, '$1queued')) // written by an HQ from before the fix
+  assert.equal(row(a.key), 'queued'); writeRepoMd('r1'); assert.equal(row(a.key), 'awaiting_answer', 'a TPM starting (writeRepoMd) brings an old file up to date')
+  run('DELETE FROM tickets WHERE id = ?', b.id); fs.rmSync(file) // a ticket that's gone: no file comes back, no throw
+  setTicket(b.id, { status: 'merged' }); assert.equal(fs.existsSync(file), false)
+})
+
+test('Bug 288: a cancelled feature\'s file still lists what was cancelled; one cancelled before it had tickets says so', async () => {
+  const f = addFeature('r1', 'Bug 288 shop', 'a shop'), file = path.join(tpmWorkspace('r1'), 'features', `${f.handle}.md`)
+  assert.match(fs.readFileSync(file, 'utf8'), /## Tickets\n\nNone yet\.\n/)
+  const a = createTicket(f.id, { title: 'list', size: 'S', spec: 'x' }), b = createTicket(f.id, { title: 'pay', size: 'S', spec: 'x' })
+  run("UPDATE tickets SET status = 'merged' WHERE id = ?", a.id)
+  await cancelFeature(f.id)
+  const md = fs.readFileSync(file, 'utf8')
+  assert.match(md, new RegExp(`\\| ${a.key} \\| S \\| merged \\|[^\\n]*\\n\\| ${b.key} \\| S \\| cancelled \\|`)); assert.match(md, /^status: cancelled · 1 merged before that$/m)
+  const g = addFeature('r1', 'Bug 288 nothing', 'nothing'); await cancelFeature(g.id)
+  assert.match(fs.readFileSync(path.join(tpmWorkspace('r1'), 'features', `${g.handle}.md`), 'utf8'), /## Tickets\n\nNone: it was cancelled before it had any\.\n\n?$/)
 })
 
 test('Bug 126: what the TPM hears HQ ran on a ticket before it merged', async () => {

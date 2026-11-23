@@ -4,13 +4,18 @@ import { names } from './localmerge.ts'
 import { j } from './util.ts'
 import { unmergedDeps } from './readiness.ts'
 import type { Message } from './delivery.ts'
-import { hqMoves, type Feature, type Repo, type Ticket } from './records.ts'
+import { autoGoing, hqMoves, type Feature, type Repo, type Ticket } from './records.ts'
 import { criteriaBlock, criteriaOf } from './criteria.ts'
 
+/** Bug 301: its PR was closed on GitHub without merging. The board offers Merge (a new PR, merged) and Make PR; auto mode merges it through a new PR. */
+const closedPr = (t: Ticket, hq: boolean): string => `finished and pushed; PR #${t.pr_number} was closed on GitHub without merging, so `
+  + (hq ? 'HQ opens a new PR and merges it' : 'it waits for the user: Merge or Make PR opens a new one')
 /** Where a ticket stands, in words, for a TPM taking over. Bug 193: on auto, HQ starts, checks, tests and merges tickets (autoOnWords), so the words say
- *  so. Not a parked ticket, and nothing starts or merges while auto mode is stopped (plans are still checked): the user does, as the board's buttons say. */
+ *  so. Not a parked ticket, and nothing starts or merges while auto mode is stopped: the user does, as the board's buttons say (hqMoves). Plans are the
+ *  exception: HQ checks every plan while auto mode is on, stopped or parked too (gate.ts, plancheck.ts autoOn), as the board says (Bug 292). The TPM
+ *  never starts while its project is being cleared (tpm.ts notClearing), so these words have no clearing case. */
 function standing(t: Ticket, all: Ticket[], repo: Repo): string {
-  const on = !!repo.auto_mode && !t.auto_parked_why, hq = hqMoves(repo, t), main = repo.default_branch // Bug 210: the project's own, say master
+  const on = !!repo.auto_mode, hq = hqMoves(repo, t), main = repo.default_branch // Bug 210: the project's own, say master
   const waits = unmergedDeps(t, all), clash = conflictLine(t, hq, main)
   const now = ((): string => {
     switch (t.status) {
@@ -22,9 +27,11 @@ function standing(t: Ticket, all: Ticket[], repo: Repo): string {
       case 'awaiting_answer': return 'its engineer waits for an answer'
       case 'escalated': return 'escalated to the user'
       case 'pr_ready': if (clash) return `finished${t.pr_state === 'local' ? '' : ' and pushed'}, but it ${clash}`
+        if (t.pr_state === 'closed') return closedPr(t, hq)
         return t.pr_state === 'local' ? `finished; ${hq ? `HQ tests it on ${main} and merges it` : 'waits for the user to merge it'}`
-        : `finished and pushed; ${hq ? `HQ tests it on ${main}, opens its PR and merges it` : 'its PR still needs opening'}`
+        : `finished and pushed; ${hq ? `HQ tests it on ${main}, opens its PR and merges it` : 'the user tries it, then merges it or makes a PR from HQ'}` // Bug 292: names who
       case 'pr_open': if (clash) return `finished, but PR #${t.pr_number} ${clash}`
+        if (t.pr_state === 'closed') return closedPr(t, hq)
         return hq ? `finished; HQ tests PR #${t.pr_number} on ${main} and merges it` : `finished; PR #${t.pr_number} waits for the user's merge`
       case 'resolving': return `its engineer is ${fixWords(t.fixing, main).ing}`
       default: return t.status
@@ -75,8 +82,8 @@ export function tpmPrompt(repo: Repo, o: { ws: string; previous: string | null; 
     + ' work any more; don\'t bring them up as such. "Built so far" in PROJECT.md is what exists in the code.' : ''
   const extra = (o.context ? '\n\nCONTEXT.md in your workspace is what the user asked for when this project started; keep it in mind.' : '')
     + `\n\n${autoLine(repo, o.messages.length > 0 || !!o.note)}`
-    + (o.localOnly ? `\n\nHQ can't push to ${repo.name}, so nothing in it goes to GitHub: no PRs; ${repo.auto_mode ? 'HQ merges' : 'the user merges'} finished tickets into the local`
-      + ` ${repo.default_branch}${repo.auto_mode ? '' : ' from HQ'}.` : '')
+    + (o.localOnly ? `\n\nHQ can't push to ${repo.name}, so nothing in it goes to GitHub: no PRs; ${autoGoing(repo) ? 'HQ merges' : 'the user merges'} finished tickets into the local`
+      + ` ${repo.default_branch}${autoGoing(repo) ? '' : ' from HQ'}.` : '') // stopped: the user, until Resume (Bug 292)
   const note = o.note ? `\n\nThe previous TPM's handoff note (HQ's ticket list above is the truth for statuses):\n${o.note}` : ''
   const ask = o.message
     ? `\n\nThe user's new message, verbatim:\n"""\n${o.message}\n"""\n\nAct on it. New work: start_feature, then create_ticket for each ticket (S/M/L, spec, criteria,`

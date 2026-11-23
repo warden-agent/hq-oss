@@ -53,7 +53,7 @@ export async function ensureTrusted(dir: string, waitMs = 5000): Promise<void> {
     const entry = projects[dir]
     projects[dir] = {
       allowedTools: [], mcpServers: {}, enabledMcpjsonServers: [], disabledMcpjsonServers: [], hasClaudeMdExternalIncludesApproved: false,
-      hasClaudeMdExternalIncludesWarningShown: false, ...(entry ?? {}), hasTrustDialogAccepted: true,
+      hasClaudeMdExternalIncludesWarningShown: false, ...entry, hasTrustDialogAccepted: true,
     }
     const tmp = `${file}.hq-${process.pid}.tmp`
     fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), { mode: fs.statSync(file).mode & 0o777 }); fs.renameSync(tmp, file)

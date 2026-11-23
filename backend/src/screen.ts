@@ -1,4 +1,5 @@
 // Reading an agent's terminal screen (a tmux capture of Claude Code; checked on 2.1.300 and 2.1.322). Pure, so it is unit-tested on real captures.
+import { pieces, PIECE } from './tmux.ts'
 
 /** The line under the input box when Claude Code waits at its prompt. It starts with the permission mode ("⏸ manual mode on", "⏸ plan mode on",
  *  "⏵⏵ accept edits on"), and that part is the only one that is always there. 2.1.300 also ended every one with "← for agents"; 2.1.322 doesn't, and shows
@@ -49,16 +50,29 @@ function typedOnly(styled: string): string[] {
   return out.split('\n')
 }
 /** Bug 149: a line somebody typed into Claude Code's prompt box and hasn't sent (a draft). HQ never types there then: Enter would send the two
- *  as one message. `styled` is a capture with `-e`. Checked on 2.1.322 (test-tools README item 25): a typed draft is drawn in the terminal's own
+ *  as one message. `styled` is a capture with `-e`. Checked on 2.1.322 (by hand): a typed draft is drawn in the terminal's own
  *  colour, on the `❯` line and the lines under it (indented) up to the box's lower rule; an empty box shows nothing or a dim placeholder
  *  (`Try "…"`), Claude Code's suggestion of what to type next is dim (`❯ ESC[2mcommit this`), and so is "Press up to edit queued messages".
  *  Only text drawn plain counts, so a capture with no styles at all (colours turned off, say) never does: a wrong "there's a draft" would hold
  *  the agent's messages for good, a missed one only does what HQ did before. */
-export function paneHasDraft(styled: string): boolean {
-  if (!/\x1b\[[0-9;:]*m/.test(styled)) return false
+export const paneHasDraft = (styled: string): boolean => /\S/.test(draftText(styled))
+/** The draft paneHasDraft finds, its lines as the box shows them ('' when there is none). Claude Code wraps a long one at spaces, and a capture
+ *  drops the space at each line's end, so only what isn't whitespace can be compared. A draft taller than the box shows only its end. Bug 331. */
+export function draftText(styled: string): string {
+  if (!/\x1b\[[0-9;:]*m/.test(styled)) return ''
   const plain = plainScreen(styled).split('\n'), typed = typedOnly(styled), rule = (l: string | undefined): boolean => /^─{10,}/.test((l ?? '').trim())
   const top = plain.map((l) => /^❯(\s|$)/.test(l)).lastIndexOf(true)
-  if (top < 1 || !rule(plain[top - 1])) return false
-  const end = plain.findIndex((l, i) => i > top && rule(l)); if (end < 0) return false
-  return typed.slice(top, end).some((l, i) => /\S/.test(i === 0 ? l.replace(/^❯/, '') : l))
+  if (top < 1 || !rule(plain[top - 1])) return ''
+  const end = plain.findIndex((l, i) => i > top && rule(l)); if (end < 0) return ''
+  return typed.slice(top, end).map((l, i) => (i === 0 ? l.replace(/^❯/, '') : l).trim()).join('\n').trim()
+}
+/** Bug 331: what is left to type of `line` when the agent's prompt box holds HQ's own first pieces of it and nothing else: a restart cut short
+ *  typeLine, whose pieces each go in whole (tmux.PIECE). '' when only its Enter is missing; null when the box is empty or holds anything else.
+ *  Only what isn't whitespace is compared (draftText). Somebody's own words before or after HQ's never match, nor does a box too tall to
+ *  show its start (it shows the end): held as a draft (Bug 149) as before. HQ never clears the box, so nobody's typing is lost. */
+export function ownHalfLine(styled: string, line: string): string | null {
+  const flat = (s: string): string => s.replace(/\s+/g, ''), box = flat(draftText(styled)); if (!box) return null
+  let at = 0
+  for (const p of pieces(line, PIECE)) { at += p.length; if (flat(line.slice(0, at)) === box) return line.slice(at) }
+  return null
 }

@@ -64,8 +64,10 @@ test('Bug 9: the early warning, a refusal that names who merged first, and Fix c
   assert.equal((await notices(t2, 'merge_conflict')).length, 1)
   // Ticked off, it stays off: neither the watcher nor another refusal brings it back (the box keeps Fix conflicts).
   await hq.api(`attention/${n[0].id}/resolve`, {})
-  await hq.api(`repos/${(await hq.state()).features.find((x: any) => x.id === f.id).repo_id}/sync`, {}); assert.equal((await merge(t2)).status, 409)
-  await new Promise((res) => setTimeout(res, 300)); assert.equal((await notices(t2, 'merge_conflict')).length, 0)
+  const sync = async () => hq.api(`repos/${(await hq.state()).features.find((x: any) => x.id === f.id).repo_id}/sync`, {}), looked = await hq.beat('merges')
+  await sync(); assert.equal((await merge(t2)).status, 409)
+  await sync(); await hq.beats('merges', 2, { from: looked }) // the watcher has looked again since the first sync (a sync sets it off)
+  assert.equal((await notices(t2, 'merge_conflict')).length, 0)
   assert.equal((await tk(t2)).conflict_files, '["version.txt"]')
   // Fix conflicts, clicked twice at once: one message to the engineer that's still there, nothing launched.
   const both = await Promise.all([fix(t2), fix(t2)])

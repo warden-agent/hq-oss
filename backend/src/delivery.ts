@@ -8,7 +8,7 @@ import { id } from './util.ts'
 import { agentDir, getAgent, liveAgents, onDialog, update, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
 import * as tmux from './tmux.ts'
-import { paneHasDraft, paneLooksIdle, paneShowsDialog, plainScreen } from './screen.ts'
+import { ownHalfLine, paneHasDraft, paneLooksIdle, paneShowsDialog, plainScreen } from './screen.ts'
 import { wake, wakeAll } from './wake.ts'
 
 export type Message = { id: string; repo_id: string | null; feature_id: string | null; channel: string; from_id: string; to_id: string | null; reason: string; in_reply_to: string | null; body: string; created_at: number; batch_id: string | null; delivered_at: number | null; delivery_method: string | null; ack_at: number | null
@@ -73,8 +73,7 @@ const oneLine = (s: string): string => s.replace(/\s*\n\s*/g, ' ').trim()
 const startsPlain = (line: string): boolean => /^[\p{L}\p{N}]/u.test(line)
 /** Delivery policy: returns a batch or null. `by`: who takes it. 'mod' is the mod's long-poll (and the Stop hook's answer when the mod has gone quiet).
  *  'typed' is HQ typing into the agent's terminal (typeNext, Bug 110): the batch's text is then the one line it types. */
-export function nextBatchFor(agent: Agent, by: 'mod' | 'typed' = 'mod'): Handed | null {
-  const t = now()
+export function nextBatchFor(agent: Agent, by: 'mod' | 'typed' = 'mod', t = now()): Handed | null {
   if (agent.takeover_locked_until && agent.takeover_locked_until > t) return null
   if (agent.status === 'paused' || pausedRoles().includes(agent.role)) return null
   const lost = t - getSetting('batch_receive_s', DEFAULTS.batch_receive_s) * 1000 // handed out, but the mod never said it got it
@@ -94,10 +93,12 @@ export function nextBatchFor(agent: Agent, by: 'mod' | 'typed' = 'mod'): Handed 
   const launch = one<Batch>("SELECT * FROM batches WHERE agent_id = ? AND method = 'launch' AND handed_at IS NULL AND acked_at IS NULL", agent.id)
   if (launch && by === 'typed') return null // a launch prompt is the mod's to give: it is the session's first, and nothing can have interrupted a turn before it
   if (launch) { run('UPDATE batches SET handed_at = ? WHERE id = ?', t, launch.id); emit({ agentId: agent.id, source: 'system', kind: 'batch.handed', payload: { id: launch.id, launch: true } }); return { ...launch, handed_at: t, raw: true, asUser: true } }
-  // While it writes its handoff note, the request is all it gets; the rest waits for the session that takes over.
-  const all = pendingFor(agent), stale = agent.fresh_start_at ? [] : all.filter((m) => m.reason === 'fresh_start') // its fresh start is over
-  for (const m of stale) dropMessage(m.id, 'fresh_start_over', t)
-  const msgs = agent.fresh_start_at ? all.filter((m) => m.reason === 'fresh_start') : all.filter((m) => m.reason !== 'fresh_start'); if (!msgs.length) return null
+  // While it writes its handoff note, its request is all it gets; the rest waits for the session that takes over. A request HQ replaced with
+  // one in other words (freshstart.ts retarget, Bug 338) never comes up, nor does one whose fresh start is over.
+  const all = pendingFor(agent), ask = (m: Message): boolean => m.reason === 'fresh_start'
+  const current = (m: Message): boolean => !!agent.fresh_start_at && (!agent.fresh_start_msg || m.id === agent.fresh_start_msg)
+  for (const m of all.filter((x) => ask(x) && !current(x))) dropMessage(m.id, agent.fresh_start_at ? 'replaced' : 'fresh_start_over', t)
+  const msgs = agent.fresh_start_at ? all.filter(current) : all.filter((m) => !ask(m)); if (!msgs.length) return null
   // Bug 110: after an interrupted turn the mod's prompt would be dropped, so nothing is handed to it. HQ types the messages itself, when the screen allows it.
   if (by === 'mod' && interrupted) { typeNext(agent.id); return null }
   const user = msgs.map((m) => m.body).join('\n\n'), bid = id('B')
@@ -165,20 +166,26 @@ export function typeNext(agentId: string): void {
  *  queue and on from there like any other message. If the Escape interrupted a turn (the mod says so within milliseconds, turnEnded), typeNext
  *  types it once the box is empty, and its box says why it waits. If there was no turn to stop, the mod hands it out at once: a prompt the mod
  *  submits goes in on its own and leaves the draft in the box (2.1.322). A fresh start's request that never gets in gets HQ's note (NEVER_MS). */
-function holdForDraft(agentId: string, m: Message): void {
+function holdForDraft(agentId: string, m: Message, why = 'draft'): void { // Bug 296: also 'screen' and 'status', after a restart (typeCutShort)
   run('UPDATE messages SET delivered_at = NULL, delivery_method = NULL WHERE id = ? AND ack_at IS NULL', m.id); patch('message', m.id, { delivered_at: null, delivery_method: null })
-  emit({ agentId, source: 'system', kind: 'message.held', payload: { id: m.id, why: 'draft' } })
+  emit({ agentId, source: 'system', kind: 'message.held', payload: { id: m.id, why } })
   wake(agentId) // its waiting `next` looks at once
 }
 /** Bug 99: when nextBatchFor could next find something with nothing else changing (no message, no ack, no setting): a hold ends,
  *  a batch handed out or submitted is due to be handed out again, or the one in flight stops holding the rest back. Null: none. */
-export function nextDeadline(agent: Agent): number | null {
-  const t = now(), receive = getSetting('batch_receive_s', DEFAULTS.batch_receive_s) * 1000, times: number[] = []
+export function nextDeadline(agent: Agent, t = now()): number | null {
+  const receive = getSetting('batch_receive_s', DEFAULTS.batch_receive_s) * 1000, times: number[] = []
   if (agent.takeover_locked_until && agent.takeover_locked_until > t) times.push(agent.takeover_locked_until)
   for (const b of q<Batch>('SELECT * FROM batches WHERE agent_id = ? AND acked_at IS NULL AND dropped_at IS NULL AND handed_at IS NOT NULL', agent.id)) {
     times.push(b.handed_at! + 180_000); if (b.received_at === null) times.push(b.handed_at! + receive); if (b.submitted_at !== null) times.push(b.submitted_at + NOT_ACKED_MS)
   }
   const later = times.filter((x) => x >= t); return later.length ? Math.min(...later) + 1 : null // the checks compare with < and >
+}
+/** One look for the mod's waiting `next` (hooks.ts): the batch to hand out now, or else when to look again. Bug 330: both from ONE reading of the
+ *  clock. Read twice, a batch that fell due between the two readings was in neither answer (not yet due for nextBatchFor, already past for
+ *  nextDeadline), and the request slept on to its backstop, or to its end. */
+export function modLook(agent: Agent, t = now()): { batch: Handed | null; due: number | null } {
+  const batch = nextBatchFor(agent, 'mod', t); return { batch, due: batch ? null : nextDeadline(agent, t) }
 }
 /** The line an urgent message is typed as. The user's goes in as written only when it starts with a letter or a digit: Bug 146, "/cd …" ran as Claude Code's
  *  own command. Otherwise, and for everyone else's, labelled; a label starts with "[", which Claude Code takes as text (2.1.322). */
@@ -190,16 +197,71 @@ function urgentLine(m: Pick<Message, 'from_id' | 'reason' | 'body'>): string {
  *  delivered before the first await, so the mod's long-poll never hands it out as well. */
 export async function interruptAndType(agent: Agent, m: Message): Promise<void> {
   const t0 = now(); run("UPDATE messages SET delivered_at = ?, delivery_method = 'tmux' WHERE id = ?", t0, m.id); patch('message', m.id, { delivered_at: t0, delivery_method: 'tmux' })
-  let draft = false
+  await typeUrgent(agent, m, false)
+}
+/** `again` (Bug 296): typed after a restart cut the first try short (typeCutShort). The Escape then goes only to a screen that shows a turn at
+ *  work (the first one never got there): an idle prompt gets no second one, which can open Claude Code's Rewind menu. Then HQ types only into
+ *  its waiting prompt; anything else on the screen, or a status that takes no messages, sends the message back to the queue, as a draft does.
+ *  Bug 331: a box at that prompt that holds the first pieces of this very line, and nothing else, is HQ's own typing from before the restart:
+ *  HQ types the rest (ownHalfLine). */
+async function typeUrgent(agent: Agent, m: Message, again: boolean): Promise<void> {
+  let held: string | null = null, rest: string | null = null
   await inTerminal(agent.id, async () => { // not in the middle of a batch HQ is typing there (Bug 110)
-    await tmux.sendEscape(agent.tmux_session).catch(() => {})
-    await new Promise((r) => setTimeout(r, 1500)) // let the interrupted turn wind down
-    if ((draft = paneHasDraft(await tmux.visiblePaneStyled(agent.tmux_session)))) return // Bug 149: one Escape leaves a half-written line in the box
-    await tmux.typeLine(agent.tmux_session, urgentLine(m)) // in pieces, as typeNext does: sent in one go, Claude Code kept only the end of a long one (Bug 183)
+    const a = again ? getAgent(agent.id) : agent; if (!a || (again && a.status === 'exited')) { held = 'gone'; return } // read again: the restart took a while
+    if (again && notTypeable(a)) { held = 'status'; return }
+    if (!again || /esc to interrupt/.test(plainScreen(await tmux.visiblePaneStyled(a.tmux_session)))) {
+      await tmux.sendEscape(a.tmux_session).catch(() => {})
+      await new Promise((r) => setTimeout(r, 1500)) // let the interrupted turn wind down
+    }
+    const styled = await tmux.visiblePaneStyled(a.tmux_session), screen = plainScreen(styled), line = urgentLine(m)
+    rest = again && paneLooksIdle(styled) ? ownHalfLine(styled, line) : null
+    held = rest !== null ? null : paneHasDraft(styled) ? 'draft' : again && !paneLooksIdle(screen) ? 'screen' : null // Bug 149: one Escape leaves a half-written line in the box
+    if (held) return
+    await tmux.typeLine(a.tmux_session, rest ?? line) // in pieces, as typeNext does: sent in one go, Claude Code kept only the end of a long one (Bug 183)
   })
-  if (draft) return holdForDraft(agent.id, m)
+  if (held === 'gone') return // its session ended: the message stays as it is, and a fresh start gets HQ's note (sweepFreshStarts)
+  if (held) return holdForDraft(agent.id, m, held)
   const t = now(); run('UPDATE messages SET ack_at = ? WHERE id = ?', t, m.id); patch('message', m.id, { ack_at: t })
-  emit({ agentId: agent.id, source: 'system', kind: 'message.typed', payload: { id: m.id, reason: m.reason } })
+  emit({ agentId: agent.id, source: 'system', kind: 'message.typed', payload: { id: m.id, reason: m.reason, ...(again ? { again: true } : {}),
+    ...(rest !== null ? { finished: true } : {}) } }) // Bug 331: only the rest was typed, after HQ's own first pieces
+}
+/** How long after HQ began typing an urgent message or a fresh start's request a restart still types it again: as long as a fresh start
+ *  waits for its request to get in (freshstart.ts NEVER_MS) before HQ writes the note itself. */
+const CUT_SHORT_MS = Number(process.env.HQ_FRESH_START_NEVER_S ?? 900) * 1000
+/** Bug 296: at start-up, each urgent message and fresh start's request the last backend was typing when it went down. interruptAndType marks
+ *  it delivered before its Escape and acks it once typed, so a restart in between left it delivered and never typed: the agent sat idle, and a
+ *  Clear, a fresh start or a switch of projects waited 15 minutes for HQ's own note. Typed again (typeUrgent) when its agent still runs and,
+ *  for a fresh start's request, that fresh start is still open; not when it is older than CUT_SHORT_MS. Bug 331: and each batch typeNext was
+ *  typing (finishCutBatch). */
+export async function typeCutShort(t = now()): Promise<void> {
+  const cut = q<Message>("SELECT * FROM messages WHERE delivery_method = 'tmux' AND batch_id IS NULL AND ack_at IS NULL AND delivered_at > ? ORDER BY delivered_at",
+    t - CUT_SHORT_MS)
+  // read now, before the waits below: a batch typeNext hands out meanwhile is this backend's own
+  const typed = q<Batch>(`SELECT * FROM batches WHERE method = 'typed' AND submitted_at IS NULL AND acked_at IS NULL AND dropped_at IS NULL
+    AND handed_at > ? AND handed_at <= ?`, t - CUT_SHORT_MS, t)
+  await Promise.all(cut.map(async (m) => {
+    const a = m.to_id ? getAgent(m.to_id) : undefined
+    if (!a || a.status === 'exited' || (m.reason === 'fresh_start' && a.fresh_start_msg !== m.id)) return
+    emit({ agentId: a.id, source: 'system', kind: 'message.cut_short', payload: { id: m.id, reason: m.reason } })
+    await typeUrgent(a, m, true).catch((e) => emit({ agentId: a.id, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
+  }))
+  await Promise.all(typed.map(finishCutBatch))
+}
+/** Bug 331: a batch typeNext was typing when the backend went down. It counted as received when handed out and is marked submitted only once
+ *  typed, so no rule of nextBatchFor ever put it back: its messages were never read, and its first pieces sat in the prompt box. HQ types the
+ *  rest when the box at the waiting prompt holds only those (ownHalfLine). Either way it counts as submitted from here: the prompt's hook acks
+ *  it if it got in (whole before the restart, or now), and if none comes within NOT_ACKED_MS its messages are typed again (requeue). */
+async function finishCutBatch(b: Batch): Promise<void> {
+  const was = getAgent(b.agent_id); if (!was || was.status === 'exited') return
+  let rest: string | null = null
+  await inTerminal(b.agent_id, async () => {
+    const styled = await tmux.visiblePaneStyled(was.tmux_session), a = getAgent(b.agent_id) // read again: the look took a moment
+    if (!a || a.status === 'exited' || notTypeable(a) || !paneLooksIdle(styled)) return
+    const r = ownHalfLine(styled, b.text); if (r === null) return
+    await tmux.typeLine(a.tmux_session, r); rest = r
+  }).catch((e) => emit({ agentId: b.agent_id, source: 'system', kind: 'batch.type_failed', payload: { id: b.id, error: String(e) } }))
+  if (one('SELECT 1 AS x FROM batches WHERE id = ? AND acked_at IS NULL AND dropped_at IS NULL', b.id)) markSubmitted(b.id)
+  emit({ agentId: b.agent_id, source: 'system', kind: 'batch.cut_short', payload: { id: b.id, finished: rest !== null } })
 }
 export function markSubmitted(batchId: string): void { run('UPDATE batches SET submitted_at = ? WHERE id = ?', now(), batchId) }
 export function markReceived(batchId: string): void { run('UPDATE batches SET received_at = ? WHERE id = ? AND received_at IS NULL', now(), batchId) }
@@ -305,9 +367,9 @@ export function readInbox(agent: Agent): Message[] {
   return msgs
 }
 /** Bug 187: a message HQ won't hand out. Its delivered_at takes it out of the queue; delivery_method and dropped_why say it was never read
- *  and why ('fresh_start_over': a fresh-start request whose fresh start was over; 'finished': a test-command note its engineer hadn't read
- *  by open_pr, Bug 147), so Messages shows it as dropped, not as delivered. */
-function dropMessage(msgId: string, why: 'fresh_start_over' | 'finished', t: number): void {
+ *  and why ('fresh_start_over': a fresh-start request whose fresh start was over; 'replaced': one HQ asked again in other words, Bug 338;
+ *  'finished': a test-command note its engineer hadn't read by open_pr, Bug 147), so Messages shows it as dropped, not as delivered. */
+function dropMessage(msgId: string, why: 'fresh_start_over' | 'replaced' | 'finished', t: number): void {
   run("UPDATE messages SET delivered_at = ?, delivery_method = 'dropped', dropped_why = ? WHERE id = ?", t, why, msgId)
   patch('message', msgId, { delivered_at: t, delivery_method: 'dropped', dropped_why: why })
 }

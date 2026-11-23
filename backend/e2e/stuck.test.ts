@@ -6,7 +6,6 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, sh, exitPlanMode, type Hq } from './harness.ts'
 
 let hq: Hq
@@ -87,7 +86,7 @@ test('an open stuck alert goes when its agent ends: Stop, its session ending, it
 test('a stuck alert left open on an agent that has already ended (saved before the fix) goes on the next look', async () => {
   const { eng, t } = await engineer('old-row')
   await hq.api(`agents/${eng.id}/stop`, {})
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 })
+  const db = hq.db()
   try {
     db.prepare("INSERT INTO needs_attention(id, agent_id, ticket_id, kind, detail, created_at) VALUES ('att-old', ?, ?, 'stuck', ?, ?)")
       .run(eng.id, t.id, `${eng.id}: no events for 10 min and the screen has not changed (status working)`, Date.now())

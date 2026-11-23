@@ -157,3 +157,50 @@ test('Bug 217: a dialog that ended while HQ was down clears within seconds of th
   // still found by its usual sign once it ends later
   await hq.session(still.id, 'idle'); await escape(still); await cleared(still); assert.equal((await now(still)).status, 'idle')
 })
+
+// Bug 289: a turn that ends with no Stop hook and no interrupt (Escape or No on a dialog) gets a "Turn ended" line in the Events tab, once, whichever way HQ
+// learns of it; a turn that ends any other way keeps the line it had (its Stop, or "Interrupted").
+const lines = async (a: any): Promise<string[]> => ((await hq.api(`agents/${a.id}/events`)).json.events as any[]).map((e) => e.text)
+const turnOvers = async (a: any) => (await events(a, 'agent.turn_over')).map((e) => JSON.parse(e.payload))
+test('Bug 289: Escape or No on a dialog says the turn ended, in the Events tab; a Stop, an interrupt or a turn HQ knows nothing of add no such line', async () => {
+  const esc = await tpm(); await ask(esc, 'go on'); await start(esc, 'T1'); await run(esc, 'touch one.txt'); await complete(esc, 'T1')
+  assert.deepEqual(await turnOvers(esc), [{ why: 'no_stop', still: null }])
+  assert.equal((await lines(esc))[0], 'Turn ended: Escape or No on a question on its screen')
+  const helped = await tpm(), d = 'Map the code'; await ask(helped, 'go on'); await start(helped, 'T1')
+  await hq.hook(helped.id, { hook_event_name: 'PostToolUse', tool_name: 'Agent', tool_input: { description: d }, tool_response: { isAsync: true, agentId: 'h289', description: d } })
+  await complete(helped, 'T1')
+  assert.equal((await lines(helped))[0], `Turn ended: Escape or No on a question on its screen · its helper still runs: ${d}`)
+  // the dialog's notice was open: the line comes once HQ has seen the dialog gone (Bug 188's way), not twice
+  const late = await tpm(); await atDialog(late); await start(late, 'T1'); await hq.session(late.id, 'idle'); await complete(late, 'T1'); await cleared(late)
+  await waitFor('the turn-ended line', async () => (await turnOvers(late)).length === 1, 5000)
+  assert.deepEqual(await turnOvers(late), [{ why: 'dialog', still: null }])
+  const l = await lines(late); assert.deepEqual(l.slice(0, 2), ['Turn ended: Escape or No on a question on its screen', 'A question on its screen was answered'])
+  // what it must not catch: a Stop (its own line), an interrupt ("Interrupted"), a normal turn with a dialog, and a turn.complete for a turn not known
+  const stopped = await tpm(); await ask(stopped, 'go on'); await start(stopped, 'T1'); await hq.hook(stopped.id, { hook_event_name: 'Stop', last_assistant_message: 'done' })
+  await complete(stopped, 'T1')
+  const intr = await tpm(); await ask(intr, 'go on'); await start(intr, 'T1'); await escape(intr, true)
+  const asked = await tpm(); await atDialog(asked); await start(asked, 'T1'); await hq.session(asked.id, 'idle')
+  await hq.hook(asked.id, { hook_event_name: 'Stop', last_assistant_message: 'ok' }); await complete(asked, 'T1'); await cleared(asked) // once cleared, what follows the clear has run
+  const unknown = await tpm(); await ask(unknown, 'go on'); await run(unknown, 'touch two.txt'); await complete(unknown, 'T9')
+  for (const x of [stopped, intr, asked, unknown]) assert.deepEqual(await turnOvers(x), [], x.id)
+  assert.equal((await lines(stopped))[0], 'Turn ended: done'); assert.equal((await lines(intr))[0], 'Interrupted (Escape)')
+})
+
+// Bug 352: an API error ends a turn with no Stop hook too. Its StopFailure says so ("Turn failed: …"); on 2.1.322 the mod's turn.complete (reason 'error')
+// comes first, and it used to add "Escape or No on a question on its screen". The status is the StopFailure's either way: blocked on the API error.
+const failed = (a: any, turnId: string) =>
+  hq.modEvent(a.id, { kind: 'turn.complete', turnId, agentId: null, isAborted: false, reason: 'error', durationMs: 900, answer: '' })
+test('Bug 352: a turn that ends on an API error reads "Turn failed", never "Escape or No", in either order; a turn with no Stop still does', async () => {
+  const late = await tpm(), early = await tpm(), plain = await tpm()
+  for (const x of [late, early, plain]) { await ask(x, 'go on'); await start(x, 'T1'); await run(x, 'touch one.txt') }
+  await failed(late, 'T1'); await hq.hook(late.id, { hook_event_name: 'StopFailure', error: 'overloaded_error' }) // 2.1.322's order
+  await hq.hook(early.id, { hook_event_name: 'StopFailure', error: 'overloaded_error' }); await failed(early, 'T1')
+  for (const x of [late, early]) {
+    assert.deepEqual(await turnOvers(x), [], x.id)
+    const l = await lines(x); assert.ok(l.slice(0, 2).includes('Turn failed: overloaded_error'), `${x.id}: ${l.slice(0, 3).join(' | ')}`); assert.ok(!l.some((t) => /Escape or No/.test(t)), x.id)
+    const a = await now(x); assert.deepEqual([a.status, a.blocked_why], ['blocked', 'api_error'], x.id)
+  }
+  // what it must not catch: a turn the mod says ended with an answer and no Stop keeps Bug 289's line
+  await hq.modEvent(plain.id, { kind: 'turn.complete', turnId: 'T1', agentId: null, isAborted: false, reason: 'answer', durationMs: 900, answer: '' })
+  assert.deepEqual(await turnOvers(plain), [{ why: 'no_stop', still: null }])
+})

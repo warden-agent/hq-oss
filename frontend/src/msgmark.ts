@@ -9,6 +9,7 @@ type Msg = { to_id: string | null; delivered_at: number | null; delivery_method:
 const WHY: Record<string, string> = {
   finished: 'its engineer finished the ticket (open_pr) before reading it, so the note came too late to act on. HQ tests the ticket with the new command anyway',
   fresh_start_over: 'the fresh start it asked for was already over when it came up',
+  replaced: 'HQ asked for the note again in other words before this came up (the reason changed, say a Clear), and sent that request instead', // Bug 338
 }
 export function deliveryMark(m: Msg): Mark {
   if (m.delivery_method === 'dropped') {

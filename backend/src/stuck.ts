@@ -8,6 +8,7 @@ import { attention, openAttention, resolveKind, resolveLeftOnEnded, type Attenti
 import { clearDialogs } from './dialogclear.ts'
 import { dialogGone } from './presence.ts'
 import { emit, patch } from './events.ts'
+import { beat } from './beats.ts'
 import { forgetHelpers } from './hooks.ts'
 import { hasRuns, idleTooLong, lookAtRuns, stopFrozen } from './bgruns.ts'
 import { getRepo, getTicket, repoOfAgent } from './records.ts'
@@ -38,8 +39,14 @@ export const trackedIds = (): string[] => [...new Set([...lastHash.keys(), ...mi
  *  the same ticket: one that took over is working on its own plan). */
 const waitsForReview = (a: Agent): boolean => a.status === 'plan_review'
   || openReviews().some((r) => r.ticket_id === a.ticket_id && getRevision(r.plan_revision_id)?.agent_id === a.id)
-export function startStuckLoop(): NodeJS.Timeout {
-  return setInterval(() => { tick().catch((e) => emit({ agentId: null, source: 'system', kind: 'stuck.error', payload: { error: String(e) } })) }, Number(process.env.HQ_STUCK_TICK_S ?? 60) * 1000)
+/** A look every `HQ_STUCK_TICK_S` seconds, one at a time (Bug 328): the next starts that long after the last one ended, never while one is under way.
+ *  "On two checks in a row" (missed, idleSeen, dialogSeen) means two looks a period apart; two at once, as a look stuck on tmux overlapped the next,
+ *  could meet it moments apart. `look` and `periodMs` are for tests. Returns what ends the loop. */
+export function startStuckLoop(look: () => Promise<void> = tick, periodMs = Number(process.env.HQ_STUCK_TICK_S ?? 60) * 1000): () => void {
+  let timer: NodeJS.Timeout | undefined, ended = false
+  const once = () => look().catch((e) => emit({ agentId: null, source: 'system', kind: 'stuck.error', payload: { error: String(e) } }))
+  const next = () => { if (!ended) timer = setTimeout(() => { void once().finally(() => { beat('stuck'); next() }) }, periodMs) }
+  next(); return () => { ended = true; clearTimeout(timer) }
 }
 export async function tick(): Promise<void> {
   const t = now(), listed = liveAgents()

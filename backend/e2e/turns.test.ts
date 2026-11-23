@@ -5,7 +5,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { startHq, waitFor, sh, exitPlanMode, pendingAfter, type Hq } from './harness.ts'
+import { startHq, waitFor, sh, exitPlanMode, pending, type Hq } from './harness.ts'
 
 let hq: Hq
 before(async () => {
@@ -37,16 +37,25 @@ function bash(agentId: string, command: string, input: Record<string, unknown> =
 const agent = async (id: string) => (await hq.state()).agents.find((a: any) => a.id === id)
 const events = async (kind: string) => ((await hq.api('events?limit=300')).json as any[]).filter((e) => e.kind === kind).map((e) => ({ agent: e.agent_id, ...JSON.parse(e.payload) })).reverse()
 
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+const lined = async (id: string) => (await events('turns.waiting')).filter((e) => e.agent === id).length
+/** Starts a command that HQ should hold, and returns once HQ has put it in line (a turns.waiting event of that agent's, newer than any before).
+ *  The test then asks whether its hook is still unanswered, where it used to sleep a second first. */
+async function held<T>(agentId: string, start: () => T): Promise<T> {
+  const before = await lined(agentId), started = start()
+  await waitFor(`HQ to put ${agentId}'s command in line`, async () => (await lined(agentId)) > before); return started
+}
 test('two engineers run their tests: the second waits its turn, its box says so, and it starts when the first ends', async () => {
   const a = await engineer('turn-a'), b = await engineer('turn-b')
   const first = bash(a.eng.id, 'npm test'); assert.deepEqual(await first.begin, {}) // nobody running: it starts at once
-  const second = bash(b.eng.id, 'cd web && npm run build'); assert.ok(await pendingAfter(second.begin, 1500), 'held while the first runs')
-  assert.equal((await agent(b.eng.id)).activity, 'Waiting its turn to build'); assert.equal((await agent(b.eng.id)).status, 'working')
+  const second = await held(b.eng.id, () => bash(b.eng.id, 'cd web && npm run build')); assert.ok(await pending(second.begin), 'held while the first runs')
+  assert.equal((await agent(b.eng.id)).activity, `Waiting its turn to build behind eng ${a.t.key}`); assert.equal((await agent(b.eng.id)).status, 'working')
   // small commands never wait, nor does a server started in the background (here helpers of the two engineers run them: an agent itself runs one tool at a time)
   const helper = (id: string, tool_input: Record<string, unknown>) =>
     hq.hook(id, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_use_id: `toolu_h${++uses}`, tool_input, agent_id: `helper-of-${id}` })
   assert.deepEqual(await helper(b.eng.id, { command: 'git status' }), {}); assert.deepEqual(await helper(a.eng.id, { command: 'npm run dev', run_in_background: true }), {})
-  assert.ok(await pendingAfter(second.begin, 300), 'still held')
+  assert.deepEqual(await events('turns.started'), [], 'still held: HQ has let nothing start from its line'); assert.ok(await pending(second.begin))
+  await wait(1100) // real-time: HQ's own figure for how long the second waited (waitedS, whole seconds) is checked below to have reached 1
   await first.end(); assert.deepEqual(await second.begin, {}); assert.equal((await agent(b.eng.id)).activity, 'Running: cd web && npm run build')
   await second.end()
   const waited = await events('turns.waiting'), started = await events('turns.started')
@@ -55,7 +64,7 @@ test('two engineers run their tests: the second waits its turn, its box says so,
   const third = bash(a.eng.id, 'npm test'); assert.deepEqual(await third.begin, {}); await third.end() // the turn came back
   // A command Claude Code refuses (a deny rule) fires its first hook and no other: HQ never hears it end. The engineer's next tool says it's over.
   const refused = bash(a.eng.id, 'npm test && git push'); assert.deepEqual(await refused.begin, {})
-  const next = bash(b.eng.id, 'npm test'); assert.ok(await pendingAfter(next.begin, 1000))
+  const next = await held(b.eng.id, () => bash(b.eng.id, 'npm test')); assert.ok(await pending(next.begin))
   await hq.hook(a.eng.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_use_id: 'toolu_read', tool_input: { file_path: 'a' } }); assert.deepEqual(await next.begin, {})
   await next.end()
 })
@@ -63,12 +72,12 @@ test('two engineers run their tests: the second waits its turn, its box says so,
 test('the limit is the user\'s to raise; one that stops waiting loses its place; and nobody waits for good', async () => {
   const a = await engineer('turn-c'), b = await engineer('turn-d'), c = await engineer('turn-e')
   const first = bash(a.eng.id, 'npm test'); await first.begin
-  const second = bash(b.eng.id, 'npm test'), third = bash(c.eng.id, 'pytest -q'); assert.ok(await pendingAfter(third.begin, 1000))
+  const second = await held(b.eng.id, () => bash(b.eng.id, 'npm test')), third = await held(c.eng.id, () => bash(c.eng.id, 'pytest -q')); assert.ok(await pending(third.begin))
   second.drop(); assert.equal(await second.begin, 'dropped') // the user pressed Esc, or the engineer was stopped
   assert.equal((await hq.api('settings', { key: 'heavy_at_once', value: 2 })).status, 200); assert.deepEqual(await third.begin, {}) // room for two now
-  const fourth = bash(b.eng.id, 'npm test'); assert.ok(await pendingAfter(fourth.begin, 1000))
+  const fourth = await held(b.eng.id, () => bash(b.eng.id, 'npm test')); assert.ok(await pending(fourth.begin))
   await hq.hook(c.eng.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' }); assert.deepEqual(await fourth.begin, {}) // c's turn ended: its command has too
-  const fifth = bash(c.eng.id, 'npm test'); assert.ok(await pendingAfter(fifth.begin, 3000)) // a's and b's never end (their hooks are lost)…
+  const fifth = await held(c.eng.id, () => bash(c.eng.id, 'npm test')); assert.ok(await pending(fifth.begin)) // a's and b's never end (their hooks are lost)…
   assert.deepEqual(await fifth.begin, {}); const late = (await events('turns.started')).at(-1)! // …so after HQ_TURN_WAIT_S it goes ahead anyway
   assert.equal(late.late, true); assert.ok(late.waitedS >= 5, JSON.stringify(late))
   assert.equal((await hq.api('settings', { key: 'heavy_at_once', value: 0 })).status, 400)
@@ -90,7 +99,9 @@ test('HQ\'s own test of a finished ticket waits in the same line as an engineer\
   assert.equal((await hq.mcp(e.id, 'open_pr', { title: 'Thing', body: 'Thing.\n\n## Deviations from approved plan\nNone' })).isError, false)
   const waiting = await waitFor("HQ's test to wait", async () => (await events('turns.waiting')).find((x) => x.who === `HQ's test of ${t.key}`), 20_000)
   assert.deepEqual(waiting.behind, [`eng ${busy.t.key}`])
-  await new Promise((r) => setTimeout(r, 2000)); assert.notEqual((await hq.state()).tickets.find((x: any) => x.id === t.id).status, 'merged') // not tested yet, so not merged
+  await hq.beats('auto', 3, { runs: 'leave' }) // the auto loop has looked again, with HQ's test still in line
+  const now = await hq.state(); assert.equal(now.testRuns.find((r: any) => r.ticket_id === t.id)?.state, 'waiting', 'the board still shows it waiting its turn')
+  assert.notEqual(now.tickets.find((x: any) => x.id === t.id).status, 'merged') // not tested yet, so not merged
   await theirs.end()
   await waitFor('the ticket to be tested and merged', async () => (await hq.state()).tickets.find((x: any) => x.id === t.id).status === 'merged', 60_000)
 })
@@ -98,7 +109,8 @@ test('HQ\'s own test of a finished ticket waits in the same line as an engineer\
 test('Bug 213: a held test run with a change after it in its line has the worktree\'s state taken when its turn comes, before it starts', async () => {
   const a = await engineer('turn213-a'), b = await engineer('turn213-b')
   const first = bash(a.eng.id, 'npm test'); assert.deepEqual(await first.begin, {})
-  const line = "npm test && sed -i 's/x/y/' list.js && git commit -qam y", second = bash(b.eng.id, line); assert.ok(await pendingAfter(second.begin, 1000), 'held while the first runs')
+  const line = "npm test && sed -i 's/x/y/' list.js && git commit -qam y", second = await held(b.eng.id, () => bash(b.eng.id, line))
+  assert.ok(await pending(second.begin), 'held while the first runs')
   const kept = async () => (await events('hook.PreToolUse:Bash')).find((e) => e.agent === b.eng.id && JSON.parse(e.input).command === line)?.before
   assert.equal(await kept(), undefined, 'nothing taken while it waits: its files may still change')
   await first.end(); assert.deepEqual(await second.begin, {}); assert.match(String(await kept()), /^[0-9a-f]{64}$/, 'taken before HQ let it start')

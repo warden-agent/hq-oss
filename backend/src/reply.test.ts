@@ -66,3 +66,9 @@ test('Bug 229: a list or a colon line after a heading, and long lines (Bug 124 k
   assert.deepEqual(replyPreview(`## Report\n\n${long}\n\nMore below.`), { text: `Report — ${long}`, more: false }, 'a long line is kept whole (the box cuts it, hover shows it)')
   assert.deepEqual(replyPreview(`${long}:\n- a`), { text: `${long}:`, more: true }, 'a long colon line still gets the link')
 })
+// Bug 283: the preview took every backtick off, so a lone ``` in a line went too ("Use  to start a fence").
+test('Bug 283: only the backticks of code go', () => {
+  assert.deepEqual(replyPreview('Use ``` to start a fence, and `x` is inline.'), { text: 'Use ``` to start a fence, and x is inline.', more: false })
+  assert.deepEqual(replyPreview('Run ``a`b`` and `npm test`, then **SHOP-4**.'), { text: 'Run a`b and npm test, then SHOP-4.', more: false })
+  assert.deepEqual(replyPreview('1. Run this:\n   ```bash\n   npm test\n   ```\n2. Next'), { text: 'Run this:', more: true }, 'a fence in a list item')
+})

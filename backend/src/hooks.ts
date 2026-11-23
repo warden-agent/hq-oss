@@ -4,9 +4,11 @@ import { BIND, PORTS, DEFAULTS } from './config.ts'
 import { checkContext } from './freshstart.ts'
 import { run, now, getSetting, one, q } from './db.ts'
 import { emit, patch } from './events.ts'
-import { agentByToken, getAgent, liveAgents, update, tmuxToken, revokeToken, type Agent } from './agents.ts'
+import { agentByToken, beingStopped, getAgent, liveAgents, update, tmuxToken, revokeToken, type Agent } from './agents.ts'
+import { presenceOf } from './presence.ts'
+import { paneShowsDialog } from './screen.ts'
 import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
-import { ackBatchFromPrompt, deliveredByStopHook, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway, nextDeadline } from './delivery.ts'
+import { ackBatchFromPrompt, deliveredByStopHook, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway, modLook } from './delivery.ts'
 import { turnEnded } from './delivery.ts'
 import { lateReportFits, submittedWhileAway } from './delivery.ts'
 import { listen, wake, type Waiter } from './wake.ts'
@@ -56,10 +58,47 @@ function describeTool(tool: string, input: Record<string, unknown>): string {
 }
 
 /** When each agent's main loop last started a turn (UserPromptSubmit; `start`: the mod's turn.start) and last ended one (Stop), as steps of one counter, not
- *  clock times: a prompt and its Stop can share a millisecond (Bug 80). Memory only: after a restart the stuck loop's screen
- *  check covers the gap. */
+ *  clock times: a prompt and its Stop can share a millisecond (Bug 80). In memory, rebuilt from the events log at start-up (rebuildTurns, Bug 281). */
 const turns = new Map<string, { prompt: number; stop: number; start?: { id: string; at: number } }>()
 let turnSeq = 0
+/** Bug 281: after a restart, each live agent's last prompt, Stop and own turn.start since its session last began, from the events log, so a quick Escape
+ *  on a turn that started before the restart still ends it (endedWithoutStop). Event ids are a counter too, so they keep the order; the counter goes on
+ *  above them. A batch handed over in a Stop hook's answer (Bug 103) counts as a prompt, as it does when it happens (its `batch.acked`). */
+export function rebuildTurns(): void {
+  turns.clear()
+  const last = (agentId: string, since: number, where: string): number =>
+    one<{ id: number | null }>(`SELECT MAX(id) AS id FROM events WHERE agent_id = ? AND id > ? AND ${where}`, agentId, since)?.id ?? 0
+  for (const a of liveAgents()) {
+    const since = last(a.id, 0, "kind = 'hook.SessionStart'")
+    const prompt = Math.max(last(a.id, since, "kind = 'hook.UserPromptSubmit'"), last(a.id, since, `kind = 'batch.acked' AND json_extract(payload, '$.id') IN
+      (SELECT id FROM batches WHERE method = 'stop_hook')`))
+    const stop = last(a.id, since, "kind = 'hook.Stop'")
+    const start = one<{ id: number; turn: unknown }>(`SELECT id, json_extract(payload, '$.turnId') AS turn FROM events WHERE agent_id = ? AND id > ?
+      AND kind = 'mod.turn.start' AND COALESCE(json_extract(payload, '$.agentId'), '') = '' ORDER BY id DESC LIMIT 1`, a.id, since)
+    turns.set(a.id, { prompt, stop, ...(start ? { start: { id: String(start.turn ?? ''), at: start.id } } : {}) })
+    turnSeq = Math.max(turnSeq, prompt, stop, start?.id ?? 0)
+  }
+}
+/** Bug 268: a turn that ended while HQ was down (a quick Escape or No on a dialog, or a Stop: only permission requests wait for HQ, hookwait.mjs) sent its
+ *  sign to no one, so the box would say "working" until the stuck loop's screen check. Once at start-up, after the helpers and runs are read back: an
+ *  agent HQ has working in its own turn whose status file says idle, changed after the last hook HQ had from it, with no menu on screen, has ended that
+ *  turn (turnOver: idle unless a helper or a run of its own still goes). Anything unknown leaves it as it is. */
+export async function lookAtTurnsAtStart(): Promise<void> {
+  const ended: string[] = []
+  for (const was of liveAgents()) {
+    if (was.status !== 'working' || beingStopped(was.id)) continue
+    const since = one<{ id: number }>("SELECT MAX(id) AS id FROM events WHERE agent_id = ? AND kind = 'hook.SessionStart'", was.id)?.id ?? 0
+    if (turnHadEnded(was, since)) continue // its turn ended and a helper or run keeps it working: nothing was lost
+    const p = presenceOf(was.claude_session_id)
+    if (!p || p.status !== 'idle' || p.statusUpdatedAt <= (was.last_event_at ?? was.started_at)) continue
+    const screen = await tmux.visiblePane(was.tmux_session)
+    const a = getAgent(was.id) // after the wait on tmux (Bug 138): a hook since means HQ knows better now
+    if (!a || a.status !== 'working' || beingStopped(a.id) || a.last_event_at !== was.last_event_at || paneShowsDialog(screen)) continue
+    turnOver(a.id)
+    emit({ agentId: a.id, source: 'system', kind: 'agent.turn_ended_away', payload: { status: getAgent(a.id)?.status ?? null } }); ended.push(a.id)
+  }
+  emit({ agentId: null, source: 'system', kind: 'turn.start_look', payload: { ended } }) // the look is over (tests wait for it)
+}
 /** Bug 94: the helpers each agent's main loop started in the background itself (the Agent tool), helper id → description. While
  *  one runs the agent is working, even after its turn ended. Claude Code's own helpers never get here (Bug 25). In memory, and in the events log
  *  (Bug 232): a start's `helper` + `helperWhat`, an end's `helper` (SubagentStop) or `helpersDone` (a prompt with their notices). */
@@ -91,32 +130,75 @@ export function rebuildHelpers(): void {
 /** Bug 148: the agent's own turn was interrupted (Escape in its terminal), as its mod tells it. No Stop hook comes for such a turn, so this is where it ends:
  *  the agent is idle at once, with no activity line, unless a helper or a run in the background of its own still goes (Bugs 94, 95). It counts as a sign of
  *  life (an engineer's idle time starts here, bgruns.ts idleTooLong). Only a working agent: a plan review or a pause has its own way out, and one on a dialog
- *  gets here once HQ has seen the dialog is gone (Bug 188, onDialogEnd). */
-function turnOver(agentId: string, afterDialog = false): void {
+ *  gets here once HQ has seen the dialog is gone (Bug 188, onDialogEnd). `why` (Bug 289): the turn ended with no Stop hook and no interrupt (Escape or No
+ *  on a dialog), so nothing in the Events tab would say so: it gets a line ('no_stop': at the mod's turn.complete; 'dialog': once its dialog had gone).
+ *  True: that line was written. */
+function turnOver(agentId: string, afterDialog = false, why?: 'no_stop' | 'dialog'): boolean {
   const a = getAgent(agentId) // read again: turnEnded has just written to it. Bug 188: after a dialog's clear, idle or working by its status file
-  if (!a || !(a.status === 'working' || (afterDialog && a.status === 'idle'))) return
+  if (!a || !(a.status === 'working' || (afterDialog && a.status === 'idle'))) return false
   const turn = turns.get(agentId); if (turn) turn.stop = ++turnSeq // a helper that ends from now on leaves it idle (SubagentStop)
   const on = stillOn(agentId, helpers.get(agentId) ?? new Map())
   update(agentId, { status: on ? 'working' : 'idle', last_event_at: now() }, { activity: on }) // one patch (Bug 98)
+  if (why) emit({ agentId, source: 'system', kind: 'agent.turn_over', payload: { why, still: on } })
+  return !!why
 }
 /** Bug 254: the turn the mod says is complete (`turnId`) ended with no Stop hook: it is the last one the mod said started (turn.start), and no prompt and no
  *  Stop came after that start. A turn that ends normally sends its Stop before the mod's turn.complete; the prompt a mod submits once the agent is idle
  *  (a waiting batch) can reach HQ before the turn.complete of the turn before it; and a Stop answered with a block (Bug 103) sends no turn.complete or
- *  turn.start, only the Stop of the turn it goes on with (all seen on 2.1.322). Nothing known (a restart since the start): no. */
+ *  turn.start, only the Stop of the turn it goes on with (all seen on 2.1.322). A start before a restart is read back (Bug 281). Nothing known: no. */
 const endedWithoutStop = (agentId: string, turnId: unknown): boolean => {
   const s = turns.get(agentId); return !!s?.start && s.start.id === String(turnId ?? '') && s.prompt < s.start.at && s.stop < s.start.at
 }
+/** Bug 297: the mod's late turn.complete (sent again once HQ was back) of a turn that ended normally, with no Stop hook since it started: the Stop
+ *  hook went to an HQ that was down. Not an interrupt, not an API error (a StopFailure, which isn't a Stop), and not a turn that ended at a tool call
+ *  (Escape or No on a dialog: no Stop hook comes for it even with HQ up, and its `reason` is 'answer' too; checked on 2.1.322). From the events log, not
+ *  `turns`: the start-up look (lookAtTurnsAtStart) may have ended the turn already. A mod from before this change sends no turn.complete late. */
+const stopLost = (agentId: string, body: Record<string, unknown>): boolean => {
+  if (body.isAborted === true || (body.reason ?? 'answer') !== 'answer' || body.atTool !== false) return false
+  const start = one<{ id: number | null }>(`SELECT MAX(id) AS id FROM events WHERE agent_id = ? AND kind = 'mod.turn.start' AND json_extract(payload, '$.turnId') = ?
+    AND COALESCE(json_extract(payload, '$.agentId'), '') = ''`, agentId, String(body.turnId ?? ''))?.id
+  return !!start && !one(`SELECT 1 AS x FROM events WHERE agent_id = ? AND id > ? AND kind IN ('hook.Stop', 'hook.StopFailure', 'hook.UserPromptSubmit') LIMIT 1`, agentId, start)
+}
+/** Bug 297: what the lost Stop hook would have done (handleHook 'Stop'): the turn is over, the TPM's answer is its reply (the 💬 line and Messages), and
+ *  the agent is idle unless a helper or a run of its own still goes. The start-up look (lookAtTurnsAtStart) may have made it idle already. Logged as a
+ *  `hook.Stop` marked `away`, so what listens for the end of a turn hears it (a finished engineer's stop, its turn to build, auto mode's look) and a
+ *  restart reads it back (rebuildTurns). */
+function stoppedWhileAway(agent: Agent, answer: string): void {
+  const turn = turns.get(agent.id); if (turn) turn.stop = ++turnSeq
+  if (agent.role === 'tpm') recordReply(agent, answer)
+  const on = stillOn(agent.id, helpers.get(agent.id) ?? new Map()), a = getAgent(agent.id)
+  if (a?.status === 'working') update(agent.id, { status: on ? 'working' : 'idle', last_event_at: now() }, { activity: on, last_message: trim(answer, 2000) })
+  else patch('agent', agent.id, { last_message: trim(answer, 2000) })
+  emit({ agentId: agent.id, source: 'mod', kind: 'hook.Stop', payload: { event: 'Stop', tool: '', last: trim(answer, 600), away: true } })
+}
+/** Bug 346: the last event id when the hooks server started listening: what is logged after it, HQ heard since it came back. */
+let upFrom = 0
+/** Bug 346: the mod's late turn.start (sent again once HQ was back, Bug 297) of a turn that still goes: its UserPromptSubmit hook went to an HQ that was
+ *  down, so the box said idle until the turn's Stop. Working now, as that hook would have made it ('Thinking' until its next tool call says more), and
+ *  an API error before it is over. Not a turn the mod saw end (`over`: its turn.complete comes next, Bug 297), not when HQ heard a Stop, an API error or
+ *  the mod's end of a turn since it came back (this turn's, which started while HQ was down, so the start is old news), not an agent HQ has working
+ *  (a hook since), stopping, on a dialog or paused. */
+function startedWhileAway(agent: Agent): void {
+  const a = getAgent(agent.id)
+  if (!a || beingStopped(a.id) || !(a.status === 'idle' || (a.status === 'blocked' && a.blocked_why === 'api_error'))) return
+  if (one(`SELECT 1 AS x FROM events WHERE agent_id = ? AND id > ? AND (kind IN ('hook.Stop', 'hook.StopFailure')
+    OR (kind = 'mod.turn.complete' AND COALESCE(json_extract(payload, '$.agentId'), '') = '')) LIMIT 1`, a.id, upFrom)) return
+  update(a.id, { status: 'working', last_event_at: now() }, { activity: 'Thinking' }) // one patch (Bug 98)
+  if (a.status === 'blocked') resolveKind('api_error', a.id)
+  emit({ agentId: a.id, source: 'system', kind: 'agent.turn_started_away', payload: { was: a.status } })
+}
 /** Bug 188: Escape or a denial on a dialog ends the turn with no Stop hook, and the mod's `turn.complete` says isAborted false (checked on 2.1.322). Once HQ
- *  has seen the dialog gone, the turn ends as above, unless a new one has started since (a prompt typed or sent meanwhile). */
-const onDialogEnd = (agentId: string): (() => void) => {
+ *  has seen the dialog gone, the turn ends as above, unless a new one has started since (a prompt typed or sent meanwhile). `say`: it ended with no Stop and
+ *  no line says so yet (Bug 289). */
+const onDialogEnd = (agentId: string, say = false): (() => void) => {
   const at = turns.get(agentId)?.prompt ?? 0
-  return () => { if ((turns.get(agentId)?.prompt ?? 0) === at) turnOver(agentId, true) }
+  return () => { if ((turns.get(agentId)?.prompt ?? 0) === at) turnOver(agentId, true, say ? 'dialog' : undefined) }
 }
 function handleHook(agent: Agent, body: Record<string, unknown>, res: http.ServerResponse): void {
   const ev = String(body.hook_event_name ?? ''); const tool = String(body.tool_name ?? ''); const input = (body.tool_input ?? {}) as Record<string, unknown>
   const mode = body.permission_mode as string | undefined; const t = now()
   const fields: Partial<Agent> = { last_event_at: t } // agent columns
-  const live: { activity?: string | null; last_message?: string } = {} // shown in the UI only (patches), not stored
+  const live: { activity?: string | null; last_message?: string } = {} // not columns: patches (the line is kept for a restart, agents.ts keepLine)
   if (mode) fields.in_plan_mode = mode === 'plan' ? 1 : 0
   const payload: Record<string, unknown> = { event: ev, tool, mode }
   const cleared = ev === 'SessionEnd' && body.reason === 'clear' // /clear: the same session goes on with a fresh context
@@ -128,7 +210,11 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   const bg = helpers.get(agent.id) ?? new Map<string, string>(); helpers.set(agent.id, bg); const helperId = String(body.agent_id ?? '')
   if (ev !== 'SessionEnd') tellIfHqWasAway(agent) // Bug 85: it was told to wait for HQ, and HQ is answering again
   switch (ev) {
-    case 'SessionStart': bg.clear(); endRuns(agent.id, 'all', 'session'); Object.assign(payload, { source: body.source, model: body.model, cwd: body.cwd }); Object.assign(fields, { claude_session_id: String(body.session_id ?? '') || null, transcript_path: (body.transcript_path as string | undefined) ?? null, status: 'working' }); run('UPDATE sessions SET claude_session_id = ?, transcript_path = ? WHERE agent_id = ? AND ended_at IS NULL', body.session_id as string, body.transcript_path as string, agent.id); break
+    case 'SessionStart': { bg.clear(); endRuns(agent.id, 'all', 'session'); Object.assign(payload, { source: body.source, model: body.model, cwd: body.cwd })
+      // Bug 324: both rows take the same values, a missing session id or transcript as null (SQLite refuses undefined, and the whole hook was dropped)
+      const sid = String(body.session_id ?? '') || null, transcript = typeof body.transcript_path === 'string' ? body.transcript_path : null
+      Object.assign(fields, { claude_session_id: sid, transcript_path: transcript, status: 'working' })
+      run('UPDATE sessions SET claude_session_id = ?, transcript_path = ? WHERE agent_id = ? AND ended_at IS NULL', sid, transcript, agent.id); break }
     case 'UserPromptSubmit': { turn.prompt = ++turnSeq; payload.prompt = trim(body.prompt, 200); fields.status = 'working'; live.activity = 'Thinking'
       const done = [...String(body.prompt ?? '').matchAll(/<task-id>([\w-]+)<\/task-id>/g)].map((m) => m[1]!) // a helper's or a background run's "done" notice
       const ended = done.filter((task) => bg.delete(task)); if (ended.length) payload.helpersDone = ended // Bug 232: logged, for rebuildHelpers
@@ -274,27 +360,29 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
       try { // later looks run from a timer, outside the server's own catch
         const a = getAgent(agent.id); if (!a || a.status === 'exited') return finish(200, {})
         w.status = a.status
-        const b = nextBatchFor(a); if (b) return finish(200, { batch: { id: b.id, text: b.text, asUser: b.asUser, raw: b.raw, handed: b.handed_at } })
+        const { batch: b, due } = modLook(a); if (b) return finish(200, { batch: { id: b.id, text: b.text, asUser: b.asUser, raw: b.raw, handed: b.handed_at } })
         const left = end - now(); if (left <= 0) return finish(200, {})
-        const due = nextDeadline(a); if (!soon) timer = setTimeout(look, Math.max(5, Math.min(left, NEXT_BACKSTOP_MS, due === null ? Infinity : due - now())))
+        if (!soon) timer = setTimeout(look, Math.max(5, Math.min(left, NEXT_BACKSTOP_MS, due === null ? Infinity : due - now())))
       } catch (e) { emit({ agentId: agent.id, source: 'system', kind: 'backend.error', payload: { server: 'mod', error: String(e) } }); return finish(500, { error: 'HQ error' }) }
     }
     update(agent.id, { mod_seen_at: t }); return look()
   }
   if (action === 'event') {
     const kind = String(body.kind ?? ''); update(agent.id, { mod_seen_at: t })
-    emit({ agentId: agent.id, source: 'mod', kind: `mod.${kind}`, payload: body })
+    emit({ agentId: agent.id, source: 'mod', kind: `mod.${kind}`, payload: typeof body.answer === 'string' ? { ...body, answer: trim(body.answer, 300) } : body })
     if (kind === 'session.start') { resolveKind('mod_missing', agent.id); if (!body.hasToken) attention('mod_token_missing', `${agent.id}: mod could not read its token file`, { agentId: agent.id }) }
     if (kind === 'turn.step') onTurnStep(agent, body)
     if (kind === 'turn.start' && !body.agentId) { // Bug 254: which turn of its own is the latest, and when it started
       const s = turns.get(agent.id) ?? { prompt: 0, stop: 0 }; s.start = { id: String(body.turnId ?? ''), at: ++turnSeq }; turns.set(agent.id, s) }
     const bid = String(body.id ?? ''), late = body.late === true, fits = !late || lateReportFits(agent, bid, body.handed) // Bug 140: a resend counts for its own hand-out only
+    if (kind === 'turn.start' && !body.agentId && late && body.over !== true) startedWhileAway(agent)
     if (kind === 'batch_received' && fits) markReceived(bid)
     if (kind === 'batch_submitted' && fits) {
       if (late) submittedWhileAway(agent, bid, body.interrupted === true); else markSubmitted(bid)
       if (agent.interrupted_at) wake(agent.id) // Bug 110: submitted after an interrupt is dropped; look now
     }
     if (kind === 'turn.complete' && !body.agentId) turnEnded(agent, body.isAborted === true) // the agent's own turn, not a helper's
+    if (kind === 'turn.complete' && !body.agentId && late && stopLost(agent.id, body)) stoppedWhileAway(agent, String(body.answer ?? ''))
     if (kind === 'batch_submit_failed' && fits) requeue(bid, 'submit_failed')
     if (kind === 'plugin.register' && body.name && body.name !== 'hq') attention('foreign_mod', `${agent.id}: another mod tried to load: ${body.name}`, { agentId: agent.id })
     if (kind === 'session.measure') {
@@ -307,9 +395,13 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
     }
     // Bug 148: after turnEnded, which keeps the interrupt. Bug 254: or the turn ended with no Stop hook since it started: Escape or No on a dialog in its first
     // ~6 s, before Claude Code's permission_prompt notification, so no dialog notice is open for Bug 188's look either (real 2.1.322: isAborted false)
-    if (kind === 'turn.complete' && !body.agentId && (body.isAborted === true || endedWithoutStop(agent.id, body.turnId))) turnOver(agent.id)
+    // Bug 289: an interrupt has its line (agent.interrupted); a turn with no Stop gets one, here or once its dialog has gone
+    const noStop = kind === 'turn.complete' && !body.agentId && body.isAborted !== true && endedWithoutStop(agent.id, body.turnId)
+    // Bug 352: an API error ends a turn with no Stop too, and on 2.1.322 its StopFailure comes after this: that hook's "Turn failed" line says so, not ours
+    const say = noStop && body.reason !== 'error'
+    const told = kind === 'turn.complete' && !body.agentId && (body.isAborted === true || noStop) && turnOver(agent.id, false, say ? 'no_stop' : undefined)
     // Bug 188: its turn is over, so a dialog may be too (Escape or a denial on it ends the turn)
-    if (kind === 'turn.complete' && !body.agentId) dialogMayBeOver(agent.id, body.isAborted === true ? 'interrupted' : 'turn_end', onDialogEnd(agent.id))
+    if (kind === 'turn.complete' && !body.agentId) dialogMayBeOver(agent.id, body.isAborted === true ? 'interrupted' : 'turn_end', onDialogEnd(agent.id, say && !told))
     return json(res, 200, { ok: true })
   }
   json(res, 404, {})
@@ -322,6 +414,7 @@ export function startHooksServer(): http.Server {
       if (!res.headersSent) json(res, e instanceof TooLarge ? 413 : 500, { error: e instanceof TooLarge ? e.message : 'HQ error' }); else res.end()
     }
   })
+  upFrom = one<{ id: number | null }>('SELECT MAX(id) AS id FROM events')?.id ?? 0 // Bug 346
   srv.listen(PORTS.hooks, BIND); return srv
 }
 async function route(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

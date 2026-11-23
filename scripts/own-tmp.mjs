@@ -11,25 +11,37 @@ import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 // --tests=<glob>, first (npm test, npm run e2e): the test files to run when the command line names none (Bug 200). npm adds what
 // follows `--` at the end, so files named there replace the glob, and every option goes before the files: node reads anything
 // after the first file as that file's own argument. The glob goes to node unexpanded (quoted in package.json): node --test
 // expands it itself, where sh would match one folder level for `**`, or keep it as it is when nothing matches.
+// More than one --tests= (npm run coverage:all): both suites in one run, so that one report covers them.
 const VALUED = new Set(['-r', '-C', ...['require', 'import', 'conditions', 'env-file', 'env-file-if-exists', 'experimental-loader', 'loader',
   'input-type', 'disable-warning', 'unhandled-rejections', 'title', 'watch-path', 'test-name-pattern', 'test-skip-pattern', 'test-reporter',
   'test-reporter-destination', 'test-concurrency', 'test-timeout', 'test-shard', 'test-isolation', 'test-global-setup', 'test-rerun-failures',
   'test-coverage-include', 'test-coverage-exclude', 'test-coverage-branches', 'test-coverage-functions', 'test-coverage-lines'].map((o) => `--${o}`)])
+// Bug 291: a test file that stops part-way, or runs fewer tests than it declares, still exits 0, and node calls that a pass. The
+// test runs get whole-files.mjs as a second reporter, which fails such a run and names the file. node wants every reporter named
+// once one is, so the usual one (spec, to stdout) is named too. A run that names a reporter of its own is left as it is.
+// What made files stop part-way is --test-force-exit throwing away the end of a file's report: flush-report.mjs, preloaded into
+// every test process, keeps that from happening (see there).
+const WHOLE = ['--test-reporter=spec', '--test-reporter-destination=stdout',
+  `--test-reporter=${path.join(import.meta.dirname, 'whole-files.mjs')}`, '--test-reporter-destination=stderr']
+const FLUSH = `--import=${pathToFileURL(path.join(import.meta.dirname, 'flush-report.mjs')).href}`
 function testFiles(argv) {
   if (!argv[0]?.startsWith('--tests=')) return argv
-  const glob = argv[0].slice('--tests='.length), [cmd, ...rest] = argv.slice(1), opts = [], files = []
+  const globs = []; while (argv[0]?.startsWith('--tests=')) globs.push(argv.shift().slice('--tests='.length))
+  const [cmd, ...rest] = argv, opts = [], files = []
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]
     if (!a.startsWith('-')) files.push(a)
     else if (VALUED.has(a) && i + 1 < rest.length) opts.push(a, rest[++i]) // `--test-name-pattern two`: `two` is no file
     else opts.push(a)
   }
-  return [cmd, ...opts, ...(files.length ? files : [glob])]
+  const whole = opts.some((o) => o === '--test-reporter' || o.startsWith('--test-reporter=')) ? [] : WHOLE
+  return [cmd, ...opts, FLUSH, ...whole, ...(files.length ? files : globs)]
 }
 
 const outer = fs.realpathSync(os.tmpdir()), short = fs.realpathSync('/tmp'), uid = process.getuid?.() ?? 0

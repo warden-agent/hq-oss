@@ -110,8 +110,8 @@ export function npmInstalls(cmd: string): NpmInstall[] {
 /** A uv, yarn or pnpm install found in a command (Bug 211). `lock`: the lockfile it would rewrite; `frozen`: it follows
  *  that lockfile instead (`--locked`, `--frozen-lockfile`, ...); `fix`: the command to use instead. `dir` as in NpmInstall.
  *  `noLock`: it writes no lockfile (`--pure-lockfile`, `--no-lockfile`, `uv run --no-sync`); `bare`: what to use instead when
- *  there is no lockfile, where a plain install would write one (Bug 239). `run`: a `uv run`, which installs (and writes a
- *  uv.lock where there is none) before it runs, but follows one that's there. */
+ *  there is no lockfile, where a plain install would write one (Bug 239). `run`: a `uv run`, which installs before it runs:
+ *  it writes a uv.lock where there is none, and rewrites one that's out of date unless `--locked`/`--frozen` (Bug 262). */
 export type LockedInstall = { text: string; dir: string | null; tool: 'uv' | 'yarn' | 'pnpm'; lock: string; frozen: boolean; noLock: boolean; run: boolean
   fix: string; bare: string }
 
@@ -127,7 +127,8 @@ const UV = { tool: 'uv' as const, lock: 'uv.lock', frozen: ['--locked', '--froze
 const TOOLS = [
   { ...UV, subs: ['sync'], noLock: [], noLockEnv: [], fix: '`uv sync --locked`', bare: UV_BARE, run: false },
   { ...UV, subs: ['run'], noLock: ['--no-sync', '--no-project'], noLockEnv: ['UV_NO_SYNC'], fix: '`uv run --locked`', bare: '`uv run --no-sync` (install with '
-    + '`uv venv --allow-existing && uv pip install -r pyproject.toml`)', run: true },
+    + '`uv venv --allow-existing && uv pip install -r pyproject.toml`)', run: true,
+    valued: [...UV.valued, '--with', '--with-editable', '--with-requirements', '--extra', '--group', '--env-file', '--package', '--index'] },
   { tool: 'yarn' as const, lock: 'yarn.lock', subs: [null, 'install'], frozen: ['--frozen-lockfile', '--immutable'], env: ['YARN_ENABLE_IMMUTABLE_INSTALLS'],
     noLock: ['--pure-lockfile', '--no-lockfile'], noLockEnv: [], fix: '`yarn install --frozen-lockfile` (or --immutable)',
     bare: '`yarn install --pure-lockfile` with install_when `package.json` (Yarn 1; Yarn 2 and later always write one)', run: false, dir: ['--cwd'],
@@ -139,13 +140,36 @@ const TOOLS = [
 /** `yarn --version` and the like: no subcommand, but not an install. */
 const NOT_INSTALL = new Set(['--version', '-v', '-V', '--help', '-h'])
 
+/** The words of a `uv run` that are uv's own: everything up to the command it runs. `uv run app.py --locked` hands `--locked` to
+ *  app.py, and uv still rewrites an out-of-date uv.lock (round-5 UI test, uv 0.12.9). An unknown option that takes a value ends
+ *  the list early, so such a command is refused, never let through. */
+function uvsOwn(args: Word[]): Word[] {
+  const i = args.findIndex((a) => a.text === 'run'), after = args.slice(i + 1), end = after.findIndex((a) => !a.text.startsWith('-'))
+  return [...args.slice(0, i), ...(end < 0 ? after : after.slice(0, end))]
+}
+
 /** Every uv, yarn or pnpm install in `cmd`, in order, with the folder it runs in: `cd server && uv sync` too, and `uv run`. */
 export function lockedInstalls(cmd: string): LockedInstall[] {
   return commands(cmd).flatMap((c) => TOOLS.flatMap((t) => {
     const r = read(c, t.tool, t.dir, t.valued)
     if (!r || !(t.subs as (string | null)[]).includes(r.sub) || (r.sub === null && r.args.some((a) => NOT_INSTALL.has(a.text)))) return []
-    const frozen = r.args.some((a) => t.frozen.includes(a.text)) || truthy(c.env, t.env)
-    const noLock = r.args.some((a) => t.noLock.includes(a.text)) || truthy(c.env, t.noLockEnv)
+    const own = t.run ? uvsOwn(r.args) : r.args
+    const frozen = own.some((a) => t.frozen.includes(a.text)) || truthy(c.env, t.env)
+    const noLock = own.some((a) => t.noLock.includes(a.text)) || truthy(c.env, t.noLockEnv)
     return [{ text: r.text, dir: r.dir, tool: t.tool, lock: t.lock, frozen, noLock, run: t.run, fix: t.fix, bare: t.bare }]
   }))
+}
+
+/** The virtual environments the `uv venv`s in `cmd` make (Bug 303: Bug 239's no-lockfile uv route installs into it), as paths relative to
+ *  the line's own folder: its path argument, else `.venv`. Null for one whose folder or path HQ can't tell. */
+export function uvVenvs(cmd: string): (string | null)[] {
+  const valued = new Set([...UV.valued, '--prompt', '--link-mode', '--index', '--default-index', '-i', '-f', '--find-links', '--index-strategy', '--keyring-provider',
+    '--exclude-newer', '--exclude-newer-package', '--refresh-package', '--allow-insecure-host']) // uv 0.12.9's `uv venv --help`
+  const dirs = new Set(UV.dir)
+  return commands(cmd).flatMap((c) => {
+    const r = read(c, 'uv', dirs, valued); if (!r || r.sub !== 'venv') return []
+    const words = r.args.filter((a) => !a.text.startsWith('-')), to = words[words.findIndex((a) => a.text === 'venv') + 1] // read() left options' values out
+    if (r.dir === null || (to && (!to.plain || path.isAbsolute(to.text)))) return [null]
+    return [path.join(r.dir, to?.text ?? '.venv')]
+  })
 }

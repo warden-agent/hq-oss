@@ -6,12 +6,13 @@ import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
-import { startHq, waitFor, sh, exitPlanMode, pendingAfter, type Hq } from './harness.ts'
+import { startHq, waitFor, sh, exitPlanMode, pending, type Hq } from './harness.ts'
 import { WebSocket } from 'ws'
 import { diffCheckWords } from '../src/checks.ts'
+import { slotWindow } from '../src/slotports.ts'
 
 let hq: Hq
 const prompt = (id: string) => fs.readFileSync(path.join(hq.hqHome, 'agents', id, 'prompt.md'), 'utf8') // what the agent was started with
@@ -70,6 +71,9 @@ async function work(p: P, t: any, e: any, files: Record<string, string>): Promis
   sh(wt(p, t), 'add', '.'); sh(wt(p, t), 'commit', '-qm', t.title); await openPr(e)
 }
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+/** The auto loop has been round again since the test's last action: twice, so one whole pass began after it, and HQ's own test runs have
+ *  ended (`false`: one is held back on purpose). For "nothing more happens", where a test used to sleep and then look. */
+const looked = (runsEnd = true) => hq.beats('auto', 2, runsEnd ? {} : { runs: 'leave' })
 
 // Bug 106: while HQ runs its own tests the page is told, so the board can say so. HELD is a test command that waits until the test lets it go, with a file in the
 // run's own checkout: the one folder both the test and the sandboxed run can reach, on a Mac and under bubblewrap. Bug 113: it orders runs without timing.
@@ -101,7 +105,7 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch
 test('Bug 69: a backend killed outright can\'t stop its test run, so the next start does', async () => {
   const p = await testRunning('killed'), old = stuckPids(); assert.ok(old.length)
   const pid = execFileSync('lsof', ['-ti', `tcp:${hq.ports.ui}`, '-sTCP:LISTEN'], { encoding: 'utf8' }).trim().split('\n')[0]!
-  process.kill(Number(pid), 'SIGKILL'); await wait(300)
+  process.kill(Number(pid), 'SIGKILL'); await wait(300) // real-time: a run that died with its backend would do so within moments of the kill, and nothing would show it but its pids
   if (process.platform === 'darwin') assert.ok(old.some(alive), 'it outlives the backend, or this proves nothing') // Linux's sandbox dies with its parent
   await hq.restart()
   await waitFor('the old test run to end', () => !old.some(alive), 5000)
@@ -114,7 +118,7 @@ test('Bug 89: auto off during the check of main ends that run at once, with no r
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: MARK })).status, 200); await turnEnds(p)
   await waitFor('the check of main', () => stuckRun(), 15_000)
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200)
-  await waitFor('the run to end', () => !stuckRun(), 5000); await wait(500)
+  await waitFor('the run to end', () => !stuckRun(), 5000); await looked()
   assert.deepEqual(await tested(), [], 'no result: not a failure, not a repair'); assert.equal((await runs(p))[0].status, 'off'); assert.deepEqual(await repairs(p), [])
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: '' })).status, 200); assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
   const c = await waitFor('a new check', async () => (await checks())[0], 15_000); assert.equal(c.result, 'pass')
@@ -177,11 +181,13 @@ test('Bug 115: a project auto mode stops ends its test run at once, frees the tu
   const e2 = await engineer(t2); await waitFor('main checked', async () => (await checks())[0]); await work(p, t, await engineer(t), { 'thing.js': '1\n' })
   await waitFor('the ticket\'s test', () => stuckRun(), 15_000); const old = stuckPids()
   const use = { tool_name: 'Bash', tool_use_id: 'toolu_115', tool_input: { command: 'npm test' } }
-  const theirs = hq.hook(e2.id, { hook_event_name: 'PreToolUse', ...use }); assert.ok(await pendingAfter(theirs, 1000), 'the engineer waits behind HQ\'s run')
+  const theirs = hq.hook(e2.id, { hook_event_name: 'PreToolUse', ...use })
+  await waitFor('its box to say it waits its turn', async () => /^Waiting its turn/.test((await hq.state()).agents.find((a: any) => a.id === e2.id)?.activity ?? ''))
+  assert.ok(await pending(theirs), 'the engineer waits behind HQ\'s run')
   await hq.hook(p.tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' })
   assert.match(await waitFor('the stop', async () => (await repoNow(p)).auto_stopped_why), /The TPM needs you/)
   await waitFor('the run to end', () => !old.some(alive), 5000); assert.deepEqual(await theirs, {}, 'its turn now')
-  await hq.hook(e2.id, { hook_event_name: 'PostToolUse', ...use }); await wait(700)
+  await hq.hook(e2.id, { hook_event_name: 'PostToolUse', ...use }); await looked()
   assert.equal((await tested()).filter((e) => e.kind === 'auto.tested').length, 0, 'the stopped run said nothing')
   const now = await tk(t); assert.equal(now.status, 'pr_ready'); assert.equal(now.auto_tries, 0, 'not sent back to its engineer')
   await hq.api(`agents/${p.tpm.id}/stop`, {}) // the dialog is over (Bug 62)
@@ -194,7 +200,7 @@ test('Bug 115: a stop during the check of main ends that run with no result, and
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: MARK })).status, 200); await turnEnds(p)
   await waitFor('the check of main', () => stuckRun(), 15_000)
   await hq.hook(p.tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' })
-  await waitFor('the stop', async () => (await repoNow(p)).auto_stopped_why); await waitFor('the run to end', () => !stuckRun(), 5000); await wait(500)
+  await waitFor('the stop', async () => (await repoNow(p)).auto_stopped_why); await waitFor('the run to end', () => !stuckRun(), 5000); await looked()
   assert.deepEqual(await tested(), [], 'no result: not a failure, not a repair'); assert.deepEqual(await repairs(p), []); assert.equal((await runs(p))[0].main_checked, null)
   await hq.api(`agents/${p.tpm.id}/stop`, {}); assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: '' })).status, 200)
   assert.equal((await hq.api(`repos/${p.repo.id}/auto-resume`, {})).status, 200)
@@ -205,7 +211,7 @@ test('Bug 152: Clear project ends the check of main at once, while the TPM still
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: MARK })).status, 200); await turnEnds(p)
   await waitFor('the check of main', () => stuckRun(), 15_000)
   const r = await hq.api(`repos/${p.repo.id}/clear`, {}); assert.equal(r.status, 200); assert.equal(r.json.done, false, 'the clear waits for the TPM\'s note')
-  await waitFor('the run to end', () => !stuckRun(), 2000); await wait(500)
+  await waitFor('the run to end', () => !stuckRun(), 2000); await looked()
   assert.deepEqual(await tested(), [], 'no result: not a failure, not a repair'); assert.deepEqual(await repairs(p), [])
   assert.ok((await repoNow(p)).clearing_at, 'the clear is still under way: the run didn\'t wait for it to finish')
 })
@@ -215,7 +221,7 @@ test('a machine that can\'t sandbox the tests says so before anything starts: no
   const p = await project('nosandbox', { auto: false })
   const check = (await hq.api(`repos/${p.repo.id}/auto-check`, {})).json; assert.match(check.sandbox, /bubblewrap|sandbox/)
   const r = await hq.api(`repos/${p.repo.id}/auto`, { on: true }); assert.equal(r.status, 409); assert.equal(r.json.error, check.sandbox)
-  await ticket(p, 'Nothing'); await turnEnds(p); await wait(700)
+  await ticket(p, 'Nothing'); await turnEnds(p); await looked()
   assert.equal((await repoNow(p)).auto_mode, 0); assert.equal((await runs(p)).length, 0)
   assert.equal((await hq.state()).agents.filter((a: any) => a.role === 'engineer').length, 0)
 })
@@ -223,7 +229,7 @@ test('a machine that can\'t sandbox the tests says so before anything starts: no
 test('a request runs to the end with nobody pressing anything: starts after the split, plan on record, tested, merged, summed up', async () => {
   const p = await project('all')
   const t1 = await ticket(p, 'Orders'), t2 = await ticket(p, 'Invoices', [t1.key])
-  await wait(700); assert.equal((await hq.state()).agents.filter((a: any) => a.role === 'engineer').length, 0, 'nothing starts while the TPM is splitting')
+  await looked(); assert.equal((await hq.state()).agents.filter((a: any) => a.role === 'engineer').length, 0, 'nothing starts while the TPM is splitting')
   await turnEnds(p)
   const e1 = await engineer(t1); await work(p, t1, e1, { 'orders.txt': 'r\n' })
   await until(t1, 'merged')
@@ -376,7 +382,7 @@ test('a broken main repairs itself: HQ opens the ticket, others keep building, n
   assert.match(r.spec, /main is broken/); assert.match(r.spec, /Reach the internet/); assert.equal(r.repairs_main, sh(p.dir, 'rev-parse', 'main'))
   const toTpm = await waitFor('the TPM to hear', async () => (await hq.state()).messages.find((m: any) => m.to_id === p.tpm.id && /opened .+ to repair/.test(m.body)))
   assert.match(toTpm.body, /Don't open another/)
-  await work(p, t2, e2, { 'two.txt': '2\n' }); await wait(1500) // finished during the repair: it waits, and it isn't blamed
+  await work(p, t2, e2, { 'two.txt': '2\n' }); await looked() // finished during the repair: it waits, and it isn't blamed
   assert.equal((await tk(t2)).status, 'pr_ready'); assert.equal((await tk(t2)).auto_tries, 0); assert.equal((await repairs(p)).length, 1, 'one repair for one broken main')
   const er = await engineer(r); await work(p, r, er, { 'test/main.test.js': PASS })
   await until(r, 'merged'); await until(t1, 'merged'); await until(t2, 'merged')
@@ -440,8 +446,45 @@ test('Bug 70: a healthy main is checked once, and a restart doesn\'t check it ag
   const p = await project('healthy'), t1 = await ticket(p, 'One'); await turnEnds(p)
   const c = await waitFor('the check', async () => (await checks())[0]); assert.equal(c.result, 'pass')
   const run0 = await waitFor('the run to record it', async () => (await runs(p)).find((r: any) => r.main_checked)); assert.equal(run0.main_checked, sh(p.dir, 'rev-parse', 'main'))
-  await engineer(t1); await hq.restart(); await wait(1500)
+  await engineer(t1); await hq.restart(); await looked()
   assert.equal((await checks()).length, 1); assert.deepEqual(await repairs(p), [])
+})
+
+test('Bug 273: HQ\'s own runs give the tests a PORT of their own, never an engineer\'s, so a server on `$PORT || <taken port>` passes; after a restart too', async () => {
+  const taken = net.createServer(); await new Promise<void>((r) => taken.listen(0, '127.0.0.1', r)) // the user's app, another HQ's run
+  const held = (taken.address() as net.AddressInfo).port
+  try {
+    const p = await project('ports', { auto: false })
+    fs.writeFileSync(path.join(p.dir, 'srv.js'), `const fs = require('fs'), s = require('http').createServer((q, r) => r.end('ok'))
+s.on('error', (e) => { console.error('server: ' + e.message); process.exit(1) })
+s.listen(Number(process.env.PORT || ${held}), '127.0.0.1', () => { fs.writeFileSync('port.txt', JSON.stringify([process.env.PORT, process.env.HQ_PORT_BASE, process.env.DB_NAME]))
+  const t = setInterval(() => { if (fs.existsSync('go')) { clearInterval(t); s.close(); console.log('served') } }, 100) })\n`)
+    sh(p.dir, 'add', '.'); sh(p.dir, 'commit', '-qm', 'server test')
+    assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'node srv.js' })).status, 200)
+    assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
+    const w = slotWindow(hq.ports.ui), inWindow = (n: number) => n >= w[0] && n + 9 <= w[1] && (n - w[0]) % 10 === 0
+    const dir = path.join(p.dir, '.claude', 'worktrees')
+    /** What the held run's server was told, once it listens; the file goes, so the next run's is new. */
+    const told = () => waitFor('the run\'s server', () => {
+      const d = fs.existsSync(dir) ? fs.readdirSync(dir).find((x) => x.startsWith('hq-test-') && fs.existsSync(path.join(dir, x, 'port.txt'))) : undefined
+      if (!d) return null
+      const f = path.join(dir, d, 'port.txt'), [port, base, db] = JSON.parse(fs.readFileSync(f, 'utf8')) as string[]; fs.rmSync(f); return { port: Number(port), base, db }
+    }, 20_000)
+    const engPort = (id: string) => Number(/export PORT='(\d+)'/.exec(fs.readFileSync(path.join(hq.hqHome, 'agents', id, 'launch.sh'), 'utf8'))?.[1])
+    const t1 = await ticket(p, 'One'); await turnEnds(p)
+    const main = await told(), e1 = await engineer(t1) // main's own check, while the engineer works
+    assert.ok(inWindow(main.port), `${main.port} in ${w}`); assert.notEqual(main.port, held)
+    assert.deepEqual([main.base, main.db], [String(main.port), `hq_test_${main.port}`]); assert.notEqual(main.port, engPort(e1.id), 'never the engineer\'s block')
+    await letGo(p); await waitFor('the check', async () => (await checks())[0]); assert.equal((await checks())[0].result, 'pass')
+    await work(p, t1, e1, { 'one.txt': '1\n' })
+    const first = await told(); assert.ok(inWindow(first.port)); assert.notEqual(first.port, held)
+    await hq.restart() // mid-run: the run is killed, and the block isn't lost with it
+    const again = await told(); assert.ok(inWindow(again.port)); assert.notEqual(again.port, held)
+    await letGo(p); await until(t1, 'merged', 30_000)
+    assert.equal(JSON.parse((await tk(t1)).merge_test).ran, 'pass')
+    const out = (await hq.api(`docs?scope=${encodeURIComponent(`ticket:${t1.id}`)}`)).json.find((d: any) => d.key === 'merge_test_output'); assert.match(out.text, /served/)
+    assert.equal(((await hq.api('events?limit=500')).json as any[]).filter((e) => e.kind === 'testrun.no_ports').length, 0)
+  } finally { taken.close() }
 })
 
 test('Bug 70: no tests stays quiet at the start of a run: the first ticket often adds them', async () => {
@@ -466,7 +509,7 @@ test('Bug 70: a repair already open isn\'t opened twice, and a repair goes past 
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200); await turnEnds(p); await engineer(t1)
   const r = await repair(p), er = await engineer(r) // one engineer is busy and the limit is one, and the repair starts anyway
   assert.equal((await tk(t2)).status, 'queued', 'an ordinary ticket still waits for a slot'); assert.ok(er)
-  await wait(1200); assert.equal((await repairs(p)).length, 1)
+  await looked(); assert.equal((await repairs(p)).length, 1)
 })
 
 test('Bug 62: a TPM that has gone can\'t stop the project again on Resume with its old dialog alert', async () => {
@@ -474,7 +517,7 @@ test('Bug 62: a TPM that has gone can\'t stop the project again on Resume with i
   await hq.hook(p.tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' })
   await waitFor('the stop', async () => (await repoNow(p)).auto_stopped_why)
   await hq.api(`agents/${p.tpm.id}/stop`, {}) // its session is over, and its dialog with it
-  assert.equal((await hq.api(`repos/${p.repo.id}/auto-resume`, {})).status, 200); await wait(1500)
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto-resume`, {})).status, 200); await looked()
   assert.equal((await repoNow(p)).auto_stopped_why, null)
 })
 
@@ -499,18 +542,48 @@ test('Bug 246: while auto mode is stopped, a finished ticket and a merge are tol
   const merged = await waitFor('the TPM told of the merge', async () => (await toTpm()).find((b) => b.startsWith('HQ: T-01 merged.')))
   assert.equal(merged, 'HQ: T-01 merged. The user merged it with Merge, which runs no tests: HQ did not test it as it merged. Ready now: T-02. The user starts them from HQ.')
   const notice = async () => (await hq.state()).attention.find((a: any) => a.kind === 'merged' && a.ticket_id === t1.id && !a.resolved_at)
-  assert.match((await notice())?.detail ?? '', /Ready now: T-02\. Start them with "Start ready"\./, 'the user hears it too, as on the board')
+  assert.match((await notice())?.detail ?? '',
+    /Ready now: T-02\. Start it with Start under Your turn, or Launch engineer on its box\. Or press Resume on the "Auto mode stopped" bar and HQ starts it\.$/,
+    'the user hears it too, as on the board, with the buttons\' names (Bug 264)')
   const stopped = (await toTpm()).slice(0, (await toTpm()).length - before)
   assert.ok(!stopped.some((b) => /HQ (tests|starts|merges)/.test(b)), stopped.join('\n'))
   // Resume: the dialog is seen to, and HQ starts T-02 by itself; its merge is HQ's, and the TPM hears that HQ starts what is ready next
   for (const a of (await hq.state()).attention.filter((x: any) => x.kind === 'dialog' && !x.resolved_at)) await hq.api(`attention/${a.id}/resolve`, {})
   assert.equal((await hq.api(`repos/${p.repo.id}/auto-resume`, {})).status, 200); await turnEnds(p) // its turn after the dialog ends
-  const e2 = await engineer(t2); await waitFor('the "Start ready" notice to go', async () => !(await notice()))
+  const e2 = await engineer(t2); await waitFor('the "Ready now" notice to go', async () => !(await notice()))
   await work(p, t2, e2, { 'two.txt': '2\n' })
   assert.equal((await toTpm()).find((b) => b.startsWith('HQ: T-02 is finished')), `HQ: T-02 is finished (${(await tk(t2)).branch}). HQ tests it on main and merges it; you'll be told when it merges.`)
   await until(t2, 'merged', 30_000)
   assert.match(await waitFor('the TPM told of the merge', async () => (await toTpm()).find((b) => b.startsWith('HQ: T-02 merged.'))), /Ready now: T-03\. HQ starts them\.$/)
   await engineer(t3)
+})
+// Bug 279: the TPM's last word was "Nothing new starts or merges until the user resumes it" until a merge came, as Resume told it nothing
+test('Bug 279: Resume tells the TPM once that auto mode is running again; a second press, or nothing to resume, says nothing', async () => {
+  const p = await project('resumed'), t = await ticket(p, 'One'), repo = p.repo.id
+  const toTpm = async (): Promise<string[]> => (await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === p.tpm.id).map((m: any) => m.body) // newest first
+  const resumed = async () => (await toTpm()).filter((b) => b.startsWith('HQ: the user resumed auto mode'))
+  const NOTE = "HQ: the user resumed auto mode, so it's running again. From now on HQ starts ready tickets when your turn ends, approves plans, tests finished tickets on main, "
+    + 'merges them and fixes conflicts. Finish each split before you end your turn. If what stopped it is still there, it stops again and HQ tells you.'
+  const resume = async () => assert.equal((await hq.api(`repos/${repo}/auto-resume`, {})).status, 200)
+  await resume(); assert.deepEqual(await resumed(), [], 'nothing was stopped')
+  await hq.hook(p.tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' })
+  await waitFor('the stop', async () => (await repoNow(p)).auto_stopped_why)
+  assert.match((await toTpm())[0], /^HQ: auto mode stopped: The TPM needs you: .*Nothing new starts or merges until the user resumes it\.$/)
+  // Resume with the dialog still open: the note, then HQ looks again and stops again, and the TPM's last word says so
+  const stops = (await toTpm()).filter((b) => b.startsWith('HQ: auto mode stopped')).length
+  await resume(); await waitFor('the second stop', async () => (await toTpm()).filter((b) => b.startsWith('HQ: auto mode stopped')).length > stops)
+  assert.deepEqual(await resumed(), [NOTE]); assert.match((await toTpm())[0], /^HQ: auto mode stopped: The TPM needs you/)
+  // the dialog seen to, Resume pressed twice at once: one note, and HQ starts the ticket by itself again
+  for (const a of (await hq.state()).attention.filter((x: any) => x.kind === 'dialog' && !x.resolved_at)) await hq.api(`attention/${a.id}/resolve`, {})
+  await Promise.all([resume(), resume()]); await turnEnds(p); await engineer(t)
+  assert.equal((await repoNow(p)).auto_stopped_why, null); assert.deepEqual(await resumed(), [NOTE, NOTE])
+  const said = await toTpm(); assert.ok(said.indexOf(NOTE) < said.findIndex((b) => b.startsWith('HQ: auto mode stopped')), 'its last word on the mode: running again')
+  await resume(); assert.deepEqual(await resumed(), [NOTE, NOTE], 'nothing to resume a second time')
+  // off and on again: the switch's own two notes, no Resume note
+  assert.equal((await hq.api(`repos/${repo}/auto`, { on: false })).status, 200); assert.equal((await hq.api(`repos/${repo}/auto`, { on: true })).status, 200)
+  const two = (await toTpm()).slice(0, 2).sort() // the same millisecond can't order them
+  assert.match(two[0]!, /^HQ: the user turned auto mode off\./); assert.match(two[1]!, /^HQ: the user turned auto mode on for this project\. From now on /)
+  await resume(); assert.deepEqual(await resumed(), [NOTE, NOTE])
 })
 test('Bug 114: a stuck alert left on a finished ticket\'s engineer that has stopped doesn\'t get it replaced when auto goes on', async () => {
   const p = await project('stale-stuck', { auto: false }); const t = await ticket(p, 'One'); await turnEnds(p)
@@ -521,7 +594,7 @@ test('Bug 114: a stuck alert left on a finished ticket\'s engineer that has stop
   fs.writeFileSync(path.join(wt(p, t), 'one.txt'), '1\n'); sh(wt(p, t), 'add', '.'); sh(wt(p, t), 'commit', '-qm', 'one'); await openPr(e)
   await hq.hook(e.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' })
   await waitFor('the finished engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === e.id)?.status === 'exited', 8000)
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 }) // an alert from before the fix: HQ now clears it as the engineer stops
+  const db = hq.db() // an alert from before the fix: HQ now clears it as the engineer stops
   try {
     db.prepare("INSERT INTO needs_attention(id, agent_id, ticket_id, kind, detail, created_at) VALUES ('att-stale', ?, ?, 'stuck', 'eng: no events for 12 min', ?)").run(e.id, t.id, Date.now())
   } finally { db.close() }
@@ -560,7 +633,7 @@ test('a repair that keeps failing stops the project with the reason, and Resume 
   const why = await waitFor('the stop', async () => (await repoNow(p)).auto_stopped_why)
   assert.match(why, /couldn't repair the tests/); assert.match(why, /still fail/); assert.equal((await tk(t1)).status, 'pr_ready')
   assert.equal(fs.existsSync(path.join(p.dir, 'one.txt')), false, 'no untested code on main')
-  const t3 = await ticket(p, 'Three'); await turnEnds(p); await wait(700); assert.equal((await tk(t3)).status, 'queued', 'nothing new starts')
+  const t3 = await ticket(p, 'Three'); await turnEnds(p); await looked(); assert.equal((await tk(t3)).status, 'queued', 'nothing new starts')
   fs.rmSync(path.join(p.dir, 'test', 'main.test.js')); sh(p.dir, 'add', '.'); sh(p.dir, 'commit', '-qm', 'fix main')
   assert.equal((await hq.api(`repos/${p.repo.id}/auto-resume`, {})).status, 200)
   await until(t1, 'merged'); await engineer(t3)
@@ -585,7 +658,7 @@ test('a restart mid-repair carries on: no second repair, and the repair still la
   const p = await project('restart')
   const t1 = await ticket(p, 'One'); await turnEnds(p)
   const e1 = await engineer(t1); breakMain(p); await work(p, t1, e1, { 'one.txt': '1\n' })
-  const r = await repair(p), er = await engineer(r); await hq.restart(); await wait(1200)
+  const r = await repair(p), er = await engineer(r); await hq.restart(); await looked()
   assert.equal((await repairs(p)).length, 1); assert.equal((await tk(t1)).status, 'pr_ready'); assert.match((await repoNow(p)).auto_waiting, /Fixing/)
   await work(p, r, er, { 'test/main.test.js': PASS }); await until(r, 'merged'); await until(t1, 'merged')
 })
@@ -626,7 +699,7 @@ test('Bug 83: a test command is taken only once Claude Code has let the repair e
 
 /** The test HQ's own database: what its events say, and state only an older HQ would have left there. */
 function sql(query: string, ...args: (string | number)[]): any[] {
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 }) // waits out HQ's write lock, as HQ's own connection does (Bug 158)
+  const db = hq.db() // waits out HQ's write lock, as HQ's own connection does (Bug 158)
   try { const s = db.prepare(query); return /^select/i.test(query) ? s.all(...args) : (s.run(...args), []) } finally { db.close() }
 }
 const changes = (): any[] => sql("SELECT payload FROM events WHERE kind = 'auto.test_changed' ORDER BY id").map((e) => JSON.parse(e.payload))
@@ -752,7 +825,7 @@ test('Bug 107: Claude Code refuses the saved test command for an engineer: HQ sa
   assert.match(await waitFor('the note', async () => (await repoNow(p)).auto_waiting), /Fixing the test command \(.+\)\. Nothing merges/)
   const toTpm = await waitFor('the TPM to hear', async () => (await hq.state()).messages.find((m: any) => m.to_id === p.tpm.id && /opened .+ to fix the command/.test(m.body)))
   assert.match(toTpm.body, /Don't open another/); assert.equal((await refusedNow(p)).ticket, r.key)
-  await work(p, t1, e1, { 'one.txt': '1\n' }); await wait(1200); assert.equal((await tk(t1)).status, 'pr_ready'); assert.equal((await repairs(p)).length, 1, 'one repair')
+  await work(p, t1, e1, { 'one.txt': '1\n' }); await looked(); assert.equal((await tk(t1)).status, 'pr_ready'); assert.equal((await repairs(p)).length, 1, 'one repair')
   // The repair: the line goes into an npm script on its branch, its engineer runs that and proposes it
   const er = await engineer(r); assert.equal((await hq.hook(er.id, exitPlanMode('Plan'))).hookSpecificOutput.decision.behavior, 'allow')
   const pkg = JSON.parse(fs.readFileSync(path.join(wt(p, r), 'package.json'), 'utf8')); pkg.scripts['test:hq'] = HARD
@@ -775,7 +848,7 @@ test('Bug 107: a repair of the command that can\'t be done parks and the rest ca
   assert.match(await waitFor('the repair to park', async () => (await tk(r))?.auto_parked_why), /No script can do this/)
   await work(p, t1, e1, { 'one.txt': '1\n' }); await until(t1, 'merged') // main is fine and HQ's own test runs: nothing waits for a parked repair of the command
   assert.equal((await repoNow(p)).auto_stopped_why, null, 'the project is not stopped'); assert.equal((await repoNow(p)).auto_waiting, null)
-  await bash(e2, HARD, refusal(wt(p, t2))); await wait(1200)
+  await bash(e2, HARD, refusal(wt(p, t2))); await looked()
   assert.equal((await repairs(p)).length, 1, 'one repair per command'); assert.equal((await cantRun(p)).length, 1, 'the notice stays')
   await bash(e2, `${HARD} 2>&1 | tail -5`, 'Exit code 1\n✖ a test failed') // Claude Code ran it this time (a newer one refuses less)
   assert.equal(await refusedNow(p), null); assert.deepEqual(await cantRun(p), [])
@@ -815,7 +888,7 @@ test('off auto HQ asks: no repair ticket by itself, and a test command waits for
   await waitFor('the question again', async () => (await repoNow(p)).test_cmd_proposed)
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd-answer`, { use: true })).status, 200)
   assert.equal((await repoNow(p)).test_cmd, 'node --test test/ok.test.js')
-  const other = await project('nevers', { auto: false }); breakMain(other); const t = await ticket(other, 'Plain'); await turnEnds(other); await wait(900)
+  const other = await project('nevers', { auto: false }); breakMain(other); const t = await ticket(other, 'Plain'); await turnEnds(other); await looked()
   assert.equal((await repairs(other)).length, 0); assert.equal((await tk(t)).status, 'queued')
 })
 
@@ -826,7 +899,7 @@ test('engineers get the project\'s test command: in their launch prompt, and as 
   const e1 = await engineer(t1); assert.match(prompt(e1.id), /use it for your full test run instead of the project's usual one: node --test test\/ok\.test\.js/)
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'node --test test/' })).status, 200)
   await waitFor('the engineer to hear', async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === e1.id && /node --test test\/$/.test(m.body)))
-  await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'node --test test/' }); await wait(300)
+  await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'node --test test/' }); await looked()
   assert.equal((await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === e1.id && /full test run/.test(m.body)).length, 1, 'no change, no message')
   breakMain(p); await work(p, t1, e1, { 'one.txt': '1\n' })
   const er = await engineer(await repair(p)); assert.doesNotMatch(prompt(er.id), /use it for your full test run/, 'a repair isn\'t told to use the command that failed')
@@ -905,6 +978,13 @@ test('an engineer that reports itself blocked is parked; a dialog on an engineer
   assert.match(await waitFor('the blocked ticket to park', async () => (await tk(t1))?.auto_parked_why), /needs a key/)
   await hq.hook(e2.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' })
   assert.match(await waitFor('the dialog ticket to park', async () => (await tk(t2))?.auto_parked_why), /Allow this/)
+  // Bug 355: the look that parked them had read the tickets before the park, saw their stopped engineers and started fresh ones
+  await looked()
+  const resumed = ((await hq.api('events?limit=500')).json as any[]).filter((e) => e.kind === 'ticket.resumed'
+    && [t1.id, t2.id].includes(JSON.parse(e.payload).ticket))
+  assert.deepEqual(resumed, [], 'nothing starts on a parked ticket')
+  const on = (await hq.state()).agents.filter((a: any) => a.role === 'engineer' && [t1.id, t2.id].includes(a.ticket_id)).map((a: any) => `${a.id}:${a.status}`).sort()
+  assert.deepEqual(on, [`${e1.id}:exited`, `${e2.id}:exited`].sort(), 'only the parked engineers, stopped')
 })
 
 test('a dialog on the TPM stops the project until the user has seen to it', async () => {
@@ -923,7 +1003,7 @@ test('Bug 61: Turn off on a stopped project clears its alert for good, and repor
   const has = async (kind: string) => (await hq.state()).attention.some((a: any) => a.kind === `${kind}:${p.repo.id}`)
   assert.ok(await has('auto_stopped'))
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200)
-  await wait(700); assert.equal(await has('auto_stopped'), false, 'gone, and no sweep brings it back'); assert.ok(await has('auto_finished'), 'the run built something')
+  await looked(); assert.equal(await has('auto_stopped'), false, 'gone, and no sweep brings it back'); assert.ok(await has('auto_finished'), 'the run built something')
   assert.equal((await repoNow(p)).auto_stopped_why, null)
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200) // the TPM's dialog is still open: it stops again, with a new alert
   await waitFor('the second stop', async () => (await repoNow(p)).auto_stopped_why); assert.ok(await has('auto_stopped'))
@@ -959,7 +1039,7 @@ test('Bug 221: Clear keeps auto mode on; nothing starts on the empty board, and 
   await hq.hook(p.tpm.id, { hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Allow this?' }) // no note to wait for
   const r = await hq.api(`repos/${p.repo.id}/clear`, {}); assert.equal(r.status, 200); assert.equal(r.json.done, true)
   const after = await repoNow(p); assert.equal(after.auto_mode, 1, 'still on'); assert.equal(after.auto_stopped_why, null); assert.equal(after.clearing_at, null)
-  await wait(1500) // a few auto ticks on the empty board
+  await hq.beats('auto', 3) // a few passes of the auto loop on the empty board
   assert.deepEqual(await runs(p), [], 'no run on an empty board'); assert.equal((await hq.state()).agents.filter((a: any) => a.role === 'engineer' && a.status !== 'exited').length, 0)
   const f = (await hq.api('features', { repoId: p.repo.id, title: 'Two', request: 'Build two' })).json
   const tpm = await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
@@ -994,7 +1074,7 @@ test('turning auto off: running work finishes, nothing new starts or merges, and
   const held = hq.hook(e1.id, exitPlanMode('Plan')); const r = await waitFor('the review', async () => (await hq.state()).reviews.find((x: any) => x.ticket_id === t1.id && x.status === 'open'))
   assert.ok(r, 'off: plans wait for the user again'); assert.equal((await hq.api(`reviews/${r.id}/answer`, { verdict: 'approve', by: 'user' })).json.ok, true); await held
   fs.writeFileSync(path.join(wt(p, t1), 'one.txt'), '1\n'); sh(wt(p, t1), 'add', '.'); sh(wt(p, t1), 'commit', '-qm', 'one'); await openPr(e1)
-  await wait(1200); assert.equal((await tk(t1)).status, 'pr_ready', 'off: finished tickets wait for the user')
+  await looked(); assert.equal((await tk(t1)).status, 'pr_ready', 'off: finished tickets wait for the user')
   assert.equal((await tk(t2)).status, 'queued'); assert.equal((await runs(p))[0].status, 'off')
   assert.equal((await hq.mcp(p.tpm.id, 'ask_user', { question: 'Dark or light?', choices: ['Dark', 'Light'] })).isError, false, 'off: the TPM asks again')
 })
@@ -1018,7 +1098,7 @@ test('a project with no tests builds but doesn\'t merge, says why, and merges on
   const p = await project('notests', { tests: false })
   const t1 = await ticket(p, 'One'); await turnEnds(p); const e1 = await engineer(t1); await work(p, t1, e1, { 'one.txt': '1\n' })
   const w = await waitFor('the notice', async () => (await repoNow(p)).auto_waiting); assert.match(w, /No tests HQ can run/)
-  await wait(1500); assert.equal((await tk(t1)).status, 'pr_ready')
+  await looked(); assert.equal((await tk(t1)).status, 'pr_ready')
   const tries = (await hq.api('events?limit=500')).json.filter((e: any) => e.kind === 'auto.tested').length
   assert.equal(tries, 1, 'once: it isn\'t tested again until something changes')
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'test -f one.txt' })).status, 200)
@@ -1132,10 +1212,12 @@ test('Bug 143: a commit to a finished ticket\'s branch while HQ tests it is not 
     const told = await waitFor('its engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === e.id &&
       /commits from after your open_pr/.test(m.body)))
     assert.match(told.body, /call open_pr again\.$/)
-    await wait(1200); assert.equal(await shown(p), '', 'nothing is tested until it calls open_pr again'); assert.equal((await tk(t)).status, 'implementing')
+    await looked(); assert.equal(await shown(p), '', 'nothing is tested until it calls open_pr again'); assert.equal((await tk(t)).status, 'implementing')
     await openPr(e); assert.equal((await tk(t)).finished_sha, sh(wt(p, t), 'rev-parse', 'HEAD'))
     await onPage(p, `${t.id}:ticket:running`); await letGo(p); await until(t, 'merged')
-    assert.equal(fs.readFileSync(path.join(p.dir, 'late.txt'), 'utf8'), 'late.txt\n'); assert.equal(sh(p.dir, 'log', '-1', '--format=%P', 'main').split(' ')[1], sh(wt(p, t), 'rev-parse', 'HEAD'))
+    assert.equal(fs.readFileSync(path.join(p.dir, 'late.txt'), 'utf8'), 'late.txt\n')
+    // The branch's head, asked of the project: HQ removes a merged ticket's worktree (the branch stays), and on Linux it was sometimes gone by here (git ENOENT)
+    assert.equal(sh(p.dir, 'log', '-1', '--format=%P', 'main').split(' ')[1], sh(p.dir, 'rev-parse', (await tk(t)).branch))
   })
 test('Bug 143: a branch that moved after open_pr, with its engineer stopped, isn\'t tested; a fresh engineer finishes it again, and open_pr again on a finished ticket counts',
   async () => {
@@ -1167,9 +1249,12 @@ test("Bug 106: a run in line behind another project's says it is waiting its tur
   const b = await project('behind'); await ticket(b, 'Two')
   assert.equal((await hq.api(`repos/${b.repo.id}/test-cmd`, { cmd: HELD })).status, 200); await turnEnds(b); await onPage(b, 'no ticket:main:waiting')
   const waitedFrom = (await hq.state()).testRuns.find((r: any) => r.repo_id === b.repo.id).since
+  const behind = (await hq.state()).testRuns.find((r: any) => r.repo_id === b.repo.id).behind // Bug 289: the page says behind whom
+  assert.equal(behind.length, 1); assert.match(behind[0], /^HQ's test of /)
   assert.equal(await shown(a), 'no ticket:main:running'); await letGo(a)
   await onPage(b, 'no ticket:main:running'); await onPage(a, '') // the first leaves the page once its checkout has gone, a moment after it gave its turn back
   assert.ok((await hq.state()).testRuns.find((r: any) => r.repo_id === b.repo.id).since >= waitedFrom, 'its clock starts again when its turn comes')
+  assert.deepEqual((await hq.state()).testRuns.find((r: any) => r.repo_id === b.repo.id).behind, [], 'running: behind nobody')
   await letGo(b); await onPage(b, '')
 })
 
@@ -1494,7 +1579,7 @@ test('a plan check ends with what it was for: a restart reads the plan afresh, a
   await waitFor('a fresh read', async () => readerCalls().length === 2 && (await planCheck(t))?.state === 'checking'); const second = readerCalls()[1].pid
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200)
   await waitFor('the second reader to end', () => gone(second), 5000); await waitFor('the page to say so', async () => (await planCheck(t)) === null)
-  const open = (await reviewsOf(t))[0]; assert.equal(open.status, 'open'); assert.ok(await pendingAfter(held, 500), 'it waits for the user now')
+  const open = (await reviewsOf(t))[0]; assert.equal(open.status, 'open'); await looked(); assert.ok(await pending(held), 'it waits for the user now')
   assert.equal((await hq.api(`reviews/${open.id}/answer`, { verdict: 'approve' })).status, 200); assert.equal(verdict(await held), 'allow')
   assert.equal(readerCalls().length, 2)
   assert.deepEqual(sql("SELECT kind FROM events WHERE kind LIKE 'plan_check.%' ORDER BY id").map((x) => x.kind), ['plan_check.started', 'plan_check.started']) // neither answered or failed
@@ -1510,18 +1595,26 @@ async function readerOnPlan(name: string) {
 const gone = (pid: number) => { try { process.kill(pid, 0); return false } catch { return true } }
 const planEnds = () => sql("SELECT kind FROM events WHERE kind IN ('plan_check.answered', 'plan_check.failed', 'gate.verdict')")
 test('Bug 177: Clear project ends a plan check at once, while the TPM still writes its note, and nothing follows from it', async () => {
-  const { p, t, e, pid } = await readerOnPlan('planclear')
+  const { p, t, pid } = await readerOnPlan('planclear')
+  const t2 = await withCriteria(p, 'Subtracting', CRIT), e2 = await engineer(t2) // still at work when the Clear comes: it is asked for a note, not stopped
   const r = await hq.api(`repos/${p.repo.id}/clear`, {}); assert.equal(r.status, 200); assert.equal(r.json.done, false, 'the clear waits for the TPM\'s note')
+  assert.ok(r.json.noting.includes(e2.display_name), `${e2.display_name} writes its note: ${JSON.stringify(r.json)}`)
   await waitFor('the reader to end', () => gone(pid), 5000)
-  plan(e, 'Plan.\nFAKE-CHECK: hang').catch(() => {}); await wait(1500) // a plan that comes late, and several auto ticks
+  // A plan that comes late, then the auto loop round again. Bug 323: it came from the engineer the Clear had stopped, whose token was gone, so it
+  // never reached HQ. This one comes from the engineer still writing its note: HQ takes it (its review opens) and starts no reader for it.
+  const drop = new AbortController(), late = hq.hook(e2.id, exitPlanMode('Plan.\nFAKE-CHECK: hang'), drop.signal)
+  await Promise.race([waitFor('HQ to have the late plan', async () => (await reviewsOf(t2))[0]?.status === 'open'),
+    late.then((x) => { throw new Error(`the late plan was answered at once: ${JSON.stringify(x)}`) })])
+  await looked()
   assert.equal(readerCalls().length, 1, 'no new reader on a project being cleared'); assert.deepEqual(planEnds(), [], 'no answer, no verdict')
   assert.ok((await repoNow(p)).clearing_at, 'the clear is still under way: the check didn\'t wait for it to finish')
-  assert.equal((await reviewsOf(t))[0]?.plan_check ?? null, null, 'the page doesn\'t say a reader has it')
+  for (const x of [t, t2]) assert.equal((await reviewsOf(x))[0]?.plan_check ?? null, null, 'the page doesn\'t say a reader has it')
+  drop.abort(); await late.catch(() => {})
 })
 test('Bug 177: Remove from HQ ends a plan check at once, and nothing follows from it', async () => {
   const { p, pid } = await readerOnPlan('planremove')
   assert.equal((await hq.api(`repos/${p.repo.id}/remove`, {})).status, 200)
-  await waitFor('the reader to end', () => gone(pid), 5000); await wait(1500)
+  await waitFor('the reader to end', () => gone(pid), 5000); await looked()
   assert.equal(readerCalls().length, 1); assert.deepEqual(planEnds(), [])
   assert.equal((await hq.state()).repos.some((x: any) => x.id === p.repo.id), false)
 })
@@ -1714,6 +1807,19 @@ test('Bug 223: what the tester couldn\'t try from a browser is "couldn\'t test" 
   // The project has `npm test`: the line about the unrecorded run says HQ's recording isn't set up, not that the project has no tests
   assert.match(r.summary, /## Findings\n- The backend checker had nothing to read: the tester's run wasn't recorded \(HQ isn't set up to record this app yet: Set up testing is under /)
   assert.match(r.summary, /This is separate from the project's own tests, `npm test`, which still run as usual\)/); assert.doesNotMatch(r.summary, /no test setup/)
+})
+
+test('Bug 260: a "problem" with no finding but what it couldn\'t test said is "couldn\'t test" with its words; an "ok" one says what it couldn\'t check', { skip: !MAC }, async () => {
+  const p = await project('uitestercouldnt'); await startCmd(p); assert.equal((await hq.api('settings', { key: 'app_look', value: 'off' })).status, 200)
+  const clock = 'I could not change the clock to see the morning greeting.', wait = 'It needs a day to pass for the reminder.'
+  const said = { 's-01': { outcome: 'problem', findings: [], couldnt_test: clock }, 's-02': { outcome: 'ok', findings: [], couldnt_test: wait } } // s-01: the real Haiku run
+  const t1 = await withCriteria(p, 'Greeting', [UI(`Says Good morning before noon. FAKE-UITEST: ${JSON.stringify(said)}`)]); await turnEnds(p)
+  await ship(p, t1, { 'greet.js': '1\n' }, [NO_TEST]); await turnEnds(p)
+  const r = await finished(p), u = await uiTestBy(p)
+  assert.deepEqual(u.scenarios.map((s: any) => [s.id, s.outcome, s.why]), [['s-01', 'couldnt_test', clock], ['s-02', 'ok', wait]]); assert.deepEqual(u.findings, [])
+  assert.match(r.summary, new RegExp(`## Tried in a browser\\n- 2 scenarios: 1 fine, 0 findings, 0 unspecified, 1 couldn't test\\n- s-01 See the list: couldn't test it from a browser, `
+    + `so it has no verdict here \\(${clock}\\)\\n- s-02 [^\\n]*: fine, but it couldn't check from a browser: ${wait}\\n`))
+  assert.doesNotMatch(r.summary, /saw a problem but reported no finding/); assert.deepEqual(await findingsOf(p), [])
 })
 
 test('Bug 170: when HQ can\'t reset the app for the tester, the summary says why once, not "not run" for every scenario', { skip: !MAC }, async () => {

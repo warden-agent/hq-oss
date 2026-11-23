@@ -9,10 +9,11 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR, PATHS } from './config.ts'
 import { getSetting, now } from './db.ts'
-import { patch } from './events.ts'
+import { emit, patch } from './events.ts'
 import { withTurn } from './heavy.ts'
 import { combinedCommit } from './localmerge.ts'
 import { killUnder } from './procs.ts'
+import { runPorts } from './runports.ts'
 import { cacheEnv } from './roles.ts'
 import { git } from './reposync.ts'
 import { id, real } from './util.ts'
@@ -181,12 +182,13 @@ export function sweepRunTmp(): string[] {
   return gone
 }
 /** Runs `cmd` in `cwd` in the sandbox with a clean environment: no tokens, no agent ids, nothing of the backend's but PATH and HOME.
- *  With no sandbox nothing runs: HQ never runs this code bare. */
-export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; watch?: string[] }): Promise<RunResult> {
+ *  With no sandbox nothing runs: HQ never runs this code bare. `env`: added to that (a test run's own ports, Bug 273). */
+export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; watch?: string[]; env?: Record<string, string> }):
+  Promise<RunResult> {
   return new Promise((resolve) => {
     if (o.signal?.aborted) return resolve({ code: null, output: '', earlier: '', timedOut: false, sandboxFailed: false }) // stopped before it began: nothing runs
     const tmp = process.platform === 'darwin' ? runTmp() : null
-    const env = cleanEnv(tmp)
+    const env = { ...cleanEnv(tmp), ...o.env }
     const { bin, args } = sandboxCommand(cwd, cmd, o)
     const p = spawn(bin, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); if (p.pid) running.set(p.pid, cwd)
     let output = '', total = 0, timedOut = false, hard: NodeJS.Timeout | undefined
@@ -227,7 +229,8 @@ export async function sweepTestWorktrees(repoPath: string): Promise<void> {
  *  (main alone, to tell what a ticket changed). `look` on a failure: it's HQ's look that failed, not the tests, and `output` is HQ's report of it. `review`:
  *  likewise for what a fresh reader of the ticket's changes found (diffcheck.ts). */
 export type TestResult = { kind: 'pass'; test: string; output: string; counts: Counts | null; ms: number; names: Watched; seen?: Seen }
-  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; look?: boolean; review?: boolean } | { kind: 'no_tests' }
+  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; look?: boolean; review?: boolean
+    asked?: boolean; tester?: boolean } | { kind: 'no_tests' } // asked: the user's check found it (hqcheck.ts), not auto mode; tester: the UI tester's findings (with look)
   | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' } | { kind: 'looked'; seen: Seen }
 /** Auto mode's own runs under way, by project folder (Bug 89). A repair's try of a test command isn't one: with auto off its result goes to the user. */
 const autoRuns = new Map<string, Set<AbortController>>(), stops = new Map<string, number>()
@@ -238,8 +241,14 @@ export const autoGen = (repoPath: string): number => stops.get(repoPath) ?? 0
 export function stopAutoTests(repoPath: string): number {
   stops.set(repoPath, autoGen(repoPath) + 1); const s = autoRuns.get(repoPath); for (const c of s ?? []) c.abort(); return s?.size ?? 0
 }
-const ownedBy = (repoPath: string, gen: number | null): { signal: AbortSignal; done: () => void } => {
+/** Who can stop a run: auto mode (its count, autoGen), a stop signal of its own (a ticket's check), or nobody (null). */
+export type Owner = number | AbortSignal | null
+const ownedBy = (repoPath: string, gen: Owner): { signal: AbortSignal; done: () => void } => {
   const c = new AbortController(); if (gen === null) return { signal: c.signal, done: () => {} }
+  if (typeof gen !== 'number') { // its own stop: fired already, or later
+    const stop = () => c.abort(); if (gen.aborted) c.abort(); else gen.addEventListener('abort', stop, { once: true })
+    return { signal: c.signal, done: () => gen.removeEventListener('abort', stop) }
+  }
   if (gen !== autoGen(repoPath)) c.abort()
   const s = autoRuns.get(repoPath) ?? new Set(); autoRuns.set(repoPath, s.add(c))
   return { signal: c.signal, done: () => { s.delete(c); if (!s.size && autoRuns.get(repoPath) === s) autoRuns.delete(repoPath) } }
@@ -251,16 +260,21 @@ export type Failed = Extract<TestResult, { kind: 'fail' }>
  *  stops takes its runs with it, and the next snapshot a page gets has none. */
 export type Shown = { repoId: string; ticketId: string | null; what: 'ticket' | 'main' | 'command' | 'look' | 'look_main' | 'review' | 'tester' | 'map' | 'scenario'
   | 'setup_check' | 'checker' | 'replay' }
-export type TestRunView = { id: string; repo_id: string; ticket_id: string | null; what: Shown['what']; state: 'waiting' | 'running'; since: number }
+/** `behind`: while it waits, who holds the turns it waits for (heavy.ts; Bug 289: the board says behind whom). */
+export type TestRunView = { id: string; repo_id: string; ticket_id: string | null; what: Shown['what']; state: 'waiting' | 'running'; since: number; behind: string[] }
 const views = new Map<string, TestRunView>()
 export const testRunViews = (): TestRunView[] => [...views.values()].map((v) => ({ ...v }))
 /** Puts a run on the page until `over`, however it ends. `state` moves it between waiting and running. Nothing to show: both do nothing. */
-function onPage(s: Shown | null): { state: (to: TestRunView['state']) => void; what: (to: Shown['what']) => void; over: () => void } {
+function onPage(s: Shown | null): { state: (to: TestRunView['state'], behind?: string[]) => void; what: (to: Shown['what']) => void; over: () => void } {
   if (!s) return { state: () => {}, what: () => {}, over: () => {} }
-  const v: TestRunView = { id: id('test'), repo_id: s.repoId, ticket_id: s.ticketId, what: s.what, state: 'running', since: now() }
+  const v: TestRunView = { id: id('test'), repo_id: s.repoId, ticket_id: s.ticketId, what: s.what, state: 'running', since: now(), behind: [] }
   views.set(v.id, v); patch('test_run', v.id, { ...v })
   return {
-    state: (to) => { if (v.state === to || !views.has(v.id)) return; v.state = to; v.since = now(); patch('test_run', v.id, { state: to, since: v.since }) },
+    // still waiting, behind someone else now: the same wait, so its clock goes on
+    state: (to, behind = []) => { const b = to === 'waiting' ? behind : [], moved = v.state !== to
+      if ((!moved && b.join('\n') === v.behind.join('\n')) || !views.has(v.id)) return
+      if (moved) { v.state = to; v.since = now() }
+      v.behind = b; patch('test_run', v.id, { state: to, since: v.since, behind: b }) },
     // the tests are over and the look has begun: the same run, saying what it's doing now
     what: (to) => { if (v.what === to || !views.has(v.id)) return; v.what = to; v.since = now(); patch('test_run', v.id, { what: to, since: v.since }) },
     over: () => { if (views.delete(v.id)) patch('test_run', v.id, null) },
@@ -277,21 +291,22 @@ export function ownTmp(): { tmp: string | null; done: () => Promise<void> } {
 /** A throwaway checkout of `sha` for work of auto mode's that isn't a test run (the tester, tester.ts): made, handed to `fn` with the signal that auto mode
  *  going off or stopping fires, and removed with everything still running in it, however `fn` ends. In turn with builds and test runs, and on the page
  *  (`show`) meanwhile. `stopped`: the signal fired before `fn` began. */
-export async function inCheckout<T>(repoPath: string, sha: string, key: string, auto: number | null, show: Shown | null, fn: (wt: string, signal: AbortSignal) => Promise<T>): Promise<T | 'stopped'> {
+export async function inCheckout<T>(repoPath: string, sha: string, key: string, auto: Owner, show: Shown | null, fn: (wt: string, signal: AbortSignal) => Promise<T>): Promise<T | 'stopped'> {
   const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto); let page = onPage(null)
   try {
     if (signal.aborted) return 'stopped'
     await dropWorktree(repoPath, wt); fs.mkdirSync(path.dirname(wt), { recursive: true })
     await git(repoPath, ['worktree', 'add', '--detach', '--quiet', wt, sha]); await seedPackages(repoPath, wt)
     page = onPage(signal.aborted ? null : show)
-    return await withTurn(`HQ's tester (${key})`, 'tests', async () => { if (signal.aborted) return 'stopped' as const; page.state('running'); return fn(wt, signal) }, () => page.state('waiting'))
+    return await withTurn(`HQ's tester (${key})`, 'tests', async () => { if (signal.aborted) return 'stopped' as const; page.state('running'); return fn(wt, signal) },
+      (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath })
   } finally { done(); await dropWorktree(repoPath, wt).finally(page.over) }
 }
 /** On the page while auto mode does something for a ticket that isn't a run of this module's: a reader on its changes (diffcheck.ts), say. */
 export const showing = (s: Shown): { over: () => void } => onPage(s)
 /** A signal that auto mode going off or stopping the project fires, for work of auto mode's that isn't a test run (Bugs 89, 115): `gen` is autoGen's count as
  *  auto read it, and `done` gives the signal up. */
-export const autoWork = (repoPath: string, gen: number): { signal: AbortSignal; done: () => void } => ownedBy(repoPath, gen)
+export const autoWork = (repoPath: string, gen: Owner): { signal: AbortSignal; done: () => void } => ownedBy(repoPath, gen)
 // At most `max` characters of the start or the end, cut between lines
 const firstChars = (s: string, max: number): string => { if (s.length <= max) return s; const i = s.lastIndexOf('\n', max); return `${s.slice(0, i > 0 ? i : max)}\n…` }
 const lastChars = (s: string, max: number): string => s.length <= max ? s : `…\n${s.slice(s.indexOf('\n', s.length - max) + 1 || s.length - max)}`
@@ -308,7 +323,7 @@ export function failReport(r: Pick<Failed, 'output' | 'earlier'>, max: number): 
 /** `watch`: test names and files to look for in what the run prints (a ticket's map of its criteria's tests). `look`: once the tests pass, start the app in the
  *  same checkout and open its pages (smoke.ts). `only`: the look alone, with no tests before it. */
 export type RunOpts = { watch?: string[]; look?: LookPlan | null; only?: 'look' }
-async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: number | null, show: Shown | null, o: RunOpts = {}): Promise<TestResult> {
+async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: Owner, show: Shown | null, o: RunOpts = {}): Promise<TestResult> {
   const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto), stopped = { kind: 'stopped' } as const
   let page = onPage(null)
   /** The look, in the checkout as the tests left it: the same turn, sandbox and end as the tests (auto off, a stop, the time limit, the backend going down). */
@@ -324,7 +339,7 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
       return await withTurn(`HQ's look at ${key}`, 'tests', async (): Promise<TestResult> => {
         if (signal.aborted) return stopped
         page.state('running'); const seen = await look(plan); return seen ? { kind: 'looked', seen } : stopped
-      }, () => page.state('waiting'))
+      }, (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath })
     }
     const found = detectTests(wt); const plan: TestPlan | null = custom ? { install: found?.install ?? null, test: custom } : found
     if (!plan) return { kind: 'no_tests' }
@@ -333,29 +348,36 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
     return await withTurn(`HQ's test of ${key}`, 'tests', async (): Promise<TestResult> => { // in line with engineers' own builds and test runs (Bug 76); the time limit starts with the run
       if (signal.aborted) return stopped // it waited for its turn and auto went off or stopped meanwhile
       page.state('running')
-      if (plan.install) {
-        const i = await runSandboxed(wt, plan.install, { network: true, timeoutMs, signal })
+      // Bug 273: ports of its own while it has its turn, as an engineer has (runports.ts): a test that starts a server on `$PORT || 3000` clashed with
+      // another HQ's run or the user's app. Given back however the run ends; a backend that goes down kills the run and forgets the block with it
+      const ports = await runPorts().catch(() => null), env = ports?.env
+      if (!ports) emit({ agentId: null, source: 'system', kind: 'testrun.no_ports', payload: { key } })
+      try {
         if (signal.aborted) return stopped
-        if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
-        if (i.code !== 0) return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier }
-      }
-      const began = Date.now(), r = await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal, watch: o.watch })
-      if (signal.aborted) return stopped
-      if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
-      if (r.code === 0) {
-        const pass: TestResult = { kind: 'pass', test: plan.test, output: r.output.replace(ANSI, ''), counts: testCounts(r.summary ?? null), ms: Date.now() - began, // Bug 126
-          names: r.names ?? { prints: false, passed: [], skipped: [] } }
-        if (!o.look) return pass
-        page.what(show?.what === 'main' ? 'look_main' : 'look'); const seen = await look(o.look) // the tests passed: now, does the app open?
-        return seen ? { ...pass, seen } : stopped
-      }
-      return { kind: 'fail', test: plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so
-    }, () => page.state('waiting'))
+        if (plan.install) {
+          const i = await runSandboxed(wt, plan.install, { network: true, timeoutMs, signal, env })
+          if (signal.aborted) return stopped
+          if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
+          if (i.code !== 0) return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier }
+        }
+        const began = Date.now(), r = await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal, watch: o.watch, env })
+        if (signal.aborted) return stopped
+        if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
+        if (r.code === 0) {
+          const pass: TestResult = { kind: 'pass', test: plan.test, output: r.output.replace(ANSI, ''), counts: testCounts(r.summary ?? null), ms: Date.now() - began, // Bug 126
+            names: r.names ?? { prints: false, passed: [], skipped: [] } }
+          if (!o.look) return pass
+          page.what(show?.what === 'main' ? 'look_main' : 'look'); const seen = await look(o.look) // the tests passed: now, does the app open?
+          return seen ? { ...pass, seen } : stopped
+        }
+        return { kind: 'fail', test: plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so
+      } finally { ports?.done() }
+    }, (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath }) // Bugs 309, 312
   } catch (e) { return { kind: 'error', why: (e as Error).message.split('\n')[0] ?? 'unknown error' } }
   finally { done(); await dropWorktree(repoPath, wt).finally(page.over) } // off the page once its checkout has gone: only then does whoever asked hear the result
 }
 /** The tests on `branch` merged into `base` (a ref): main isn't touched, and the commit tested goes away unused. */
-export async function testCombined(repoPath: string, base: string, branch: string, key: string, custom: string | null, auto: number | null = null,
+export async function testCombined(repoPath: string, base: string, branch: string, key: string, custom: string | null, auto: Owner = null,
   show: Shown | null = null, o: RunOpts = {}): Promise<TestResult> {
   const c = await combinedCommit(repoPath, base, branch)
   if ('conflicts' in c) return { kind: 'conflicts', files: c.conflicts }
@@ -363,8 +385,8 @@ export async function testCombined(repoPath: string, base: string, branch: strin
   return runAt(repoPath, c.sha, key, custom, auto, show, o)
 }
 /** HQ's look at the app on `base` alone, no tests: when a ticket's look showed something wrong, was it already like that? */
-export const lookAtBase = (repoPath: string, base: string, key: string, plan: LookPlan, auto: number | null = null, show: Shown | null = null): Promise<TestResult> =>
+export const lookAtBase = (repoPath: string, base: string, key: string, plan: LookPlan, auto: Owner = null, show: Shown | null = null): Promise<TestResult> =>
   runAt(repoPath, base, `${key}-main`, null, auto, show, { look: plan, only: 'look' })
 /** The tests on `base` alone: when a ticket fails, is it the ticket, or was main already broken? */
-export const testBase = (repoPath: string, base: string, key: string, custom: string | null, auto: number | null = null, show: Shown | null = null): Promise<TestResult> =>
+export const testBase = (repoPath: string, base: string, key: string, custom: string | null, auto: Owner = null, show: Shown | null = null): Promise<TestResult> =>
   runAt(repoPath, base, `${key}-main`, custom, auto, show)

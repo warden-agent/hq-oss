@@ -162,6 +162,15 @@ test('Bug 201: every kind HQ logs that can reach an Events tab has plain words (
   assert.deepEqual(raw, [], 'these kinds would show in the Events tab as their raw name: give them words in eventtext.ts, or leave them out (HIDDEN)')
 })
 
+test('"Have HQ test this": its start, its end each way, and a send to the engineer, in words', () => {
+  assert.equal(eventLine('check.started', { key: 'T-01' }), 'You had HQ test T-01')
+  assert.equal(eventLine('check.ended', { key: 'T-01', state: 'pass' }), "HQ's test of T-01: everything passed")
+  assert.equal(eventLine('check.ended', { key: 'T-01', state: 'fail' }), "HQ's test of T-01 found a problem (View results on its box)")
+  assert.equal(eventLine('check.ended', { key: 'T-01', state: 'stopped', why: 'you stopped it' }), "HQ's test of T-01 stopped: you stopped it")
+  assert.equal(eventLine('check.ended', { key: 'T-01', state: 'error', why: 'the app wouldn\'t start' }), "HQ couldn't finish testing T-01: the app wouldn't start")
+  assert.equal(eventLine('check.sent', { key: 'T-01' }), "You sent what HQ's test of T-01 found to its engineer")
+})
+
 test('Bug 201: what the stop of a frozen run and the other newly worded kinds say', () => {
   assert.equal(eventLine('bg.stopped', { by: 'user', tasks: ['b1'], minutes: 12, commands: ['npm run test-backend'] }),
     'You stopped its frozen background run: npm run test-backend (no CPU, no output for 12 min)')
@@ -177,6 +186,13 @@ test('Bug 201: what the stop of a frozen run and the other newly worded kinds sa
   assert.equal(eventLine('bg.ended', { task: 'b1', why: 'gone' }), 'Background run ended (its process is gone)')
   assert.equal(eventLine('bg.ended', { task: 'b1', why: 'something new' }), 'Background run ended (something new)')
   assert.equal(eventLine('message.held', { id: 'm', why: 'draft' }), 'HQ held a message back: there was half-typed text in its prompt box')
+  assert.equal(eventLine('message.held', { id: 'm', why: 'screen' }), "HQ held a message back: its terminal didn't show its waiting prompt") // Bug 296
+  assert.equal(eventLine('message.held', { id: 'm', why: 'something new' }), 'HQ held a message back')
+  assert.equal(eventLine('message.cut_short', { id: 'm', reason: 'fresh_start' }), 'HQ restarted while it was typing a message into its terminal: it types it again')
+  assert.equal(eventLine('message.typed', { id: 'm', reason: 'fresh_start', again: true }), 'HQ typed a message into its terminal after its restart')
+  assert.equal(eventLine('message.typed', { id: 'm', reason: 'urgent' }), 'HQ typed a message into its terminal')
+  assert.equal(eventLine('message.typed', { id: 'm', reason: 'urgent', again: true, finished: true }), // Bug 331
+    'HQ typed the rest of a message into its terminal after its restart (its first part was already in)')
 })
 
 test('Bug 210: the lines name the project\'s own default branch (master here), and main for a ticket that is gone', () => {
@@ -207,4 +223,66 @@ test('Bug 248: a refused open_pr shows on its engineer\'s Events in plain words,
   assert.ok(!lines.some((l) => l.startsWith('mcp.')), lines.join(' | '))
   assert.equal(eventLine('mcp.open_pr', { args: {} }), null) // what it must not change: HQ's other mcp calls stay out
   assert.equal(agentEvents('eng-2', 300).some((e) => /as finished/.test(e.text)), false) // only its own engineer's tab
+})
+
+test('Bug 289: a background run that ended names its command, a turn with no Stop hook gets a "Turn ended" line, and a wait for a turn says behind whom', () => {
+  assert.equal(eventLine('bg.ended', { task: 'b1', why: 'gone', command: 'npm test -- --runInBand' }), 'Background run ended: npm test -- --runInBand (its process is gone)')
+  assert.equal(eventLine('bg.ended', { task: 'b1', why: 'done', command: `node --test ${'x'.repeat(200)}` }), `Background run ended: node --test ${'x'.repeat(88)}… (it finished)`)
+  assert.equal(eventLine('bg.ended', { task: 'b1', why: 'gone' }), 'Background run ended (its process is gone)') // logged before: no command, no "undefined"
+  assert.equal(eventLine('bg.ended', { task: 'b1' }), 'Background run ended')
+  // Escape or No on a dialog: no Stop hook comes, so HQ's own line says the turn ended, and what the agent still waits on
+  assert.equal(eventLine('agent.turn_over', { why: 'no_stop', still: null }), 'Turn ended: Escape or No on a question on its screen')
+  assert.equal(eventLine('agent.turn_over', { why: 'dialog', still: 'Subagent: Map the code' }),
+    'Turn ended: Escape or No on a question on its screen · its helper still runs: Map the code')
+  assert.equal(eventLine('agent.turn_over', { why: 'no_stop', still: 'Waiting on: npm test (+1 more)' }),
+    'Turn ended: Escape or No on a question on its screen · still waiting on npm test (+1 more)')
+  assert.equal(eventLine('agent.turn_over', {}), 'Turn ended: Escape or No on a question on its screen')
+  assert.equal(eventLine('agent.interrupted', { why: 'turn' }), 'Interrupted (Escape)') // what it must not change: an interrupt keeps its own line
+  // a wait for a turn: behind whoever holds the turns as it began to wait (heavy.ts), one, two or more
+  assert.equal(eventLine('turns.waiting', { who: 'eng PAY-2', what: 'tests', behind: ["HQ's test of PAY-1"] }), "Waiting its turn for tests behind HQ's test of PAY-1")
+  assert.equal(eventLine('turns.waiting', { what: 'build', behind: ['eng PAY-1', "HQ's test of PAY-3"] }), "Waiting its turn for build behind eng PAY-1 and HQ's test of PAY-3")
+  assert.equal(eventLine('turns.waiting', { what: 'tests', behind: ['eng PAY-1', 'eng PAY-3', 'eng PAY-4'] }), 'Waiting its turn for tests behind eng PAY-1 and 2 more')
+  assert.equal(eventLine('turns.waiting', { what: 'tests', behind: [] }), 'Waiting its turn for tests') // the holder had just gone: nobody to name
+  assert.equal(eventLine('turns.waiting', { what: 'tests' }), 'Waiting its turn for tests') // no `behind` at all: the old words
+  assert.equal(eventLine('turns.waiting', { what: 'tests', behind: 'garbled' }), 'Waiting its turn for tests')
+})
+
+test('Bug 297: a Stop HQ learnt of late (its hook went to an HQ that was down) says so', () => {
+  assert.equal(eventLine('hook.Stop', { last: 'Here is the list:\n1. Apple', away: true }), 'Turn ended while HQ was down: Here is the list: 1. Apple')
+  assert.equal(eventLine('hook.Stop', { away: true }), 'Turn ended while HQ was down')
+  assert.equal(eventLine('hook.Stop', { last: 'Done.' }), 'Turn ended: Done.') // what it must not change: a Stop that came in time
+})
+
+test('Bug 309: HQ\'s own wait for its turn reaches its ticket\'s engineer\'s Events tab, by the run\'s name; one with no ticket reaches no tab', async () => {
+  const { release, take, withTurn } = await import('./heavy.ts')
+  agent('eng-309', 'engineer', 'eng PAY-9'); agent('eng-309b', 'engineer', 'eng PAY-8')
+  run('INSERT INTO tickets(id, feature_id, key, slug, title, created_at, updated_at, assignee_agent_id) VALUES (?,?,?,?,?,?,?,?)', 'tkt-309', 'f-1', 'PAY-9', 'pay-9',
+    'Refunds', 1, 1, 'eng-309'); run('UPDATE agents SET ticket_id = ? WHERE id = ?', 'tkt-309', 'eng-309')
+  const live: { owner: string | null; text: string | null }[] = [], { bus } = await import('./events.ts') // what the page's live feed sends, as ui.ts does
+  const feed = (e: { agentId: string | null; kind: string; payload: Record<string, unknown> }) => live.push({ owner: lineOwner(e.agentId, e.payload), text: eventLine(e.kind, e.payload) })
+  bus.on('event:turns.waiting', feed); bus.on('event:turns.started', feed)
+  take({ id: 'b309:u1', who: 'eng PAY-8', what: 'tests', agentId: 'eng-309b', lane: 'main', limitMs: Infinity }) // the other engineer's npm test holds the turn
+  let ran = false
+  const hq = withTurn("HQ's test of PAY-9", 'tests', async () => { ran = true }, undefined, { ticket: 'tkt-309' })
+  await new Promise((r) => setImmediate(r)); assert.equal(ran, false)
+  assert.deepEqual(live, [{ owner: 'eng-309', text: "HQ's test of PAY-9 waits its turn behind eng PAY-8" }])
+  release('b309:u1'); await hq; assert.equal(ran, true)
+  assert.deepEqual(live.at(-1), { owner: 'eng-309', text: "HQ's test of PAY-9 started" })
+  assert.deepEqual(agentEvents('eng-309', 2).map((e) => e.text), ["HQ's test of PAY-9 started", "HQ's test of PAY-9 waits its turn behind eng PAY-8"])
+  assert.ok(!agentEvents('eng-309b').some((e) => e.text.includes('PAY-9'))) // not the tab of the engineer it waited behind
+  // main's own test: no ticket, so no tab (as before)
+  take({ id: 'b309:u2', who: 'eng PAY-8', what: 'tests', agentId: 'eng-309b', lane: 'main', limitMs: Infinity })
+  const main = withTurn("HQ's test of main", 'tests', async () => {}); await new Promise((r) => setImmediate(r)); release('b309:u2'); await main
+  assert.deepEqual(live.slice(-2).map((l) => l.owner), [null, null])
+  bus.off('event:turns.waiting', feed); bus.off('event:turns.started', feed)
+  // the words: HQ's run by its name, an engineer's own as before
+  assert.equal(eventLine('turns.waiting', { who: "HQ's test of PAY-1", what: 'tests', behind: ['eng PAY-2', 'eng PAY-3', 'eng PAY-4'], ticket: 'tkt-1', hq: true }),
+    "HQ's test of PAY-1 waits its turn behind eng PAY-2 and 2 more")
+  assert.equal(eventLine('turns.waiting', { who: "HQ's look at PAY-1", what: 'tests', behind: [], hq: true }), "HQ's look at PAY-1 waits its turn")
+  assert.equal(eventLine('turns.started', { who: "HQ's test of PAY-1", what: 'tests', waitedS: 42, late: false, hq: true }), "HQ's test of PAY-1 started after waiting 42 s")
+  assert.equal(eventLine('turns.started', { who: 'eng PAY-2', what: 'tests', use: 'u', waitedS: 42 }), 'Its turn: tests started after 42 s')
+})
+
+test('Bug 346: a turn HQ learnt of late (it started while HQ was down) says so', () => {
+  assert.equal(eventLine('agent.turn_started_away', { was: 'idle' }), 'Its turn started while HQ was down: shown as working')
 })

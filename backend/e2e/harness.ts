@@ -6,6 +6,8 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
+import { afterEach, beforeEach, type TestContext } from 'node:test'
+import type { DatabaseSync } from 'node:sqlite'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { elapsedMs, pidsUnder } from '../src/procs.ts'
@@ -23,17 +25,6 @@ export async function waitFor<T>(what: string, fn: () => T | Promise<T>, ms = 10
   const end = Date.now() + ms
   for (;;) { const v = await fn(); if (v) return v as NonNullable<T>; if (Date.now() > end) throw new Error(`timed out waiting for ${what}`); await new Promise((r) => setTimeout(r, 100)) }
 }
-const freePort = (): Promise<number> => new Promise((resolve, reject) => {
-  const s = net.createServer(); s.on('error', reject); s.listen(0, '127.0.0.1', () => { const p = (s.address() as net.AddressInfo).port; s.close(() => resolve(p)) })
-})
-/** `n` different free ports. Bug 92: picked one after another, each closed before the next pick, two can be the same port. */
-async function freePorts(n: number): Promise<number[]> {
-  const held = await Promise.all(Array.from({ length: n }, () => new Promise<net.Server>((resolve, reject) => {
-    const s = net.createServer(); s.on('error', reject); s.listen(0, '127.0.0.1', () => resolve(s))
-  })))
-  const ports = held.map((s) => (s.address() as net.AddressInfo).port)
-  await Promise.all(held.map((s) => new Promise((r) => s.close(r)))); return ports
-}
 /** The TCP ports `pid` listens on (lsof exits 1 when it finds none). */
 export function listeningPorts(pid: number): number[] {
   let out = ''; try { out = execFileSync('lsof', ['-a', '-p', String(pid), '-iTCP', '-sTCP:LISTEN', '-P', '-n', '-Fn'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) }
@@ -44,16 +35,33 @@ export function listeningPorts(pid: number): number[] {
 const answers = (port: number, host: string): Promise<boolean> => new Promise((resolve) => {
   const c = net.connect({ host, port }); c.once('connect', () => { c.destroy(); resolve(true) }); c.once('error', () => resolve(false))
 })
-/** Ten ports nothing listens on (IPv4 or IPv6), for this test HQ's previews alone (Bug 44): test HQs that run at the same time,
- *  and the live HQ, never hand out the same port. */
-async function previewRange(avoid: number[]): Promise<string> {
-  for (;;) {
-    const base = await freePort(); if (base + 9 > 65535) continue
-    const ports = Array.from({ length: 10 }, (_, i) => base + i); if (ports.some((p) => avoid.includes(p))) continue // not HQ's own ports
-
-    if ((await Promise.all(ports.flatMap((p) => [answers(p, '127.0.0.1'), answers(p, '::1')]))).some(Boolean)) continue
-    return `${base}-${base + 9}`
+/** Thirteen ports for one test HQ alone, in a block of fourteen: its own three (the page, hooks, agents' tools) and ten for its previews (Bug 44).
+ *  Test HQs that run at the same time, of this run or another, never share a port. The blocks lie in 29400–32767: below the ports an OS hands
+ *  out by itself (Linux from 32768, macOS from 49152) and above HQ's windows for engineers (slotports.ts, to 29399). The first of the fourteen
+ *  is the claim: this process listens on it for as long as the test HQ lives, so the OS itself keeps two test HQs off one block, and a claim
+ *  goes with its process. HQ gets the thirteen after it.
+ *  Bug 321: the preview ports used to start at a port the OS had just handed out, so they lay among the ports every other socket on the
+ *  machine gets. On Linux an outgoing connection takes one of those as its own end, and nothing can listen there while it is open or for a
+ *  minute after it closes, though nothing answers there either: HQ took such a port as free and the app ended with EADDRINUSE (one or two
+ *  preview tests in every whole-suite run in Docker, 2026-11-19; macOS lets the listen through).
+ *  Bug 325: HQ's own three were still ports the OS handed out. A test that takes its backend down gives them up until it is back, and on
+ *  Linux the OS hands a port just given up to one of the next programs that ask for any port (measured: 3 of 200 tries within 30 asks,
+ *  bind0.mjs). The backend that came back found its port "in use by node" (3 of 13 whole-suite runs in Docker), held by a program that was
+ *  gone a moment later: by all signs another test file's listener, though it was never caught at it. Nothing is handed a port in these blocks.
+ *  `from`: the block to try first (a test's; a random one otherwise, so runs spread out). `avoid`: ports a test gave its test HQ itself. */
+export const PORT_BLOCKS = { from: 29400, size: 14, count: Math.floor((32768 - 29400) / 14) }
+export type PortBlock = { own: [number, number, number]; range: string; block: number; release: () => void }
+export async function claimPorts(avoid: number[] = [], from = Math.floor(Math.random() * PORT_BLOCKS.count)): Promise<PortBlock> {
+  for (let n = 0; n < PORT_BLOCKS.count; n++) {
+    const block = (from + n) % PORT_BLOCKS.count, first = PORT_BLOCKS.from + block * PORT_BLOCKS.size
+    const ports = Array.from({ length: PORT_BLOCKS.size - 1 }, (_, i) => first + 1 + i); if ([first, ...ports].some((p) => avoid.includes(p))) continue
+    const claim = await new Promise<net.Server | null>((resolve) => { const s = net.createServer(); s.once('error', () => resolve(null)); s.listen(first, '127.0.0.1', () => resolve(s)) })
+    if (!claim) continue // another test HQ's, or some other program's
+    claim.unref() // it never keeps a test file alive
+    if ((await Promise.all(ports.flatMap((p) => [answers(p, '127.0.0.1'), answers(p, '::1')]))).some(Boolean)) { claim.close(); continue } // something of the user's listens in it
+    return { own: [ports[0]!, ports[1]!, ports[2]!], range: `${ports[3]}-${ports[12]}`, block, release: () => { claim.close() } }
   }
+  throw new Error(`no block of ports is free: all ${PORT_BLOCKS.count} from ${PORT_BLOCKS.from} are claimed or have something listening in them`)
 }
 /** lsof's list of working folders. It exits 1 when it can't see every process, and what it saw is still on stdout. */
 const workingFolders = (): string => { try { return execFileSync('lsof', ['-d', 'cwd', '-Fpn'], { encoding: 'utf8', maxBuffer: 1 << 26, stdio: ['ignore', 'pipe', 'ignore'] }) }
@@ -82,7 +90,34 @@ const abortAll = () => { for (const f of live) f() }
 process.once('exit', abortAll)
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.once(sig, () => { abortAll(); process.exit(128 + os.constants.signals[sig]) }) // SIGHUP: own-tmp.mjs passes it on
 
+/** What this file's test HQs have printed, for the test that fails. The log used to go to one file every test HQ of every test file wrote
+ *  (hq-e2e-last.log), so after a failure it was nearly always some other test's. Now a failed test gets a file of its own, with what each
+ *  test HQ alive during it printed since that test began: <tmpdir>/hq-e2e-failed/<checkout>/<test file>--<test>.log, named in the test's
+ *  own output. A file's old ones go when the file runs again. `HQ_E2E_LOG_TAIL=<lines>` also prints the end of it (80 lines in CI, where
+ *  the machine is gone after the run). Only under the test runner: one-off demo scripts import this file as a plain script.
+ *  A test that ends with its test HQ's backend down (it failed between `down()` and `up()`) used to leave it down for every test after it in
+ *  the file, which then failed at once with ECONNREFUSED: one real failure and a row of false ones. The backend is started again here. */
+const said = new Set<{ log: () => string; from: number; gone: boolean; down: () => boolean; up: () => Promise<void> }>()
+const FAILED = path.join(process.env.HQ_OUTER_TMPDIR ?? os.tmpdir(), 'hq-e2e-failed', path.basename(path.dirname(BACKEND)))
+if (process.env.NODE_TEST_CONTEXT) {
+  const mine = `${path.basename(process.argv[1] ?? 'test').replace(/\.test\.[cm]?[jt]s$/, '')}--`
+  try { for (const f of fs.readdirSync(FAILED)) if (f.startsWith(mine)) fs.rmSync(path.join(FAILED, f), { force: true }) } catch { /* none yet */ }
+  beforeEach(() => { for (const s of said) { if (s.gone) said.delete(s); else s.from = s.log().length } })
+  afterEach(async (t) => {
+    const test = t as TestContext & { passed?: boolean; error?: unknown }
+    for (const s of said) if (!s.gone && s.down()) { await s.up(); test.diagnostic('this test ended with its test HQ down: the backend was started again for the tests after it') }
+    if (test.passed !== false || !said.size) return
+    const text = [...said].map((s, i) => `--- test HQ ${i + 1}${s.gone ? ' (stopped during the test)' : ''}\n${s.log().slice(s.from)}`).join('\n')
+    const file = path.join(FAILED, `${mine}${test.name.replace(/[^\w]+/g, '-').slice(0, 80)}.log`)
+    try { fs.mkdirSync(FAILED, { recursive: true }); fs.writeFileSync(file, `${test.name}\n${String((test.error as Error | undefined)?.message ?? '')}\n\n${text}\n`) } catch { return }
+    test.diagnostic(`what the test HQ printed during this test: ${file}`)
+    const tail = Number(process.env.HQ_E2E_LOG_TAIL ?? (process.env.CI ? 80 : 0))
+    if (tail > 0) console.error(`[the test HQ's output, "${test.name}"]\n${text.split('\n').slice(-tail).join('\n')}`)
+  })
+}
+
 export type Hq = Awaited<ReturnType<typeof startHq>>
+type BeatName = import('../src/beats.ts').Beat
 /** `env`: extra environment for the backend (a fake `gh` on PATH, say). `ports`: the first try's ports, for a test of a taken one. `startMs`: how long a start
  *  may take to listen, and then to answer (a test of one that doesn't). */
 export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Record<'ui' | 'hooks' | 'mcp', number>>; startMs?: number } = {}) {
@@ -91,24 +126,25 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
   const tmuxDir = fs.mkdtempSync(path.join(process.env.HQ_SHORT_TMPDIR ?? '/tmp', 'hq-e2e-')) // unix socket paths must stay short
   const home = path.join(root, 'home'), hqHome = path.join(root, 'hq'); fs.mkdirSync(home)
   fs.writeFileSync(path.join(home, '.claude.json'), '{ "projects": {} }') // HQ marks workspaces trusted in it
-  const pick = async () => { const [ui, hooks, mcp] = await freePorts(3); return { ui: ui!, hooks: hooks!, mcp: mcp! } }
-  const ports = { ...await pick(), ...o.ports }
+  // Its ports: a block of its own (claimPorts). `o.ports` puts one of its three elsewhere for the first try (a test of a taken port)
+  let block = await claimPorts(Object.values(o.ports ?? {}))
+  const own = () => ({ ui: block.own[0], hooks: block.own[1], mcp: block.own[2] })
+  const ports = { ...own(), ...o.ports }
   const screens = path.join(root, 'screens'); fs.mkdirSync(screens)
   const env: NodeJS.ProcessEnv = { ...process.env, HQ_FAKE_SCREEN_DIR: screens, HOME: home, HQ_HOME: hqHome, HQ_CLAUDE_BIN: FAKE, TMUX_TMPDIR: tmuxDir,
     HQ_AGENT_TMP: path.join(tmuxDir, 'a-'), // agents' own temp folders go with the run (Bug 81)
     HQ_FAKE_VERSION: CHECKED_VERSION, HQ_INSTALLED_CLAUDE: '', // the fake is the version HQ was checked on, and this machine's own Claude Code isn't looked at (Bug 97)
     GIT_AUTHOR_NAME: 'HQ e2e', GIT_AUTHOR_EMAIL: 'e2e@hq.test', GIT_COMMITTER_NAME: 'HQ e2e', GIT_COMMITTER_EMAIL: 'e2e@hq.test', GIT_CONFIG_NOSYSTEM: '1', ...o.env }
-  const usePorts = async () => {
-    Object.assign(env, { HQ_UI_PORT: String(ports.ui), HQ_HOOKS_PORT: String(ports.hooks), HQ_MCP_PORT: String(ports.mcp), HQ_PREVIEW_PORTS: await previewRange(Object.values(ports)) })
-  }
-  await usePorts()
+  const usePorts = () => { Object.assign(env, { HQ_UI_PORT: String(ports.ui), HQ_HOOKS_PORT: String(ports.hooks), HQ_MCP_PORT: String(ports.mcp), HQ_PREVIEW_PORTS: block.range }) }
+  usePorts()
   delete env.TMUX; delete env.TMUX_PANE // inside tmux these would point every tmux call at the live server
   // This run's own tmux server, named in every call the harness makes. With its folder gone, a bare `tmux` falls back to the default server, which is
   // the user's own: live HQ, its agents and their sessions. On 2026-11-07 a second stop() killed it that way. A server that isn't running has no socket.
   const sock = path.join(tmuxDir, `tmux-${process.getuid?.() ?? 0}`, 'default')
   fs.mkdirSync(path.dirname(sock), { mode: 0o700 }) // tmux makes this folder only when it goes through TMUX_TMPDIR
   const killTmux = () => { try { if (fs.existsSync(sock)) execFileSync('tmux', ['-S', sock, 'kill-server'], { env, stdio: 'ignore' }) } catch { /* gone meanwhile */ } }
-  let proc: ChildProcess | null = null; let log = ''
+  let proc: ChildProcess | null = null; let log = ''; let stopped = false
+  const mark = { log: () => log, from: 0, gone: false, down: () => !stopped && proc === null, up: () => startBackend() }; said.add(mark)
   const uiToken = () => { try { return fs.readFileSync(path.join(hqHome, 'ui-token'), 'utf8').trim() } catch { return '' } }
   const agentToken = (agentId: string) => fs.readFileSync(path.join(hqHome, 'agents', agentId, 'token'), 'utf8').trim()
   /** One hook event as the agent, nothing more (see `hook`). */
@@ -124,6 +160,7 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
     return { status: r.status, json }
   }
   const state = async (): Promise<any> => (await api('state')).json
+  const beatCount = async (name: BeatName): Promise<number> => { const r = await api('beats'); if (r.status !== 200) throw new Error(`GET /api/beats answered ${r.status}`); return r.json[name] }
   /** Starts the backend and waits until it listens on all three of its ports. Bug 92: a port can be taken between the pick and the backend's
    *  listen (by a test HQ in another file, say). HQ then ran on without that server, and a test's MCP calls reached a hooks server (404).
    *  Since Bug 118 the backend stops by itself then, with its own exit code. False when a port was taken. Bug 166: a start that fails or runs out of time
@@ -147,54 +184,77 @@ export async function startHq(o: { env?: NodeJS.ProcessEnv; ports?: Partial<Reco
       throw new Error(problems.join('\n'))
     }
   }
-  /** A restart keeps its ports: running agents were given them. */
+  /** A restart keeps its ports: running agents were given them. When one was taken meanwhile, the error also says what the program HQ named is
+   *  and what started it: on Linux this failed preview-stop-restart.test.ts in 2 of 12 whole-suite runs with only "node (pid …)" to go on. */
   async function startBackend(): Promise<void> {
-    if (!await tryStart()) throw new Error(`a port of this test HQ (${JSON.stringify(ports)}) was taken while it was down:\n${log}`)
+    const from = log.length; if (await tryStart()) return
+    const ps = (pids: string[]): string => { try { return pids.length ? execFileSync('ps', ['-o', 'pid=,ppid=,etime=,args=', '-p', pids.join(',')], { encoding: 'utf8' }) : '' } catch { return '' } }
+    const holders = ps([...new Set([...log.slice(from).matchAll(/\(pid (\d+)\)/g)].map((m) => m[1]!))])
+    const parents = ps([...new Set(holders.split('\n').map((l) => l.trim().split(/\s+/)[1] ?? '').filter((x) => Number(x) > 1))])
+    const who = holders ? `\nits holder now (pid, parent, running for, command):\n${holders}started by:\n${parents || '(gone)\n'}this test process is pid ${process.pid}` : ''
+    throw new Error(`a port of this test HQ (${JSON.stringify(ports)}) was taken while it was down:\n${log}${who}`)
   }
   /** Bug 113: every wait has a time limit, teardown too. A backend still there STOP_MS after SIGTERM is killed, and the test is told. */
   async function stopBackend(): Promise<void> {
     const p = proc; proc = null; if (!p || p.exitCode !== null || p.signalCode !== null) return // killed from outside: its exit event has already gone
     const gone = new Promise((r) => p.once('exit', r)); p.kill('SIGTERM')
-    if (!await pendingAfter(gone, STOP_MS)) return
+    if (!await pendingAfter(gone, STOP_MS)) return // limit: a teardown's own time limit (Bug 113), not a pause: it ends as soon as the backend has
     p.kill('SIGKILL'); await gone; throw new Error(`the test HQ's backend didn't stop within ${STOP_MS / 1000} s of SIGTERM, so it was killed`)
   }
   /** Bug 113: something HQ started that still holds the backend's output keeps the test file from ever exiting (CI waited 16 minutes). Its pipes close
    *  here, and the test is told. False when they were already closed. */
   const outputHeld = async (p: ChildProcess): Promise<boolean> => {
     const closed = (s: NodeJS.ReadableStream & { closed?: boolean } | null) => !s || s.closed ? Promise.resolve() : new Promise((r) => s.once('close', r))
-    if (!await pendingAfter(Promise.all([closed(p.stdout), closed(p.stderr)]), PIPE_MS)) return false
+    if (!await pendingAfter(Promise.all([closed(p.stdout), closed(p.stderr)]), PIPE_MS)) return false // limit: as above, for its pipes
     p.stdout?.destroy(); p.stderr?.destroy(); return true
   }
   const started: ChildProcess[] = [] // every backend process this test HQ ran (restarts too), kept past stopBackend for their pipes
   const abort = () => { // the test process is going: its folders go too, last, since no tmux call may come after (Bug 81)
+    mark.gone = true; block.release()
     try { proc?.kill('SIGKILL') } catch { /* gone */ }
     killTmux(); killLeftovers(root, born)
     fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(tmuxDir, { recursive: true, force: true })
   }
   live.add(abort)
   try {
-    for (let tries = 1; !await tryStart(); tries++) { // nothing has its ports yet: new ones
+    for (let tries = 1; !await tryStart(); tries++) { // nothing has its ports yet: another block, whole
       if (tries === 3) throw new Error(`the test HQ's ports were taken ${tries} times:\n${log}`)
-      Object.assign(ports, await pick()); await usePorts()
+      const next = await claimPorts(); block.release(); block = next; Object.assign(ports, own()); usePorts()
     }
   } catch (e) { // Bug 166: no test HQ to stop for the file's after(), so all of it goes here: its tmux server, what it started, its folders, its pipes
     live.delete(abort); abort(); await Promise.all(started.map(outputHeld)); throw e
   }
-  let stopped = false
 
   return {
     root, home, hqHome, ports, env, api, state, agentToken,
     log: () => log,
+    /** HQ's database, opened the way HQ's own connection is: it waits out a write lock where a plain open fails at once with "database is
+     *  locked" (Bug 158; tests that opened it themselves failed now and then on a busy machine). The caller closes it. */
+    db: (o: { readOnly?: boolean } = {}): DatabaseSync =>
+      new (process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite')).DatabaseSync(path.join(hqHome, 'hq.sqlite'), { timeout: 5000, ...o }),
+    /** Waits until HQ's look `name` has ended `n` more times (src/beats.ts), in place of a sleep before checking that something did NOT
+     *  happen. One beat proves nothing: a look that began before the test's last action may end just after it. Two mean a whole look ran after
+     *  it; the default of three leaves one to spare. The test HQ must run that loop fast (HQ_AUTO_TICK_MS, HQ_STUCK_TICK_S, HQ_FINISHED_TICK_S,
+     *  HQ_LEFTOVER_TICK_S), or `ms` runs out. A look that runs on events and not on a clock a test can speed up (`merges`) is counted from
+     *  before the action, `from: await hq.beat(name)`, and set off twice (two syncs): its second end is a look that began after the first.
+     *  For `auto` a pass only starts HQ's test runs and merges, so by default this also waits until the page shows none under way;
+     *  `runs: 'leave'` for a test that holds one back on purpose. */
+    async beats(name: BeatName, n = 3, o: { ms?: number; runs?: 'leave'; from?: number } = {}): Promise<void> {
+      const from = o.from ?? await beatCount(name), ms = o.ms ?? 15_000
+      await waitFor(`HQ's ${name} look to end ${n} more time${n === 1 ? '' : 's'} (it had ended ${from} times)`, async () => (await beatCount(name)) >= from + n, ms)
+      if (name === 'auto' && o.runs !== 'leave') await waitFor("HQ's own test runs to end", async () => (await state()).testRuns.length === 0, ms)
+    },
+    /** How often HQ's look `name` has ended so far. */
+    beat: (name: BeatName): Promise<number> => beatCount(name),
     restart: async () => { await stopBackend(); await startBackend() },
     /** The backend alone goes away and comes back (agents, like their tmux server, stay): a restart with time in between. */
     down: stopBackend, up: startBackend,
-    /** Stops everything and deletes the temp dirs; the backend's output stays in <tmpdir>/hq-e2e-last.log (the shared one, past own-tmp.mjs's). */
+    /** Stops everything and deletes the temp dirs. What the backend printed is kept for a test that fails (see `said`). */
     async stop(): Promise<void> { // twice is fine: a test may stop it and its afterEach again
       if (stopped) return; stopped = true
-      const problems: string[] = []; await stopBackend().catch((e) => { problems.push((e as Error).message) })
-      fs.writeFileSync(path.join(process.env.HQ_OUTER_TMPDIR ?? os.tmpdir(), 'hq-e2e-last.log'), log)
+      const problems: string[] = []; await stopBackend().catch((e) => { problems.push((e as Error).message) }); mark.gone = true
       live.delete(abort); killLeftovers(root, born) // previews first: HQ leaves them running on purpose (a restart picks them up)
-      killTmux()
+      killTmux(); block.release() // once nothing of this test HQ can still listen in the block
       fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(tmuxDir, { recursive: true, force: true })
       if ((await Promise.all(started.map(outputHeld))).some(Boolean)) problems.push(`a process the test HQ started still held its output ${PIPE_MS / 1000} s after it stopped`)
       if (problems.length) throw new Error(problems.join('; '))
@@ -269,8 +329,24 @@ export const exitPlanMode = (plan: string) => ({ hook_event_name: 'PermissionReq
 export const pendingAfter = (p: Promise<unknown>, ms: number): Promise<boolean> => new Promise((resolve) => {
   const t = setTimeout(() => resolve(true), ms), done = () => { clearTimeout(t); resolve(false) }; p.then(done, done)
 })
-/** `git worktree list --porcelain` lock line for a worktree path, or null. */
+/** Whether a promise is still pending once everything that has already arrived has had its turn: ten turns of the event loop, and no time. An
+ *  answer HQ sent before the caller's last request came back is seen (its bytes are read on one turn, its body on a later one); an answer HQ
+ *  sends after that is not. So for "HQ is holding this": wait for what shows the hold (an event, the line on its box), then ask this.
+ *  `pendingAfter` is for a hold nothing shows, and counts as a fixed wait. */
+export const pending = async (p: Promise<unknown>): Promise<boolean> => {
+  let done = false; const set = () => { done = true }; p.then(set, set)
+  for (let i = 0; i < 10 && !done; i++) await new Promise((r) => setImmediate(r))
+  return !done
+}
+/** `git worktree list --porcelain` lock line for a worktree path, or null. git finds a lock's file and then reads it, and dies when the lock
+ *  goes in between ("failed to read '…/locked'": HQ unlocked it at that moment; bugs.test.ts, 1 of 12 whole-suite runs on Linux, 2026-11-19).
+ *  That answer says nothing about the lock, so git is asked again. */
 export function lockOf(repo: string, wt: string): string | null {
-  const block = sh(repo, 'worktree', 'list', '--porcelain').split('\n\n').find((b) => b.startsWith(`worktree ${wt}\n`))
+  let list = ''
+  for (let tries = 1; ; tries++) {
+    try { list = sh(repo, 'worktree', 'list', '--porcelain'); break }
+    catch (e) { if (tries === 5 || !/failed to read '[^']*\/locked'/.test(String((e as { stderr?: unknown }).stderr))) throw e }
+  }
+  const block = list.split('\n\n').find((b) => b.startsWith(`worktree ${wt}\n`))
   return block?.split('\n').find((l) => l.startsWith('locked'))?.replace(/^locked ?/, '') ?? null
 }

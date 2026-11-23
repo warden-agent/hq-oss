@@ -6,7 +6,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
-import { claudeLockPid, claudeRunning, listWorktrees, removeMerged, seedPackages, unlockStale } from './worktrees.ts'
+import { claudeLockPid, claudeRunning, excludeLeftovers, listWorktrees, removeMerged, seedPackages, unlockStale } from './worktrees.ts'
 
 const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 const DEAD = 999_999 // above macOS's pid limit: never running
@@ -95,4 +95,28 @@ test('seedPackages: no copy when git doesn\'t ignore node_modules there, or main
   assert.deepEqual(await seedPackages(dir, wt('T-1')), [], 'main has none')
   fs.mkdirSync(path.join(dir, 'node_modules')); assert.deepEqual(await seedPackages(dir, wt('T-1')), [], 'would show up as new files')
   assert.ok(!fs.existsSync(path.join(wt('T-1'), 'node_modules')))
+})
+
+test('excludeLeftovers (Bug 263): an install\'s files never show in git status, in the checkout or its worktrees; ignored or tracked ones are left alone', async () => {
+  const { dir, wt } = repo('T-1') // its .gitignore covers node_modules/
+  fs.mkdirSync(path.join(dir, '.yarn', 'cache'), { recursive: true }); fs.writeFileSync(path.join(dir, '.yarn', 'cache', 'ms.zip'), 'z') // zero-install: the cache is committed
+  sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'cache')
+  const rels = ['node_modules/', '.pnp.cjs', '.pnp.loader.mjs', '.yarn/install-state.gz', '.yarn/cache/', '.yarn/unplugged/']
+  assert.deepEqual(await excludeLeftovers(dir, rels), ['/.pnp.cjs', '/.pnp.loader.mjs', '/.yarn/install-state.gz', '/.yarn/unplugged/'])
+  const install = (at: string) => { // what Yarn 4 leaves after `yarn install --immutable` (checked on 4.5.3)
+    for (const f of ['.pnp.cjs', '.yarn/install-state.gz', '.yarn/unplugged/x/index.js', 'node_modules/ms/index.js']) {
+      fs.mkdirSync(path.dirname(path.join(at, f)), { recursive: true }); fs.writeFileSync(path.join(at, f), 'x')
+    }
+  }
+  install(dir); install(wt('T-1'))
+  assert.equal(sh(dir, 'status', '--porcelain', '--untracked-files=all'), '')
+  assert.equal(sh(wt('T-1'), 'status', '--porcelain', '--untracked-files=all'), '', 'a ticket worktree shares the exclude')
+  fs.writeFileSync(path.join(dir, '.yarn', 'cache', 'new.zip'), 'z') // a zero-install project's new package still shows, to be committed
+  assert.equal(sh(dir, 'status', '--porcelain', '--untracked-files=all'), '?? .yarn/cache/new.zip')
+  assert.deepEqual(await excludeLeftovers(dir, rels), [], 'already covered: nothing added twice')
+  fs.mkdirSync(path.join(dir, 'web')); fs.writeFileSync(path.join(dir, 'web', 'package.json'), '{}')
+  assert.deepEqual(await excludeLeftovers(path.join(dir, 'web'), ['.pnp.cjs']), ['/web/.pnp.cjs']) // a checkout below the repo's top: anchored there
+  const excl = fs.readFileSync(path.join(dir, '.git', 'info', 'exclude'), 'utf8')
+  assert.equal(excl.split('\n').filter((l) => l === '/.pnp.cjs').length, 1); assert.match(excl, /^\/web\/\.pnp\.cjs$/m)
+  assert.deepEqual(await excludeLeftovers(dir, []), [])
 })

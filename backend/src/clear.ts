@@ -11,9 +11,9 @@ import { one, q, run, now, tx } from './db.ts'
 import { bus, emit, patch } from './events.ts'
 import { rememberGone, sweepNow } from './leftovers.ts'
 import { attention, resolveKind } from './attention.ts'
-import { agentDir, liveAgents, stopAgent, update, type Agent } from './agents.ts'
-import { features, getRepo, repoOfAgent, setTicket, tickets, type Feature, type Repo, type Ticket } from './records.ts'
-import { fallbackNote, freshStart, freshStartBlocker, inRepo } from './freshstart.ts'
+import { agentDir, getAgent, liveAgents, onDialog, stopAgent, type Agent } from './agents.ts'
+import { autoOn, features, getFeature, getRepo, repoOfAgent, setTicket, tickets, type Feature, type Repo, type Ticket } from './records.ts'
+import { fallbackNote, freshStart, freshStartBlocker, inRepo, retarget } from './freshstart.ts'
 import { agentNote, noteScope, readNote, saveNote } from './notes.ts'
 import { launching } from './tickets.ts'
 import { builtLines, dropFeatureMd, featureState, keepBuilt, tpmWorkspace, writeFeatureMd, writeProjectMd } from './projectmd.ts'
@@ -24,6 +24,7 @@ import { git } from './repos.ts'
 import { dropFindings } from './findings.ts'
 import { stopAutoTests } from './testrun.ts'
 import { stopPlanChecks } from './plancheck.ts'
+import { stopChecksIn } from './hqcheck.ts'
 
 const name = (a: Agent): string => a.display_name ?? a.id
 /** The repo's agents that a clear stops: its TPM, engineers and reviewers (not a Launch helper: it goes with the app). */
@@ -54,35 +55,70 @@ export async function clearRepo(repoId: string): Promise<{ noting: string[]; sto
   patch('repo', repoId, { clearing_at: at })
   stopAutoTests(repo.path) // auto mode is off for it from here: its test run ends now, not at its time limit, with no result (Bug 152)
   stopPlanChecks(repoId) // and so does a reader checking one of its plans: nothing it says lands on the cleared board (Bug 177)
+  stopChecksIn(repoId, 'the project is being cleared') // and the user's checks of its tickets (hqcheck.ts)
   if ((one<{ status: string }>('SELECT status FROM previews WHERE id = ?', repoId)?.status ?? 'stopped') !== 'stopped') await stopPreview(repoId).catch(() => {})
   stopFirstMap(repoId) // a first map half written goes; one already saved stays (the app is still what it was)
-  const noting: string[] = [], stopped: string[] = []
-  for (const a of liveAgents().filter(ofRepo(repoId))) {
-    if (a.fresh_start_at) { update(a.id, { fresh_start_then: 'clear' }); noting.push(name(a)); continue } // already writing one
-    let why = a.role === 'tpm' || a.role === 'engineer' ? freshStartBlocker(a) : `${a.role}s don't keep notes`
-    if (!why) { try { await freshStart(a.id, { how: 'now', then: 'clear' }); noting.push(name(a)); continue } catch (e) { why = (e as Error).message } }
-    const scope = noteScope(a) // HQ's note only where there's none: a real one the agent wrote earlier stays (Bug 73)
-    if (scope && unfinished(a, tks) && !agentNote(scope)) saveNote(a, fallbackNote(a, why))
-    await stopAgent(a.id, 'cleared'); stopped.push(`${name(a)}: ${why}`)
-  }
-  emit({ agentId: null, source: 'ui', kind: 'repo.clear_started', payload: { repo: repoId, noting, stopped } })
-  const done = !noting.length && await maybeFinishClear(repoId)
-  return { noting, stopped, done }
+  asking.add(repoId) // the sweep leaves these agents to this request while it runs
+  let r: { noting: string[]; stopped: string[] }
+  try { r = await askForNotes(repoId) } finally { asking.delete(repoId) }
+  emit({ agentId: null, source: 'ui', kind: 'repo.clear_started', payload: { repo: repoId, ...r } })
+  const done = !r.noting.length && await maybeFinishClear(repoId)
+  return { ...r, done }
 }
 export const unfinished = (a: Agent, tks: Ticket[]): boolean => a.role === 'tpm' ? true
   : a.role === 'engineer' && UNFINISHED.includes(tks.find((t) => t.id === a.ticket_id)?.status ?? '')
 
+/** Repos whose clearRepo request is asking its agents for notes right now. In memory on purpose: after a restart nobody is
+ *  asking, and maybeFinishClear asks whoever the request didn't reach (Bug 275). */
+const asking = new Set<string>()
+/** Each live agent of the clearing repo that hasn't been asked yet writes a handoff note and stops (`noting`), or, when it
+ *  can't write one now, stops at once with HQ's note (`stopped`, with why). Each is read again before it is handled: the
+ *  stop of the one before can take a while. */
+async function askForNotes(repoId: string): Promise<{ noting: string[]; stopped: string[] }> {
+  const noting: string[] = [], stopped: string[] = []
+  for (const { id } of liveAgents().filter(ofRepo(repoId))) {
+    const a = getAgent(id); if (!a || a.status === 'exited') continue
+    if (a.fresh_start_at) { await retarget(a.id, 'clear'); noting.push(name(a)); continue } // already writing one: now for the Clear, in its words (Bug 338)
+    let why = a.role === 'tpm' || a.role === 'engineer' ? freshStartBlocker(a) : `${a.role}s don't keep notes`
+    if (!why) { try { await freshStart(a.id, { how: 'now', then: 'clear' }); noting.push(name(a)); continue } catch (e) { why = (e as Error).message } }
+    const fids = inRepo(repoId), tks = tickets().filter((t) => fids.has(t.feature_id)), scope = noteScope(a)
+    // HQ's note only where there's none: a real one the agent wrote earlier stays (Bug 73)
+    if (scope && unfinished(a, tks) && !agentNote(scope)) saveNote(a, fallbackNote(a, archiveWhy(a, tks, why)))
+    await stopAgent(a.id, 'cleared'); stopped.push(`${name(a)}: ${why}`)
+  }
+  return { noting, stopped }
+}
+/** Why HQ wrote the note, for whoever reads the archive later (Bug 261): what the agent was waiting on when the project was
+ *  cleared, not what the user should have done about it then ("Answer it first"). `why`: the reason given to the user. */
+export function archiveWhy(a: Agent, tks: Ticket[], why: string): string {
+  if (onDialog(a)) return 'the project was cleared while it waited on a dialog in its terminal'
+  const t = tks.find((x) => x.id === a.ticket_id)
+  if (t?.status === 'plan_review') {
+    const by = autoOn(getFeature(t.feature_id)?.repo_id) ? "HQ's plan check" : "the user's review"
+    const kept = one('SELECT 1 FROM plan_revisions WHERE ticket_id = ?', t.id) ? '; its plan is archived as PLAN.md' : '' // archive() copies it there
+    return `the project was cleared while ${t.key}'s plan waited for ${by}, so it was never approved${kept}`
+  }
+  return why
+}
+
 const finishing = new Set<string>()
 /** Finishes the clear of `repoId` once none of its agents runs or is still writing a note. True when it did. Called after each
- *  note and by the fresh-start sweep every 10 s (which also picks a clear up after a restart). */
+ *  note and by the fresh-start sweep every 10 s (which also picks a clear up after a restart). An agent the clear's request
+ *  never reached (a restart cut it short, Bug 275) is asked here first. */
 export async function maybeFinishClear(repoId: string): Promise<boolean> {
-  const repo = getRepo(repoId); if (!repo?.clearing_at || finishing.has(repoId)) return false
-  if (q<Agent>("SELECT * FROM agents WHERE status != 'exited' OR fresh_start_at IS NOT NULL").some(ofRepo(repoId))) return false
+  const repo0 = getRepo(repoId); if (!repo0?.clearing_at || finishing.has(repoId) || asking.has(repoId)) return false
   finishing.add(repoId)
-  try { await finishClear(repo); resolveKind(`repo_clear_failed:${repoId}`, null); return true } catch (e) {
+  try {
+    if (liveAgents().some((a) => ofRepo(repoId)(a) && !a.fresh_start_at)) {
+      emit({ agentId: null, source: 'system', kind: 'repo.clear_asked_rest', payload: { repo: repoId, ...await askForNotes(repoId) } })
+    }
+    const repo = getRepo(repoId); if (!repo?.clearing_at) return false
+    if (q<Agent>("SELECT * FROM agents WHERE status != 'exited' OR fresh_start_at IS NOT NULL").some(ofRepo(repoId))) return false
+    await finishClear(repo); resolveKind(`repo_clear_failed:${repoId}`, null); return true
+  } catch (e) {
     // The repo stays locked and the sweep tries again every 10 s; the notice says why, once, until it works.
     emit({ agentId: null, source: 'system', kind: 'repo.clear_failed', payload: { repo: repoId, error: String(e) } })
-    attention(`repo_clear_failed:${repoId}`, `Clearing ${repo.name} hasn't finished: ${(e as Error).message} HQ keeps trying every 10 seconds.`)
+    attention(`repo_clear_failed:${repoId}`, `Clearing ${repo0.name} hasn't finished: ${(e as Error).message} HQ keeps trying every 10 seconds.`)
     return false
   } finally { finishing.delete(repoId) }
 }

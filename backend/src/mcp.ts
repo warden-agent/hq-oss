@@ -15,7 +15,7 @@ import { addFeature, changeFinished, createTicket, finishedAndStopped, hqOpened,
 import { featureDone, writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { proposeTestCommand } from './auto.ts'
 import { LEFT_OUT_ASK, leftOutSection } from './leftout.ts'
-import { autoOn, features, featureByHandle, tickets, getFeature, getRepo, setTicket, ticketForAgent, ticketInRepo, type Feature } from './records.ts'
+import { autoOn, closedWhy, features, featureByHandle, tickets, getFeature, getRepo, repoOfAgent, setTicket, ticketForAgent, ticketInRepo, type Feature } from './records.ts'
 import { finishTicket } from './mergewatch.ts'
 import { id, j, readJson, TooLarge } from './util.ts'
 import { noteProblem, saveNote } from './notes.ts'
@@ -170,7 +170,7 @@ function registerTools(s: McpServer, agent: Agent): void {
       const done = t.status === 'pr_ready' || t.status === 'pr_open'
       if (done && (spec || criteria)) { // already built: an engineer builds the change before anything merges
         try {
-          const r = await changeFinished(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}) }); changed(getFeature(t.feature_id)!)
+          const r = await changeFinished(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}) })
           const who = r.via === 'launch' ? `HQ started an engineer (${r.engineer})` : `HQ told its engineer (${r.engineer})`
           return text(`${ok} ${t.key} was already finished, so ${who} to build the change. It can't be merged until that's done; HQ tells you when it is.`)
         } catch (e) {
@@ -180,7 +180,7 @@ function registerTools(s: McpServer, agent: Agent): void {
       }
       const what = [spec && 'spec', criteria && 'acceptance criteria', title && `title (now "${title}")`].filter(Boolean).join(' and ')
       if (!what) return text(`${t.key} already says that: nothing changed.`) // the spec, title or criteria it has, given again: nobody is told
-      setTicket(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}) }); changed(getFeature(t.feature_id)!)
+      setTicket(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}) })
       if (done) return text(ok) // a finished ticket's engineer has nothing to do with a new title (and has usually stopped)
       // Bug 102: the engineer on the ticket now hears it. One that has gone never would: its notice waits, and the next engineer on the
       // ticket gets it when it starts (startEngineer hands over). HQ's notice, not the TPM's message: no DM limits (Bug 86)
@@ -214,6 +214,7 @@ function registerTools(s: McpServer, agent: Agent): void {
         hard_to_undo: z.boolean().default(false).describe('In auto mode, only for things hard to undo: deleting the user\'s data, spending money, using logins or keys') },
     }, async (a) => {
       logCall('ask_user', a); const question = a.question.trim(), choices = a.choices.map((c) => c.trim()).filter(Boolean)
+      const closed = closedWhy(repoId); if (closed) return fail(closed) // Bug 294: the user can't answer it during a Clear, and it goes with the board
       if (autoOn(agent.repo_id) && !a.hard_to_undo) {
         return fail('Auto mode is on: decide this yourself, pick what the user would most likely want, and record it with write_feature under '
           + '"Decided in auto mode". Only something hard to undo goes to the user (hard_to_undo: true).')
@@ -231,6 +232,7 @@ function registerTools(s: McpServer, agent: Agent): void {
       inputSchema: { key: z.string(), why: z.string().describe('One short line for the user: why it should go') },
     }, async (a) => {
       logCall('cancel_ticket', a); const t = byKey(a.key); if (!t) return fail('no such ticket')
+      const closed = closedWhy(repoId); if (closed) return fail(closed) // Bug 294: it asks the user, who can't answer during a Clear
       if (t.status === 'merged') return fail(`${t.key} is already merged; it can't be removed. Create a ticket that undoes it instead.`)
       if (t.status === 'cancelled') return fail(`${t.key} is already removed.`)
       if (openAsks().some((x) => actionOf(x)?.ticket === t.id)) return fail(`HQ is already asking the user about removing ${t.key}. Wait for their answer.`)
@@ -336,6 +338,7 @@ function registerTools(s: McpServer, agent: Agent): void {
       const refused = (why: string): ToolResult => {
         emit({ agentId: agent.id, source: 'mcp', kind: 'ticket.pr_refused', payload: { ticket: t.id, key: t.key, why: why.slice(0, 1000) } }); return fail(why)
       }
+      const closed = closedWhy(repoOfAgent(agent) ?? ''); if (closed) return refused(closed) // Bug 294: a Clear asked for its note; the ticket stays as it is
       if (!/## Deviations from approved plan/.test(a.body)) return refused('PR body must contain a "## Deviations from approved plan" section.')
       if (t.repairs_main && !leftOutSection(a.body)) return refused(`This is HQ's repair ticket, so ${LEFT_OUT_ASK.replace('its body', 'the PR body')} Then call open_pr again.`) // Bug 142
       if (!t.handoff_updated_at) return refused('Call update_handoff(kind: before_pr) first.')

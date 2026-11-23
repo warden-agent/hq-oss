@@ -80,7 +80,9 @@ test('Bug 66: Remove forgets the project, leaves its folder exactly as it was, a
 test('the fresh-start sweep, which finishes any clear it finds, leaves a removal alone', async () => {
   const dir = project('r3', 'third'); board('r3', 'f3', 't3', 'a3'); const before = folder(dir)
   run('UPDATE repos SET clearing_at = NULL WHERE id = ?', 'r3'); removing.add('r3')
-  sweepFreshStarts(); await new Promise((r) => setTimeout(r, 50)); removing.delete('r3')
+  sweepFreshStarts()
+  await new Promise((r) => setTimeout(r, 50)) // real-time: the sweep finishes a clear in the background and gives nothing to wait on; it would have touched the project by now
+  removing.delete('r3')
   assert.equal(getRepo('r3')?.clearing_at, null); assert.deepEqual(folder(dir), before)
 })
 

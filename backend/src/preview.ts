@@ -9,14 +9,15 @@ import path from 'node:path'
 import { PATHS } from './config.ts'
 import { one, q, run, now } from './db.ts'
 import { emit, patch, type HqEvent } from './events.ts'
-import { assignPorts, commandRecipe, detectCommand, frameBlocked, PREVIEW_PORTS, portBusy, printedPorts, recipeProblem, refusedWords, runScript, supervisorSpec,
-  type Recipe, type Refusal } from './apprun.ts'
+import { assignPorts, commandRecipe, commandWarning, detectCommand, frameBlocked, installLeftovers, PREVIEW_PORTS, portBusy, printedPorts, recipeProblem, refusedWords, runScript, supervisorSpec,
+  ownInstall, type Recipe, type Refusal } from './apprun.ts'
 import { groupPids, pgidOf, portHolders, whoAnswers, whose, type Holder, type Whose } from './procs.ts'
 import { markFor, runOver, runStarting, sweepNow } from './leftovers.ts'
 import { git } from './reposync.ts'
 import { getFeature, getRepo, getTicket, repos, type Repo, notClearing } from './records.ts'
 import { syncRepo } from './repos.ts'
 import { shq, sleep } from './util.ts'
+import { excludeLeftovers } from './worktrees.ts'
 import { copyMainData, tryable } from './trydata.ts'
 import { setupView } from './testsetupstore.ts'
 import * as tmux from './tmux.ts'
@@ -29,20 +30,22 @@ export type Preview = {
   helper_worktree: string | null; port_holders: string | null; helper_ticket_id: string | null; helper_ports: string | null
   /** Bug 215: HQ is ending this run (kept before anything is signalled): for the user's Stop (Clear and Remove too) or to start it again. */
   stopping: Stopping | null
+  /** Bug 351: the `started_at` of HQ's first run of the steps the user OK'd for the Launch helper (null until it starts), for a restart during it. */
+  helper_run: number | null
 }
 export type Stopping = 'stop' | 'restart'
 /** A program on one of the recipe's fixed ports (Bug 42), and whose it is. */
 export type PortHolder = Holder & Whose & { port: number; part: string }
 const COLS = ['id', 'command', 'status', 'detail', 'port', 'url', 'frameable', 'branch', 'head', 'started_at', 'updated_at', 'ticket_id',
   'recipe', 'draft_recipe', 'helper_agent_id', 'helper_state', 'helper_note', 'helper_saves', 'helper_worktree', 'port_holders', 'helper_ticket_id', 'stopping',
-  'helper_ports'] as const
+  'helper_ports', 'helper_run'] as const
 
 export const previewSession = (repoId: string): string => `hq-preview-${repoId}`
 export const row = (repoId: string): Preview | undefined => one<Preview>('SELECT * FROM previews WHERE id = ?', repoId)
 const blank = (repoId: string): Preview => ({
   id: repoId, command: null, status: 'stopped', detail: null, port: null, url: null, frameable: null, branch: null, head: null, started_at: null, updated_at: 0,
   ticket_id: null, recipe: null, draft_recipe: null, helper_agent_id: null, helper_state: null, helper_note: null, helper_saves: 0, helper_worktree: null, port_holders: null, helper_ticket_id: null,
-  stopping: null, helper_ports: null,
+  stopping: null, helper_ports: null, helper_run: null,
 })
 /** The ports a Launch helper was given for its test runs (Bug 226); [] when it has none. */
 export function helperPorts(p: Pick<Preview, 'helper_ports'> | undefined): number[] {
@@ -70,13 +73,16 @@ type PreviewView = Omit<Preview, 'recipe' | 'draft_recipe' | 'port_holders' | 'h
   /** The Launch helper's ticket (Bug 46), by key. */
   helper_ticket_key: string | null
   /** How HQ tests this app (testsetupstore.ts), and its helper. */
-  test_setup: ReturnType<typeof setupView> }
+  test_setup: ReturnType<typeof setupView>
+  /** Bug 316: what the user's own ⚙ command would do to the lockfile, checked in the checkout it runs in; null when fine or with no command. */
+  command_warning: string | null }
 const holdersOf = (json: string | null): PortHolder[] | null => { try { return json ? JSON.parse(json) as PortHolder[] : null } catch { return null } }
 export function previewView(repo: Repo): PreviewView {
-  const p = row(repo.id) ?? blank(repo.id), t = p.ticket_id ? getTicket(p.ticket_id) : undefined
+  const p = row(repo.id) ?? blank(repo.id), t = p.ticket_id ? getTicket(p.ticket_id) : undefined, cwd = t?.worktree_path ?? repo.path
   return { ...p, recipe: parse(p.recipe), draft_recipe: parse(p.draft_recipe), port_holders: holdersOf(p.port_holders), helper_ports: p.helper_ports ? helperPorts(p) : null,
-    auto_command: detectCommand(repo.path), default_branch: repo.default_branch, path: t?.worktree_path ?? repo.path,
-    helper_ticket_key: p.helper_ticket_id ? getTicket(p.helper_ticket_id)?.key ?? null : null, test_setup: setupView(repo.id) }
+    auto_command: detectCommand(repo.path), default_branch: repo.default_branch, path: cwd,
+    helper_ticket_key: p.helper_ticket_id ? getTicket(p.helper_ticket_id)?.key ?? null : null, test_setup: setupView(repo.id),
+    command_warning: p.command ? commandWarning(p.command, cwd) : null }
 }
 /** Sends the UI the repo's preview again: something it shows besides the row changed (the test setup). */
 export function repush(repoId: string): void { const repo = getRepo(repoId); if (repo) patch('preview', repoId, previewView(repo)) }
@@ -212,9 +218,36 @@ export function heldText(port: number, part: string, hs: PortHolder[]): string {
   return `port ${port} (${part}) is being used by ${h.cmd} in ${h.name} (${ids})`
 }
 const SUPERVISOR = path.join(import.meta.dirname, 'supervise.mjs')
+/** Bug 354: ports chosen for a start still on its way (its row not yet saved "starting"), by repo; startPreview drops them when that start ends. */
+const handing = new Map<string, number[]>()
+/** Bug 354: every port this HQ gave another repo's app that is starting or running, or is giving one now. An app that hasn't bound its port yet (still
+ *  installing, or slow to listen) leaves it looking free. Every part's port, from its run's spec.json (the row keeps the page's only); read from the
+ *  rows, so it holds after a backend restart too. A stopped or crashed app's ports are free again. */
+function givenElsewhere(repoId: string): number[] {
+  const live = q<Preview>(`SELECT * FROM previews WHERE status IN ('starting', 'running') AND id != ?`, repoId)
+  const inSpec = (id: string): number[] => {
+    try {
+      const spec = JSON.parse(fs.readFileSync(path.join(PATHS.home, 'previews', id, 'spec.json'), 'utf8')) as { parts: { env: Record<string, string> }[] }
+      return spec.parts.map((x) => Number(x.env.PORT)).filter((n) => Number.isInteger(n) && n > 0)
+    } catch { return [] }
+  }
+  return [...live.flatMap((p) => [...(p.port ? [p.port] : []), ...inSpec(p.id)]), ...[...handing].flatMap(([id, ps]) => id === repoId ? [] : ps)]
+}
+/** Bug 354: one port choice at a time across this HQ (each repo's own queue lets two repos' starts overlap). Reading what the others were given, the busy
+ *  checks and keeping this start's choice happen in one go, so two starts a moment apart can't both take the same free port. */
+let choosing: Promise<unknown> = Promise.resolve()
+function choosePorts(repoId: string, recipe: Recipe, saved: number | null): ReturnType<typeof assignPorts> {
+  const job = async () => {
+    const got = await assignPorts(recipe, saved, portBusy, helperPortsHeld(repoId), givenElsewhere(repoId))
+    if (got && !got.taken.length) handing.set(repoId, Object.values(got.ports)) // kept before the next choice can start
+    return got
+  }
+  const p = choosing.then(job, job); choosing = p.catch(() => {}); return p
+}
 
-export function startPreview(repoId: string, why: string | null = null, opts: { ticket?: string | null } = {}): Promise<ReturnType<typeof previewView>> {
-  return serial(repoId, () => startJob(repoId, why, opts).catch(async (e) => { await gaveUp(repoId, e); throw e }))
+/** `helperRun` (Bug 351): this is the Launch helper's first run of the steps the user OK'd; the row keeps its `started_at` as `helper_run`. */
+export function startPreview(repoId: string, why: string | null = null, opts: { ticket?: string | null; helperRun?: boolean } = {}): Promise<ReturnType<typeof previewView>> {
+  return serial(repoId, () => startJob(repoId, why, opts).finally(() => handing.delete(repoId)).catch(async (e) => { await gaveUp(repoId, e); throw e }))
     .catch((e) => { // Bug 39: a start that never got going still leaves a trace in the Events tab and the log
       if (!(e instanceof NeedsSetup)) {
         const error = e instanceof Error ? e.message : String(e), ticket = (opts.ticket && getTicket(opts.ticket)?.key) || null
@@ -232,7 +265,7 @@ async function gaveUp(repoId: string, e: unknown): Promise<void> {
   const error = e instanceof Error ? e.message : String(e), name = getRepo(repoId)?.name ?? 'the app'
   save(repoId, { status: 'stopped', detail: `HQ couldn't start ${name}: ${error}`, url: null, frameable: null, port_holders: null, stopping: null })
 }
-async function startJob(repoId: string, why: string | null, opts: { ticket?: string | null }): Promise<ReturnType<typeof previewView>> {
+async function startJob(repoId: string, why: string | null, opts: { ticket?: string | null; helperRun?: boolean }): Promise<ReturnType<typeof previewView>> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
   notClearing(repoId)
   const cur = row(repoId)
@@ -246,13 +279,18 @@ async function startJob(repoId: string, why: string | null, opts: { ticket?: str
   const recipe = runnableRecipe(cur, cwd)
   if (!recipe) throw new NeedsSetup(`HQ doesn't know how to start ${repo.name} yet. Launch asks Claude to work it out (or set your own command with ⚙).`)
   unwatch(repoId); await kill(repoId, 'restart')
-  const stale = cur?.command ? null : recipeProblem(recipe, cwd) // the user's own command chose its install from npm's record
+  const stale = cur?.command ? null : recipeProblem(recipe, cwd) // the user's own command: HQ picks its install (ownInstall); the pane warns (Bug 316)
+  const cant = cur?.command ? ownInstall(cwd).stop : undefined // Bug 343: its package manager isn't installed, say, and npm is no stand-in for it
+  if (cant) {
+    const msg = `HQ didn't start ${repo.name}: ${cant}`
+    save(repoId, { status: 'stopped', detail: msg, url: null, port_holders: null, stopping: null }); throw new Error(msg)
+  }
   if (stale) {
     const msg = `HQ didn't start ${repo.name}: its saved start steps ${refusedWords(stale.lock)}.` // Bug 238: the lockfile they'd touch
     save(repoId, { status: 'stopped', detail: `${msg} Start it again and Claude fixes them for your OK.`, url: null, port_holders: null, stopping: null })
     throw new StepsOutdated(msg, stale) // the check's own words go to the helper, not to the user
   }
-  const got = await assignPorts(recipe, cur?.port ?? null, portBusy, helperPortsHeld(repoId))
+  const got = await choosePorts(repoId, recipe, cur?.port ?? null) // its row says "starting" with them before the claim goes
   const range = `ports ${PREVIEW_PORTS[0]}–${PREVIEW_PORTS.at(-1)} are all in use`
   if (!got) { save(repoId, { status: 'stopped', detail: range, port_holders: null, stopping: null }); throw new Error(range) }
   if (got.taken.length) { // something else answers there (the user's own dev server, say): this app would talk to it, not to its own part
@@ -265,6 +303,7 @@ async function startJob(repoId: string, why: string | null, opts: { ticket?: str
   }
   const port = got.ports[recipe.show]!
   const copied = tk && asked ? await copyMainData(repo.path, cwd, recipe.worktree_files).catch(() => []) : [] // a restart keeps what the user did while trying
+  const hidden = await excludeLeftovers(cwd, installLeftovers(recipe, cwd)).catch(() => []) // Bug 263: the installs' node_modules, .pnp.cjs, ... stay out of git status
   const branch = await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => null)
   const head = await git(cwd, ['rev-parse', '--short', 'HEAD']).catch(() => null)
   const dir = path.join(PATHS.home, 'previews', repoId); fs.mkdirSync(dir, { recursive: true })
@@ -283,9 +322,10 @@ async function startJob(repoId: string, why: string | null, opts: { ticket?: str
     await tmux.newSession(previewSession(repoId), `bash ${shq(script)}`, { cwd })
     await tmux.tmux('set-option', '-t', previewSession(repoId), 'status', 'off').catch(() => {}) // the Server tab is just the app's output
     save(repoId, { status: 'starting', detail: install ? `installing packages (${install})…` : 'starting…', port, url: null, port_holders: null,
-      frameable: null, branch, head, started_at: t, ticket_id: tk?.id ?? null, stopping: null })
+      frameable: null, branch, head, started_at: t, ticket_id: tk?.id ?? null, stopping: null, ...(opts.helperRun ? { helper_run: t } : {}) }) // with the run: no gap
   } finally { runStarting(mark, false) }
-  emit({ agentId: null, source: 'system', kind: 'preview.started', payload: { repo: repo.name, command, port, ports: got.ports, head, install, why, ticket: tk?.key ?? null, copied } })
+  emit({ agentId: null, source: 'system', kind: 'preview.started',
+    payload: { repo: repo.name, command, port, ports: got.ports, head, install, why, ticket: tk?.key ?? null, copied, ...(hidden.length ? { hidden } : {}) } })
   watch(repoId, t, why)
   return previewView(repo)
 }
@@ -293,7 +333,8 @@ async function startJob(repoId: string, why: string | null, opts: { ticket?: str
 export function stopPreview(repoId: string, resumed = false): Promise<ReturnType<typeof previewView>> {
   return serial(repoId, async () => {
     const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
-    const since = row(repoId)?.started_at ?? 0
+    const cur = row(repoId), since = cur?.started_at ?? 0, on = cur?.status === 'starting' || cur?.status === 'running' // a crashed run ended by itself
+    if (!resumed && since && on) stopped.set(repoId, [since, ...(stopped.get(repoId) ?? [])].slice(0, 10)) // before the row says so: a waiter reads both
     unwatch(repoId); const { forced } = await kill(repoId, 'stop', !resumed)
     save(repoId, { status: 'stopped', detail: null, url: null, frameable: null, port_holders: null, stopping: null })
     // `forced`: HQ had to kill the supervisor (its whole process group), so the supervisor's own report is missing or cut short
@@ -302,6 +343,13 @@ export function stopPreview(repoId: string, resumed = false): Promise<ReturnType
     return previewView(repo)
   })
 }
+
+/** Bug 332: the runs (by `started_at`) a Stop ended, newest first, per repo: the user's Stop, the one-app dialog's, a Clear's or a Remove's (every
+ *  stopPreview but the start-up one; the Launch helper's own, of a run that never answered, comes after it read the run), never the app ending by
+ *  itself or HQ restarting it. Kept in memory, as the Launch helper's wait on its run is. */
+const stopped = new Map<string, number[]>()
+/** Bug 332: did a Stop end this run of the repo's app? */
+export const stoppedByStop = (repoId: string, since: number): boolean => !!stopped.get(repoId)?.includes(since)
 
 /** "Stop it and Launch" (Bug 42): stops the programs the user was shown on the recipe's fixed ports, then starts the app. Only
  *  those: if anything else holds a port now, nothing is stopped. Never HQ itself or a live agent's session. A program that
@@ -395,6 +443,11 @@ export async function recoverPreviews(): Promise<void> {
     watch(p.id, p.started_at ?? 0, p.status === 'running' ? p.detail : null)
     emit({ agentId: null, source: 'system', kind: 'preview.recovered', payload: { repo: p.id, status: p.status } })
   }
+}
+/** Bug 351: the Launch helper's first run of the OK'd steps starts the app again itself (resumeTries), so resumeRestarts doesn't. True when it was due to. */
+export function takeRestart(repoId: string): boolean {
+  const i = restartLater.indexOf(repoId); if (i < 0) return false
+  restartLater.splice(i, 1); return true
 }
 /** Bug 215: starts again the apps recoverPreviews found half-restarted. index.ts calls it after the start-up leftover look, which a start's own would come before. */
 export function resumeRestarts(): void {

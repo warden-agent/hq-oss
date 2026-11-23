@@ -39,7 +39,7 @@ test('Bug 45: Merge from HQ opens and merges the PR on GitHub; Make PR only open
     const r = await hq.mcp(e.id, 'open_pr', { title: t.title, body: `${t.title}.\n\n## Deviations from approved plan\nNone` }); assert.equal(r.isError, false, r.text)
     return e
   }
-  const t1 = await ticket('Orders'), t2 = await ticket('Invoices'), t3 = await ticket('Billing', ['T-01'])
+  const t1 = await ticket('Orders'), t2 = await ticket('Invoices'); await ticket('Billing', ['T-01'])
 
   // Finished: pushed, no PR, waiting for the user's choice
   const e1 = await finish(t1, 'orders.txt'), e2 = await finish(t2, 'orders.txt') // both add orders.txt: T-02 conflicts once T-01 is in

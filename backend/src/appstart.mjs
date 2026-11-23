@@ -32,7 +32,7 @@ export async function startApp(spec, o = {}) {
   const tail = (p) => { const t = (tails.get(p.name) ?? '').trim(); return t ? `${spec.parts.length > 1 ? `[${p.name}]\n` : ''}${t}` : '' }
   const output = () => spec.parts.map(tail).filter(Boolean).join('\n').slice(-3000)
   // Ports: one the project hard-wires must be free (the user's own preview of this app may hold it: then HQ can't look, and says so); the rest are picked here.
-  const ports = { ...(o.ports ?? {}) }
+  const ports = { ...o.ports }
   for (const p of spec.parts) {
     if (p.port === 'auto' || o.ports) continue
     if (await taken(p.port)) return { kind: 'skipped', why: `port ${p.port}, which its ${p.name} part always uses, is taken (the app may be running in the preview)`, kids }

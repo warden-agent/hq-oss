@@ -49,7 +49,7 @@ test('Bug 52: the TPM box starts the project\'s TPM; it makes features itself, s
   const t1 = (await state()).tickets.find((t: any) => t.key === 'T-01')
   await merged(dir, t1)
   await hq.hook(tpm, { hook_event_name: 'Stop', last_assistant_message: 'All set.' })
-  await new Promise((r) => setTimeout(r, 4000)) // longer than the old done-TPM idle stop (HQ_DONE_TPM_IDLE_S=2)
+  await new Promise((r) => setTimeout(r, 4000)) // limit: twice the old done-TPM idle stop (HQ_DONE_TPM_IDLE_S is 2 here), which must not come back
   assert.equal(await status(tpm), 'idle') // the feature is done; the project's TPM stays
   assert.match(fs.readFileSync(path.join(hq.hqHome, 'workspaces', `repo-${repo.id}`, 'tpm', 'PROJECT.md'), 'utf8'), /## Built so far\n\n- F-1 Hello page: T-01 Say hello/)
 

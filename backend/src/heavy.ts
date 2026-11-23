@@ -21,11 +21,13 @@ import { heldKind, type Heavy } from './heavykind.ts'
 export { heavyKind, programs, type Heavy } from './heavykind.ts'
 
 /** `lane`: who in the agent runs the command: 'main' for the agent itself, else its helper's (subagent's) id. One lane runs one command at a time.
- *  `at`: when it asked for its turn. `activity`: what the agent's box says while it runs ("Running: npm test"), kept for a restart (Bug 186). */
-type Turn = { id: string; who: string; what: Heavy; agentId: string | null; lane: string; limitMs: number; at?: number; activity?: string | null }
+ *  `at`: when it asked for its turn. `activity`: what the agent's box says while it runs ("Running: npm test"), kept for a restart (Bug 186).
+ *  `away`: read back after a restart (Bug 145); its hook (or HQ's own run, Bug 312) hasn't asked again yet, so nobody is told when its turn comes. */
+type Turn = { id: string; who: string; what: Heavy; agentId: string | null; lane: string; limitMs: number; at?: number; activity?: string | null; away?: boolean }
 const running = new Map<string, Turn & { at: number; started: number; until: number; timer: NodeJS.Timeout | null }>()
-/** `away`: read back after a restart (Bug 145); its hook hasn't asked again yet, so nobody is told when its turn comes. */
-type Waiting = Turn & { at: number; go: (late: boolean) => void; giveUp: NodeJS.Timeout; left?: () => void; away?: boolean }
+/** `behind`: told whom it waits behind each time that changes (Bug 289); `said`: whom it was told last. */
+type Waiting = Turn & { at: number; go: (late: boolean) => void; giveUp: NodeJS.Timeout; left?: () => void; behind?: (who: string[]) => void
+  said?: string }
 const line: Waiting[] = []
 const MAX_WAIT_MS = TURN_WAIT_S * 1000, BEAT_MS = Number(process.env.HQ_TURN_BEAT_MS) || 30_000, BG_TURN_MS = 2 * 3_600_000
 /** Bug 145: how long a command that waited in the line before a restart keeps its place (or its turn, once it comes) for its hook to ask again. The hook
@@ -34,17 +36,31 @@ const CLAIM_MS = Number(process.env.HQ_TURN_CLAIM_MS) || 30_000
 const cap = (): number => Math.max(1, Math.floor(Number(getSetting('heavy_at_once', DEFAULTS.heavy_at_once))) || 1)
 /** What runs now and what waits, in order, for tests and the Events tab. */
 export const turns = (): { running: string[]; waiting: string[] } => ({ running: [...running.values()].map((r) => r.who), waiting: line.map((w) => w.who) })
+/** Bug 289: whom a turn waits behind, in words: "eng T-02", "eng T-02 and HQ's test of T-01", "eng T-02 and 2 more". '' for nobody (a row from before). */
+export const behindWords = (who: unknown): string => {
+  const b = Array.isArray(who) ? who.map(String).filter(Boolean) : []; return b.length > 2 ? `${b[0]} and ${b.length - 1} more` : b.join(' and ')
+}
+/** Bug 289: everyone in the line hears whom it waits behind now, once per change: an agent's box says it (waitText), HQ's own run is told (`behind`). */
+function tellLine(): void {
+  const who = turns().running, said = who.join('\n')
+  for (const w of line) {
+    if (w.said === said) continue
+    w.said = said; w.behind?.(who)
+    if (w.agentId) patch('agent', w.agentId, { activity: waitText(w.what, who) })
+  }
+}
 
-/** Bug 145: an agent's turn, running (`started` set) or waiting, is kept in the database too, so a restarted backend still counts it. HQ's own runs aren't:
- *  a restart ends them. */
+/** Bug 145: an agent's turn, running (`started` set) or waiting, is kept in the database too, so a restarted backend still counts it. Bug 312: so is HQ's
+ *  own run's (id `hq:<place>`, agent_id ''): a restart ends the run, but it keeps its place in the line for HQ to start it again (readBackTurns). */
+const hqKept = (id: string): boolean => id.startsWith('hq:')
 function save(t: Turn & { at: number }, started: number | null, until: number | null): void {
-  if (t.agentId) run('INSERT OR REPLACE INTO turns(id, agent_id, who, what, lane, asked_at, started_at, until, activity) VALUES (?,?,?,?,?,?,?,?,?)',
-    t.id, t.agentId, t.who, t.what, t.lane, t.at, started, until !== null && Number.isFinite(until) ? until : null, t.activity ?? null)
+  if (t.agentId || hqKept(t.id)) run('INSERT OR REPLACE INTO turns(id, agent_id, who, what, lane, asked_at, started_at, until, activity) VALUES (?,?,?,?,?,?,?,?,?)',
+    t.id, t.agentId ?? '', t.who, t.what, t.lane, t.at, started, until !== null && Number.isFinite(until) ? until : null, t.activity ?? null)
 }
 const forget = (id: string): void => run('DELETE FROM turns WHERE id = ?', id)
 function begin(t: Turn, started = now(), until = now() + t.limitMs): void { // a turn nobody gives back ends with its command's own time limit
   const timer = Number.isFinite(until) ? setTimeout(() => release(t.id), Math.max(0, until - now())) : null; timer?.unref()
-  const r = { ...t, at: t.at ?? started, started, until, timer }; running.set(t.id, r); save(r, started, until)
+  const r = { ...t, at: t.at ?? started, started, until, timer }; running.set(t.id, r); save(r, started, until); tellLine()
 }
 /** Free turns go to whoever has waited longest. Also called when the user raises the limit. */
 export function pump(): void {
@@ -52,14 +68,14 @@ export function pump(): void {
 }
 export function release(id: string): void {
   const r = running.get(id); if (!r) return
-  if (r.timer) clearTimeout(r.timer); running.delete(id); forget(id); pump()
+  if (r.timer) clearTimeout(r.timer); running.delete(id); forget(id); pump(); tellLine()
 }
 /** Out of the line without a turn: it isn't coming (its agent went, moved on, or dropped the hook). */
 function leave(w: Waiting): void { const i = line.indexOf(w); if (i < 0) return; line.splice(i, 1); clearTimeout(w.giveUp); forget(w.id); w.left?.() }
 /** Asks for a turn. `waiting` false: it has one already. Else `got` resolves when its turn comes, `late` when it waited MAX_WAIT_MS and goes ahead over the limit.
  *  `drop`: it isn't coming after all (or is done). `left`: called if it leaves the line without ever getting a turn, whoever took it out.
  *  Asked again by the same command (its hook asks again after a restart, Bug 145): it has the turn it held, or its old place in the line. */
-export function take(t: Turn, left?: () => void): { waiting: boolean; got: Promise<{ waitedMs: number; late: boolean }>; drop: () => void } {
+export function take(t: Turn, left?: () => void, behind?: (who: string[]) => void): { waiting: boolean; got: Promise<{ waitedMs: number; late: boolean }>; drop: () => void } {
   const had = running.get(t.id), mine = line.findIndex((w) => w.id === t.id && w.away)
   if (had || (mine < 0 && running.size < cap() && !line.length)) {
     if (had?.timer) clearTimeout(had.timer)
@@ -67,22 +83,31 @@ export function take(t: Turn, left?: () => void): { waiting: boolean; got: Promi
   }
   const at = mine < 0 ? now() : line[mine]!.at; let go!: (late: boolean) => void
   const got = new Promise<{ waitedMs: number; late: boolean }>((resolve) => { go = (late) => resolve({ waitedMs: now() - at, late }) })
-  const w: Waiting = { ...t, at, go, left, giveUp: setTimeout(() => { const i = line.indexOf(w); if (i < 0) return; line.splice(i, 1); begin(w); go(true) }, Math.max(0, at + MAX_WAIT_MS - now())) }
+  const w: Waiting = { ...t, at, go, left, behind, said: turns().running.join('\n'), // whom it waits behind now: the caller says so itself
+    giveUp: setTimeout(() => { const i = line.indexOf(w); if (i < 0) return; line.splice(i, 1); begin(w); go(true) }, Math.max(0, at + MAX_WAIT_MS - now())) }
   w.giveUp.unref()
   if (mine < 0) line.push(w); else { clearTimeout(line[mine]!.giveUp); line[mine] = w }
   save(w, null, null)
   return { waiting: true, got, drop: () => { if (line.includes(w)) leave(w); else release(t.id) } }
 }
 let n = 0
-const waitText = (what: Heavy): string => `Waiting its turn to ${what === 'tests' ? 'run tests' : 'build'}`
+/** What a waiting agent's box says, and behind whom (Bug 289). It starts "Waiting its turn" either way: the top bar counts those. */
+const waitText = (what: Heavy, behind: string[] = []): string => {
+  const b = behindWords(behind); return `Waiting its turn to ${what === 'tests' ? 'run tests' : 'build'}${b ? ` behind ${b}` : ''}`
+}
 /** HQ's own heavy work (a test run): waits its turn like an engineer's command, and gives it back however `fn` ends. `onWait`: it has to wait first
- *  (Bug 106: the board says so). */
-export async function withTurn<T>(who: string, what: Heavy, fn: () => Promise<T>, onWait?: () => void): Promise<T> {
-  const id = `hq:${++n}`, t = take({ id, who, what, agentId: null, lane: 'main', limitMs: Infinity })
-  if (t.waiting) onWait?.()
-  if (t.waiting) emit({ agentId: null, source: 'system', kind: 'turns.waiting', payload: { who, what, behind: turns().running } })
+ *  (Bug 106: the board says so), behind whom; called again each time that changes (Bug 289). `ticket`: the ticket it's for, so its wait reaches that
+ *  ticket's engineer's Events tab (Bug 309; lineOwner). `place`: its project's folder: with `who` it names this run across a restart (Bug 312), so the
+ *  same run started again after a restart gets back the place in the line (or the turn) it had. None, or that run is going already: not kept. */
+export async function withTurn<T>(who: string, what: Heavy, fn: () => Promise<T>, onWait?: (behind: string[]) => void,
+  o: { ticket?: string | null; place?: string } = {}): Promise<T> {
+  const named = o.place ? `hq:${o.place}:${who}` : '', live = running.get(named) ?? line.find((w) => w.id === named)
+  const id = named && !(live && !live.away) ? named : `hq#${++n}`, ticket = o.ticket ?? null
+  const t = take({ id, who, what, agentId: null, lane: 'main', limitMs: Infinity }, undefined, (b) => onWait?.(b))
+  if (t.waiting) onWait?.(turns().running)
+  if (t.waiting) emit({ agentId: null, source: 'system', kind: 'turns.waiting', payload: { who, what, behind: turns().running, ticket, hq: true } })
   const { waitedMs, late } = await t.got
-  if (t.waiting) emit({ agentId: null, source: 'system', kind: 'turns.started', payload: { who, what, waitedS: Math.round(waitedMs / 1000), late } })
+  if (t.waiting) emit({ agentId: null, source: 'system', kind: 'turns.started', payload: { who, what, waitedS: Math.round(waitedMs / 1000), late, ticket, hq: true } })
   try { return await fn() } finally { release(id) }
 }
 
@@ -103,11 +128,10 @@ export function gateBash(agent: Agent, c: { use: string; command: string; timeou
   const limitMs = bashLimitMs(c.timeout) + 15_000, t = take({ id, who, what, agentId: agent.id, lane: c.lane, limitMs, activity: c.activity }, left)
   if (!t.waiting) return false
   const behind = turns().running
-  const waiting = { activity: waitText(what) }
-  patch('agent', agent.id, waiting)
+  patch('agent', agent.id, { activity: waitText(what, behind) }) // and again each time whom it waits behind changes (tellLine)
   emit({ agentId: agent.id, source: 'system', kind: 'turns.waiting', payload: { who, what, use: c.use, command: c.command.slice(0, 200), behind } })
   // waiting isn't stuck: the stuck loop goes by the last event. The box says it again too, for a page opened meanwhile (what an agent is doing isn't stored)
-  beat = setInterval(() => { update(agent.id, { last_event_at: now() }); patch('agent', agent.id, waiting) }, BEAT_MS); beat.unref()
+  beat = setInterval(() => { update(agent.id, { last_event_at: now() }); patch('agent', agent.id, { activity: waitText(what, turns().running) }) }, BEAT_MS); beat.unref()
   res.on('close', () => { if (!over) t.drop() })
   void t.got.then(({ waitedMs, late }) => {
     if (over) return release(id)
@@ -164,22 +188,23 @@ type Kept = { id: string; agent_id: string; who: string; what: Heavy; lane: stri
   activity: string | null }
 /** Bug 145: what the last backend counted, read back at start (index.ts: after recoverAgents, before the hooks server answers). A command that was running
  *  holds its turn until HQ hears it end (or its agent move on, or go) or until its own time limit has passed. One that waited keeps its place for its hook to
- *  ask again, at most CLAIM_MS, and its turn when that comes first. An agent that ended meanwhile holds nothing. */
+ *  ask again, at most CLAIM_MS, and its turn when that comes first. An agent that ended meanwhile holds nothing. Bug 312: HQ's own run, waiting or running
+ *  (the restart ended it), keeps its place the same way for HQ to start it again (withTurn's `place`); it used to come back last, behind those read back. */
 export function readBackTurns(): void {
   const t0 = now(), kept: string[] = [], dropped: string[] = []
   for (const k of q<Kept>('SELECT * FROM turns ORDER BY asked_at, rowid')) {
     if (running.has(k.id) || line.some((w) => w.id === k.id)) continue // counted already
-    const a = getAgent(k.agent_id), t: Turn = { id: k.id, who: k.who, what: k.what, agentId: k.agent_id, lane: k.lane, limitMs: CLAIM_MS, at: k.asked_at,
-      activity: k.activity }
-    if (!a || a.status === 'exited' || (k.started_at !== null && (k.until === null || k.until <= t0))) { forget(k.id); dropped.push(k.who); continue }
+    const hq = hqKept(k.id), a = getAgent(k.agent_id), t: Turn = { id: k.id, who: k.who, what: k.what, agentId: hq ? null : k.agent_id, lane: k.lane,
+      limitMs: CLAIM_MS, at: k.asked_at, activity: k.activity }
+    if (!hq && (!a || a.status === 'exited' || (k.started_at !== null && (k.until === null || k.until <= t0)))) { forget(k.id); dropped.push(k.who); continue }
     kept.push(k.who)
-    if (k.started_at !== null) { begin(t, k.started_at, k.until!); continue }
+    if (k.started_at !== null && !hq) { begin(t, k.started_at, k.until!); continue }
     const w: Waiting = { ...t, at: k.asked_at, away: true, go: () => {}, giveUp: setTimeout(() => leave(w), CLAIM_MS) }; w.giveUp.unref(); line.push(w)
   }
   pump() // a turn nobody runs any more is free: the longest waiting has it, for its hook to ask again
   // Bug 186: what each box said lives in memory only (ui.ts extras), so the boxes say it again: what runs and who waits. Not a run gone to the background:
   // its agent may be doing something else by now
   for (const r of running.values()) if (r.agentId && !r.lane.startsWith('bg:')) patch('agent', r.agentId, { activity: r.activity ?? `Running ${r.what === 'tests' ? 'tests' : 'a build'}` })
-  for (const w of line) if (w.agentId) patch('agent', w.agentId, { activity: waitText(w.what) })
+  for (const w of line) if (w.agentId) { w.said = turns().running.join('\n'); patch('agent', w.agentId, { activity: waitText(w.what, turns().running) }) }
   if (kept.length || dropped.length) emit({ agentId: null, source: 'system', kind: 'turns.read_back', payload: { ...turns(), dropped } })
 }

@@ -10,9 +10,10 @@ import { execFileSync } from 'node:child_process'
 import { startHq, sh, waitFor, type Hq } from './harness.ts'
 
 let hq: Hq
-// A `ps` that fails only for the supervisor's own look (the one asking for lstart=) while NOPS exists; every other ps is the real one
+// A `ps` that fails only for the supervisor's own look (its fields, supervise.mjs: no uid=, unlike HQ's own looks, which ask for lstart= too since
+// Bug 319) while NOPS exists; every other ps is the real one
 const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hq182-')), NOPS = path.join(bin, 'nops')
-fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/bash\ncase "$*" in *lstart=*) [ -e '${NOPS}' ] && exit 1 ;; esac\nexec /bin/ps "$@"\n`, { mode: 0o755 })
+fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/bash\ncase "$*" in *pid=,ppid=,pgid=,tty=,stat=,lstart=*) [ -e '${NOPS}' ] && exit 1 ;; esac\nexec /bin/ps "$@"\n`, { mode: 0o755 })
 // 3 s: shorter than the supervisor's 5 s grace, so a helper that ignores SIGTERM makes HQ kill the supervisor
 before(async () => { hq = await startHq({ env: { HQ_PREVIEW_STOP_MS: '3000', PATH: `${bin}:${process.env.PATH}` } }) })
 after(async () => { for (const p of stubborn('')) try { process.kill(p, 'SIGKILL') } catch { /* gone */ } await hq?.stop(); fs.rmSync(bin, { recursive: true, force: true }) })

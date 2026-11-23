@@ -42,7 +42,7 @@ test('Clear project: notes first, then the board goes; the code is kept on its b
   const r = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.deepEqual([...r.json.noting].sort(), [eng.display_name, tpm.display_name].sort()); assert.equal(r.json.done, false)
   const asks = (await hq.state()).messages.filter((m: any) => m.reason === 'fresh_start' && [eng.id, tpm.id].includes(m.to_id))
-  assert.equal(asks.length, 2); for (const m of asks) assert.match(m.body, /clearing this project/)
+  assert.equal(asks.length, 2); for (const m of asks) { assert.match(m.body, /clearing this project/); assert.doesNotMatch(m.body, /fresh start/i) } // Bug 308
   assert.ok((await hq.state()).repos.find((x: any) => x.id === repo.id).clearing_at)
   // Meanwhile nothing new starts there, and a second clear is refused
   const nf = await hq.api('features', { repoId: repo.id, title: 'more', request: 'more' }); assert.equal(nf.status, 500); assert.match(nf.json.error, /being cleared/)
@@ -96,6 +96,19 @@ test('Bug 219: a backend restart while the TPM writes its note still brings the 
   await waitFor('it to run', async () => (await agent(next))?.status === 'working')
   assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', next, 'prompt.md'), 'utf8'), /RESTART-NOTE/)
   assert.equal((await hq.state()).repos.find((x: any) => x.id === repo.id).clear_tpm_was_on, null) // done with: the next clear starts afresh
+})
+
+test('Bug 285: "its TPM didn\'t start again" after a Clear alerts until a TPM has started', async () => {
+  const { dir, repo, tpm } = await setup('tpm-clear'), kind = `repo_clear_tpm:${repo.id}`
+  const r = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  const away = `${dir}-away`; fs.renameSync(dir, away) // the project's folder is gone as the clear finishes, so its TPM can't start again
+  assert.equal((await hq.mcp(tpm.id, 'write_handoff_note', { text: '## What the user wants\n- a demo (AWAY-NOTE)' })).isError, false)
+  const open = async () => (await hq.state()).attention.find((a: any) => a.kind === kind && !a.resolved_at)
+  assert.match((await waitFor('the notice', open, 30_000)).detail, /its TPM didn't start again/)
+  fs.renameSync(away, dir)
+  const m = await hq.api(`repos/${repo.id}/message`, { body: 'Carry on, please.' }); assert.equal(m.status, 200, JSON.stringify(m.json)) // the notice's own advice
+  await waitFor('the notice gone', async () => !(await open()))
+  assert.ok((await hq.state()).attention.some((a: any) => a.kind === `repo_cleared:${repo.id}` && !a.resolved_at)) // the clear's own news stays
 })
 
 test('Bug 231: a plan answered during a Clear is refused, its stopped engineer stays stopped, and the clear finishes once the TPM has its note', async () => {

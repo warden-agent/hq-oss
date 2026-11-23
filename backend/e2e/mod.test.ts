@@ -3,7 +3,6 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, type Hq } from './harness.ts'
 import { startMod, type ModHost } from './modhost.ts'
 
@@ -17,7 +16,7 @@ const message = async (body: string) => (await hq.state()).messages.find((m: any
 const turn = () => new Promise((r) => setImmediate(r))
 /** A batch as HQ has stored it. */
 const batch = (id: string): any => {
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { readOnly: true }); try { return db.prepare('SELECT * FROM batches WHERE id = ?').get(id) } finally { db.close() }
+  const db = hq.db({ readOnly: true }); try { return db.prepare('SELECT * FROM batches WHERE id = ?').get(id) } finally { db.close() }
 }
 /** A project's TPM with the real mod. Its prompt box works as Claude Code's: a prompt goes in once the agent is idle (`busy` is
  *  over), and its UserPromptSubmit hook tells HQ it started; a hook that can't reach HQ fails, and the prompt goes in all the same.

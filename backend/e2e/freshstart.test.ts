@@ -5,7 +5,6 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
 import { startHq, waitFor, exitPlanMode, type Hq } from './harness.ts'
 
 let hq: Hq
@@ -145,11 +144,11 @@ test("Bug 196: a second clear with no note from the TPM gets HQ's new note, not 
   await waitFor('on a dialog', async () => (await agent(tpm.id)).status === 'blocked')
   const r1 = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r1.status, 200, JSON.stringify(r1.json)); assert.equal(r1.json.noting.length, 0)
   const second = await tpmBack(tpm.id)
-  assert.match(await prompt(second), /didn't leave a note: .* is waiting on a dialog in its terminal/)
+  assert.match(await prompt(second), /didn't leave a note: the project was cleared while it waited on a dialog in its terminal/) // Bug 261's words
   const r2 = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r2.status, 200, JSON.stringify(r2.json)); assert.equal(r2.json.noting.length, 1)
   const third = await tpmBack(second) // the second TPM never writes its note: HQ writes one when the time is up
   const [first, then] = handoffs()
-  assert.match(first!, /is waiting on a dialog/); assert.match(then!, /^\(Written by HQ: the TPM didn't leave a note: none came within/)
+  assert.match(first!, /waited on a dialog/); assert.match(then!, /^\(Written by HQ: the TPM didn't leave a note: none came within/)
   assert.doesNotMatch(then!, /dialog/)
   assert.match(await prompt(third), /didn't leave a note: none came within/); assert.doesNotMatch(await prompt(third), /dialog/)
 })
@@ -187,6 +186,11 @@ test('switching away parks the repo; coming back resumes it', async () => {
   const { repo, f, tpm } = await setup('fresh-park')
   const t = await ticket(f, 'Park'); const eng = await building(t)
   const r = await hq.api(`repos/${repo.id}/park`, {}); assert.deepEqual(r.json.left, []); assert.equal(r.json.parked.length, 2)
+  for (const a of [eng, tpm]) { // Bug 308: asked as a switch of projects, not as a fresh start
+    assert.equal((await agent(a.id)).fresh_start_then, 'switch')
+    const ask = (await hq.state()).messages.find((m: any) => m.to_id === a.id && m.reason === 'fresh_start')
+    assert.match(ask.body, /The user switched to another project in HQ/); assert.doesNotMatch(ask.body, /fresh start/i)
+  }
   await hq.mcp(eng.id, 'write_handoff_note', { text: 'ENG-PARK' }); await hq.mcp(tpm.id, 'write_handoff_note', { text: 'TPM-PARK' })
   await waitFor('both parked', async () => (await tk(t)).parked_at && (await repoRow(repo.id)).tpm_parked_at)
   assert.equal((await agent(eng.id)).status, 'exited'); assert.equal((await agent(tpm.id)).status, 'exited')
@@ -195,10 +199,130 @@ test('switching away parks the repo; coming back resumes it', async () => {
   const rr = await repoRow(repo.id); assert.equal(rr.tpm_parked_at, null); assert.notEqual(rr.tpm_agent_id, tpm.id); assert.match(await prompt(rr.tpm_agent_id), /TPM-PARK/)
 })
 
+test('Bug 339: switching away while a fresh start is writing its note parks that agent too: no new session starts in the project left', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' }) // "A new session picks up right away"
+  const { repo, f } = await setup('b339x')
+  const t = await ticket(f, 'Switch'); const eng = await building(t)
+  assert.equal((await hq.api(`agents/${eng.id}/fresh-start`, {})).status, 200)
+  assert.equal((await agent(eng.id)).fresh_start_then, 'continue')
+  const r = await hq.api(`repos/${repo.id}/park`, {}); assert.deepEqual(r.json.left, []); assert.equal(r.json.parked.length, 2)
+  assert.equal((await agent(eng.id)).fresh_start_then, 'switch') // what its box says now: "you switched projects · writing its handoff note…"
+  const asks = (await hq.state()).messages.filter((m: any) => m.to_id === eng.id && m.reason === 'fresh_start') // and its terminal (Bug 338's retarget)
+  assert.equal(asks.length, 2); assert.ok(asks.some((m: any) => /^This replaces HQ's earlier request[^]*The user switched to another project in HQ/.test(m.body)))
+  await hq.mcp(eng.id, 'write_handoff_note', { text: 'B339-NOTE' })
+  await waitFor('parked', async () => (await tk(t)).parked_at && (await agent(eng.id)).status === 'exited')
+  assert.equal(await live(t), undefined); assert.equal((await agent(eng.id)).ended_why, 'parked')
+  const back = await hq.api(`repos/${repo.id}/resume`, {}); assert.ok(back.json.resumed.includes(t.key), JSON.stringify(back.json))
+  const e2 = await waitFor('the engineer back', () => live(t)); assert.match(await prompt(e2.id), /B339-NOTE/)
+})
+
+test('Bug 339: a note that comes in while the switch still asks the project\'s other agents for theirs parks its work too', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, f, tpm } = await setup('b339r')
+  const t1 = await ticket(f, 'Older'); const e1 = await building(t1)
+  const t2 = await ticket(f, 'Newer'); const e2 = await building(t2)
+  assert.equal((await hq.api(`agents/${e2.id}/fresh-start`, {})).status, 200)
+  const parking = hq.api(`repos/${repo.id}/park`, {}) // asks the TPM and T-01 first (by start), typing into each terminal
+  await hq.mcp(e2.id, 'write_handoff_note', { text: 'B339R-NOTE' }) // its note comes in meanwhile
+  await waitFor('T-02 ended', async () => (await agent(e2.id)).status === 'exited')
+  const r = await parking; assert.equal(r.json.parked.length, 3, JSON.stringify(r.json))
+  await hq.mcp(e1.id, 'write_handoff_note', { text: 'B339R-1' }); await hq.mcp(tpm.id, 'write_handoff_note', { text: 'B339R-TPM' })
+  await waitFor('all parked', async () => (await tk(t1)).parked_at && (await tk(t2)).parked_at && (await repoRow(repo.id)).tpm_parked_at)
+  assert.equal(await live(t2), undefined); assert.equal(await live(t1), undefined); assert.equal((await agent(e2.id)).ended_why, 'parked')
+  // and the switch's words reached it too, unless its note was in first (then nothing more is asked)
+  assert.ok((await asksTo(e2.id)).length >= 1)
+})
+
+test('Bug 339: a switch away while a fresh start\'s new session is still starting parks that session too', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, f, tpm } = await setup('b339s')
+  const t = await ticket(f, 'Starting'); const eng = await building(t)
+  assert.equal((await hq.api(`agents/${eng.id}/fresh-start`, {})).status, 200)
+  await hq.mcp(eng.id, 'write_handoff_note', { text: 'B339S-NOTE' })
+  // the old session has ended and its fresh start is over: the new one is on its way (often not running yet)
+  for (const end = Date.now() + 10_000; ;) { // polled without a pause: the window is the new session's start
+    const a = await agent(eng.id); if (a.status === 'exited' && !a.fresh_start_at) break
+    if (Date.now() > end) throw new Error('timed out waiting for the old one done')
+  }
+  const r = await hq.api(`repos/${repo.id}/park`, {}); assert.equal(r.status, 200)
+  const next = await waitFor('the new session', async () => (await hq.state()).agents.find((a: any) => a.ticket_id === t.id && a.id !== eng.id))
+  if ((await agent(next.id)).fresh_start_at) await hq.mcp(next.id, 'write_handoff_note', { text: 'B339S-NEXT' }) // running by the park: asked as usual
+  await hq.mcp(tpm.id, 'write_handoff_note', { text: 'B339S-TPM' })
+  await waitFor('parked', async () => (await tk(t)).parked_at && (await agent(next.id)).status === 'exited' && (await repoRow(repo.id)).tpm_parked_at)
+  assert.equal(await live(t), undefined); assert.equal((await agent(next.id)).ended_why, 'parked')
+  const back = await hq.api(`repos/${repo.id}/resume`, {}); assert.ok(back.json.resumed.includes(t.key), JSON.stringify(back.json))
+  const e3 = await waitFor('the engineer back', () => live(t)); assert.match(await prompt(e3.id), /B339S-(NOTE|NEXT)/)
+})
+
+test('Bug 339, what it must not catch: switching away from a project being cleared leaves its note requests a Clear\'s', async () => {
+  const { repo, f, tpm } = await setup('b339y')
+  const t = await ticket(f, 'Clear'); const eng = await building(t)
+  assert.equal((await hq.api(`repos/${repo.id}/clear`, {})).status, 200)
+  await hq.api(`repos/${repo.id}/park`, {})
+  for (const a of [eng, tpm]) assert.equal((await agent(a.id)).fresh_start_then, 'clear')
+  await hq.mcp(eng.id, 'write_handoff_note', { text: 'B339-CLEAR' }); await hq.mcp(tpm.id, 'write_handoff_note', { text: 'B339-CLEAR-TPM' })
+  await waitFor('cleared', async () => !(await repoRow(repo.id)).clearing_at && (await agent(eng.id)) === undefined, 20_000)
+  assert.equal((await repoRow(repo.id)).tpm_parked_at, null)
+})
+
+const asksTo = async (id: string) => (await hq.state()).messages.filter((m: any) => m.to_id === id && m.reason === 'fresh_start')
+test('Bug 350: switching straight back before the notes are in: each agent picks up from its note once it is in, nothing stays parked', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, f, tpm } = await setup('b350x')
+  const t = await ticket(f, 'Back'); const eng = await building(t)
+  const away = hq.api(`repos/${repo.id}/park`, {}) // the switch away asks one agent after the other, a few seconds each
+  await waitFor('the first request', async () => (await agent(eng.id)).fresh_start_at || (await agent(tpm.id)).fresh_start_at)
+  const back = await hq.api(`repos/${repo.id}/resume`, {}) // straight back: waits for the park, then tells both
+  assert.equal((await away).json.parked.length, 2); assert.equal(back.json.resumed.length, 2, JSON.stringify(back.json))
+  for (const a of [eng, tpm]) {
+    assert.equal((await agent(a.id)).fresh_start_then, 'continue')
+    const asks = await asksTo(a.id); assert.equal(asks.length, 2) // and its terminal (retarget): the switch's request, then this one
+    assert.ok(asks.some((m: any) => !/^This replaces/.test(m.body) && /The user switched to another project/.test(m.body)))
+    assert.ok(asks.some((m: any) => /^This replaces HQ's earlier request[^]*Fresh start: this session/.test(m.body)))
+  }
+  await hq.mcp(eng.id, 'write_handoff_note', { text: 'B350-ENG' }); await hq.mcp(tpm.id, 'write_handoff_note', { text: 'B350-TPM' })
+  const e2 = await waitFor('the engineer back', async () => { const a = await live(t); return a?.id !== eng.id && (await tk(t)).assignee_agent_id === a?.id && a })
+  assert.match(await prompt(e2.id), /B350-ENG/)
+  const t2 = await waitFor('the TPM back', async () => { const id = (await repoRow(repo.id)).tpm_agent_id; return id !== tpm.id ? id : null })
+  assert.match(await prompt(t2), /B350-TPM/)
+  assert.equal((await tk(t)).parked_at, null); assert.equal((await repoRow(repo.id)).tpm_parked_at, null)
+  assert.deepEqual([(await agent(eng.id)).ended_why, (await agent(tpm.id)).ended_why], ['fresh_start', 'fresh_start'])
+})
+
+test('Bug 350, what it must not catch: a switch away again parks once more; a fresh start waiting for Resume stays so', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'wait' })
+  const { repo, f, tpm } = await setup('b350y')
+  const t = await ticket(f, 'Wait'); const eng = await building(t)
+  assert.equal((await hq.api(`agents/${eng.id}/fresh-start`, {})).status, 200); assert.equal((await agent(eng.id)).fresh_start_then, 'park')
+  await hq.api(`repos/${repo.id}/park`, {}); await hq.api(`repos/${repo.id}/resume`, {})
+  assert.deepEqual([(await agent(eng.id)).fresh_start_then, (await agent(tpm.id)).fresh_start_then], ['park', 'continue'])
+  await hq.api(`repos/${repo.id}/park`, {}) // away again before the notes: the TPM waits for the user to come back once more
+  assert.equal((await agent(tpm.id)).fresh_start_then, 'switch')
+  const now = (await agent(tpm.id)).fresh_start_msg // the request it has now, in its terminal too
+  assert.match((await asksTo(tpm.id)).find((m: any) => m.id === now).body, /^This replaces HQ's earlier request[^]*The user switched to another project/)
+  // The engineer's note may be HQ's by now: this file's HQ waits only 2 s for a note once the request is in, and the three moves above type
+  // to the TPM (a few seconds on a slow machine). Either way its work is parked, which is what this checks.
+  if ((await agent(eng.id)).status !== 'exited') await hq.mcp(eng.id, 'write_handoff_note', { text: 'B350-WAIT' }).catch(async (e) => {
+    if ((await agent(eng.id)).status !== 'exited') throw e })
+  await hq.mcp(tpm.id, 'write_handoff_note', { text: 'B350-AWAY' })
+  await waitFor('both parked', async () => (await tk(t)).parked_at && (await repoRow(repo.id)).tpm_parked_at)
+  assert.equal(await live(t), undefined)
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+})
+
+test('Bug 350: auto turned on while the switch\'s notes are still being written: they pick up once in, as with a parked TPM', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'wait' }) // so the switch back itself didn't ask HQ to resume (App.tsx)
+  const { repo, tpm } = await setup('b350z')
+  await hq.api(`repos/${repo.id}/park`, {}); assert.equal((await agent(tpm.id)).fresh_start_then, 'switch')
+  assert.equal((await hq.api(`repos/${repo.id}/auto`, { on: true })).status, 200)
+  assert.equal((await agent(tpm.id)).fresh_start_then, 'continue')
+  await hq.api(`repos/${repo.id}/auto`, { on: false }); await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+})
+
 test("the project's TPM is parked and comes back even when every feature is done (Bug 52: no done-TPM stop)", async () => {
   const { repo, f, tpm } = await setup('fresh-done')
   const t = await ticket(f, 'Done already')
-  execFileSync('sqlite3', [path.join(hq.hqHome, 'hq.sqlite'), `UPDATE tickets SET status = 'merged' WHERE id = '${t.id}'`])
+  const db = hq.db(); try { db.prepare('UPDATE tickets SET status = ? WHERE id = ?').run('merged', t.id) } finally { db.close() } // not the sqlite3 command: Linux CI has none
   const r = await hq.api(`repos/${repo.id}/park`, {}); assert.deepEqual(r.json.stopped, []); assert.equal(r.json.parked.length, 1)
   await hq.mcp(tpm.id, 'write_handoff_note', { text: 'DONE-PARK' })
   await waitFor('parked', async () => (await repoRow(repo.id)).tpm_parked_at)

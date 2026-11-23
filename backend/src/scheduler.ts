@@ -1,7 +1,7 @@
 // M1: capacity/pause checks. Dependencies are enforced in launchEngineer; overlap prediction arrives in M2.
 import { getSetting, one } from './db.ts'
 import { DEFAULTS } from './config.ts'
-import { FINISHED } from './readiness.ts'
+import { FINISHED, LIMIT_REACHED } from './readiness.ts'
 /** Tickets whose engineer is being started right now (launchEngineer adds and removes them). */
 export const starting = new Set<string>()
 /** Whether another engineer may start. The parallel limit counts engineers still working a ticket, not finished ones
@@ -11,7 +11,7 @@ export function canLaunch(o: { ignoreCap?: boolean } = {}): { ok: boolean; why?:
   const cap = getSetting('concurrency_cap', DEFAULTS.concurrency_cap)
   const running = one<{ c: number }>(`SELECT COUNT(*) AS c FROM agents a LEFT JOIN tickets t ON t.id = a.ticket_id WHERE a.role = 'engineer' AND a.status != 'exited' AND (t.status IS NULL OR t.status NOT IN (${FINISHED.map(() => '?').join(',')}))`, ...FINISHED)!.c + starting.size
   const free = Math.max(0, cap - running)
-  if (!free && !o.ignoreCap) return { ok: false, why: `Parallel limit reached (${running}/${cap})`, free }
+  if (!free && !o.ignoreCap) return { ok: false, why: `${LIMIT_REACHED} (${running}/${cap})`, free }
   const paused = getSetting<string[]>('paused_roles', []); if (paused.includes('engineer')) return { ok: false, why: 'Engineer role is paused (model fallback or usage limit)', free: 0 }
   const u = one<{ fh: number | null; sd: number | null }>('SELECT MAX(five_hour_pct) fh, MAX(seven_day_pct) sd FROM usage_samples WHERE at > ?', Date.now() - 600_000)
   const why = overPause(u?.fh, u?.sd, pauseLevels()); if (why) return { ok: false, why, free: 0 }

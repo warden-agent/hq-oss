@@ -3,8 +3,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
+import net from 'node:net'
 import path from 'node:path'
-import { EPHEMERAL_FROM, strayPorts, testPorts } from './apprun.ts'
+import { spawn } from 'node:child_process'
+import { commandWarning, EPHEMERAL_FROM, onPath, ownInstall, packageManager, installLeftovers, installOutputs, portBusy, portBusyWith, strayPorts, testPorts } from './apprun.ts'
 import { assignPorts, portRange, checkRecipe, commandRecipe, detectCommand, frameBlocked, installMark, installStep, lockfileProblem, needsInstall, NO_LOCK_INSTALL, npmLock, parseRunMark, printedPorts,
   recipeProblem, refusedWords, runMark, runScript, RUN_MARK, sameCommands, supervisorSpec, type Recipe } from './apprun.ts'
 
@@ -62,6 +64,57 @@ test('install with packages but no lockfile: never writes one, and installs agai
   assert.equal(installStep(repo({ 'package.json': deps, 'package-lock.json': '{}' })), 'npm ci')
 })
 
+test('the user\'s own command installs with the project\'s own package manager, never npm in its place (Bug 343)', () => {
+  const all = () => true, none = () => false, own = (files: Record<string, string>, has: (tool: string) => boolean = all) => ownInstall(repo({ 'package.json': deps, ...files }), has)
+  const named = (pm: string) => JSON.stringify({ name: 'x', dependencies: { ms: '2.1.3' }, packageManager: pm })
+  // the entry's case: a yarn.lock, no node_modules (it was `npm install --no-package-lock`); each follows its lockfile, or writes none with none
+  assert.deepEqual(own({ 'yarn.lock': '# yarn lockfile v1\n' }), { install: 'yarn install --frozen-lockfile', install_when: 'yarn.lock' })
+  assert.deepEqual(own({ 'yarn.lock': '__metadata:\n  version: 8\n' }), { install: 'yarn install --immutable', install_when: 'yarn.lock' }) // Yarn 2+
+  assert.deepEqual(own({ 'yarn.lock': '', '.yarnrc.yml': 'nodeLinker: node-modules\n' }), { install: 'yarn install --immutable', install_when: 'yarn.lock' })
+  assert.deepEqual(own({ 'pnpm-lock.yaml': "lockfileVersion: '9.0'\n" }), { install: 'pnpm install --frozen-lockfile', install_when: 'pnpm-lock.yaml' })
+  // package.json's packageManager decides, lockfile or not (Yarn 1 and pnpm can install without writing one)
+  assert.deepEqual(own({ 'package.json': named('pnpm@9.15.9+sha512.abc') }), { install: 'pnpm install --no-lockfile', install_when: 'package.json' })
+  assert.deepEqual(own({ 'package.json': named('yarn@1.22.22') }), { install: 'yarn install --pure-lockfile', install_when: 'package.json' })
+  assert.deepEqual(own({ 'package.json': named('yarn@4.5.3'), 'yarn.lock': '' }), { install: 'yarn install --immutable', install_when: 'yarn.lock' })
+  assert.deepEqual(own({ 'package.json': named('pnpm@9.0.0'), 'package-lock.json': '{}' }), { install: 'pnpm install --no-lockfile', install_when: 'package.json' })
+  assert.equal(packageManager(repo({ 'package.json': named('pnpm@9.15.9+sha512.abc') })).why, 'its package.json names pnpm@9.15.9 as its packageManager')
+  // what it must not catch: npm's projects as before (npm-shrinkwrap.json is npm's lockfile too), an unknown packageManager, no packages at all
+  assert.deepEqual(own({}), { install: NO_LOCK_INSTALL }); assert.deepEqual(own({ 'package-lock.json': '{}', 'yarn.lock': '' }), { install: 'npm ci' })
+  assert.deepEqual(own({ 'npm-shrinkwrap.json': '{}' }), { install: 'npm ci' }); assert.deepEqual(own({ 'package.json': named('npm@10.9.0') }), { install: NO_LOCK_INSTALL })
+  assert.deepEqual(own({ 'package.json': named('bun@1.1.0'), 'yarn.lock': '' }), { install: 'yarn install --frozen-lockfile', install_when: 'yarn.lock' })
+  assert.deepEqual(ownInstall(repo({ 'package.json': pkg({ start: 'x' }), 'yarn.lock': '' }), all), {})
+  // each install passes the same lockfile check as Claude's steps (it writes no lockfile, and follows the one there is)
+  const cases: Record<string, string>[] = [{ 'yarn.lock': '' }, { 'yarn.lock': '__metadata:\n' }, { 'pnpm-lock.yaml': '' },
+    { 'package.json': named('pnpm@9.0.0') }, { 'package.json': named('yarn@1.0.0') }]
+  for (const files of cases) {
+    const dir = repo({ 'package.json': deps, ...files }), o = ownInstall(dir, all); assert.equal(lockfileProblem(o.install!, dir, dir, o.install_when), null, JSON.stringify(files))
+  }
+  // the tool isn't installed: HQ says so (never npm in its place), unless the packages are installed already (it runs as it is, as before)
+  const stop = own({ 'yarn.lock': '' }, none).stop ?? ''
+  assert.match(stop, /^it uses Yarn \(it has a yarn\.lock\), and yarn isn't installed on this computer .*npm ignores the yarn\.lock .*Install Yarn, then press Start again\.$/)
+  assert.match(own({ 'package.json': named('pnpm@9.0.0') }, none).stop ?? '', /it uses pnpm \(its package\.json names pnpm@9\.0\.0 as its packageManager\).*the project asks for pnpm/)
+  assert.deepEqual(own({ 'yarn.lock': '', 'node_modules/ms/index.js': '' }, none), {})
+  assert.deepEqual(own({ 'yarn.lock': '__metadata:\n', '.pnp.cjs': '' }, none), {}); assert.ok(own({ 'yarn.lock': '__metadata:\n', 'node_modules/x': '' }, none).stop)
+  assert.deepEqual(own({ 'pnpm-lock.yaml': '' }, (t) => t !== 'yarn'), { install: 'pnpm install --frozen-lockfile', install_when: 'pnpm-lock.yaml' })
+  // Yarn 2+ with no yarn.lock always writes one: no install, and why
+  assert.match(own({ 'package.json': named('yarn@4.5.3') }).stop ?? '', /^it uses Yarn 4 .*has no yarn\.lock.*Run yarn install in the project yourself/)
+  assert.deepEqual(own({ 'package.json': named('yarn@4.5.3'), 'node_modules/ms/index.js': '' }), {})
+  // the recipe: install_when makes it run when the lockfile changes or what it made is gone (Bug 303), like Claude's steps
+  const dir = repo({ 'package.json': deps, 'pnpm-lock.yaml': 'a' }), r = commandRecipe('pnpm start', dir)
+  if (!onPath('pnpm')) assert.equal(r.parts[0]!.install, undefined) // stopped by startJob instead (ownInstall's stop)
+  const part = { ...r.parts[0]!, install: 'pnpm install --frozen-lockfile', install_when: 'pnpm-lock.yaml' }
+  assert.equal(needsInstall(part, dir, {}), true); fs.mkdirSync(path.join(dir, 'node_modules'))
+  assert.equal(needsInstall(part, dir, { [dir]: installMark(dir, 'pnpm-lock.yaml')! }), false)
+  fs.writeFileSync(path.join(dir, 'pnpm-lock.yaml'), 'b'); assert.equal(needsInstall(part, dir, { [dir]: installMark(dir, 'pnpm-lock.yaml')! }), false)
+  assert.equal(needsInstall(part, dir, { [dir]: 'an older mark' }), true)
+})
+
+test('onPath: an executable file in a PATH folder', () => {
+  const d = repo({ 'yarn': '#!/bin/sh\n', 'pnpm/x': '' }); fs.chmodSync(path.join(d, 'yarn'), 0o755); fs.writeFileSync(path.join(d, 'npm'), '')
+  assert.equal(onPath('yarn', `/nowhere${path.delimiter}${d}`), true)
+  assert.equal(onPath('npm', d), false); assert.equal(onPath('pnpm', d), false); assert.equal(onPath('yarn', ''), false) // not executable; a folder; no PATH
+})
+
 test('run script: the supervisor with its spec, from the checkout', () => {
   assert.equal(runScript({ cwd: "/tmp/it's here", node: '/n/node', supervisor: '/hq/supervise.mjs', spec: '/hq/p/spec.json' }),
     "#!/bin/bash\ncd '/tmp/it'\\''s here' || exit 1\nexec '/n/node' '/hq/supervise.mjs' '/hq/p/spec.json'\n")
@@ -93,7 +146,7 @@ test('framing: X-Frame-Options and CSP frame-ancestors', () => {
 
 const split = (): string => repo({ 'server/uv.lock': 'x', 'server/app.py': '', 'web/package.json': pkg({ dev: 'vite' }), 'web/package-lock.json': '{}' })
 const splitApp = (over: Partial<Recipe> = {}): unknown => ({
-  parts: [{ name: 'api', dir: 'server', install: 'uv sync --locked', install_when: 'uv.lock', run: 'uv run uvicorn app.main:app --port 3189', port: 3189 },
+  parts: [{ name: 'api', dir: 'server', install: 'uv sync --locked', install_when: 'uv.lock', run: 'uv run --locked uvicorn app.main:app --port 3189', port: 3189 },
     { name: 'web', dir: 'web', install: 'npm ci', install_when: 'package-lock.json', run: 'npm run dev -- --port $PORT --strictPort', port: 'auto' }],
   show: 'web', worktree_files: ['server/.env'], notes: 'proxy → 3189', ...over })
 
@@ -162,7 +215,7 @@ test('recipe (Bug 156): a workspace member follows the root lockfile; a project 
 })
 
 test('installs (Bug 156): a member\'s install_when is the root lockfile, so a change there installs again', () => {
-  const root = workspace(), web = path.join(root, 'web')
+  const root = workspace(), web = path.join(root, 'web'); fs.mkdirSync(path.join(root, 'node_modules')) // installed, at the root (Bug 303)
   const mark = installMark(web, 'package-lock.json', root)!; assert.equal(mark, installMark(root, 'package-lock.json'))
   assert.equal(installMark(web, 'package-lock.json'), null) // only its own folder without the checkout
   assert.equal(needsInstall(member, web, { [web]: mark }, root), false)
@@ -216,6 +269,19 @@ test('ports (Bug 226): previews keep off a Launch helper\'s test ports while oth
   assert.deepEqual((await assignPorts(r, null, busy([3092, 3093, 3094, 3095, 3096, 3097, 3098, 3099]), avoid))!.ports.web, 3090) // the last free ones
 })
 
+test('ports (Bug 354): a port another app of this HQ was given is never taken, though nothing listens on it yet', async () => {
+  const busy = (taken: number[]) => async (p: number) => taken.includes(p)
+  const r = (checkRecipe(splitApp(), split()) as { recipe: Recipe }).recipe
+  assert.equal((await assignPorts(r, null, busy([]), [], [3090]))!.ports.web, 3091)
+  assert.equal((await assignPorts(r, 3090, busy([]), [], [3090]))!.ports.web, 3091) // not even its saved one: the other app has it now
+  assert.equal((await assignPorts(r, 3094, busy([]), [], [3090]))!.ports.web, 3094) // what the others weren't given is kept as before
+  assert.equal((await assignPorts(r, null, busy([3091]), [3092], [3090]))!.ports.web, 3093) // busy, given and a helper's ports all skipped
+  assert.equal(await assignPorts(r, null, busy([]), [], Array.from({ length: 10 }, (_, i) => 3090 + i)), null) // never as a last resort
+  assert.deepEqual((await assignPorts(r, null, busy([]), [], [3189]))!.taken, []) // a fixed port is the recipe's own: as before
+  const two = { ...r, parts: r.parts.map((p) => ({ ...p, port: 'auto' as const })) }
+  assert.deepEqual((await assignPorts(two, null, busy([]), [], [3090, 3092]))!.ports, { web: 3091, api: 3093 })
+})
+
 test('test ports (Bug 226): up to three free ones from the top of the range, another helper\'s only when no others are free; [] when none is', async () => {
   const busy = (taken: number[]) => async (p: number) => taken.includes(p)
   assert.deepEqual(await testPorts([], busy([])), [3097, 3098, 3099])
@@ -234,6 +300,81 @@ test('stray test ports (Bug 226): only a port the helper chose itself; its given
   assert.deepEqual(strayPorts([], [4087], r), [])
 })
 
+/** Bug 322: a socket bound to a port of the OS's choosing on `host` and not listening, as Linux keeps the local end of an outgoing connection: nothing answers
+ *  there and, on Linux and macOS alike, nothing can listen there. Python, not Node: Node's sockets set SO_REUSEADDR, and Linux lets a listener through a
+ *  socket that has it and isn't listening. Null when the machine has no such address (no IPv6). */
+async function bindOnly(host: string): Promise<{ port: number; release: () => Promise<void> } | null> {
+  const code = ['import socket, sys', 's = socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET)',
+    'try: s.bind((sys.argv[1], 0))', 'except OSError: print("none", flush=True); sys.exit(0)', 'print(s.getsockname()[1], flush=True); sys.stdin.read()'].join('\n')
+  const py = spawn('python3', ['-c', code, host], { stdio: ['pipe', 'pipe', 'inherit'] })
+  const exited = new Promise<void>((resolve) => py.once('close', () => resolve()))
+  const line = await new Promise<string>((resolve, reject) => {
+    py.stdout.once('data', (d) => resolve(String(d).trim())); py.once('error', reject); void exited.then(() => reject(new Error('python3 ended before it bound')))
+  })
+  const release = async () => { py.stdin.end(); await exited }
+  if (line === 'none') { await release(); return null }
+  return { port: Number(line), release }
+}
+const listensAt = (port: number, host: string): Promise<void> => new Promise((resolve, reject) => {
+  const s = net.createServer(); s.once('error', reject); s.listen(port, host, () => s.close(() => resolve()))
+})
+
+test('portBusy (Bug 322): a port nothing answers on but nothing can listen on is busy, on IPv4 and IPv6; once it is let go it is free, and the check leaves it so',
+  { timeout: 20_000 }, async () => {
+    let tried = 0
+    for (const host of ['127.0.0.1', '::1']) {
+      const held = await bindOnly(host); if (!held) continue // this machine has no IPv6
+      tried++
+      try {
+        assert.equal(await portBusyWith(held.port, [], null), false, `nothing answers on ${host}: a connect alone takes it as free (the bug)`)
+        assert.equal(await portBusy(held.port), true, `held on ${host}`)
+        assert.deepEqual(await Promise.all([held.port].map(portBusy)), [true], 'as freeBase calls it, with map\'s index and array after the port')
+        // what it must not catch: an address this machine doesn't have (EADDRNOTAVAIL) says nothing about the port
+        assert.equal(await portBusyWith(held.port, ['192.0.2.1'], null), false)
+      } finally { await held.release() }
+      assert.equal(await portBusy(held.port), false, `once it is let go on ${host}`)
+      await listensAt(held.port, host) // the check closed its own listeners before it answered
+    }
+    assert.ok(tried >= 1, 'at least the IPv4 hold ran')
+  })
+
+test('portBusy (Bug 322): the local end of an outgoing connection is busy on Linux, where no listener can take it, and free on macOS, where one can',
+  { timeout: 10_000 }, async () => {
+    const server = net.createServer((c) => c.resume()); await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    const c = net.connect({ host: '127.0.0.1', port: (server.address() as net.AddressInfo).port }); await new Promise((r) => c.once('connect', r))
+    try { assert.equal(await portBusy(c.localPort!), process.platform === 'linux') } finally { c.destroy(); await new Promise((r) => server.close(r)) }
+  })
+
+test('portBusy (Bug 340): a port bound but not listening is busy at once, not after a connect\'s whole 500 ms wait (macOS answers no such connect)',
+  { timeout: 20_000 }, async () => {
+    for (const host of ['127.0.0.1', '::1']) {
+      const held = await bindOnly(host); if (!held) continue // this machine has no IPv6
+      try {
+        const t0 = performance.now(); assert.equal(await portBusy(held.port), true, `held on ${host}`)
+        const ms = performance.now() - t0; assert.ok(ms < 400, `held on ${host}: answered after ${Math.round(ms)} ms`)
+        const ports = await Promise.all([1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(() => bindOnly(host)))
+        try { // as an engineer's slot is checked: ten ports at once
+          const t1 = performance.now(); assert.deepEqual(await Promise.all(ports.map((x) => portBusy(x!.port))), ports.map(() => true))
+          assert.ok(performance.now() - t1 < 400, 'ten held ports at once')
+        } finally { for (const x of ports) await x?.release() }
+      } finally { await held.release() }
+    }
+  })
+
+test('portBusy (Bug 340): what the early listen must not catch: an app that answers, on all addresses, is busy and HQ never listens beside it, even when its loop is held up',
+  { timeout: 20_000 }, async () => {
+    const app = net.createServer((c) => c.end()); await new Promise<void>((r) => app.listen(0, r)) // '::', as Node apps listen by default
+    const port = (app.address() as net.AddressInfo).port, real = net.createServer; let listens = 0
+    net.createServer = ((...a: Parameters<typeof real>) => { listens++; return real(...a) }) as typeof real // what cantListen opens
+    try {
+      for (let i = 0; i < 10; i++) assert.equal(await portBusy(port), true)
+      const busy = portBusy(port); await new Promise((r) => process.nextTick(r)) // the connects have gone out
+      const until = Date.now() + 200; while (Date.now() < until) { /* HQ's loop held up past QUIET_MS */ }
+      assert.equal(await busy, true, 'with the loop held up')
+      assert.equal(listens, 0, 'a listen of HQ\'s on 127.0.0.1 would take connections meant for the app')
+    } finally { net.createServer = real; await new Promise((r) => app.close(r)) }
+  })
+
 test('installs: once per checkout, again when the install_when file changes', () => {
   const root = split(), web = path.join(root, 'web'), part = { name: 'web', dir: 'web', install: 'npm ci', install_when: 'package-lock.json', run: 'vite', port: 'auto' as const }
   assert.equal(needsInstall(part, web, {}), true)
@@ -242,6 +383,37 @@ test('installs: once per checkout, again when the install_when file changes', ()
   fs.writeFileSync(path.join(web, 'package-lock.json'), '{"changed":1}'); assert.equal(needsInstall(part, web, { [web]: mark }), true)
   assert.equal(needsInstall({ ...part, install_when: undefined }, web, { [web]: 'installed' }), true) // the user's own command: installStep decided
   assert.equal(needsInstall({ ...part, install: undefined }, web, {}), false)
+})
+
+test('installs (Bug 303): again when what the install made is gone, the lockfile unchanged; each tool\'s own, where it puts it', () => {
+  const root = repo({ 'package.json': JSON.stringify({ private: true, workspaces: ['web'] }), 'package-lock.json': '{}', 'web/package.json': deps,
+    'yarnapp/package.json': deps, 'yarnapp/yarn.lock': '__metadata:\n  version: 8\n', 'linked/package.json': deps, 'linked/yarn.lock': '__metadata:\n',
+    'linked/.yarnrc.yml': 'nodeLinker: "node-modules"\n', 'classic/package.json': deps, 'classic/yarn.lock': '# yarn lockfile v1\n',
+    'admin/package.json': deps, 'admin/pnpm-lock.yaml': '', 'server/pyproject.toml': '[project]\nname = "api"\n', 'server/uv.lock': 'x',
+    'bare/pyproject.toml': '[project]\nname = "b"\n', 'empty/package.json': '{"name":"e"}', 'empty/package-lock.json': '{}' })
+  const cases: [string, string, string, string][] = [ // folder, install, install_when, what it makes (relative to the checkout)
+    ['web', 'npm ci', 'package-lock.json', 'node_modules'], // a workspace member: npm installs at the root
+    ['yarnapp', 'yarn install --immutable', 'yarn.lock', 'yarnapp/.pnp.cjs'], // the entry's case: Yarn 2+ Plug'n'Play
+    ['linked', 'yarn install --immutable', 'yarn.lock', 'linked/node_modules'], ['classic', 'yarn --frozen-lockfile', 'yarn.lock', 'classic/node_modules'],
+    ['.', 'cd admin && pnpm install --frozen-lockfile', 'admin/pnpm-lock.yaml', 'admin/node_modules'], ['server', 'uv sync --locked', 'uv.lock', 'server/.venv'],
+    ['bare', 'uv venv --allow-existing && uv pip install -r pyproject.toml', 'pyproject.toml', 'bare/.venv'],
+  ]
+  for (const [dir, install, when, made] of cases) {
+    const at = path.join(root, dir), part = { name: 'app', dir, install, install_when: when, run: 'x', port: 'auto' as const }
+    assert.deepEqual(installOutputs(install, at, root), [path.join(root, made)], install)
+    const marks = { [at]: installMark(at, when, root)! }; assert.ok(marks[at], when)
+    assert.equal(needsInstall(part, at, marks, root), true, `${install}: never installed, though marked`)
+    fs.mkdirSync(path.join(root, made), { recursive: true }); assert.equal(needsInstall(part, at, marks, root), false, `${install}: installed`)
+    fs.rmSync(path.join(root, made), { recursive: true }); assert.equal(needsInstall(part, at, marks, root), true, `${install}: deleted`)
+    const spec = supervisorSpec({ recipe: { parts: [part], show: 'app', worktree_files: [], notes: '' }, root, ports: { app: 3090 }, marks, marksFile: '/m.json', header: 'h' })
+    assert.deepEqual([spec.parts[0]!.install, spec.parts[0]!.mark], [install, marks[at]]) // installs again, and the mark stays the lockfile's
+  }
+  // what it must not catch: nothing to install (npm makes no node_modules), installs HQ can't read or follow, a `uv run`, a venv outside the checkout
+  for (const [dir, install] of [['empty', 'npm ci'], ['.', 'go build ./...'], ['.', 'pip install -r requirements.txt'], ['.', 'cd $X && npm ci'],
+    ['server', 'uv run --locked python -c 1'], ['bare', 'uv venv /tmp/elsewhere']]) assert.deepEqual(installOutputs(install!, path.join(root, dir!), root), [], install)
+  assert.deepEqual(installOutputs('uv venv --python 3.12 env2 && uv pip install .', path.join(root, 'bare'), root), [path.join(root, 'bare', 'env2')])
+  const empty = path.join(root, 'empty'), part = { name: 'e', dir: 'empty', install: 'npm ci', install_when: 'package-lock.json', run: 'x', port: 'auto' as const }
+  assert.equal(needsInstall(part, empty, { [empty]: installMark(empty, 'package-lock.json')! }, root), false)
 })
 
 test('the user\'s own command installs again after a merge changes dependencies, even after an earlier install', () => {
@@ -260,7 +432,7 @@ test('recipe: an install needs install_when', () => {
 })
 
 test('supervisor spec: each part\'s folder, port and the others\' ports; installs only where needed', () => {
-  const root = split(), r = (checkRecipe(splitApp(), root) as { recipe: Recipe }).recipe
+  const root = split(), r = (checkRecipe(splitApp(), root) as { recipe: Recipe }).recipe; fs.mkdirSync(path.join(root, 'server', '.venv'))
   const marks = { [path.join(root, 'server')]: installMark(path.join(root, 'server'), 'uv.lock')! }
   const spec = supervisorSpec({ recipe: r, root, ports: { api: 3189, web: 3090 }, marks, marksFile: '/m.json', header: 'h' })
   assert.deepEqual(spec.parts.map((p) => [p.name, p.cwd, p.install, p.env.PORT, p.env.HQ_PORT_API, p.env.HQ_PORT_WEB, p.env.BROWSER]),
@@ -328,7 +500,7 @@ test('recipe (Bug 211): a uv, yarn or pnpm install anywhere in the command is ch
   // what it must not catch: following the lockfile, a folder with no uv project, commands that aren't installs (no lockfile: Bug 239's test)
   for (const ok of ['cd server && uv sync --locked', 'cd server && uv sync --frozen', 'UV_LOCKED=1 uv sync --directory server', 'cd $SRV && uv sync --locked',
     'cd web && yarn install --frozen-lockfile', 'yarn --cwd web install --immutable', 'pnpm -C admin install --frozen-lockfile', 'uv sync',
-    'cd server && uv run app.py', 'cd web && yarn build', "sh -c 'cd server && uv sync'", 'echo cd server && echo uv sync'])
+    'cd server && uv run --locked app.py', 'cd web && yarn build', "sh -c 'cd server && uv sync'", 'echo cd server && echo uv sync'])
     assert.ok('recipe' in app(ok), ok)
   // its own folder, as before: no folder named in the words
   assert.match(lockfileProblem('uv sync', path.join(root, 'server'), root) ?? '', /^use `uv sync --locked`/)
@@ -336,7 +508,7 @@ test('recipe (Bug 211): a uv, yarn or pnpm install anywhere in the command is ch
   // in the run command (it runs on every start), and in steps saved before this check (Bug 156's re-check)
   assert.match(err('cd server && uv sync --locked', 'cd server && uv sync && uv run app.py'),
     /^app: run has an install that would run on every start \(`uv sync`; put installs in install\): `uv sync` runs in server: use `uv sync --locked`/)
-  assert.ok('recipe' in app('cd server && uv sync --locked', 'cd server && uv run app.py'))
+  assert.ok('recipe' in app('cd server && uv sync --locked', 'cd server && uv run --locked app.py'))
   const part = { name: 'app', dir: '.', install: 'cd web && yarn', install_when: 'web/yarn.lock', run: 'cd web && yarn dev', port: 'auto' as const }
   assert.match(recipeProblem({ parts: [part], show: 'app', worktree_files: [], notes: '' }, root)?.why ?? '', /^app: `yarn` runs in web: use `yarn install --frozen-lockfile`/)
 })
@@ -354,7 +526,7 @@ test('recipe (Bug 239): with no lockfile, uv, yarn and pnpm installs must not wr
     + 'use `uv run --no-sync` (install with `uv venv --allow-existing && uv pip install -r pyproject.toml`)')
   assert.match(err(uvInstall, 'server/pyproject.toml', 'uv run --directory server app.py'), /^app: `uv run --directory server app.py` runs in server: there is no uv.lock.*: use `uv run --no-sync`/)
   for (const run of ['cd server && uv run --no-sync app.py', 'cd server && UV_NO_SYNC=1 uv run app.py', 'cd server && uv run --no-project app.py',
-    'uv run scripts/x.py', 'cd scripts && uv run x.py', 'cd $SRV && uv run app.py', 'cd server && .venv/bin/python app.py'])
+    'uv run scripts/x.py', 'cd scripts && uv run x.py', 'cd $SRV && uv run --no-sync app.py', 'cd server && .venv/bin/python app.py'])
     assert.ok('recipe' in app(uvInstall, 'server/pyproject.toml', run), run) // no project there (no pyproject.toml), or a run that writes nothing
   assert.match(err(uvInstall, 'server/uv.lock', 'cd server && uv run --no-sync app.py'), // a file that isn't there: it would never install again
     /^app: install_when must be a `pyproject.toml` with `uv pip install` \(there is no uv.lock to watch\)$/)
@@ -372,13 +544,13 @@ test('recipe (Bug 239): with no lockfile, uv, yarn and pnpm installs must not wr
   assert.match(err('cd web && yarn && yarn dev', 'web/package.json'), /`yarn` runs in web: there is no yarn.lock.*: use `yarn install --pure-lockfile`/) // the first, not the run after it
   // saved steps refused when they run, naming the lockfile they'd write (Bug 238)
   const saved = (install: string): Recipe =>
-    ({ parts: [{ name: 'app', dir: 'server', install, install_when: 'uv.lock', run: 'uv run app.py', port: 'auto' }], show: 'app', worktree_files: [], notes: '' })
+    ({ parts: [{ name: 'app', dir: 'server', install, install_when: 'uv.lock', run: 'uv run --locked app.py', port: 'auto' }], show: 'app', worktree_files: [], notes: '' })
   assert.deepEqual(recipeProblem(saved('uv sync'), root), { why: `app: there is no uv.lock, and \`uv sync\` would write one into the user's project: use ${uvBare}`, lock: 'uv.lock' })
   assert.equal(recipeProblem(saved('uv venv --allow-existing && uv pip install -r pyproject.toml'), root)?.lock, 'uv.lock') // its run
   assert.equal(recipeProblem({ ...saved(''), parts: [{ name: 'web', dir: 'web', install: 'yarn', install_when: 'package.json', run: 'yarn dev', port: 'auto' }] }, root)?.lock, 'yarn.lock')
   assert.equal(recipeProblem({ ...saved(''), parts: [{ name: 'web', dir: 'web', install: 'npm i', install_when: 'package.json', run: 'npm start', port: 'auto' }] }, root)?.lock, 'package-lock.json')
   assert.equal(refusedWords('uv.lock'), 'would write a uv.lock into the project, or not follow the one it has')
-  fs.writeFileSync(path.join(root, 'server', 'uv.lock'), 'x') // a lockfile now: the old advice, and `uv run` follows it
+  fs.writeFileSync(path.join(root, 'server', 'uv.lock'), 'x') // a lockfile now: the old advice, and `uv run --locked` follows it
   assert.equal(recipeProblem(saved('uv sync --locked'), root), null)
   assert.match(recipeProblem(saved('uv sync'), root)?.why ?? '', /^app: use `uv sync --locked` \(there is a uv.lock\)$/)
 })
@@ -392,7 +564,8 @@ test('recipe (Bug 240): uv, yarn and pnpm workspace members follow the lockfile 
     if (!fs.existsSync(at(d))) fs.mkdirSync(at(d))
     assert.match(lockfileProblem('uv sync', at(d), root) ?? '',
       d === '.' ? /^use `uv sync --locked` \(there is a uv.lock\)$/ : /^use `uv sync --locked` \(there is a uv.lock at uv.lock, which this folder follows\)$/, d)
-    assert.equal(lockfileProblem('uv sync --locked', at(d), root), null, d); assert.equal(lockfileProblem('uv run app.py', at(d), root), null, d)
+    assert.equal(lockfileProblem('uv sync --locked', at(d), root), null, d); assert.equal(lockfileProblem('uv run --locked app.py', at(d), root), null, d)
+    assert.match(lockfileProblem('uv run app.py', at(d), root) ?? '', /^use `uv run --locked` \(there is a uv.lock.*, and `uv run app.py` rewrites it when it is out of date\)$/, d) // Bug 262
   }
   for (const d of ['packages/skip', 'tools/x']) // excluded, or not listed (another table's `exclude` doesn't count): a project of its own (uv 0.12.9 writes its own uv.lock)
     assert.match(lockfileProblem('uv sync', at(d), root) ?? '', /there is no uv.lock, and `uv sync` would write one/, d)
@@ -413,6 +586,64 @@ test('recipe (Bug 240): uv, yarn and pnpm workspace members follow the lockfile 
   }
   const own = repo({ 'pnpm-workspace.yaml': '', 'pnpm-lock.yaml': '', 'packages/a/package.json': deps, 'packages/a/pnpm-lock.yaml': '' }) // its own (shared-workspace-lockfile=false)
   assert.match(lockfileProblem('pnpm i', path.join(own, 'packages/a'), own) ?? '', /\(there is a pnpm-lock.yaml\)$/)
+})
+
+test('recipe (Bug 262): a `uv run` must follow the uv.lock as it is, not rewrite an out-of-date one', () => {
+  const root = repo({ 'server/pyproject.toml': '[project]\nname = "api"\n', 'server/uv.lock': 'x', 'web/package.json': deps })
+  const app = (run: string, dir = 'server') => checkRecipe({ parts: [{ name: 'app', dir, install: 'uv sync --locked', install_when: 'uv.lock', run, port: 'auto' }], show: 'app' }, root)
+  const err = (run: string, dir?: string) => { const x = app(run, dir); return 'error' in x ? x.error : '(accepted)' }
+  assert.equal(err('uv run app.py'), 'app: use `uv run --locked` (there is a uv.lock, and `uv run app.py` rewrites it when it is out of date)') // the entry's case
+  assert.match(err('cd server && uv run uvicorn app:app', '.'), /^app: `uv run uvicorn app:app` runs in server: use `uv run --locked` \(there is a uv.lock/)
+  assert.match(err('uv run --directory server app.py', '.'), /runs in server: use `uv run --locked`/)
+  assert.match(err('cd $SRV && uv run app.py'), /^app: HQ can't tell which folder of the repo `uv run app.py` runs in: use `uv run --locked`, or give the part that folder as its dir$/)
+  // the flag must be uv's: after the command it is the app's argument, and uv still rewrites uv.lock (round-5 UI test, uv 0.12.9)
+  for (const late of ['uv run app.py --locked', 'uv run python app.py --frozen', 'uv run app.py --no-sync', 'uv run uvicorn app:app --locked'])
+    assert.match(err(late), /^app: use `uv run --locked`/, late)
+  // what it must not catch: a run that follows the lockfile (--locked stops on an out-of-date one, --frozen ignores it) or syncs nothing
+  for (const ok of ['uv run --locked app.py', 'uv run --frozen app.py', 'UV_LOCKED=1 uv run app.py', 'UV_FROZEN=1 uv run app.py', 'uv run --no-sync app.py',
+    'UV_NO_SYNC=1 uv run app.py', 'uv run --no-project app.py', 'cd $SRV && uv run --locked app.py', '.venv/bin/python app.py', 'uvx ruff check',
+    'uv run --with rich --locked app.py', 'uv run --python 3.12 --no-sync app.py --locked'])
+    assert.ok('recipe' in app(ok), ok)
+  assert.ok('recipe' in app('uv --directory server run --frozen app.py', '.')) // uv's options before `run` are uv's too
+  const saved = (run: string): Recipe => ({ parts: [{ name: 'app', dir: 'server', install: 'uv sync --locked', install_when: 'uv.lock', run, port: 'auto' }],
+    show: 'app', worktree_files: [], notes: '' })
+  assert.deepEqual(recipeProblem(saved('uv run app.py'), root), // saved before this check: refused when it starts, and the helper fixes it (Bug 156)
+    { why: 'app: use `uv run --locked` (there is a uv.lock, and `uv run app.py` rewrites it when it is out of date)', lock: 'uv.lock' })
+  assert.equal(recipeProblem(saved('uv run --locked app.py'), root), null)
+})
+
+test('the user\'s own command (Bug 316): a warning in plain words when it would write or rewrite a lockfile, the same check as Claude\'s steps', () => {
+  const uv = repo({ 'pyproject.toml': '[project]\nname = "a"\n', 'uv.lock': 'version = 1\n' }), lockless = repo({ 'package.json': deps })
+  assert.equal(commandWarning('uv run app.py', uv), '`uv run app.py` would write a uv.lock into the project, or not follow the one it has: '
+    + 'use `uv run --locked` (there is a uv.lock, and `uv run app.py` rewrites it when it is out of date). '
+    + 'If it then says the uv.lock needs to be updated, run `uv lock` yourself first, where the command runs, and commit the new uv.lock.') // Bug 343
+  assert.match(commandWarning('yarn && yarn start', repo({ 'package.json': deps, 'yarn.lock': '' })) ?? '', /needs to be updated, run `yarn install` yourself/)
+  assert.match(commandWarning('npm i && npm start', repo({ 'package.json': deps, 'package-lock.json': '{}' })) ?? '', /needs to be updated, run `npm install` yourself/)
+  assert.equal(commandWarning('npm install && npm start', lockless), '`npm install` would write a package-lock.json into the project, or not follow the one it has: '
+    + 'use `npm install --no-package-lock` (there is no package-lock.json, and `npm install` would write one into the user\'s project).') // no recipe words
+  assert.match(commandWarning('cd sub && uv sync', repo({ 'sub/pyproject.toml': '', 'sub/uv.lock': 'x' })) ?? '', /^`uv sync` would write a uv\.lock .*: `uv sync` runs in sub: use `uv sync --locked`/)
+  assert.doesNotMatch(commandWarning('uv run app.py', repo({ 'pyproject.toml': '' })) ?? '', /install_when/)
+  // what it must not catch: commands that follow the lockfile or write none, no install at all, a folder HQ can't follow, a plain script
+  for (const c of ['uv run --locked app.py', 'uv run --frozen app.py', 'UV_FROZEN=1 uv run app.py', 'uv run --no-sync app.py', 'npm start',
+    'python app.py', 'cd $X && uv sync']) assert.equal(commandWarning(c, uv), null, c)
+  assert.equal(commandWarning('npm install --no-package-lock && npm start', lockless), null)
+  assert.equal(commandWarning('uv run app.py', repo({ 'app.py': '' })), null) // no pyproject.toml: uv writes no uv.lock
+})
+
+test('installLeftovers (Bug 263): what each install leaves in the project, in the folder it runs in and at the root it follows', () => {
+  const root = repo({ 'package.json': JSON.stringify({ private: true, workspaces: ['packages/*'] }), 'yarn.lock': '', 'packages/a/package.json': deps,
+    'web/package.json': deps, 'web/package-lock.json': '{}', 'admin/package.json': deps, 'admin/pnpm-lock.yaml': '', 'server/pyproject.toml': '', 'server/uv.lock': 'x' })
+  const of = (...parts: [string, string | undefined, string][]): string[] =>
+    installLeftovers({ parts: parts.map(([dir, install, run], i) => ({ name: `p${i}`, dir, install, install_when: 'x', run, port: 'auto' })), show: 'p0', worktree_files: [], notes: '' }, root)
+  const YARN = ['node_modules/', '.pnp.cjs', '.pnp.loader.mjs', '.pnp.data.json', '.yarn/install-state.gz', '.yarn/cache/', '.yarn/unplugged/', '.yarn/__virtual__/']
+  assert.deepEqual(of(['.', 'yarn install --immutable', 'yarn start']), YARN) // the entry's case: Yarn 2+ writes .pnp.cjs and its install state, lockfile followed or not
+  assert.deepEqual(of(['packages/a', 'yarn install --immutable', 'yarn start']).sort(), [...YARN.map((f) => `packages/a/${f}`), ...YARN].sort()) // a member: the root's
+  assert.deepEqual(of(['.', 'cd web && npm ci', 'cd web && npm start']), ['web/node_modules/'])
+  assert.deepEqual(of(['admin', 'pnpm install --frozen-lockfile', 'pnpm dev']), ['admin/node_modules/'])
+  assert.deepEqual(of(['web', undefined, 'npm ci && npm start']), ['web/node_modules/']) // the user's own ⚙ command: its run, too
+  // what it must not catch: uv (its .venv ignores itself), commands that aren't installs, folders HQ can't follow or outside the checkout
+  assert.deepEqual(of(['server', 'uv sync --locked', 'uv run --locked app.py'], ['web', undefined, 'npm start'], ['.', 'cd $X && yarn', 'yarn --version'],
+    ['.', 'cd ../.. && npm ci', 'node x'], ['.', 'echo yarn install', 'yarn build']), [])
 })
 
 test('recipe (Bug 191): an npm install in the run command runs on every start, so it is checked too', () => {

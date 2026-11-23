@@ -37,10 +37,12 @@ test('Bug 232: after a restart HQ still knows the helpers an agent waits on, and
   // one still in its turn when HQ went: its next hook says what it does
   await hq.hook(mid.id, { hook_event_name: 'UserPromptSubmit', prompt: 'hi' })
   await startHelper(mid.id, 'm1', 'Read the code')
+  const midLine = (await agentOf(mid.id)).activity ?? null
   await hq.restart()
   let a = await agentOf(tpm.id)
   assert.equal(a.status, 'working'); assert.equal(a.activity, 'Subagent: Map the metrics code (+1 more)', 'the line is back without a new hook, with only the two still running')
-  assert.equal((await agentOf(mid.id)).activity ?? null, null, 'one still in its turn is not said to be waiting')
+  // Bug 337: it keeps the line it had (its last tool), not one HQ makes up from its helpers
+  assert.equal((await agentOf(mid.id)).activity ?? null, midLine, 'one still in its turn keeps its own line, and is not said to be waiting')
   // h2 ends: h1, started before the restart, still runs, so the agent is still working
   await hq.hook(tpm.id, { hook_event_name: 'SubagentStop', agent_id: 'h2' })
   await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: notice('h2') })

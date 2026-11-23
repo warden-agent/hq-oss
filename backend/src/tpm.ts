@@ -15,7 +15,7 @@ import { wake } from './wake.ts'
 import { resolveKind } from './attention.ts'
 import { tpmPrompt } from './handover.ts'
 import { readNote } from './notes.ts'
-import { writeProjectMd } from './projectmd.ts'
+import { writeRepoMd } from './projectmd.ts'
 import { answerOpenAsks } from './asks.ts'
 
 const starting = new Set<string>() // repos whose TPM is being started right now
@@ -51,12 +51,13 @@ async function launch(repoId: string, o: { message?: string | null; cleared?: bo
     const prev = r0.tpm_agent_id ? getAgent(r0.tpm_agent_id) : undefined
     if (prev && prev.status !== 'exited') throw new Error(`${r0.name}'s TPM is already running (${prev.id}).`)
     const repo = await ensureFresh(repoId)
-    const ws = writeProjectMd(repoId), note = readNote(`resume:repo:${repoId}`)
+    const ws = writeRepoMd(repoId), note = readNote(`resume:repo:${repoId}`)
     const prompt = tpmPrompt(repo, { ws, previous: prev?.id ?? null, note, board: board(repoId), messages: prev ? lastTalk(repoId) : [], message: o.message,
       cleared: o.cleared, context: fs.existsSync(path.join(ws, 'CONTEXT.md')), localOnly: localOnly(repo) })
     const a = await launchAgent({ role: 'tpm', repoId, model: modelFor('tpm'), cwd: ws, displayName: `TPM ${repo.name}`, launchPrompt: prompt, extraFlags: ['--add-dir', repo.path] })
     run('UPDATE repos SET tpm_agent_id = ?, tpm_parked_at = NULL WHERE id = ?', a.id, repoId); patch('repo', repoId, { tpm_agent_id: a.id, tpm_parked_at: null })
     if (prev) { handOver(prev.id, a.id); resolveKind('agent_exited', prev.id) }
+    resolveKind(`repo_clear_tpm:${repoId}`, null) // Bug 285: "its TPM didn't start again" alerts, so it goes once one has started
     emit({ agentId: a.id, source: 'system', kind: 'tpm.started', payload: { repo: repoId, previous: prev?.id ?? null, why: o.why } })
     return a
   } finally { starting.delete(repoId) }

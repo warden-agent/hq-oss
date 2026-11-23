@@ -4,7 +4,6 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, type Hq } from './harness.ts'
 import { slotWindow } from '../src/slotports.ts'
 
@@ -58,10 +57,9 @@ test('a batch that never reached the mod is handed out again; one it got is not'
   assert.equal((await hq.api('settings', { key: 'batch_receive_s', value: 1 })).status, 200)
   await say(tpm.id, 'First note.')
   const lost = (await hq.modNext(tpm.id)).batch; assert.match(lost.text, /First note/) // the long-poll answer never arrives
-  await new Promise((r) => setTimeout(r, 1300))
-  const again = (await hq.modNext(tpm.id)).batch; assert.ok(again, 'handed again'); assert.equal(again.text, lost.text)
+  const again = await waitFor('the batch to be handed out again', async () => (await hq.modNext(tpm.id)).batch); assert.equal(again.text, lost.text) // after batch_receive_s, 1 s here
   await hq.modEvent(tpm.id, { kind: 'batch_received', id: again.id }) // this one got there; it waits for the session to go idle
-  await new Promise((r) => setTimeout(r, 1300))
+  await new Promise((r) => setTimeout(r, 1300)) // limit: batch_receive_s is 1 s here; a batch HQ did not take as received would be handed out again after it
   assert.deepEqual(await hq.modNext(tpm.id), {})
   await hq.api('settings', { key: 'batch_receive_s', value: 30 })
 })
@@ -78,7 +76,7 @@ test('a hold set while the mod is polling holds the batch', async () => {
   const { tpm } = await setup('hold-mid-poll')
   await takeLaunch(tpm.id)
   const poll = hq.modNext(tpm.id, 2500)
-  await new Promise((r) => setTimeout(r, 300))
+  await new Promise((r) => setTimeout(r, 300)) // window: the 2.5 s long-poll has to be open at HQ before the hold is set, and nothing shows that it is
   await hq.api(`agents/${tpm.id}/takeover`, { locked: true }); await say(tpm.id, 'Held note.')
   assert.deepEqual(await poll, {})
   await hq.api(`agents/${tpm.id}/takeover`, { locked: false })
@@ -87,7 +85,7 @@ test('a hold set while the mod is polling holds the batch', async () => {
 
 /** Writes to the test HQ's database, for state only time would bring (a mod gone quiet, a batch handed out long ago). */
 function sql(query: string, ...args: (string | number)[]): void {
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 }); try { db.prepare(query).run(...args) } finally { db.close() }
+  const db = hq.db(); try { db.prepare(query).run(...args) } finally { db.close() }
 }
 /** Moves a batch's times 10 minutes back: past the "submitted but never started" wait (90 s) and the one-in-flight window (3 min). */
 const ageBatch = (id: string) => sql(`UPDATE batches SET handed_at = handed_at - 600000, received_at = received_at - 600000,
@@ -401,7 +399,7 @@ test('Bug 157: a ticket that asks again while it waits goes back to what it was 
 })
 
 test('a blocker always reaches the TPM; one the hourly cap refuses goes to the user', async () => {
-  const { f, tpm } = await setup('blocker-limit')
+  const { f } = await setup('blocker-limit')
   const t = (await hq.api('tickets', { featureId: f.id, title: 'Tests', size: 'S', spec: 'Run them.' })).json
   const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
   await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))

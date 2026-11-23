@@ -5,8 +5,8 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Handle, Position, useStore, type Node, type NodeProps } from '@xyflow/react'
-import { alertFrom, api, type State } from './api'
-import { askLabels, askText, cancelConfirm, mergeConfirm, startLabel, startText, turnOn, waitingOn } from './board'
+import { alertFrom, answerAsk, api, type State } from './api'
+import { askLabels, askText, cancelConfirm, featureCancelText, mergeConfirm, removeText, startLabel, startText, turnOn, waitingOn } from './board'
 import { actLabel, answerReview, kindLabel, freshBlocker, freshConfirm, freshOffered, localOnly, OPEN_PREVIEW, stopOthers, ticketLabel, useBoard, useBusy, useRevisionCap,
   type Act, type FeatureView, type Line, type TicketView, type TpmView, type Tone } from './board'
 import { goodNews, plainNews, ticketBase, turnQuestionText, type Question, type Turn } from './needs.ts'
@@ -15,10 +15,11 @@ import { mergeTestOf, mergeTestWords } from './testruns.ts'
 import { DoRestBtn } from './Auto'
 import type { Agent } from './api'
 import { ActBtn, Elapsed, Linked, LiveDot, Md, Pill } from './ui'
-import { useAtEnd } from './atend.ts'
+import { sendHere, sentHere, useAtEnd } from './atend.ts'
 import { placePop } from './fit'
 import { openDone } from './donefold'
 import { byKind, criteriaOf, KIND_HEADING } from '../../backend/src/criteria.ts'
+import { allSteps, canSend, checkButton, checkFacts, checkHeadline, checkOf, outOfDate, STEP_NAME, type Tone as CheckTone } from '../../backend/src/hqcheckrules.ts'
 
 const tone: Record<Tone, string> = { plain: 'text-zinc-200', muted: 'text-zinc-400', amber: 'text-amber-300', rose: 'text-rose-300', sky: 'text-sky-300', emerald: 'text-emerald-300', indigo: 'text-indigo-300' }
 const POP = 'nodrag nopan nowheel' // popovers: the wheel scrolls them and a drag in them doesn't pan the graph
@@ -66,7 +67,7 @@ function TurnBox({ turn, repoId, answer }: { turn: Turn; repoId: string; answer:
       <div className="break-words">{askText(a)}</div>
       <div className="flex flex-wrap gap-1">{askLabels(a).map((l) => l === 'Answer…'
         ? <button key={l} className="btn-sm" title="Write your own answer in the box below" onClick={answer}>{l}</button>
-        : <ActBtn key={l} primary label={l} busyLabel="Sending…" title={`Answer "${l}"`} run={() => api(`asks/${a.id}/answer`, { answer: l })} />)}</div>
+        : <ActBtn key={l} primary label={l} busyLabel="Sending…" title={`Answer "${l}"`} run={() => answerAsk(a.id, l)} />)}</div>
     </div>)}
     {(turn.questions ?? []).map((x) => <div key={x.id} className="contents">
       <div className="line-clamp-3 break-words" title={turnQuestionText(x)}>{turnQuestionText(x)}</div>
@@ -89,14 +90,14 @@ function Card({ id, border, ring = '', className = '', children }: { id: string;
 function CancelBtn({ tip, title, body, go, path }: { tip: string; title: string; body: string; go: string; path: string }) {
   const [busy, run] = useBusy()
   return <button className="nopan shrink-0 rounded px-1 text-[10px] leading-4 text-zinc-400 hover:bg-rose-500/20 hover:text-rose-300 disabled:opacity-40" disabled={busy} title={tip}
-    aria-label={tip} onClick={() => run(async () => { if (await cancelConfirm(title, body, go)) await api(path, {}) })}>✕</button>
+    aria-label={tip} onClick={() => run(() => api(path, {}), () => cancelConfirm(title, body, go))}>✕</button>
 }
 /** ⟳ in a box's header: fresh start its running TPM or engineer (it writes a handoff note; a new session takes over). */
 export function FreshBtn({ a, label }: { a: Agent | null; label?: string }) {
   const b = useBoard(); const [busy, run] = useBusy()
   if (!a || !freshOffered(a, b.state)) return null
   const why = freshBlocker(a, b.state), name = a.display_name ?? a.id
-  const go = () => run(async () => { if (await freshConfirm(b.state, [name])) await api(`agents/${a.id}/fresh-start`, {}) })
+  const go = () => run(() => api(`agents/${a.id}/fresh-start`, {}), () => freshConfirm(b.state, [name]))
   if (label) return <button className="btn-sm nopan" disabled={busy || !!why} title={why ?? `Fresh start ${name}`} onClick={go}>{label}</button>
   return <button className="nopan shrink-0 rounded px-1 text-[10px] leading-4 text-zinc-500 hover:bg-sky-500/20 hover:text-sky-300 disabled:opacity-40" disabled={busy || !!why}
     title={why ?? `Fresh start ${name}: it writes a short handoff note, and a new session takes over with a clean context`} onClick={go}>⟳</button>
@@ -157,7 +158,7 @@ function splitPlan(text: string): { plain: string; rest: string } {
   return { plain, rest: (text.slice(0, m.index) + (next ? after.slice(next.index) : '')).trim() }
 }
 /** The plan under review with Approve / Revise. On a box it closes with × or Esc; in the top-bar menu it has no ×. Its header and
- *  its note box and buttons always show; the plan between them scrolls (Bug 120). */
+ *  its note box and buttons always show; the plan between them scrolls (Bug 120). The plan is markdown, shown as such (Bug 304). */
 export function ReviewPanel({ r, label, onDone }: { r: any; label: string; onDone?: () => void }) {
   const [msg, setMsg] = useState(''); const [busy, run] = useBusy(); const cap = useRevisionCap(); const b = useBoard()
   const repoId = b.state.features.find((f) => f.id === b.state.tickets.find((t) => t.id === r.ticket_id)?.feature_id)?.repo_id, repo = b.state.repos.find((x) => x.id === repoId)
@@ -171,9 +172,9 @@ export function ReviewPanel({ r, label, onDone }: { r: any; label: string; onDon
     <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium text-amber-300" title={label}>{label}</span>{onDone && <button className="btn" title="Close (Esc)" onClick={onDone}>×</button>}</div>
     <div className="min-h-0 overflow-y-auto">
       {plain && <div className="mt-2"><div className="text-zinc-400">In plain words</div>{/* Bug 130: says it sums up the plan */}
-        <div className="mt-1 whitespace-pre-wrap break-words rounded-md bg-zinc-800/60 p-2 text-[13px] leading-5 text-zinc-100">{plain}</div></div>}
+        <div className="mt-1 rounded-md bg-zinc-800/60 p-2 text-[13px] leading-5 text-zinc-100"><Md text={plain} /></div></div>}
       <details className="mt-2" open={!plain}><summary className="cursor-pointer text-zinc-400">{plain ? 'Technical details' : 'The plan'}</summary>
-        <pre className="mt-1 whitespace-pre-wrap break-words rounded-md border border-zinc-800 bg-zinc-950 p-2 text-[11px] text-zinc-300">{rest}</pre></details></div>
+        <div className="mt-1 rounded-md border border-zinc-800 bg-zinc-950 p-2 text-[11px] text-zinc-300"><Md text={rest} /></div></details></div>
     {repo?.clearing_at ? <div className="mt-2 shrink-0 break-words text-xs text-zinc-400">{repo.name} is being cleared: its engineer was stopped, and this plan can't be approved
       or sent back now.</div> /* Bug 231: HQ refuses an answer, so no buttons */
       : <>{capped ? <div className="mt-2 text-xs text-rose-300">Sent back {r.revises_used} times already, the limit. Approve it, or cancel the ticket with ✕.</div>
@@ -209,7 +210,8 @@ function TpmInput({ v, chat, toggleChat }: { v: TpmView; chat: boolean; toggleCh
   const repo = v.repo, [text, setText] = useState(() => drafts.get(repo?.id) ?? ''); const [busy, run] = useBusy()
   const edit = (t: string) => { setText(t); if (repo) drafts.set(repo.id, t) }
   const off = !repo || !!repo.clearing_at
-  const send = () => { if (text.trim() && !off) run(() => api(`repos/${repo.id}/message`, { body: text }).then(() => { setText(''); drafts.delete(repo.id) })) }
+  const send = () => { if (text.trim() && !off) run(() => sendHere(() => api(`repos/${repo.id}/message`, { body: text }), (r) => r.message?.id)
+    .then(() => { setText(''); drafts.delete(repo.id) })) }
   return <div className="nodrag nopan nowheel mt-1.5 flex flex-col gap-1">
       <textarea id="hq-tpm-input" className="input h-11 resize-none text-xs!" disabled={off} value={text} onChange={(e) => edit(e.target.value)}
         placeholder={!repo ? 'Add a project first (top bar)' : repo.clearing_at ? `${repo.name} is being cleared` : v.empty ? 'What are you building? Say it in your own words'
@@ -232,7 +234,8 @@ export function FeatureNode({ id, data }: NodeProps<Node<{ view: FeatureView }>>
     <div className="flex h-4 items-center gap-1"><span className={`min-w-0 truncate ${v.done ? 'text-emerald-300' : 'font-semibold'}`} title={`${f.handle ?? ''} ${f.title}`}>
       {v.done ? '✓ ' : ''}{f.title}</span><span className="shrink-0 text-zinc-500">{f.handle}</span><span className="grow" />
       <AttChip id={id} items={v.att} />
-      {!v.done && f.status !== 'cancelled' && <CancelBtn tip="Cancel this feature…" title={`Cancel "${f.title}"?`} go="Cancel feature" path={`features/${f.id}/cancel`}
+      {!v.done && f.status !== 'cancelled' && !b.state.repos.find((r) => r.id === f.repo_id)?.clearing_at // HQ refuses it during a Clear (Bug 347)
+        && <CancelBtn tip="Cancel this feature…" title={`Cancel "${f.title}"?`} go="Cancel feature" path={`features/${f.id}/cancel`}
         body={featureCancelText(v, b.state)} />}</div>
     {v.done ? <><DoneLine v={v} /><Lines lines={v.lines.slice(1)} /></> : <Lines lines={v.lines} />}
     <AttPop id={id} open={pop === 'attention'} items={v.att} />
@@ -253,7 +256,7 @@ function TalkPanel({ v, onDone }: { v: TpmView; onDone: () => void }) {
   const b = useBoard(); const tpms = new Set(v.tpmIds)
   const talk = b.state.messages.filter((m) => (m.from_id === 'user' && tpms.has(m.to_id)) || (tpms.has(m.from_id) && m.to_id === 'user'))
     .sort((x, y) => x.created_at - y.created_at).slice(-12)
-  const last = talk.at(-1), { ref, onScroll, unseen, toEnd } = useAtEnd(last?.id, last?.from_id === 'user')
+  const last = talk.at(-1), { ref, onScroll, unseen, toEnd } = useAtEnd(last?.id, last?.from_id === 'user' && sentHere(last.id))
   return <div className="hq-pop flex max-h-[var(--pop-h,80vh)] w-full flex-col gap-2">
     <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium">You and the TPM · {v.repo?.name}</span>
       <button className="btn" title="Close (Esc)" onClick={onDone}>×</button></div>
@@ -267,16 +270,6 @@ function TalkPanel({ v, onDone }: { v: TpmView; onDone: () => void }) {
   </div>
 }
 
-/** What removing a ticket does (Bug 50), for HQ's dialog. */
-const removeText = (t: any, eng: Agent | null, waiting: string[]): string => `${t.key} · ${t.title}.${eng ? ` Its engineer (${eng.display_name ?? eng.id}) stops.` : ''}`
-  + ` It leaves the board for good; its branch is kept.`
-  + (waiting.length ? ` ${waiting.join(', ')} ${waiting.length === 1 ? 'waits' : 'wait'} on it: ask the TPM to rewire ${waiting.length === 1 ? 'it' : 'them'}.` : '')
-const featureCancelText = (v: FeatureView, s: any): string => {
-  const open = s.tickets.filter((t: any) => t.feature_id === v.f.id && t.status !== 'merged' && t.status !== 'cancelled')
-  const engs = open.filter((t: any) => s.agents.some((a: any) => a.id === t.assignee_agent_id && a.status !== 'exited')).length
-  return `${open.length ? `Its ${open.length} unmerged ticket${open.length === 1 ? ' is' : 's are'} cancelled${engs ? ` and ${engs} engineer${engs === 1 ? '' : 's'} stop` : ''}. ` : ''}`
-    + "Merged work stays, and the project's TPM keeps going."
-}
 export function TicketNode({ id, data }: NodeProps<Node<{ view: TicketView }>>) {
   const b = useBoard(); const v = data.view, t = v.t
   const pop = b.pop?.node === id ? b.pop.kind : null
@@ -294,7 +287,7 @@ export function TicketNode({ id, data }: NodeProps<Node<{ view: TicketView }>>) 
   return <Card id={id} border={v.border} ring={v.review && !v.hqPlan ? 'ring-2 ring-amber-400/60' : ''}><Anchors sides />
     <div className="flex h-4 items-center gap-1"><span className="min-w-0 truncate font-semibold" title={t.key}>{t.key}</span><span className="shrink-0 text-zinc-500">{t.size}</span><span className="grow" />
       <AttChip id={id} items={v.att} /><FreshBtn a={v.eng} />
-      {t.status !== 'merged' && t.status !== 'cancelled' && <CancelBtn tip={`Remove ${t.key}…`} title={`Remove ${t.key}?`} go="Remove" path={`tickets/${t.id}/cancel`}
+      {t.status !== 'merged' && t.status !== 'cancelled' && !v.clearing && <CancelBtn tip={`Remove ${t.key}…`} title={`Remove ${t.key}?`} go="Remove" path={`tickets/${t.id}/cancel`}
         body={removeText(t, v.eng, waitingOn(b.state, t))} />}<Pill s={t.status} label={ticketLabel(t, v.hqPlan, v.clearing)} className="py-0! text-[10px]! leading-4!" /></div>
     <div className={v.titleRows === 2 ? 'line-clamp-2 h-8 break-words' : 'h-4 truncate'} title={t.title}>{t.title}</div>
     {v.crit && <button className="nopan block h-4 max-w-full truncate text-left text-indigo-300 hover:underline" title={`${v.crit}. Click to read them: they say what "done" means for ${t.key}.`}
@@ -305,6 +298,7 @@ export function TicketNode({ id, data }: NodeProps<Node<{ view: TicketView }>>) 
       label={`Plan R-${v.review.round} · ${t.key}${eng ? ` · ${eng.display_name ?? eng.id}` : ''}`} /></BoardPop>}
     {pop === 'question' && v.question && <BoardPop id={id} want={380}><QuestionPanel x={v.question} v={v} onDone={() => b.setPop(null)} /></BoardPop>}
     {pop === 'criteria' && v.crit && <BoardPop id={id} want={420}><CriteriaPanel t={t} onDone={() => b.setPop(null)} /></BoardPop>}
+    {pop === 'check' && checkOf(t) && <BoardPop id={id} want={480}><CheckPanel v={v} onDone={() => b.setPop(null)} /></BoardPop>}
     {attPop}
   </Card>
 }
@@ -335,8 +329,59 @@ function TicketAct({ a, v, id }: { a: Act; v: TicketView; id: string }) {
   if (a.kind === 'approve') return <ActBtn primary label="Approve" busyLabel="Approving…" title="Approve the plan without opening it" run={() => answerReview(v.review, 'approve')} />
   if (a.kind === 'try') return <TryAct on={a.on} t={v.t} />
   if (a.kind === 'do-rest') return <DoRestBtn repoId={b.repo?.id} />
+  if (a.kind === 'check') return <CheckAct v={v} id={id} />
   if (a.kind === 'auto-retry') return <ActBtn primary label="Try again" busyLabel="Trying…" title="Auto mode gives this ticket another go" run={() => api(`tickets/${v.t.id}/auto-retry`, {})} />
   return <MergeAct a={a} t={v.t} />
+}
+/** The colour of "Have HQ test this" as its check stands: green all passed, red something failed, amber HQ couldn't finish, grey out of date. */
+const CHECK_TONE: Record<CheckTone, string> = { plain: '', green: 'border-emerald-500/60! bg-emerald-600/60! hover:bg-emerald-500/70! text-white!',
+  red: 'border-rose-500/60! bg-rose-600/60! hover:bg-rose-500/70! text-white!', amber: 'border-amber-500/60! bg-amber-600/50! hover:bg-amber-500/60! text-white!',
+  grey: 'text-zinc-400!' }
+/** "Have HQ test this" (backend hqcheck.ts): starts HQ's check of this finished ticket; once there is one, it says how it's going or how it went, in its
+ *  colour, and opens the results. */
+function CheckAct({ v, id }: { v: TicketView; id: string }) {
+  const b = useBoard(), btn = checkButton(v.t, true), open = b.pop?.node === id && b.pop.kind === 'check'
+  if (!btn) return null
+  if (btn.start) return <ActBtn label={btn.label} busyLabel="Starting…" title={btn.tip} run={() => api(`tickets/${v.t.id}/check`, {})} />
+  return <button className={`btn-sm nopan inline-flex items-center gap-1 ${CHECK_TONE[btn.tone]}`} title={btn.tip} aria-expanded={open}
+    onClick={() => open ? b.setPop(null) : b.focus(id, 'check')}>{btn.label === 'Testing…' && <LiveDot on />}{btn.label}</button>
+}
+const STEP_MARK = { pass: ['✓', 'text-emerald-400'], fail: ['✗', 'text-rose-400'], skipped: ['–', 'text-zinc-500'], running: ['●', 'text-emerald-300 animate-pulse'],
+  waiting: ['·', 'text-zinc-600'], not_run: ['·', 'text-zinc-600'] } as const
+const LINE_TONE = { ok: 'text-emerald-300/90', bad: 'text-rose-300', plain: 'text-zinc-300' } as const
+/** HQ's check of a ticket: how it went (or how far it has got), each check in order with what it saw, and what the user can do next: stop it, test again, send
+ *  what failed to the engineer, merge. Closes with × or Esc. */
+function CheckPanel({ v, onDone }: { v: TicketView; onDone: () => void }) {
+  const t = v.t, c = checkOf(t)!, old = outOfDate(t, c), going = c.state === 'running'
+  const head = going ? 'text-zinc-200' : c.state === 'pass' && !old ? 'text-emerald-300' : c.state === 'fail' && !old ? 'text-rose-300' : 'text-amber-300'
+  const finished = t.status === 'pr_ready' || t.status === 'pr_open', merge = v.acts.find((a) => a.kind === 'merge')
+  return <div className="hq-pop flex max-h-[var(--pop-h,70vh)] w-full flex-col gap-2">
+    <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium text-zinc-200" title={`${t.key}: ${t.title}`}>{t.key}: HQ's test</span>
+      <button className="btn" title="Close (Esc)" onClick={onDone}>×</button></div>
+    <div><div className={`break-words font-medium ${head}`}>{checkHeadline(c)}</div>
+      <div className="break-words text-xs text-zinc-400">{checkFacts(c)}{going && <> · going for <Elapsed since={c.started_at} /></>}</div>
+      {old && <div className="mt-1 break-words text-xs text-amber-300">
+        {t.key}'s engineer finished it again after this test, so these results are about older code. Test again to check what it has now.</div>}
+      {c.sent_at && <div className="mt-1 text-xs text-sky-300">Sent to its engineer at {new Date(c.sent_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.</div>}</div>
+    <ol className="min-h-0 space-y-1.5 overflow-y-auto text-xs leading-5">{allSteps(c).map((s) => {
+      const [mark, tone] = STEP_MARK[s.state]
+      return <li key={s.kind} className="break-words"><span className={`inline-block w-4 font-semibold ${tone}`}>{mark}</span><span className="font-semibold text-zinc-200">{STEP_NAME[s.kind]}</span>
+        <span className="text-zinc-400"> · </span><span className={s.state === 'fail' ? 'text-rose-200' : 'text-zinc-300'}>{s.words}</span>
+        {'lines' in s && s.lines?.length ? <ul className="ml-4 mt-0.5 space-y-0.5">{s.lines.map((l, i) => <li key={i} className={LINE_TONE[l.tone]}>{l.text}</li>)}</ul> : null}
+        {'output' in s && s.output ? <details className="ml-4 mt-0.5"><summary className="cursor-pointer text-indigo-300">What it printed ›</summary>
+          <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-zinc-950/70 p-1.5 text-[11px] leading-4 text-zinc-300">{s.output}</pre></details> : null}
+      </li>
+    })}</ol>
+    <div className="flex flex-wrap gap-1">
+      {going ? <ActBtn label="Stop" busyLabel="Stopping…" title="Stop HQ's test now. Nothing is kept from it but what it has already said." run={() => api(`tickets/${t.id}/check-stop`, {})} />
+        : <>
+          {canSend(t, c) && <ActBtn primary label="Send to engineer" busyLabel="Sending…" run={() => api(`tickets/${t.id}/check-send`, {})}
+            title={c.send?.kind === 'conflicts' ? `Its engineer merges ${c.base} in and fixes the conflicts (as Fix conflicts does)`
+              : 'What failed goes to its engineer to fix (a fresh one starts if it has stopped). It calls open_pr again when done; then test it again.'} />}
+          {finished && <ActBtn label="Test again" busyLabel="Starting…" title="HQ tests the ticket as it is now, from the start" run={() => api(`tickets/${t.id}/check`, {})} />}
+          {merge && <MergeAct a={merge} t={t} />}</>}
+    </div>
+  </div>
 }
 /** The question a ticket's engineer asked (Bug 129): whom, when, and all of it. One for the user has a box to answer it: the answer goes to the
  *  engineer and takes the ticket back to work. One for the TPM or another agent is theirs to answer; the user can still write to the engineer
@@ -363,11 +408,8 @@ function TryAct({ on, t }: { on: boolean; t: any }) {
   const b = useBoard(), repoId = b.state.features.find((f) => f.id === t.feature_id)?.repo_id
   if (!repoId) return null
   if (on) return <ActBtn label="Back to main" busyLabel="Switching…" title="Show main in the preview again" run={() => api(`previews/${repoId}/start`, { ticket: null })} />
-  const go = async () => {
-    if (!(await stopOthers(b.state, repoId, { title: `Try ${t.key}?`, go: 'Try it' }))) return
-    window.dispatchEvent(new Event(OPEN_PREVIEW)); await api(`previews/${repoId}/start`, { ticket: t.id })
-  }
-  return <ActBtn label="Try it" busyLabel="Starting…" run={go}
+  const go = async () => { window.dispatchEvent(new Event(OPEN_PREVIEW)); await api(`previews/${repoId}/start`, { ticket: t.id }) }
+  return <ActBtn label="Try it" busyLabel="Starting…" run={go} ask={() => stopOthers(b.state, repoId, { title: `Try ${t.key}?`, go: 'Try it' })}
     title={`Run ${t.key}'s version in the preview before you merge it. It uses a copy of your data, so nothing you do while trying changes main.`} />
 }
 /** Merge into main after an are-you-sure (local repos: HQ merges; GitHub: HQ opens and merges the PR, Bug 45; either refuses and says
@@ -376,8 +418,8 @@ export function MergeAct({ a, t }: { a: Act; t: any }) {
   const { state } = useBoard()
   if (a.kind === 'fix') return <FixAct t={t} why={a.why} base={ticketBase(state, t.id)} />
   if (a.kind === 'merge') {
-    const go = async () => { if (await mergeConfirm(t, a, state.defaults.github_account ?? 'the HQ account')) await api(`tickets/${t.id}/merge`, {}) }
-    return <ActBtn primary label={`Merge into ${a.into}`} busyLabel="Merging…" run={go} title={a.github
+    return <ActBtn primary label={`Merge into ${a.into}`} busyLabel="Merging…" run={() => api(`tickets/${t.id}/merge`, {})}
+      ask={() => mergeConfirm(t, a, state.defaults.github_account ?? 'the HQ account')} title={a.github
       ? `HQ ${a.pr ? `merges PR #${a.pr}` : 'opens a PR and merges it'} on GitHub. If GitHub won't, or ${t.key} conflicts with ${a.into}, nothing changes and HQ tells you why.`
       : `HQ merges ${t.branch} into ${a.into} in your checkout. If that isn't safe it changes nothing and tells you why.`} />
   }

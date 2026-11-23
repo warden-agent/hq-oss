@@ -4,8 +4,21 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
-import { listenersUnder, listenPorts, pgidOf, pidsUnder, whoAnswers, whose } from './procs.ts'
+import { execFileSync, spawn } from 'node:child_process'
+import { listenersUnder, listenPorts, lstartMs, pgidOf, pidsUnder, psEnv, whoAnswers, whose } from './procs.ts'
+
+test('lstartMs (Bug 319): ps\'s date for a process, in UTC; anything else is no date', () => {
+  const f = (s: string) => lstartMs(s.trim().split(/\s+/))
+  assert.equal(f('Fri Nov  6 09:05:07 2026'), Date.UTC(2026, 10, 6, 9, 5, 7)); assert.equal(f('Thu Jan 1 00:00:00 1970'), 0)
+  for (const bad of ['-', 'ven.  6 nov 09:05:07 2026', 'Fri Nov 6 09:05 2026', 'Fri Nov 6 09:05:07', 'Fri Nev 6 09:05:07 2026']) assert.ok(Number.isNaN(f(bad)), bad)
+  // this machine's own ps (a Mac, Linux on CI), as HQ asks it: the date this process began, whatever language or time zone the user has
+  const was = { LANG: process.env.LANG, LC_TIME: process.env.LC_TIME, TZ: process.env.TZ }
+  Object.assign(process.env, { LANG: 'fr_FR.UTF-8', LC_TIME: 'fr_FR.UTF-8', TZ: 'Pacific/Chatham' }); let env: NodeJS.ProcessEnv
+  try { env = psEnv() } finally { for (const [k, v] of Object.entries(was)) { if (v === undefined) delete process.env[k]; else process.env[k] = v } }
+  const said = execFileSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { env }).toString(), at = f(said)
+  const began = Date.now() - process.uptime() * 1000 // node's own clock starts a little after the process did
+  assert.ok(at <= began + 50 && at > began - 3000, `began ${began}, ps says ${said.trim()} = ${at}`)
+})
 
 test('pidsUnder: processes working in the folder or below it, each once; a sibling with the same prefix is not inside', () => {
   const listing = ['p10', 'fcwd', 'n/repo/.claude/worktrees/launch-1', 'p11', 'fcwd', 'n/repo/.claude/worktrees/launch-1/server',

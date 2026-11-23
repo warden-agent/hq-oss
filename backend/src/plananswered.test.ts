@@ -4,7 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { register } from 'node:module'
-import { agentPill, menuActivity, planAnswered, shownStatus } from '../../frontend/src/api.ts'
+import { agentPill, menuActivity, noteLine, planAnswered, shownStatus } from '../../frontend/src/api.ts'
 
 register(`data:text/javascript,${encodeURIComponent(`export async function resolve(s, c, next) {
   if (/^\\.\\.?\\//.test(s) && !/\\.[a-z]+$/.test(s)) { try { return await next(s + '.ts', c) } catch { /* not a .ts file */ } }
@@ -50,4 +50,29 @@ test('what it must not catch: an open review says whom it waits on as before, in
   assert.equal(seen(state(false, [review(2, 'open'), review(1, 'answered', 'revise')], 'plan_review')).box, 'Plan R-2 waiting for you')
   const working = state(false, [review(1, 'answered', 'revise')]); working.agents[0].status = 'working' // moved on: its box says what it does
   assert.equal(box(working).lines[0].text, 'engineer · working')
+})
+
+// Bug 287: a Clear (or a Fresh start) in that gap asks the engineer for its handoff note. Its box said "fresh start · writing its handoff note…" under
+// "engineer · its plan was sent back · it is revising it", and its Agents card said only "revising plan" / "… it is revising it". Now the box, the pill and
+// the card all say it is at work on its note (noteLine, one function for both), and its next step in plan mode doesn't read "planning" either.
+test('Bug 287: writing its handoff note in the gap after a send-back: box, pill and Agents card say so, and nothing says revising', () => {
+  for (const auto of [true, false]) {
+    const s = state(auto, [review(1, 'answered', 'revise')]); Object.assign(s.agents[0], { fresh_start_at: 5, in_plan_mode: 1 })
+    const note = 'fresh start · writing its handoff note…'
+    assert.deepEqual(box(s).lines.map((l: any) => l.text), ['engineer · working', note], `auto ${auto}`)
+    assert.deepEqual([agentPill(s.agents[0], s), menuActivity(s.agents[0], s), noteLine(s.agents[0])], ['working', null, note]) // the card: pill, line, note line
+    assert.deepEqual(colour(s), ['#10b981', 'working'])
+    s.agents[0].status = 'working'; s.agents[0].activity = 'Editing NOTE.md' // its next step: still in plan mode, writing the note
+    assert.deepEqual(box(s).lines.map((l: any) => l.text), ['engineer · working', note, 'Editing NOTE.md'])
+    assert.deepEqual([agentPill(s.agents[0], s), menuActivity(s.agents[0], s), noteLine(s.agents[0])], ['working', 'Editing NOTE.md', note])
+  }
+})
+
+test('Bug 287, what it must not catch: an open review still says whom it waits on; no note asked, planning reads planning; an ended agent has no note line', () => {
+  const s = state(false, [review(1, 'open')], 'plan_review'); s.agents[0].fresh_start_at = 5
+  assert.deepEqual(seen(s), { box: 'Plan R-1 waiting for you', pill: 'plan for you', menu: 'Plan R-1 waiting for you' })
+  const plan = state(false, [review(1, 'answered', 'revise')]); Object.assign(plan.agents[0], { status: 'working', in_plan_mode: 1 })
+  assert.equal(box(plan).lines[0].text, 'engineer · planning')
+  assert.equal(noteLine(plan.agents[0]), null)
+  assert.equal(noteLine({ ...plan.agents[0], status: 'exited', fresh_start_at: 5 }), null)
 })

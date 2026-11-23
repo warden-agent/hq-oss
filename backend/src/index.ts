@@ -3,8 +3,8 @@ import path from 'node:path'
 import { PATHS, PORTS, uiToken } from './config.ts'
 import { migrate } from './db.ts'
 import { recoverAgents, liveAgents } from './agents.ts'
-import { tellIfHqWasAway } from './delivery.ts'
-import { rebuildHelpers, startHooksServer } from './hooks.ts'
+import { tellIfHqWasAway, typeCutShort } from './delivery.ts'
+import { lookAtTurnsAtStart, rebuildHelpers, rebuildTurns, startHooksServer } from './hooks.ts'
 import { startMcpServer } from './mcp.ts'
 import { startUiServer } from './ui.ts'
 import { startStuckLoop } from './stuck.ts'
@@ -14,7 +14,7 @@ import { startMergeWatcher } from './mergewatch.ts'
 import { slotBasesNow, sweepWorktrees } from './slots.ts'
 import { startListeners } from './listeners.ts'
 import { recoverPreviews, resumeRestarts } from './preview.ts'
-import { recoverHelpers } from './launchhelper.ts'
+import { recoverHelpers, resumeTries } from './launchhelper.ts'
 import { recoverSetupHelpers } from './testsetup.ts'
 import { repos } from './records.ts'
 import { emit } from './events.ts'
@@ -29,6 +29,7 @@ import { sweepUiTmp } from './uitester.ts'
 import { plugIn } from './loopinputs.ts'
 import { realParts } from './loopparts.ts'
 import { forgetChecking } from './plancheck.ts'
+import { endLeftChecks, watchChecks } from './hqcheck.ts'
 import { readBackCommands, startLeftoverSweeps, sweepAgentTmp, sweepNow } from './leftovers.ts'
 import { checkClaude, claudeInfo, ensureClaude, startClaudeCheck } from './claudecheck.ts'
 import { saveTestCmds } from './heavy.ts'
@@ -59,6 +60,7 @@ async function main(): Promise<void> {
   migrate(); ensureAssets()
   plugIn(realParts) // the findings loop reads the real recordings, test setup and UI tester run: before the auto loop can end a run
   forgetChecking() // a plan check under way when the backend last stopped went with it
+  endLeftChecks(); watchChecks() // a ticket check under way went with the last backend too (its button says so); from now on, what ends one by itself
   saveTestCmds() // Bug 112: for commands saved before this file existed, and projects removed since it was written
   try { await ensureClaude() } catch (e) { console.error((e as Error).message); process.exit(1) } // no agent could start
   // Bug 97: which Claude Code the agents run, and whether HQ was checked on it, before the page or a launch can ask. A look that fails stops nothing
@@ -78,12 +80,19 @@ async function main(): Promise<void> {
   await recoverSetupHelpers(repos()).catch((e) => console.error('test setup helper recovery failed', e))
   startBgRuns() // before the first sweep and any hook: it reads back what agents wait on in the background (Bug 96)
   rebuildHelpers() // and the helpers they started in the background, after it: a helper's line comes first (Bug 232)
+  rebuildTurns() // Bug 281: each agent's last turn start, prompt and Stop, so a quick Escape on a turn from before the restart still ends it
+  // Bug 268: a turn that ended while HQ was down; after the helpers and runs, which keep an agent working
+  lookAtTurnsAtStart().catch((e) => emit({ agentId: null, source: 'system', kind: 'turn.look_error', payload: { error: String(e) } }))
   readBackCommands() // what agents' commands are still running, so the sweep spares what they started (Bug 145)
   await sweepNow() // what agents' commands left running while HQ was down (Bug 75)
   await sweepAgentTmp() // and the temp folders of agents that ended meanwhile (Bug 81)
+  resumeTries() // Bug 351: a Launch helper's first run of its OK'd steps, picked up again or started again (before resumeRestarts: it may take one)
   resumeRestarts() // an app the last backend was restarting starts again, now that the look is done (Bug 215)
   startListeners()
   await listeningOrStop({ hooks: startHooksServer(), mcp: startMcpServer(), ui: startUiServer() }) // never half-started (Bug 118)
+  // Bug 296: an urgent message or a fresh start's request the last backend was typing when it went down. Once the servers listen: the prompt it
+  // types starts a turn, whose hooks must reach HQ (typed before, they failed with ECONNREFUSED on the screen). In the background: an Escape waits 1.5 s
+  void typeCutShort().catch((e) => emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
   startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
   startLeftoverSweeps()
   startClaudeCheck()

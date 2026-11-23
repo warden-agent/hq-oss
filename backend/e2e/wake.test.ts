@@ -30,7 +30,7 @@ async function drain(agentId: string): Promise<void> {
 /** Starts a waiting `next` and returns once HQ holds it: the request stamps the agent's mod_seen_at when it starts waiting. */
 async function waiting(agentId: string, wait: number): Promise<{ poll: Promise<any> }> {
   const seen = async () => (await hq.state()).agents.find((a: any) => a.id === agentId)?.mod_seen_at ?? 0
-  const before = await seen(); await new Promise((r) => setTimeout(r, 5)) // a later millisecond than `before`
+  const before = await seen(); await new Promise((r) => setTimeout(r, 5)) // real-time: a later millisecond than `before`
   const poll = hq.modNext(agentId, wait)
   await waitFor('the mod waiting', async () => (await seen()) > before)
   return { poll }

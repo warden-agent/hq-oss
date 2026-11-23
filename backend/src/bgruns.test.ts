@@ -4,11 +4,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { execFileSync, spawn } from 'node:child_process'
 
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-bgruns-')))
 process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_AGENT_TMP = path.join(tmp, 'a-')
 const { migrate, run, setSetting } = await import('./db.ts'); migrate()
-const { addRun, clockMs, endRuns, groupOf, hasRuns, judge, outputBytes, parseRows, rebuildRuns, runsOf, waitingText, watchedTask } = await import('./bgruns.ts')
+const { addRun, clockMs, endRuns, groupOf, hasRuns, judge, outputBytes, parseRows, ps, rebuildRuns, runsOf, waitingText, watchedTask } = await import('./bgruns.ts')
 const { bus, emit } = await import('./events.ts')
 const { release, startTurns, take, turns } = await import('./heavy.ts')
 after(() => fs.rmSync(tmp, { recursive: true, force: true }))
@@ -28,7 +29,22 @@ test('what HQ watches: a command that went to the background without being asked
 
 test('ps times: elapsed and CPU, on a Mac and on Linux', () => {
   assert.equal(clockMs('0:00.06'), 60); assert.equal(clockMs('123:45.67'), 7_425_670); assert.equal(clockMs('01:02:03'), 3_723_000); assert.equal(clockMs('2-00:00:01'), 172_801_000)
-  assert.deepEqual(parseRows(' 91492 90201 91492   00:41   0:00.06\nbad\n', 100_000), [{ pid: 91492, ppid: 90201, pgid: 91492, start: 59_000, cpu: 60 }])
+  const row = { pid: 91492, ppid: 90201, pgid: 91492, start: Date.UTC(2026, 10, 6, 9, 5, 7), cpu: 60 }
+  for (const t of [100_000, 102_800]) assert.deepEqual(parseRows(' 91492 90201 91492   0:00.06 Fri Nov  6 09:05:07 2026   \nbad\n', t), [row]) // Bug 319: read later, the same
+  assert.deepEqual(parseRows('7 1 7 0:00.00 -\n', 100_000), [{ pid: 7, ppid: 1, pgid: 7, start: 100_000, cpu: 0 }], 'no date given: counted as new')
+})
+
+test('Bug 319, for real: a run\'s process is dated when it began, however long ps takes to answer', async () => {
+  const bin = fs.mkdtempSync(path.join(tmp, 'slow-ps-')), real = execFileSync('sh', ['-c', 'command -v ps']).toString().trim(), was = process.env.PATH
+  fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/sh\nout=$('${real}' "$@"); s=$?; sleep 2; printf '%s\\n' "$out"; exit $s\n`, { mode: 0o755 })
+  const t0 = Date.now(), p = spawn('sleep', ['30'], { stdio: 'ignore' }), t1 = Date.now()
+  try {
+    process.env.PATH = `${bin}:${was}`
+    const asked = Date.now(), rows = await ps(), took = Date.now() - asked
+    assert.ok(took >= 2000, `the stand-in ps took ${took} ms`)
+    const start = rows.find((x) => x.pid === p.pid)?.start ?? NaN
+    assert.ok(start <= t1 && start > t0 - 2000, `began between ${t0} and ${t1}, dated ${start} (${start - t1} ms after)`)
+  } finally { process.env.PATH = was; p.kill('SIGKILL') }
 })
 
 test("a run's process: the group Claude Code started for it, under the agent's own Claude Code, by start time, with the CPU of all it runs", () => {

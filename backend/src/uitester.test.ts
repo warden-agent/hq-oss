@@ -216,7 +216,7 @@ test('the browser: Playwright MCP in its own sandbox reaches the app and nothing
     const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-uitester-project-'))); fs.writeFileSync(path.join(project, 'secret.js'), 'const key = 1')
     const b = fs.mkdtempSync('/private/tmp/hq-ut-test-'); for (const d of ['empty', 'home', 'out']) fs.mkdirSync(path.join(b, d))
     const cmd = _forTests.browserServer(b, port, project, headlessShell()!)
-    const client = new Client({ name: 'hq-test', version: '0.0.1' }); await client.connect(new StdioClientTransport({ command: cmd.command, args: cmd.args, stderr: 'pipe' }))
+    let client = new Client({ name: 'hq-test', version: '0.0.1' }); await client.connect(new StdioClientTransport({ command: cmd.command, args: cmd.args, stderr: 'pipe' }))
     const call = async (name: string, args: Record<string, unknown>) => {
       const r = await client.callTool({ name, arguments: args }) as { content: { type: string; text?: string }[]; isError?: boolean }
       return { text: r.content.map((c) => c.text ?? `[${c.type}]`).join('\n'), isError: !!r.isError }
@@ -232,7 +232,9 @@ test('the browser: Playwright MCP in its own sandbox reaches the app and nothing
       assert.match((await call('browser_navigate', { url: `file://${project}/secret.js` })).text, /Access to "file:" protocol is blocked/)
       assert.deepEqual(fs.readdirSync(path.join(b, 'empty')), [], 'the folder it starts in stays empty')
       // Playwright's list of origins is no boundary (its own docs say so): without it, HQ's sandbox still lets the browser reach the app's port only
-      await client.close()
+      // Bug 310: a new client. close() can return before the old browser has exited (the SDK kills it after 4 s and doesn't wait), and until it
+      // has, the old client still holds its transport: connecting it again threw "Already connected to a transport" on a busy machine.
+      await client.close(); client = new Client({ name: 'hq-test', version: '0.0.1' })
       const bare = { ...cmd, args: cmd.args.map((a) => a.replace(/ '--allowed-origins' '[^']*'/, '')) }; assert.notDeepEqual(bare.args, cmd.args)
       await client.connect(new StdioClientTransport({ command: bare.command, args: bare.args, stderr: 'pipe' }))
       assert.match((await call('browser_navigate', { url: `http://localhost:${port}/` })).text, /Page Title: Library/)

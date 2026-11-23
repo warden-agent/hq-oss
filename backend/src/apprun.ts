@@ -7,7 +7,8 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { shq } from './util.ts'
-import { lockedInstalls, npmInstalls, type LockedInstall, type NpmInstall } from './npminstalls.ts'
+import { cantListen } from './ports.ts'
+import { lockedInstalls, npmInstalls, uvVenvs, type LockedInstall, type NpmInstall } from './npminstalls.ts'
 
 /** The ports HQ hands out to previews, from HQ_PREVIEW_PORTS ("3090-3099", the default; engineers get ports of their own, slotports.ts).
  *  A test HQ gets a range of its own (Bug 44): two HQs that share one can both pick the same free port before either app is up. */
@@ -48,9 +49,55 @@ export function installStep(repoPath: string): 'npm ci' | typeof NO_LOCK_INSTALL
   const at = (f: string) => { try { return fs.statSync(path.join(repoPath, f)).mtimeMs } catch { return null } }
   const pkg = at('package.json')
   if (pkg === null || !listsPackages(path.join(repoPath, 'package.json'))) return null
-  const lock = at('package-lock.json'), record = at('node_modules/.package-lock.json')
+  const lock = at('package-lock.json') ?? at('npm-shrinkwrap.json'), record = at('node_modules/.package-lock.json') // npm ci follows either (Bug 343)
   if (lock === null) return at('node_modules') === null || (record !== null && record < pkg) ? NO_LOCK_INSTALL : null
   return record === null || record < lock ? 'npm ci' : null
+}
+
+/** Is `tool` a program on this PATH (HQ's own, which the app's run inherits)? */
+export function onPath(tool: string, PATH: string = process.env.PATH ?? ''): boolean {
+  return PATH.split(path.delimiter).filter(Boolean).some((d) => {
+    try { const f = path.join(d, tool); fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile() } catch { return false }
+  })
+}
+type NodeTool = 'npm' | 'yarn' | 'pnpm'
+/** Bug 343: the package manager a Node project uses: the one its package.json's `packageManager` names (what Corepack follows), else the
+ *  one whose lockfile it has (npm's first, as before; then yarn.lock, pnpm-lock.yaml), else npm. `lock`: that tool's lockfile, if there is
+ *  one; `why`: how HQ can tell, in the user's words; `major`: the version `packageManager` names. */
+export function packageManager(repoPath: string): { tool: NodeTool; lock: string | null; why: string; major: number | null } {
+  const lockOf = (t: NodeTool) => LOCKS[t].files.find((f) => fs.existsSync(path.join(repoPath, f))) ?? null
+  let named: unknown; try { named = JSON.parse(fs.readFileSync(path.join(repoPath, 'package.json'), 'utf8'))?.packageManager } catch { /* none */ }
+  const m = typeof named === 'string' ? /^(npm|yarn|pnpm)@(\d+)/.exec(named) : null
+  if (m) {
+    const tool = m[1] as NodeTool
+    return { tool, lock: lockOf(tool), why: `its package.json names ${String(named).split('+')[0]} as its packageManager`, major: Number(m[2]) }
+  }
+  for (const tool of ['npm', 'yarn', 'pnpm'] as const) { const lock = lockOf(tool); if (lock) return { tool, lock, why: `it has a ${lock}`, major: null } }
+  return { tool: 'npm', lock: null, why: 'it has no lockfile', major: null }
+}
+/** Bug 343: what HQ does about the packages before the user's own ⚙ command: an install by the project's own package manager (npm's as
+ *  installStep says; Yarn's and pnpm's follow their lockfile, or write none when there is none, and run again when it changes or what they
+ *  made is gone, as Claude's steps do), nothing, or `stop`: why HQ can't install them (the tool isn't installed; Yarn 2+ with no yarn.lock
+ *  would write one), in words for the user (plain text: the App tab shows it as it is). It never falls back to npm, which ignores yarn.lock and pnpm-lock.yaml. A project whose packages
+ *  are installed already (node_modules, .pnp.cjs) runs as it is when HQ can't install them, as before. */
+export function ownInstall(repoPath: string, has: (tool: string) => boolean = onPath): { install?: string; install_when?: string; stop?: string } {
+  const pkg = path.join(repoPath, 'package.json'); if (!fs.existsSync(pkg) || !listsPackages(pkg)) return {}
+  const pm = packageManager(repoPath)
+  if (pm.tool === 'npm') { const install = installStep(repoPath); return install ? { install } : {} }
+  const berry = pm.tool === 'yarn' && (pm.major !== null ? pm.major >= 2 : yarnBerry(repoPath))
+  const install = pm.tool === 'pnpm' ? `pnpm install ${pm.lock ? '--frozen-lockfile' : '--no-lockfile'}`
+    : pm.lock ? `yarn install ${berry ? '--immutable' : '--frozen-lockfile'}` : berry ? null : 'yarn install --pure-lockfile'
+  if (install && has(pm.tool)) return { install, install_when: pm.lock ?? 'package.json' }
+  const made = install ? installOutputs(install, repoPath) : ['node_modules', '.pnp.cjs'].filter((f) => fs.existsSync(path.join(repoPath, f)))
+  if (made.length && made.every((f) => fs.existsSync(path.resolve(repoPath, f)))) return {}
+  const name = pm.tool === 'yarn' ? 'Yarn' : 'pnpm'
+  if (!install) {
+    return { stop: `it uses Yarn ${pm.major ?? 2} (${pm.why}) and has no yarn.lock. Yarn 2 and later always write one, and HQ doesn't add files to `
+      + 'your project, so it installed nothing. Run yarn install in the project yourself (and commit the yarn.lock it writes), then press Start again.' }
+  }
+  return { stop: `it uses ${name} (${pm.why}), and ${pm.tool} isn't installed on this computer (HQ looked in its PATH), so HQ can't install its packages. `
+    + `HQ won't install them with npm instead: ${pm.lock ? `npm ignores the ${pm.lock} and could install other versions` : `the project asks for ${name}`}. `
+    + `Install ${name}, then press Start again.` }
 }
 
 /** One part of an app: a folder of the repo, how to install it (optional) and run it, and its port. `auto`: HQ picks a free
@@ -150,14 +197,15 @@ function placed(n: { text: string; dir: string | null }, dirPath: string, root: 
 /** ` at uv.lock, which this folder follows` when the lockfile is its workspace root's, not the folder's own (Bugs 156, 240). */
 const above = (lock: string, at: string, root: string) => path.dirname(lock) !== at ? ` at ${path.relative(root, lock)}, which this folder follows` : ''
 /** A uv, yarn or pnpm install that would rewrite the lockfile it follows (its own, or its workspace root's, Bug 240), or write
- *  one where there is none (Bug 239). */
+ *  one where there is none (Bug 239). A `uv run` too: with no `--locked`/`--frozen` it rewrites an out-of-date uv.lock (Bug 262). */
 function lockedProblem(n: LockedInstall, dirPath: string, root: string, installWhen?: string): string | null {
   const { at, where } = placed(n, dirPath, root)
-  if (!at) return n.frozen || n.noLock || n.run ? null // writes nothing wherever it runs, or a run HQ can't follow
+  if (!at) return n.frozen || n.noLock ? null // writes nothing wherever it runs (a plain `uv run` rewrites an out-of-date uv.lock, Bug 262)
     : `HQ can't tell which folder of the repo \`${n.text}\` runs in: use ${n.fix}, or give the part that folder as its dir`
   if (!fs.existsSync(at)) return `${where}that folder doesn't exist`
   const { lock, project } = lockOf(n.tool, at, root)
-  if (lock) return n.frozen || n.noLock || n.run ? null : `${where}use ${n.fix} (there is a ${n.lock}${above(lock, at, root)})`
+  if (lock) return n.frozen || n.noLock ? null // Bug 262: a plain `uv run` follows a uv.lock only while it's up to date, and rewrites it after a pyproject.toml change
+    : `${where}use ${n.fix} (there is a ${n.lock}${above(lock, at, root)}${n.run ? `, and \`${n.text}\` rewrites it when it is out of date` : ''})`
   if (n.tool === 'uv' && !project) return null // no pyproject.toml: uv makes no project and no uv.lock (a plain script)
   if (!n.noLock) return `${where}there is no ${n.lock}`
     + `${n.frozen ? ` for \`${n.text}\` to follow` : `, and \`${n.text}\` would write one into the user's project`}: use ${n.bare}`
@@ -196,6 +244,26 @@ function partProblem(p: RecipePart, dir: string, root: string): Refusal | null {
   return { why: `run has an install that would run on every start (\`${run.text}\`; put installs in install): ${run.why}`, lock: run.lock }
 }
 
+/** What an install leaves in the project besides its lockfile (Bug 263): node_modules, and Yarn 2+'s Plug'n'Play files, install
+ *  state and cache (Yarn 4.5.3 writes `.pnp.cjs` and `.yarn/install-state.gz` even with `--immutable`). uv's .venv ignores itself. */
+const LEFTOVERS = { npm: ['node_modules/'], pnpm: ['node_modules/'],
+  yarn: ['node_modules/', '.pnp.cjs', '.pnp.loader.mjs', '.pnp.data.json', '.yarn/install-state.gz', '.yarn/cache/', '.yarn/unplugged/', '.yarn/__virtual__/'] }
+/** Where the installs in a recipe's steps (install and run) leave those files, relative to the checkout `root`: the folder each runs in,
+ *  and the project whose lockfile it follows (a Yarn workspace's .pnp.cjs is at its root). A folder HQ can't follow is left out. */
+export function installLeftovers(r: Recipe, root: string): string[] {
+  const out = new Set<string>()
+  const add = (dirs: (string | null)[], names: string[]) => { for (const d of dirs) if (d) for (const f of names) out.add(path.join(path.relative(root, d), f).split(path.sep).join('/')) }
+  for (const p of r.parts) for (const cmd of [p.install, p.run]) {
+    if (!cmd) continue
+    const dirPath = path.join(root, p.dir), lockDir = (lock: string | null) => lock && path.dirname(lock)
+    for (const n of npmInstalls(cmd)) { const { at } = placed(n, dirPath, root); if (at) add([at, lockDir(npmLock(at, root))], LEFTOVERS.npm) }
+    for (const n of lockedInstalls(cmd)) {
+      const { at } = placed(n, dirPath, root); if (at && n.tool !== 'uv') add([at, lockDir(lockOf(n.tool, at, root).lock)], LEFTOVERS[n.tool])
+    }
+  }
+  return [...out]
+}
+
 /** The recipe if it's one HQ can run in `root` (a checkout), else what's wrong, in words the helper can act on. */
 export function checkRecipe(input: unknown, root: string): { recipe: Recipe } | { error: string } {
   const r = recipeSchema.safeParse(input)
@@ -221,17 +289,33 @@ export function recipeCommands(r: Recipe): string {
 }
 export const sameCommands = (a: Recipe | null, b: Recipe | null): boolean => !!a && !!b && recipeCommands(a) === recipeCommands(b)
 
-/** The user's own ⚙ command as a one-part recipe (no OK needed: they typed it). Installs follow npm's own record (installStep). */
+/** The user's own ⚙ command as a one-part recipe (no OK needed: they typed it). Its install is the project's own package manager's (ownInstall). */
 export function commandRecipe(command: string, repoPath: string): Recipe {
-  const install = installStep(repoPath)
-  return { parts: [{ name: 'app', dir: '.', run: command, port: 'auto', ...(install ? { install } : {}) }], show: 'app', worktree_files: [], notes: '' }
+  const { install, install_when } = ownInstall(repoPath)
+  return { parts: [{ name: 'app', dir: '.', run: command, port: 'auto', ...(install ? { install } : {}), ...(install_when ? { install_when } : {}) }],
+    show: 'app', worktree_files: [], notes: '' }
 }
+
+/** Bug 316: what the user's own ⚙ command would do to the project's lockfile, as a warning, not a refusal (they typed it, and HQ runs it as
+ *  written): the same check as Claude's steps (an own `uv run app.py` rewrote an out-of-date uv.lock), in plain words. Null when fine, and for
+ *  an install HQ can't place (`cd $X && npm i`): a guess about a folder isn't worth a warning. */
+export function commandWarning(command: string, root: string): string | null {
+  const bad = installProblem(command, root, root); if (!bad || /^HQ can't tell /.test(bad.why)) return null
+  const fix = bad.why.replace(/ with install_when `[^`]*`/g, '') // a recipe's field, not something the user's command has
+  // Bug 343: the advice follows the lockfile as it is, so an out-of-date one stops the command (`uv run --locked`: code 2): the user updates it first
+  const update = /\(there is a /.test(fix) ? UPDATE_LOCK[bad.lock] : undefined
+  return `\`${bad.text}\` ${refusedWords(bad.lock)}: ${fix}.${update ? ` If it then says the ${bad.lock} needs to be updated, run \`${update}\``
+    + ` yourself first, where the command runs, and commit the new ${bad.lock}.` : ''}`
+}
+/** How the user updates each lockfile by hand (Bug 343). */
+const UPDATE_LOCK: Record<string, string> = { 'uv.lock': 'uv lock', 'package-lock.json': 'npm install', 'yarn.lock': 'yarn install', 'pnpm-lock.yaml': 'pnpm install' }
 
 /** Ports for every part: fixed ones as written, auto ones from the preview range (the show part keeps `saved` when it's free).
  *  `taken`: fixed ports something else already holds, so HQ won't start an app that would talk to the wrong server. `avoid`: ports
- *  a Launch helper was given for its test runs (Bug 226), taken only when nothing else in the range is free. */
-export async function assignPorts(r: Recipe, saved: number | null, busy: (port: number) => Promise<boolean> = portBusy, avoid: number[] = []):
-  Promise<{ ports: Record<string, number>; taken: { part: string; port: number }[] } | null> {
+ *  a Launch helper was given for its test runs (Bug 226), taken only when nothing else in the range is free. `given`: ports this HQ handed to another
+ *  app that is starting or running (Bug 354: one that hasn't bound its port yet looks free), never taken. */
+export async function assignPorts(r: Recipe, saved: number | null, busy: (port: number) => Promise<boolean> = portBusy, avoid: number[] = [],
+  given: number[] = []): Promise<{ ports: Record<string, number>; taken: { part: string; port: number }[] } | null> {
   const ports: Record<string, number> = {}, taken: { part: string; port: number }[] = []
   for (const p of r.parts) if (p.port !== 'auto') { ports[p.name] = p.port; if (await busy(p.port)) taken.push({ part: p.name, port: p.port }) }
   const order = (p: RecipePart) => p.name === r.show ? 0 : 1 // the page the user sees gets the saved port first
@@ -239,7 +323,7 @@ export async function assignPorts(r: Recipe, saved: number | null, busy: (port: 
     const prefer = p.name === r.show && saved && PREVIEW_PORTS.includes(saved) && !avoid.includes(saved) ? [saved] : []
     const tryIn = [...prefer, ...PREVIEW_PORTS.filter((c) => !avoid.includes(c)), ...PREVIEW_PORTS.filter((c) => avoid.includes(c))]
     let got: number | null = null
-    for (const c of tryIn) if (!Object.values(ports).includes(c) && !(await busy(c))) { got = c; break }
+    for (const c of tryIn) if (!Object.values(ports).includes(c) && !given.includes(c) && !(await busy(c))) { got = c; break }
     if (got === null) return null
     ports[p.name] = got
   }
@@ -274,13 +358,42 @@ export function installMark(dirPath: string, file: string | undefined, root: str
   try { return createHash('sha256').update(fs.readFileSync(at)).digest('hex').slice(0, 16) } catch { return null }
 }
 /** Should this part install before it runs? With install_when (the helper's recipes): when it never installed in this
- *  checkout, or that file changed since (marks from the supervisor, keyed by the folder). Without it (the user's own command,
- *  whose install installStep already chose from npm's own record): every time it's there. */
+ *  checkout, that file changed since (marks from the supervisor, keyed by the folder), or what the install made is gone (Bug 303:
+ *  node_modules or .pnp.cjs deleted, the lockfile unchanged). Without it (the user's own command, whose install installStep
+ *  already chose from npm's own record): every time it's there. */
 export function needsInstall(p: RecipePart, dirPath: string, marks: Record<string, string>, root: string = dirPath): boolean {
   if (!p.install) return false
   if (!p.install_when) return true
   const done = marks[dirPath]; if (done === undefined) return true
-  const now = installMark(dirPath, p.install_when, root); return now !== null && now !== done
+  const now = installMark(dirPath, p.install_when, root); if (now !== null && now !== done) return true
+  return installOutputs(p.install, dirPath, root).some((f) => !fs.existsSync(f))
+}
+/** Is the Yarn project in `dir` a Yarn 2+ one that installs Plug'n'Play (its default: a .pnp.cjs, no node_modules)? Yarn 2+ has a
+ *  .yarnrc.yml or a yarn.lock with `__metadata`; its `nodeLinker: node-modules` (or `pnpm`) makes a node_modules instead. */
+function yarnPnp(dir: string): boolean {
+  if (!yarnBerry(dir)) return false
+  const linker = /^nodeLinker:\s*["']?([\w-]+)/m.exec(readIn(dir, '.yarnrc.yml') ?? '')?.[1]; return !linker || linker === 'pnp'
+}
+const readIn = (dir: string, f: string) => { try { return fs.readFileSync(path.join(dir, f), 'utf8') } catch { return null } }
+/** A Yarn 2+ project: a .yarnrc.yml, or a yarn.lock with `__metadata` (Yarn 1's has none). */
+const yarnBerry = (dir: string): boolean => readIn(dir, '.yarnrc.yml') !== null || /^__metadata:/m.test(readIn(dir, 'yarn.lock') ?? '')
+/** What the installs in a part's `install` make that its app needs (Bug 303), as absolute paths: npm's and pnpm's node_modules, Yarn's
+ *  .pnp.cjs or node_modules, uv's .venv, each where the tool puts it (the project whose lockfile it follows). None for a package.json
+ *  that lists no packages (npm makes no node_modules then), nor for installs HQ can't read (go build, pip) or follow (`cd $X`). */
+export function installOutputs(install: string, dirPath: string, root: string = dirPath): string[] {
+  const out: string[] = []
+  const node = (lock: string | null, at: string, made: (d: string) => string) => {
+    const d = lock ? path.dirname(lock) : at; if (listsPackages(path.join(d, 'package.json'))) out.push(path.join(d, made(d)))
+  }
+  for (const n of npmInstalls(install)) { const { at } = placed(n, dirPath, root); if (at) node(npmLock(at, root), at, () => 'node_modules') }
+  for (const n of lockedInstalls(install)) {
+    const { at } = placed(n, dirPath, root); if (!at || n.run) continue
+    const { lock, project } = lockOf(n.tool, at, root)
+    if (n.tool === 'uv') out.push(path.join(lock ? path.dirname(lock) : project ?? at, '.venv'))
+    else node(lock, at, (d) => n.tool === 'yarn' && yarnPnp(d) ? '.pnp.cjs' : 'node_modules')
+  }
+  for (const v of uvVenvs(install)) { const at = v === null ? null : path.resolve(dirPath, v); if (at && !path.relative(path.resolve(root), at).startsWith('..')) out.push(at) }
+  return out
 }
 
 /** What the supervisor (supervise.mjs) runs: per part its folder, install (only if needed), command and environment. */
@@ -329,11 +442,37 @@ export function frameBlocked(get: (name: string) => string | null): boolean {
   return !sources.some((s) => s === '*' || s === 'http:' || /^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1)(?::(?:\d+|\*))?\/?$/.test(s))
 }
 
-/** Something accepts connections on this port (IPv4 or IPv6 loopback). */
-export function portBusy(port: number): Promise<boolean> {
+/** Where portBusy tries to listen (Bug 322). Linux refuses a listener on a port another socket is bound to: the local end of an outgoing connection, or one
+ *  closed under a minute ago, though nothing answers there. Its own end may be any address of the machine (an agent's connection to its API) and apps often
+ *  listen on all of them, so Linux tries those (`::` covers IPv4 too, unless the machine says otherwise). macOS lets a listener on all addresses through
+ *  whatever holds one, and HQ's own previews are reached on loopback, so it tries those two (and never shows the firewall's "accept connections?"). */
+const LISTEN_HOSTS = process.platform === 'linux' ? ['0.0.0.0', '::'] : ['127.0.0.1', '::1']
+/** Codes that mean a program couldn't listen there either. Any other (EADDRNOTAVAIL: no IPv6 on this machine, say) tells nothing about the port. */
+const REFUSED = new Set(['EADDRINUSE', 'EACCES'])
+/** Bug 340: on macOS a connect to a port a socket is bound to but not listening on gets no answer at all (Linux refuses it at once), so it waited its
+ *  whole 500 ms, once per port tried. A connect with no answer after this long (counted from when it went out; loopback answers in a few ms) asks
+ *  then whether a program could listen on that same address: if not, the port is busy, as the listens below would say. If it could, the connect waits
+ *  on as before. Not before: a listen next to a program listening on all addresses would take the connections meant for it. Null: Linux, as before. */
+const QUIET_MS: number | null = process.platform === 'darwin' ? 50 : null
+/** Something accepts connections on this port (IPv4 or IPv6 loopback), or nothing does but a program couldn't listen there (Bug 322: the app would end with
+ *  EADDRINUSE, and Launch would pick the same port again). The listens come after the connects (a connect would reach HQ's own listener) and one at a time,
+ *  each closed before the next and before this answers: nothing of HQ's still holds the port when the app starts. */
+export const portBusy = (port: number): Promise<boolean> => portBusyWith(port, LISTEN_HOSTS) // one argument: callers pass it to map()
+/** portBusy, trying to listen on `listenOn` (a test's choice); `quietMs`, when a connect with no answer yet tries a listen on its own address. */
+export async function portBusyWith(port: number, listenOn: readonly string[], quietMs = QUIET_MS): Promise<boolean> {
   const one = (host: string) => new Promise<boolean>((resolve) => {
-    const s = net.connect({ host, port }); const done = (busy: boolean) => { s.destroy(); resolve(busy) }
+    const s = net.connect({ host, port }); let quiet: NodeJS.Timeout | undefined, over = false
+    const done = (busy: boolean) => { over = true; clearTimeout(quiet); s.destroy(); resolve(busy) }
     s.once('connect', () => done(true)); s.once('error', () => done(false)); s.setTimeout(500, () => done(false))
+    if (quietMs !== null) { // after Node's own next tick, which sends the connect
+      process.nextTick(() => {
+        quiet = setTimeout(() => setImmediate(() => { // an answer that came while HQ's loop was held up is read first
+          if (!over) void cantListen(port, host).then((code) => { if (REFUSED.has(code ?? '')) done(true) })
+        }), quietMs)
+      })
+    }
   })
-  return Promise.all([one('127.0.0.1'), one('::1')]).then(([a, b]) => a || b)
+  if ((await Promise.all([one('127.0.0.1'), one('::1')])).some(Boolean)) return true
+  for (const host of listenOn) if (REFUSED.has((await cantListen(port, host)) ?? '')) return true
+  return false
 }

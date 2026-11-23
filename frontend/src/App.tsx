@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { agentPill, agentPlanWait, api, connectWs, endedLine, errText, jsonList, menuActivity, nextHoldEnd, onDialog, showError, shownStatus, waitLine, FINISHED,
+import { agentPill, agentPlanWait, answerAsk, api, clearErrors, connectWs, endedLine, jsonList, menuActivity, nextHoldEnd, noteLine, onDialog, outdatedBar, showError, shownStatus, waitLine, FINISHED,
   type Agent, type State, type WsMsg } from './api'
 import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
 import { AttentionList, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
-import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, hasParked, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel,
-  removeConfirm, openAuto, openSummary, boardKeeper, turnOn, useBoard, type Board, type Pop, type PopKind } from './board'
+import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel,
+  noteTakers, parkWords, removeConfirm, openAuto, openSummary, boardKeeper, turnOn, useBoard, type Board, type Pop, type PopKind } from './board'
 import { ActBtn, Elapsed, ErrorBar, LiveDot, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
 import { mergeTestOf, mergeTestWords, runWords } from './testruns.ts'
 import { byKind, criteriaOf, flagLines, KIND_HEADING, proofOf, proofWords } from '../../backend/src/criteria.ts'
 import { lookWords } from '../../backend/src/smokerules.ts'
 import { diffCheckOf, diffCheckWords, planCheckOf, planCheckWords } from '../../backend/src/checks.ts'
 import { messageRoute } from '../../backend/src/msgroute.ts'
+import { nextMover } from '../../backend/src/mover.ts'
 import { agentHeader, pauseAt, usageParts } from './usage.ts'
 import { LaunchBtn, PreviewPane } from './Preview'
 import { clampH, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
@@ -25,6 +26,7 @@ import { Events } from './Events'
 import { MapBtn } from './FeatureMap'
 import { eventLog } from './eventlog.ts'
 import { deliveryMark } from './msgmark.ts'
+import { sendHere } from './atend.ts'
 
 type Tab = 'agent' | 'ticket' | 'messages' | 'events'
 type Sel = { node: string | null; agentId: string | null; ticketId: string | null }
@@ -97,7 +99,7 @@ export default function App() {
         }
         else if (m.type === 'patch' || m.type === 'event') { queue.push(m); flushAt ||= window.setTimeout(flush, 100) }
         else if (m.type === 'term') feeds.current.get(m.agentId)?.(m.data)
-      }, (w) => { opened = true; delay = 1500; setConn('open'); setWs(w) })
+      }, (w) => { opened = true; delay = 1500; setConn('open'); setWs(w); clearErrors((m) => !!m.away) }) // Bug 278: HQ is back, so "Can't reach HQ" is out of date
       sock.onclose = () => {
         if (stopped) return
         // Bug 106: HQ's own test runs end with the backend, so with no word from it none is shown as going (their clocks would tick on). The next snapshot says what runs.
@@ -109,6 +111,8 @@ export default function App() {
     }
     open(); return () => { stopped = true; clearTimeout(retry); clearTimeout(flushAt); sock?.close() }
   }, [events]) // the log never changes: once
+  const before = useRef<State | null>(null) // Bug 305: a red bar goes once what it was about has gone or come right, in this tab or another
+  useEffect(() => { if (all) clearErrors((m) => outdatedBar(m, before.current, all)); before.current = all }, [all])
   const feed = useCallback((agentId: string, cb: (d: string) => void) => { feeds.current.set(agentId, cb); return () => { feeds.current.delete(agentId) } }, [])
   const repoNow = all ? all.repos.find((r) => r.id === repoId) ?? all.repos[all.repos.length - 1] ?? null : null
   const state = useMemo(() => all && forRepo(all, repoNow?.id ?? null), [all, repoNow?.id]) // each repo is its own slate
@@ -149,9 +153,10 @@ export default function App() {
   const switchRepo = async (id: string) => {
     if (id === repo?.id || !(await stopOthers(all!, id, { title: `Switch to ${all!.repos.find((r) => r.id === id)?.name ?? 'that repo'}?`, go: 'Switch' }, repo?.id ?? null))) return
     setRepoId(id); try { localStorage.setItem(REPO_KEY, id) } catch { /* private window: the pick just isn't remembered */ }
-    // Coming back: work parked when the user left picks up from its handoff notes, unless they chose to press Resume themselves.
+    // Coming back: work parked when the user left picks up from its handoff notes, unless they chose to press Resume themselves. Asked
+    // every time (Bug 350): HQ may still be asking for those notes, which this page can't know yet, and then each picks up once its note is in.
     const clearing = !!all!.repos.find((r) => r.id === id)?.clearing_at // its work is being archived, not picked up
-    if (hasParked(all!, id) && !clearing && (all!.settings.after_fresh_start ?? all!.defaults.after_fresh_start) !== 'wait') api(`repos/${id}/resume`, {}).catch((e) => showError(errText(e)))
+    if (!clearing && (all!.settings.after_fresh_start ?? all!.defaults.after_fresh_start) !== 'wait') api(`repos/${id}/resume`, {}).catch((e) => showError(e))
   }
   /** A project removed from HQ. Not switchRepo: there's nothing left to park, and the project it lands on wasn't picked, so its parked work stays parked. */
   const removed = (id: string, next: string | null) => {
@@ -213,8 +218,11 @@ export default function App() {
         </main>
         {panel.open && <><Splitter dir="col" label="Resize panel" size={panelPx} def={PANEL_DEFAULT} set={(w) => { const c = panelWidth(w, win.w); setPanelW(c); return c }} save={(w) => { try { localStorage.setItem(PANEL_KEY, String(w)) } catch { /* private window: width just isn't remembered */ } }} />
           <aside className="flex min-h-0 min-w-0 flex-col gap-2 p-2">
-            <div className="flex items-center gap-1 text-xs">{(['agent', 'ticket', 'messages', 'events'] as Tab[]).map((t) => <button key={t} className={`btn min-w-0 truncate ${panel.tab === t ? 'btn-primary' : ''}`} onClick={() => showPanel(true, t)}>{tabLabel[t]}</button>)}
-              <span className="grow" /><button className="btn" title="Close the panel" onClick={() => showPanel(false)}>×</button></div>
+            {/* Bugs 270, 290: the tabs wrap to a second row when the panel is narrow, and a long agent name wraps inside its tab: nothing is cut */}
+            <div className="flex items-start gap-1 text-xs"><div className="flex min-w-0 grow flex-wrap gap-1">{(['agent', 'ticket', 'messages', 'events'] as Tab[]).map((t) =>
+              <button key={t} className={`btn ${t === 'agent' ? 'min-w-0 max-w-full text-left wrap-anywhere' : 'shrink-0 whitespace-nowrap'} ${panel.tab === t ? 'btn-primary' : ''}`}
+                onClick={() => showPanel(true, t)}>{tabLabel[t]}</button>)}</div>
+              <button className="btn shrink-0" title="Close the panel" onClick={() => showPanel(false)}>×</button></div>
             <div className="min-h-0 grow">{panel.tab === 'agent' ? (selAgent ? <AgentPane a={selAgent} ws={ws} feed={feed} /> : <div className="p-4 text-sm text-zinc-500">Click a box on the graph to see its agent here.</div>)
               : panel.tab === 'ticket' ? <TicketInfo t={selTicket} state={state} />
               : panel.tab === 'messages' ? <Messages state={state} featureId={sel.node?.startsWith('f:') ? sel.node.slice(2) : selTicket?.feature_id ?? null} />
@@ -270,19 +278,19 @@ function RepoBar({ state, all, repo, onRepo, onRemoved, now }: { state: State; a
   const [busy, setBusy] = useState<null | 'pick' | 'add' | 'sync' | 'clear' | 'remove'>(null), [making, setMaking] = useState(false)
   const [choices, setChoices] = useState<{ in: string; repos: { path: string; name: string; github: string | null }[] } | null>(null) // a picked folder held several repos
   const account = state.defaults.github_account ?? 'warden-agent'
-  const addRepo = () => { if (busy) return; setBusy('pick'); setChoices(null); api('repos/pick', {}).then((r) => { if (r.choose) setChoices({ in: r.in, repos: r.choose }); else if (!r.cancelled) onRepo(r.id) }).catch((e) => showError(errText(e))).finally(() => setBusy(null)) }
-  const choose = (p: string) => { if (busy) return; setBusy('add'); setChoices(null); api('repos', { path: p }).then((r) => onRepo(r.id)).catch((e) => showError(errText(e))).finally(() => setBusy(null)) }
-  const sync = () => { if (!repo || busy) return; setBusy('sync'); api(`repos/${repo.id}/sync`, {}).catch((e) => showError(errText(e))).finally(() => setBusy(null)) }
+  const addRepo = () => { if (busy) return; setBusy('pick'); setChoices(null); api('repos/pick', {}).then((r) => { if (r.choose) setChoices({ in: r.in, repos: r.choose }); else if (!r.cancelled) onRepo(r.id) }).catch((e) => showError(e)).finally(() => setBusy(null)) }
+  const choose = (p: string) => { if (busy) return; setBusy('add'); setChoices(null); api('repos', { path: p }).then((r) => onRepo(r.id)).catch((e) => showError(e)).finally(() => setBusy(null)) }
+  const sync = () => { if (!repo || busy) return; setBusy('sync'); api(`repos/${repo.id}/sync`, {}).catch((e) => showError(e)).finally(() => setBusy(null)) }
   const clear = async () => {
     if (!repo || busy || !(await clearConfirm(all, repo))) return
-    setBusy('clear'); await api(`repos/${repo.id}/clear`, {}).catch((e) => showError(errText(e))).finally(() => setBusy(null))
+    setBusy('clear'); await api(`repos/${repo.id}/clear`, {}).catch((e) => showError(e)).finally(() => setBusy(null))
   }
   const remove = async () => {
     if (!repo || busy || !(await removeConfirm(all, repo))) return
     const next = all.repos.filter((r) => r.id !== repo.id).at(-1)?.id ?? null
-    setBusy('remove'); await api(`repos/${repo.id}/remove`, { landing: next }).then(() => onRemoved(repo.id, next), (e) => showError(errText(e))).finally(() => setBusy(null))
+    setBusy('remove'); await api(`repos/${repo.id}/remove`, { landing: next }).then(() => onRemoved(repo.id, next), (e) => showError(e)).finally(() => setBusy(null))
   }
-  const noting = repo?.clearing_at ? state.agents.filter((a) => a.status !== 'exited' && a.fresh_start_at).length : 0
+  const noting = repo?.clearing_at ? noteTakers(all, repo).length : 0 // Bug 313: everyone HQ asks, from the start, not each as it's reached
   const ago = (t: number) => { const m = Math.round((now - t) / 60_000); return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago` }
   const failed = repo?.kind === 'github' && !repo.sync_ok
   const status = !repo ? '' : busy === 'sync' ? 'Syncing…' : !repo.kind ? 'Not synced yet' : repo.kind === 'local' ? 'Local only · nothing to pull' : failed ? 'GitHub · sync failed' : localOnly(repo) ? `GitHub (read only) · ${repo.sync_detail.replace(/local (\S+) has commits not on GitHub, not pulled$/, 'local $1 has your merges')}` : `GitHub · ${account} · ${repo.sync_detail}`
@@ -317,7 +325,7 @@ function ParallelLimit({ state }: { state: State }) {
   const [draft, setDraft] = useState<number | null>(null) // shown until the next snapshot carries the saved value
   const cap = draft ?? Number(state.settings.concurrency_cap ?? state.defaults.concurrency_cap ?? 2)
   const working = state.agents.filter((a) => a.role === 'engineer' && a.status !== 'exited' && !FINISHED.includes(state.tickets.find((t) => t.id === a.ticket_id)?.status ?? '')).length
-  const set = (n: number) => { if (!Number.isInteger(n) || n < 1) return; setDraft(n); api('settings', { key: 'concurrency_cap', value: n }).catch((e) => showError(errText(e))) }
+  const set = (n: number) => { if (!Number.isInteger(n) || n < 1) return; setDraft(n); api('settings', { key: 'concurrency_cap', value: n }).catch((e) => showError(e)) }
   return <div className="flex items-center gap-1.5 text-zinc-400" title="How many engineers may work at the same time">Engineers at once <input type="number" min={1} max={10} className="input w-14! py-0.5! text-xs!" value={cap} onChange={(e) => set(Number(e.target.value))} /><span className="text-zinc-600" title={`${working} of ${cap} engineers are working`}>{working}/{cap} busy</span></div>
 }
 /** Bug 76: how many builds and full test runs go at once on this computer, engineers' own and HQ's together. The rest wait their turn, and their boxes say so. */
@@ -327,7 +335,7 @@ function TestLimit({ state }: { state: State }) {
   const engs = state.agents.filter((a) => a.status !== 'exited' && String(a.activity ?? '').startsWith('Waiting its turn')).length
   const hq = (state.testRuns ?? []).filter((r) => r.state === 'waiting').length, waiting = engs + hq // HQ's own test runs wait in the same line (Bug 106)
   const who = [engs ? `${engs} engineer${engs === 1 ? '' : 's'}` : '', hq ? `${hq === 1 ? 'a test run' : `${hq} test runs`} of HQ's own` : ''].filter(Boolean).join(' and ')
-  const set = (n: number) => { if (!Number.isInteger(n) || n < 1) return; setDraft(n); api('settings', { key: 'heavy_at_once', value: n }).catch((e) => showError(errText(e))) }
+  const set = (n: number) => { if (!Number.isInteger(n) || n < 1) return; setDraft(n); api('settings', { key: 'heavy_at_once', value: n }).catch((e) => showError(e)) }
   const why = 'How many builds and full test runs may run at the same time on this computer. The others wait their turn, so the computer stays usable'
   return <div className="flex items-center gap-1.5 text-zinc-400" title={why}>
     Test runs at once <input type="number" min={1} max={10} aria-label="Test runs at once" className="input w-14! py-0.5! text-xs!" value={cap} onChange={(e) => set(Number(e.target.value))} />
@@ -354,6 +362,7 @@ function AgentsMenu({ state, selected, onPick }: { state: State; selected: strin
       <div className="flex items-center justify-between gap-2"><span className="min-w-0 truncate font-medium" title={a.display_name ?? a.id}>{a.display_name ?? a.id}</span>
         <Pill s={shownStatus(a, state)} label={agentPill(a, state)} /></div>
       <div className="mt-1 text-zinc-500">{a.role} · {a.model_live ?? a.model_alias}{a.in_plan_mode ? ' · plan' : ''}{a.steps_total ? ` · step ${a.steps_done}/${a.steps_total}` : ''}</div>
+      {noteLine(a) && <div className="mt-1 break-words text-sky-300">{noteLine(a)}</div>/* as its box says: it writes its handoff note (Bug 287) */}
       {a.status === 'exited' ? (() => { const e = endedLine(a, state); return e && <div className="mt-1 break-words text-zinc-500">{e}</div> })()
         : (() => { const line = menuActivity(a, state), gate = a.status === 'plan_review' ? agentPlanWait(a, state) : null
           // whom its plan waits on: you (amber), or HQ's check (sky), as on its box; nobody once its review has closed (Bug 234)
@@ -384,8 +393,8 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
   const reviews = state.reviews.filter((r) => r.status === 'open' && !hqAnswersPlan(state, r) && !clearingPlan(state, r)) // on auto: HQ's to answer; during a Clear: nobody's
     .sort((x, y) => (y.opened_at ?? 0) - (x.opened_at ?? 0))
   const base = (t: any) => { const f = state.features.find((x) => x.id === t.feature_id); return { cancelled: f?.status === 'cancelled', branch: state.repos.find((r) => r.id === f?.repo_id)?.default_branch ?? 'main' } }
-  const onAuto = !!b.repo?.auto_mode && !b.repo.auto_stopped_why
-  const merges = state.tickets.flatMap((t) => { const f = base(t), acts = f.cancelled || (onAuto && !t.auto_parked_why) ? [] : mergeActs(t, f.branch, liveEngineer(t, state));
+  // whose merge it is: not on auto (HQ's), nor during a Clear (HQ refuses it, Bug 311): the box's rule (backend mover.ts)
+  const merges = state.tickets.flatMap((t) => { const f = base(t), acts = f.cancelled || (b.repo && nextMover(b.repo, t) !== 'user') ? [] : mergeActs(t, f.branch, liveEngineer(t, state));
     return acts.length ? [{ t, acts }] : [] })
   const repo = b.repo, turn = repo ? yourTurn(state, repo.id) : { asks: [], start: [] } // Bug 43, on the project's TPM since Bug 52
   const n = turn.asks.length + (turn.start.length ? 1 : 0) + uncountedQuestions(state, turn).length + reviews.length + merges.length + state.attention.length
@@ -407,7 +416,7 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
       {turn.asks.map((a) => <div key={a.id} className="flex flex-col gap-1">
         <div className="flex items-start gap-2"><span className="min-w-0 grow break-words text-amber-200">The TPM asked: {a.question}</span>{showT(close)}</div>
         {a.choices.length > 0 && <div className="flex flex-wrap gap-1">
-          {a.choices.map((c) => <ActBtn key={c} primary label={c} busyLabel="Sending…" run={() => api(`asks/${a.id}/answer`, { answer: c })} />)}</div>}</div>)}
+          {a.choices.map((c) => <ActBtn key={c} primary label={c} busyLabel="Sending…" run={() => answerAsk(a.id, c)} />)}</div>}</div>)}
       {(turn.questions ?? []).map((x) => <div key={x.id} className="flex items-start gap-2"><span className="min-w-0 grow break-words text-amber-200">{turnQuestionText(x)}</span>
         {board.has(`t:${x.ticketId}`) && <button className="btn-sm shrink-0" onClick={() => { b.focus(`t:${x.ticketId}`, 'question'); close() }}>Show</button>}</div>)}
       {turn.start.length > 0 && <div className="flex items-center gap-2">
@@ -430,12 +439,20 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
 }
 function TicketInfo({ t, state }: { t: any | null; state: State }) {
   if (!t) return <div className="p-4 text-sm text-zinc-500">Click a ticket box to see its details here.</div>
-  const f = state.features.find((x) => x.id === t.feature_id), deps = jsonList(t.deps), files = jsonList(t.expected_files), ask = ticketQuestion(state, t)
+  const f = state.features.find((x) => x.id === t.feature_id), deps = jsonList(t.deps), files = jsonList(t.expected_files), ask = ticketQuestion(state, t), park = parkWords(t)
+  const clearing = !!state.repos.find((r) => r.id === f?.repo_id)?.clearing_at // HQ refuses Try again during a Clear, so the tab doesn't offer it (as the box, Bug 335)
   // break-words: a long run with no spaces (a path in a stack trace) wraps instead of making the tab scroll sideways (Bug 144)
   return <div className="h-full overflow-y-auto break-words pr-1 text-xs">
     <div className="flex items-center gap-2"><span className="font-semibold">{t.key}</span><span className="text-zinc-500">{t.size}</span>
       <Pill s={t.status} label={ticketLabel(t, state.reviews.some((r) => r.ticket_id === t.id && r.status === 'open' && hqAnswersPlan(state, r)), clearingPlan(state, { ticket_id: t.id }))} /></div>
     <div className="mt-1 text-sm text-zinc-200">{t.title}</div>
+    {/* Bug 349: why auto mode parked it and what Try again does, as its box says; Try again here too, as on its box */}
+    {park && <div className="mt-2 rounded-md border border-rose-900 p-2">
+      <div className="font-semibold text-rose-300">Parked by auto mode</div><div className="mt-0.5 text-rose-200">{park.why}</div>
+      {clearing ? <div className="mt-1 text-zinc-400">The project is being cleared: nothing starts until that's done.</div> : <>
+        <div className="mt-1 text-zinc-400">{park.next}</div>
+        <div className="mt-1.5"><ActBtn primary label="Try again" busyLabel="Trying…" title="Auto mode gives this ticket another go"
+          run={() => api(`tickets/${t.id}/auto-retry`, {})} /></div></>}</div>}
     <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1 text-zinc-400">
       {ask && <><dt>Question</dt><dd className="break-words text-amber-200">asked {askedWho(ask, state.agents)}: {ask.body}</dd></>}
       <dt>Feature</dt><dd className="text-zinc-300">{f?.title ?? '—'}</dd>
@@ -448,7 +465,7 @@ function TicketInfo({ t, state }: { t: any | null; state: State }) {
     <Criteria t={t} />
     <Readers t={t} state={state} />
     <div className="mt-3 font-semibold text-zinc-400">Spec</div>
-    <pre className="mt-1 whitespace-pre-wrap break-words text-[11px] text-zinc-300">{t.spec || '—'}</pre>
+    <div className="mt-1 text-[11px] text-zinc-300"><Md text={t.spec || '—'} /></div>{/* Bug 304: specs are markdown (HQ's own too) */}
     <HandoffNote scope={`resume:ticket:${t.id}`} stamp={`${t.parked_at}:${t.assignee_agent_id}`} />
   </div>
 }
@@ -505,9 +522,10 @@ function AgentPane({ a, ws, feed }: { a: any; ws: WebSocket | null; feed: (id: s
   const route = messageRoute(a, state.tickets.find((t) => t.id === a.ticket_id), state.repos.find((r) => r.id === a.repo_id))
   // cleared at once (a second click sends nothing), and put back if HQ refuses it (a stale tab of an agent nothing comes after: 409)
   const send = (how: { reason?: string; urgent?: boolean }) => { const body = text; if (!body.trim()) return; setText('')
-    api(`agents/${a.id}/message`, { body, ...how }).catch((x) => { setText((t) => t || body); showError(errText(x)) }) }
-  return <div className="flex h-full flex-col gap-2">
-    <div className="flex flex-wrap items-center gap-2 text-xs"><span className="shrink-0 whitespace-nowrap font-semibold">{a.display_name ?? a.id}</span>
+    sendHere(() => api(`agents/${a.id}/message`, { body, ...how }), (m) => m.id).catch((x) => { setText((t) => t || body); showError(x) }) }
+  // Bug 270: wrap-anywhere: a long name with no spaces (the TPM is "TPM <project>") wraps in the header and the lines under the terminal
+  return <div className="flex h-full flex-col gap-2 wrap-anywhere">
+    <div className="flex flex-wrap items-center gap-2 text-xs"><span className="min-w-0 font-semibold">{a.display_name ?? a.id}</span>
       <Pill s={shownStatus(a, state)} label={agentPill(a, state)} />
       <span className="grow" /><FreshBtn a={a} label="Fresh start" />{stop && <button className="btn" onClick={() => api(`agents/${a.id}/stop`, {})}>Stop</button>}
       <span className="basis-full text-zinc-500">{who}{usage.map((u) => <span key={u.key}>{'\u00a0· '}{/* a wrap never starts a line with the dot */}
@@ -515,8 +533,10 @@ function AgentPane({ a, ws, feed }: { a: any; ws: WebSocket | null; feed: (id: s
     <div className="min-h-0 grow overflow-hidden rounded-md border border-zinc-800">{a.status !== 'exited' ? <AgentTerminal agentId={a.id} ws={ws} feed={feed} /> : <div className="p-4 text-zinc-500">Exited.</div>}</div>
     {'none' in route ? <div className="text-xs text-zinc-500">It has stopped, so a message can't reach it. {route.none}</div>
       : <>{'next' in route && <div className="text-xs text-zinc-500">It has stopped: a message here goes to {route.next}, once one starts.</div>}
-        <form className="flex gap-1" onSubmit={(e) => { e.preventDefault(); send({ reason: 'fyi' }) }}>
-          <input className="input" placeholder={'next' in route ? `Message for ${route.next}` : `Message ${a.display_name ?? a.id} (delivered when idle)`}
+        {/* the header names the agent and the line above says who gets it, so the hint stays short enough for a narrow panel; Send and Urgent
+            go under the box when there's no room beside it */}
+        <form className="flex flex-wrap gap-1" onSubmit={(e) => { e.preventDefault(); send({ reason: 'fyi' }) }}>
+          <input className="input min-w-0 grow basis-56" placeholder={'next' in route ? 'Message (sent once one starts)' : 'Message (delivered when idle)'}
             value={text} onChange={(e) => setText(e.target.value)} />
           <button className="btn btn-primary">Send</button>
           {/* Urgent interrupts a running turn; a stopped agent has none */}
@@ -534,8 +554,9 @@ function Messages({ state, featureId }: { state: State; featureId: string | null
   return <div className="flex h-full flex-col gap-2 text-xs">
     <div className="flex flex-wrap items-center gap-1"><button className={`btn ${!all ? 'btn-primary' : ''}`} onClick={() => setAll(false)}>Yours</button>
       <button className={`btn ${all ? 'btn-primary' : ''}`} onClick={() => setAll(true)} title="Also HQ's notices and the agents' messages to each other">Everything</button>
-      {what && <span className="min-w-0 truncate text-zinc-500" title={what}>· {what}</span>}</div>
-    <div className="min-h-0 grow overflow-y-auto">{!msgs.length && <div className="p-4 text-sm text-zinc-500">No messages yet.</div>}
+      {what && <span className="min-w-0 text-zinc-500 wrap-anywhere">· {what}</span>}</div>
+    {/* Bug 270: a long name with no spaces (the TPM is "TPM <project>") wraps in a message's "from → to" line instead of running out of the panel */}
+    <div className="min-h-0 grow overflow-y-auto wrap-anywhere">{!msgs.length && <div className="p-4 text-sm text-zinc-500">No messages yet.</div>}
       {msgs.map((m) => <div key={m.id} className="mb-2"><div className="text-zinc-500">{name(m.from_id)} → {m.to_id ? name(m.to_id) : 'everyone'}{all ? ` [${m.reason}]` : ''}
         {' '}<MsgMark m={m} /> · {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
         <div className="text-zinc-300"><Md text={m.body} /></div></div>)}</div>
@@ -552,14 +573,14 @@ function HandoffNote({ scope, stamp }: { scope: string; stamp: string }) {
   useEffect(() => { let on = true; api<any[]>(`docs?scope=${encodeURIComponent(scope)}`).then((r) => { if (on) setNote(r[0]?.text ?? null) }, () => {}); return () => { on = false } }, [scope, stamp])
   if (!note) return null
   return <><div className="mt-3 font-semibold text-zinc-400">Handoff note <span className="font-normal text-zinc-600">(left at its last fresh start)</span></div>
-    <pre className="mt-1 whitespace-pre-wrap break-words text-[11px] text-zinc-300">{note}</pre></>
+    <div className="mt-1 text-[11px] text-zinc-300"><Md text={note} /></div></>
 }
 const CTX_PICKS = [100_000, 150_000, 200_000]
 const shareTone = (share: number | null, [over, near, calm]: [string, string, string]) => share !== null && share >= 1 ? over : share !== null && share >= 0.8 ? near : calm
 /** Sessions: how full each agent's context is, the limit (a preset, never typed), what happens at it, what follows a Fresh
  *  start, and Fresh start one or all. The label warns when an agent is near or past its limit. */
 function Sessions({ state, repo }: { state: State; repo: any | null }) {
-  const set = (key: string, value: unknown) => api('settings', { key, value }).catch((e) => showError(errText(e)))
+  const set = (key: string, value: unknown) => api('settings', { key, value }).catch((e) => showError(e))
   const setting = (key: string, def: unknown) => state.settings[key] ?? state.defaults[key] ?? def
   const pick = Number(setting('context_limit', 150_000)), action = setting('context_action', 'warn'), after = setting('after_fresh_start', 'continue')
   const agents = state.agents.filter((a) => a.status !== 'exited' && (a.role === 'tpm' || a.role === 'engineer'))
@@ -567,7 +588,7 @@ function Sessions({ state, repo }: { state: State; repo: any | null }) {
   const near = agents.filter((x) => (x.share ?? 0) >= 0.8).length, worst = agents[0]?.share ?? null
   const can = agents.filter((x) => !freshBlocker(x.a, state)), names = can.map((x) => x.a.display_name ?? x.a.id)
   const all = async () => {
-    if (repo && can.length && await freshConfirm(state, names)) await api(`repos/${repo.id}/fresh-start-all`, {}).catch((e) => showError(errText(e)))
+    if (repo && can.length && await freshConfirm(state, names)) await api(`repos/${repo.id}/fresh-start-all`, {}).catch((e) => showError(e))
   }
   const radio = (key: string, cur: string, opts: [string, string][]) => <div className="flex flex-col gap-1">{opts.map(([v, label]) =>
     <label key={v} className="flex cursor-pointer items-start gap-2 text-zinc-300">

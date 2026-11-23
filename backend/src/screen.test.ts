@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { paneHasDraft, paneLooksIdle, plainScreen } from './screen.ts'
+import { draftText, ownHalfLine, paneHasDraft, paneLooksIdle, plainScreen } from './screen.ts'
 
 const RULE = '─'.repeat(120)
 const box = (prompt: string, footer: string, above = '') => `${above}\n${RULE} TPM demo ─\n${prompt}\n${RULE}\n${footer}\n`
@@ -218,4 +218,35 @@ test('Bug 189: paneLooksIdle on a plain capture: the working line above the box 
     assert.equal(paneLooksIdle(box('❯ ', '  ⏸ manual mode on', done)), true, done)
   }
   assert.equal(paneLooksIdle(box('❯ ', '  ⏸ manual mode on', '✽ Doodling… (3s · ↓ 16 tokens)\n  ⎿  Tip: Create skills')), false) // a tip line under it
+})
+
+// ---- Bug 331: a restart in the middle of HQ typing a line leaves its first pieces (250 characters each) in the box. Captured from real
+// Claude Code 2.1.322 on Haiku (2026-11-21), HQ's own typing (send-keys -l in pieces): `half` 2 of 8 pieces after Escape stopped a turn (110
+// columns), `half-200` the same at 200, `whole` all pieces with no Enter, `mine` 1 piece and then words typed after it, `scrolled` 15 of 20
+// pieces, more than the box shows (only the end, with the ❯ on its first line). The rest typed after `half` went in as exactly the whole line.
+const cap331 = (name: string): string => readFileSync(new URL(`./testdata/bug331/${name}`, import.meta.url), 'utf8')
+const flat = (s: string): string => s.replace(/\s+/g, '')
+test('Bug 331: draftText is what was typed in the box, lines as wrapped (the space at each break gone)', () => {
+  const long = cap331('long.txt'), d = draftText(cap331('half.ansi'))
+  assert.equal(d.split('\n').length, 5); assert.ok(d.startsWith('[urgent] from HQ: Stop'))
+  assert.equal(flat(d), flat(long.slice(0, 500))); assert.equal(flat(draftText(cap331('half-200.ansi'))), flat(long.slice(0, 500)))
+  for (const s of [EMPTY_PLACEHOLDER, SUGGESTION, '']) assert.equal(draftText(s), '')
+})
+test("Bug 331: ownHalfLine: the box holds HQ's own first pieces of the line and nothing else: the rest, or '' when only Enter is missing", () => {
+  const long = cap331('long.txt')
+  assert.equal(ownHalfLine(cap331('half.ansi'), long), long.slice(500)); assert.equal(ownHalfLine(cap331('half-200.ansi'), long), long.slice(500))
+  assert.equal(ownHalfLine(cap331('whole.ansi'), cap331('short.txt')), '')
+  assert.equal(paneLooksIdle(cap331('half.ansi')), true) // at its waiting prompt: HQ may type there
+})
+test("Bug 331: ownHalfLine: what it must not catch, so a person's typing is never sent or added to", () => {
+  const long = cap331('long.txt')
+  assert.equal(ownHalfLine(cap331('mine.ansi'), long), null, "somebody's words after HQ's first piece")
+  assert.equal(ownHalfLine(cap331('scrolled.ansi'), cap331('longer.txt')), null, 'only the end of the box shows')
+  assert.equal(ownHalfLine(cap331('half.ansi'), long.replace('Pin it', 'Pin It')), null, 'another line')
+  assert.equal(ownHalfLine(cap331('half.ansi'), cap331('short.txt')), null, 'more in the box than the whole line')
+  const typed = (t: string): string => [`\x1b[38;5;244m${R}`, `\x1b[39m❯ ${t}`, `\x1b[38;5;244m${R}`, '\x1b[39m  \x1b[38;5;147m⏵⏵ accept edits on\x1b[39m'].join('\n')
+  assert.equal(ownHalfLine(typed(long.slice(0, 250)), long), long.slice(250)); assert.equal(ownHalfLine(typed(long.slice(0, 200)), long), null, 'not a whole piece')
+  assert.equal(ownHalfLine(typed(`my own ${long.slice(0, 250)}`), long), null, 'words before it')
+  const grey = typed(`\x1b[2m${long.slice(0, 250)}\x1b[0m`); assert.equal(ownHalfLine(grey, long), null, "Claude Code's grey suggestion is nobody's typing")
+  for (const s of [EMPTY_PLACEHOLDER, SUGGESTION, plainScreen(cap331('half.ansi'))]) assert.equal(ownHalfLine(s, long), null)
 })

@@ -108,6 +108,18 @@ test('fixTestsText (Bug 82): what failed early is kept with the end of the outpu
   assert.match(hung, /find what never finishes and fix it/); assert.match(hung, /ℹ fail 1\n\nFix it now/)
 })
 
+test('"Have HQ test this": a failure the user sent back says so, never that HQ didn\'t merge it, and the UI tester\'s findings say whose they are', () => {
+  const t = getTicket('shop')!, failed = { kind: 'fail' as const, test: 'npm test', output: 'ℹ fail 1', earlier: '', asked: true }
+  const kinds = [failed, { ...failed, hung: true }, { ...failed, unproven: true }, { ...failed, look: true }, { ...failed, review: true }, { ...failed, look: true, tester: true }]
+  for (const f of kinds) { const text = fixTestsText({ t, base: 'main', failed: f }); assert.match(text, /so the user sent it back to you/); assert.doesNotMatch(text, /HQ didn't merge/) }
+  const tester = fixTestsText({ t, base: 'main', failed: { ...failed, look: true, tester: true, output: "HQ's UI tester used the app…" } })
+  assert.match(tester, /HQ's UI tester found problems when it used the app in a browser/); assert.match(tester, /A real browser can't start in your session/)
+  assert.doesNotMatch(fixTestsText({ t, base: 'main', failed: { ...failed, review: true } }), /this read happens once/) // nobody merges it by itself with auto off
+  keepTestsFailed(t, { ...failed, look: true, tester: true }) // an engineer taking over gets it too
+  assert.deepEqual(testsFailed(t, null), { ...failed, hung: false, look: true, tester: true })
+  run("DELETE FROM docs WHERE scope = ? AND key = 'tests_failed'", `ticket:${t.id}`) // the next test starts with nothing kept
+})
+
 test('Bug 84: what the tests printed is kept for an engineer that takes over, and a note stands in when it\'s gone', () => {
   const t = getTicket('shop')!, failed = { kind: 'fail' as const, test: 'npm test', output: 'ℹ fail 1', earlier: "Error: Cannot find module 'jsdom'", hung: true }
   assert.match(testsFailed({ ...t, fixing: 'tests_hung' }, 'npm run check').output, /doesn't have what they printed/)

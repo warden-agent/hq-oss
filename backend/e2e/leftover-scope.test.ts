@@ -48,13 +48,13 @@ const calls = () => { try { return fs.readFileSync(log, 'utf8').split('\n').filt
  *  asked for the working folder of (other programs on this machine that were orphaned just now are asked about too). */
 const looks = (from: number) => {
   const c = calls().slice(from), lsof = c.filter((l) => l.startsWith('lsof -a -d cwd -p '))
-  return { ps: c.filter((l) => l.includes('etime=')).length, lsof: lsof.length, asked: new Set(lsof.flatMap((l) => l.split(' ')[5]!.split(',').map(Number))) }
+  return { ps: c.filter((l) => l.includes('lstart=')).length, lsof: lsof.length, asked: new Set(lsof.flatMap((l) => l.split(' ')[5]!.split(',').map(Number))) }
 }
 
 test("after a command: only what it can have left, in its own agent's worktree; the full look covers the rest", async () => {
   const a = await engineer('scope-a'), b = await engineer('scope-b')
   const older = await orphan(a.wt) // in A's worktree, from before A's command (a stand-in for anything a narrowed look can't tell is that command's)
-  await sleep(6000) // clearly older than the command: ps gives start times in whole seconds, and a busy HQ reads them late
+  await sleep(6000) // real-time: clearly older than the command; ps gives start times in whole seconds (leftovers.test.ts OLDER_MS)
 
   // one command that leaves nothing, then one that leaves a server while something new turns up in B's worktree too (B runs
   // nothing). Looks run one at a time, so once the server is gone every look after either command is in the log.
@@ -78,8 +78,9 @@ test('a TPM, or any agent with no worktree, gets no look at all after its comman
   const repo = (await hq.api('repos', { path: hq.repo('scope-tpm') })).json
   const first = (await hq.api(`repos/${repo.id}/message`, { body: 'A place to jot notes.' })).json
   await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === first.agent.id)?.status === 'working', 20_000)
-  await sleep(6500) // let any look already due go by
+  await sleep(6500) // limit: a look put off by earlier commands runs within 6 s at the latest (leftovers.ts); after that none is due
   const from = calls().length
   await bash(first.agent.id, 'PreToolUse', 't1'); await bash(first.agent.id, 'PostToolUse', 't1')
-  await sleep(4000); assert.equal(looks(from).ps, 0, calls().slice(from).join('\n'))
+  await sleep(4000) // limit: a look after a command starts 2 s after it (leftovers.ts); by now one would have run
+  assert.equal(looks(from).ps, 0, calls().slice(from).join('\n'))
 })

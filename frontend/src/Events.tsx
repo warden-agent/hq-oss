@@ -27,7 +27,7 @@ export function Events({ log, agent, ticketKey, ws }: { log: EventLog; agent: Ag
   const lines = [...log.lines(agent.id), ...(mine?.lines ?? [])].sort((a, b) => b.id - a.id).filter((e) => !seen.has(e.id) && !!seen.add(e.id)).slice(0, KEEP)
   const note = !mine ? 'Loading its history…' : mine.error ? `Couldn't load its history: ${mine.error}` : !lines.length ? 'Nothing recorded for it yet.' : null
   return <div className="flex h-full min-h-0 flex-col gap-2 text-[11px]">
-    <p className="text-xs text-zinc-500">What <span className="text-zinc-300">{agent.display_name ?? agent.id}</span> did, newest first: prompts, tool calls,
+    <p className="text-xs text-zinc-500 wrap-anywhere">What <span className="text-zinc-300">{agent.display_name ?? agent.id}</span> did, newest first: prompts, tool calls,
       turns and tickets. Its screen is in the Agent tab.</p>
     {note && <p className="text-zinc-500">{note}</p>}
     <div className="min-h-0 grow overflow-y-auto" data-testid="events-list">{lines.map((e) => <div key={e.id} className="break-words py-px text-zinc-400">

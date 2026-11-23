@@ -9,7 +9,8 @@ import { BIND, PATHS, PORTS, DEFAULTS, CHOICES, ENGINEER_LIMIT, NOTE_CAP, GITHUB
 import { homeShort } from './projectname.ts'
 import { q, getSetting, setSetting, now, one } from './db.ts'
 import { bus, emit, patch, type Patch, type HqEvent } from './events.ts'
-import { allAgents, getAgent, onDialog, pageAgent, stopAgent, update, type Agent } from './agents.ts'
+import { beats } from './beats.ts'
+import { allAgents, getAgent, liveAgents, onDialog, pageAgent, stopAgent, update, type Agent } from './agents.ts'
 import type { Term } from './terminal.ts'
 import { termMessage } from './termws.ts'
 import { createFeature, createTicket, launchEngineer, resumeEngineer, startReady, startReadyRepo, fillSlots, cancelTicket, cancelFeature, fixConflicts } from './tickets.ts'
@@ -18,12 +19,13 @@ import { messageTpm, restartTpm } from './tpm.ts'
 import { freshStart, freshStartAll, parkRepo, resumeRepo } from './freshstart.ts'
 import { clearRepo } from './clear.ts'
 import { removeRepo } from './remove.ts'
-import { repos, features, tickets, getTicket, getRepo } from './records.ts'
+import { repos, features, tickets, getTicket, getRepo, closedWhy, repoOfAgent } from './records.ts'
 import { messageRoute } from './msgroute.ts'
 import { pump } from './heavy.ts'
 import { addRepo, defaultParent, pickParent, pickRepo, repoAroundProject, syncRepo } from './repos.ts'
 import { createProject, githubReady, RepoHere } from './newproject.ts'
 import { makePr, mergeTicket } from './mergewatch.ts'
+import { sendCheck, startCheck, stopCheck } from './hqcheck.ts'
 import { answerReview, openReviews, pageReviews, getReview, getRevision, heldCount, isVerdict, VERDICTS } from './gate.ts'
 import { interruptAndType, sendMessage, messagesForFeature, openQuestions } from './delivery.ts'
 import { wakeAll } from './wake.ts'
@@ -51,14 +53,22 @@ const extras = new Map<string, Record<string, unknown>>() // non-column agent fi
 function seedExtras(): void {
   for (const r of q<{ agent_id: string; context_tokens: number | null; five_hour_pct: number | null; seven_day_pct: number | null }>(`SELECT u.agent_id, u.context_tokens, u.five_hour_pct,
     u.seven_day_pct FROM usage_samples u JOIN agents a ON a.id = u.agent_id WHERE a.status != 'exited' AND u.id IN (SELECT MAX(id) FROM usage_samples GROUP BY agent_id)`)) {
-    extras.set(r.agent_id, { ...(extras.get(r.agent_id) ?? {}), context_tokens: r.context_tokens, five_hour_pct: r.five_hour_pct, seven_day_pct: r.seven_day_pct })
+    extras.set(r.agent_id, { ...extras.get(r.agent_id), context_tokens: r.context_tokens, five_hour_pct: r.five_hour_pct, seven_day_pct: r.seven_day_pct })
+  }
+  // Bug 337: and each box's line as the last backend left it ("Thinking", the tool it uses). A line said again at start-up (a build's turn read back, a helper,
+  // a run in the background, a turn that ended while HQ was down) has patched `extras` already and is newer: it stays
+  for (const a of liveAgents()) { const cur = extras.get(a.id) ?? {}; if (a.activity && !('activity' in cur)) extras.set(a.id, { ...cur, activity: a.activity }) }
+  // Bug 348: and each box's step count ("step 1/3"), counted from its task list as hooks.ts recordTask counts it; it was gone until the agent's next step
+  for (const r of q<{ agent_id: string; total: number; done: number | null }>(`SELECT t.agent_id, COUNT(*) total, SUM(t.status = 'completed') done
+    FROM task_progress t JOIN agents a ON a.id = t.agent_id GROUP BY t.agent_id`)) {
+    const cur = extras.get(r.agent_id) ?? {}; if (!('steps_total' in cur)) extras.set(r.agent_id, { ...cur, steps_done: r.done ?? 0, steps_total: r.total })
   }
 }
 bus.on('patch', (p: Patch) => { if (p.entity === 'agent' && p.patch) { const cur = extras.get(p.id) ?? {}; for (const [k, v] of Object.entries(p.patch)) if (['activity', 'last_message', 'steps_done', 'steps_total', 'context_tokens', 'five_hour_pct', 'seven_day_pct', 'type_waits'].includes(k)) cur[k] = v; extras.set(p.id, cur) } })
 /** What follows a clicked Fresh start: the body's choice, else the user's setting ('wait' parks the work for Resume). */
 const afterFresh = (v: unknown): 'continue' | 'park' => v === 'continue' || v === 'park' ? v : getSetting('after_fresh_start', DEFAULTS.after_fresh_start) === 'wait' ? 'park' : 'continue'
 /** Bug 122: an exited agent has no activity line, even when a late patch (a build's turn coming up after it was stopped) left one in `extras`. */
-const agentView = (a: Agent) => ({ ...pageAgent(a), ...(extras.get(a.id) ?? {}), ...(a.status === 'exited' ? { activity: null } : {}) })
+const agentView = (a: Agent) => ({ ...pageAgent(a), ...extras.get(a.id), ...(a.status === 'exited' ? { activity: null } : {}) })
 
 /** Bug 48: the frontend build HQ serves (its hashed script, e.g. index-pXb_ChmJ.js), or null when there's no build. A tab still
  *  running another build reloads itself (App.tsx). */
@@ -88,7 +98,7 @@ const cookieToken = (req: http.IncomingMessage): string | null => { const m = /(
 const authed = (req: http.IncomingMessage): boolean => { const bearer = (req.headers.authorization ?? '').replace(/^Bearer\s+/i, ''); return bearer === TOKEN || cookieToken(req) === TOKEN }
 /** What a GET may do: read. Every change is a POST, so a page shown inside HQ (the live preview) can't make one with a link
  *  or an <img> (a cross-origin POST carries an Origin, which originOk refuses). */
-const readRoute = ([r0, r1, r2, r3]: (string | undefined)[]): boolean => !r3 && ((['state', 'events', 'docs'].includes(r0 ?? '') && !r1)
+const readRoute = ([r0, r1, r2, r3]: (string | undefined)[]): boolean => !r3 && ((['state', 'events', 'docs', 'beats'].includes(r0 ?? '') && !r1)
   || (r0 === 'reviews' && !r2) || (r0 === 'ticket' && !!r1 && !r2) || (r0 === 'agents' && !!r1 && (r2 === 'screen' || r2 === 'events')))
 const originOk = (req: http.IncomingMessage): boolean => { const o = req.headers.origin; if (!o) return true; return [`http://127.0.0.1:${PORTS.ui}`, `http://localhost:${PORTS.ui}`, `http://127.0.0.1:5173`, `http://localhost:5173`].includes(o) }
 
@@ -100,6 +110,7 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
   if (req.method !== 'POST' && !readRoute(parts)) return json(res, 405, { error: 'changes must be sent as POST' })
   try {
     if (r0 === 'state') return json(res, 200, snapshot())
+    if (r0 === 'beats' && !r1 && req.method !== 'POST') return json(res, 200, beats()) // for tests: how often each timed look has ended (beats.ts)
     if (r0 === 'repos' && r1 && r2 === 'sync' && req.method === 'POST') return json(res, 200, await syncRepo(r1))
     if (r0 === 'repos' && r1 === 'pick' && req.method === 'POST') { try { return json(res, 200, await pickRepo()) } catch (e) { return json(res, 400, { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 === 'new-setup' && req.method === 'POST') return json(res, 200, { parent: await defaultParent(), account: GITHUB_ACCOUNT, githubReady: await githubReady() })
@@ -154,10 +165,18 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'tickets' && r1 && r2 === 'cancel') { try { return json(res, 200, await cancelTicket(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'fix-conflicts') { try { return json(res, 200, await fixConflicts(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'make-pr') { try { return json(res, 200, await makePr(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
+    // "Have HQ test this" (hqcheck.ts): start a check of a finished ticket, stop it, and send what it found to the ticket's engineer
+    if (r0 === 'tickets' && r1 && r2 === 'check' && req.method === 'POST') {
+      try { return json(res, 200, await startCheck(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
+    if (r0 === 'tickets' && r1 && r2 === 'check-stop' && req.method === 'POST') return json(res, 200, { stopped: stopCheck(r1, 'you stopped it') })
+    if (r0 === 'tickets' && r1 && r2 === 'check-send' && req.method === 'POST') {
+      try { return json(res, 200, await sendCheck(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'merge') { try { return json(res, 200, await mergeTicket(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'tickets' && r1 && r2 === 'launch') { try { return json(res, 200, agentView(await launchEngineer(r1))) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
     if (r0 === 'agents' && r1 && r2 === 'message') {
       const a = getAgent(r1); if (!a) return json(res, 404, {})
+      // Bug 294: during a Clear its TPM and engineers only write their notes and stop, and their messages go with the board; Urgent would cut a note off
+      const closed = a.role === 'launcher' ? null : closedWhy(repoOfAgent(a) ?? ''); if (closed) return json(res, 409, { error: closed })
       // Bug 174: a stopped agent's message waits for the session that takes its place; with none to come, it would wait for ever
       const route = messageRoute(a, a.ticket_id ? getTicket(a.ticket_id) : undefined, a.repo_id ? getRepo(a.repo_id) : undefined)
       if ('none' in route) return json(res, 409, { error: `${a.display_name ?? a.id} has stopped, so a message can't reach it. ${route.none}` })

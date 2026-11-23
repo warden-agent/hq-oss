@@ -22,8 +22,10 @@ test('GitHub refused the PR: the box has the Create PR link the error names, in 
   assert.deepEqual(kinds(acts), ['merge', `link:${CREATE_PR}:${FORM}`])
   assert.equal(acts[0].github, true)
   const src = fs.readFileSync(new URL('./mergewatch.ts', import.meta.url), 'utf8')
-  const said = src.match(/GitHub wouldn't open the PR for \$\{t\.key\}[^`]*/)?.[0] ?? ''
-  assert.ok(said.includes(`${CREATE_PR} on its box`), `makePr's refusal names the box's link: ${said}`)
+  const words = src.match(/const FORM_WORDS = "([^"]*)"/)?.[1] ?? ''
+  assert.ok(words.includes(`${CREATE_PR} on its box`), `the refusals name the box's link: ${words}`)
+  assert.match(src, /GitHub wouldn't open the PR for \$\{t\.key\}\. \$\{FORM_WORDS\}/, "makePr's refusal says it")
+  assert.match(src, /HQ couldn't open a PR to merge \$\{t0\.key\}: \$\{lands \? `[^`]*\$\{FORM_WORDS\}/, "HQ's own try says it where the box has it (Bug 280)")
 })
 
 test('what it must not catch: a PR nobody asked for yet, a refusal with no link, a conflict, an open PR, a local repo', () => {
@@ -35,4 +37,22 @@ test('what it must not catch: a PR nobody asked for yet, a refusal with no link,
   const open = ticket({ status: 'pr_open', pr_state: 'open', pr_number: 7, pr_url: 'https://github.com/e2e/notes/pull/7' })
   assert.deepEqual(kinds(mergeActs(open, 'main', null)), ['merge', 'link:PR #7 ↗:https://github.com/e2e/notes/pull/7'])
   assert.deepEqual(kinds(mergeActs(ticket({ pr_state: 'local' }), 'main', null)), ['merge'])
+})
+
+// Bug 301: a ticket whose PR was closed on GitHub offered only "Create PR ↗", which opened the closed PR (or, once HQ had moved it to pr_open, nothing at
+// all). It has no open PR, so it gets what a finished ticket with none gets: Merge (HQ opens a new PR and merges it) and Make PR; the closed PR stays a link.
+test('Bug 301: a closed PR: Merge and Make PR open a new one; the closed PR is a link under its own number, never Create PR', () => {
+  const PR9 = 'https://github.com/e2e/notes/pull/9'
+  for (const status of ['pr_ready', 'pr_open']) {
+    const acts = mergeActs(ticket({ status, pr_state: 'closed', pr_number: 9, pr_url: PR9 }), 'main', null)
+    assert.deepEqual(kinds(acts), ['merge', 'make-pr', `link:PR #9 ↗:${PR9}`], status)
+    assert.equal(acts[0].github, true); assert.equal(acts[0].pr, undefined, 'Merge opens a new PR, not the closed #9')
+    assert.equal(acts[2].primary, false)
+  }
+  const conflict = ticket({ status: 'pr_open', pr_state: 'closed', pr_number: 9, pr_url: PR9, conflict_files: '["a.txt"]' })
+  assert.deepEqual(kinds(mergeActs(conflict, 'main', null)), ['fix', `link:PR #9 ↗:${PR9}`], 'conflict: Fix conflicts first, no Merge')
+  assert.deepEqual(kinds(mergeActs(ticket({ pr_state: 'closed', pr_number: null, pr_url: null }), 'main', null)), ['merge', 'make-pr'], 'no PR to link')
+  // what it must not catch: a closed PR on a ticket sent back (its engineer at work) or one that merged since
+  assert.deepEqual(kinds(mergeActs(ticket({ status: 'resolving', pr_state: 'closed', pr_number: 9, pr_url: PR9 }), 'main', { status: 'working' })), [])
+  assert.deepEqual(kinds(mergeActs(ticket({ status: 'merged', pr_state: 'merged', pr_number: 9, pr_url: PR9 }), 'main', null)), [])
 })

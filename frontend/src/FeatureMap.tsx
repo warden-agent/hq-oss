@@ -25,6 +25,7 @@ function MapDialog({ all, repo, m, onClose }: { all: State; repo: any; m: MapVie
   useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }; document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k) })
   const text = m?.text ?? '', first = m?.first ?? null, running = first?.running === true
   const canStart = runnable((all.previews ?? []).find((p) => p.id === repo.id))
+  const closed = repo.clearing_at ? `${repo.name} is being cleared; wait until it's done.` : '' // Bug 333: HQ refuses it now, as it does Launch app
   const start = () => go(async () => { setErr(''); await api(`repos/${repo.id}/first-map`, {}).catch((e: Error) => setErr(errText(e))) })
   return <Backdrop onClose={onClose} z="z-[80]">
     <div role="dialog" aria-modal="true" aria-label={`Feature map of ${repo.name}`}
@@ -40,10 +41,12 @@ function MapDialog({ all, repo, m, onClose }: { all: State; repo: any; m: MapVie
           one session clicks through the running app (in a throwaway copy, with no internet and none of your logins) and writes down what it finds, in a minute or two.</div>
         {first && !first.running && !first.ok && <div role="alert" className="mb-2 break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">
           The last try ({when(first.at)}) didn't work: {first.why}</div>}
-        <button className="btn btn-primary" disabled={busy || !canStart} onClick={start}
-          title={canStart ? 'Start the app in a throwaway copy and have one session click through it and write the map' : 'HQ doesn\'t know how to start this app yet: press Launch app once first'}>
+        <button className="btn btn-primary" disabled={busy || !canStart || !!closed} onClick={start}
+          title={closed || (canStart ? 'Start the app in a throwaway copy and have one session click through it and write the map'
+            : 'HQ doesn\'t know how to start this app yet: press Launch app once first')}>
           {busy ? 'Starting…' : first && !first.running && !first.ok ? 'Try again' : 'Write the first map'}</button>
-        {!canStart && <span className="ml-2 text-zinc-500">HQ doesn't know how to start this app yet: press Launch app once first.</span>}
+        {closed ? <span className="ml-2 text-zinc-500">{closed}</span>
+          : !canStart && <span className="ml-2 text-zinc-500">HQ doesn't know how to start this app yet: press Launch app once first.</span>}
       </div>}
       {running && <div role="status" className="break-words rounded-md border border-sky-500/40 bg-sky-950/30 p-2 text-sky-200">
         HQ is clicking through the app to write its first map (<Elapsed since={first.since} />). The map shows here when it's done.</div>}

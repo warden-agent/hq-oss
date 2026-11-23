@@ -10,7 +10,6 @@ import { startHq, waitFor, sh, exitPlanMode, type Hq } from './harness.ts'
 let hq: Hq
 beforeEach(async () => { hq = await startHq({ env: { HQ_AUTO_SOON_MS: '100', HQ_AUTO_TICK_MS: '500', HQ_REMOVE_SETTLE_MS: '3000' } }) })
 afterEach(async () => { await hq?.stop() })
-const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const answers = (port: number) => fetch(`http://127.0.0.1:${port}/`).then(() => true, () => false)
 const running = (mark: string) => execFileSync('ps', ['-axo', 'command='], { encoding: 'utf8' }).split('\n').some((l) => l.startsWith(mark))
 
@@ -49,7 +48,7 @@ test('Bug 66: everything running in the project stops with no note, another proj
   assert.equal(s.attention.some((x: any) => x.kind === `project_removed:${b.repo.id}` && /Its folder wasn't touched/.test(x.detail)), true)
   const events = (await hq.api('events?limit=500')).json as any[]
   assert.equal(events.some((x) => /^fresh_start/.test(x.kind)), false, 'nobody was asked for a note')
-  await wait(1500); assert.equal((await hq.state()).repos.some((x: any) => x.id === a.repo.id), false) // nothing brings it back
+  await hq.beats('auto'); assert.equal((await hq.state()).repos.some((x: any) => x.id === a.repo.id), false) // the auto loop has been round again: nothing brings it back
   assert.equal(fs.existsSync(path.join(hq.hqHome, 'workspaces', `repo-${a.repo.id}`)), false); assert.equal(fs.existsSync(path.join(hq.hqHome, 'previews', a.repo.id)), false)
 })
 
@@ -65,7 +64,7 @@ test('Bug 66: a test run in flight dies with it, nothing follows from it, and th
   await waitFor('the test run', () => running(MARK), 15_000)
   const tb = await ticket(b.f, 'Next'), head = sh(a.dir, 'rev-parse', 'main')
   const r = await hq.api(`repos/${a.repo.id}/remove`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
-  await waitFor('the test run to end', () => !running(MARK), 4000); await wait(1500); assert.equal(running(MARK), false)
+  await waitFor('the test run to end', () => !running(MARK), 4000); await hq.beats('auto'); assert.equal(running(MARK), false) // and the auto loop, round again, starts no other
   assert.equal(sh(a.dir, 'rev-parse', 'main'), head, 'nothing merged'); assert.equal((await hq.state()).repos.some((x: any) => x.id === a.repo.id), false)
   assert.deepEqual(fs.readdirSync(path.join(a.dir, '.claude', 'worktrees')).filter((d) => d.startsWith('hq-test-')), []) // HQ's own scratch
   assert.equal((await hq.api(`tickets/${tb.id}/launch`, {})).status, 200) // the slot it held is free

@@ -44,7 +44,7 @@ const median = (xs: number[]): number => { const s = [...xs].sort((a, b) => a - 
 
 /** The flags of each call, by its number. HQ's own 503s while it resets the app are not the app's. */
 export function flagCalls(calls: Call[], labels: Endpoint[], limits: Limits = {}): Map<number, Flag[]> {
-  const L = { ...DEFAULT_LIMITS, ...limits, label_ms: { ...DEFAULT_LIMITS.label_ms, ...(limits.label_ms ?? {}) } }
+  const L = { ...DEFAULT_LIMITS, ...limits, label_ms: { ...DEFAULT_LIMITS.label_ms, ...limits.label_ms } }
   const out = new Map<number, Flag[]>(), add = (c: Call, f: Flag) => out.set(c.i, [...(out.get(c.i) ?? []), f])
   const mine = calls.filter((c) => !c.resetting).sort((a, b) => a.at - b.at || a.i - b.i)
   for (const c of mine) {

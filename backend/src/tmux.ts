@@ -41,6 +41,17 @@ export async function killSession(name: string): Promise<void> { await tmux('kil
 export async function capturePane(name: string, lines = 60, styled = false): Promise<string> {
   return tmux('capture-pane', ...(styled ? ['-e'] : []), '-p', '-t', name, '-S', `-${lines}`).catch(() => '')
 }
+/** Bug 302: tmux writes a dead pane's "Pane is dead (status N, …)" on its bottom row, so an app that printed a few lines and ended has
+ *  a screenful of blank lines between its output and that line (and "the last 40 lines" were all blank). The pane's text, `lines`
+ *  back, with those blank lines gone: the output, then tmux's line right under it. A live pane's text just loses its blank end. */
+export async function paneOutput(name: string, lines: number, styled = false): Promise<string> { return closeUpDead(await capturePane(name, lines, styled)) }
+const blank = (row: string): boolean => !row.replace(/\x1b\[[0-9;:]*m/g, '').trim() // styles alone (`-e`) print nothing
+export function closeUpDead(text: string): string {
+  const rows = text.trimEnd().split('\n'); while (rows.length > 1 && blank(rows.at(-1)!)) rows.pop()
+  const last = rows.at(-1)!; if (!/^Pane is dead\b/.test(last.replace(/\x1b\[[0-9;:]*m/g, ''))) return rows.join('\n')
+  let end = rows.length - 1; while (end > 0 && blank(rows[end - 1]!)) end--
+  return [...rows.slice(0, end), last].join('\n')
+}
 /** Only what's on the screen now, no scrollback: a menu that scrolled away isn't open any more. */
 export async function visiblePane(name: string): Promise<string> { return tmux('capture-pane', '-p', '-t', name).catch(() => '') }
 /** The same with its styles (`-e`): only they tell a line somebody typed from Claude Code's grey suggestion (Bug 149, screen.ts paneHasDraft). */
@@ -62,11 +73,13 @@ export function pieces(text: string, max: number): string[] {
   }
   return out
 }
+/** How many characters typeLine sends in one go. Each piece goes in whole (one send-keys), so a line cut short shows whole pieces (Bug 331). */
+export const PIECE = 250
 /** Types one line into the session's prompt and sends it with Enter. In small pieces: Claude Code takes more than 800 characters that arrive at once
  *  for a paste (the box shows "[Pasted text #1]" and the prompt is wrapped as pasted content), and three pieces read together still stay under that.
  *  `--`: a piece may start with a dash. Checked on 2.1.322 with 8,000 characters. */
 export async function typeLine(name: string, text: string): Promise<void> {
-  for (const p of pieces(text, 250)) await tmux('send-keys', '-t', name, '-l', '--', p)
+  for (const p of pieces(text, PIECE)) await tmux('send-keys', '-t', name, '-l', '--', p)
   await tmux('send-keys', '-t', name, 'Enter')
 }
 export async function setHook(name: string, hook: string, shell: string): Promise<void> { await tmux('set-hook', '-t', name, hook, `run-shell ${JSON.stringify(shell)}`).catch(() => {}) }
@@ -74,10 +87,16 @@ export async function paneDead(name: string): Promise<boolean> { const out = awa
 /** Exit code of a dead pane's command (null while it runs or when the session is gone). One a signal ended has no code of its own: 128 plus the signal,
  *  as a shell gives it. Read as "still running", a killed app looked fine for good (Bug 77). */
 const SIGNALS: Record<string, number> = { hup: 1, int: 2, quit: 3, abrt: 6, kill: 9, segv: 11, term: 15 }
+/** The code in tmux's `#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}`. tmux 3.8 names the signal ("1::kill"); tmux 3.6, which Ubuntu ships,
+ *  gives its number ("1::9"). Only names were known, so there a killed app read as 128 plus nothing: "stopped with code 128", not 137 (Bug 320). */
+export function deadPaneCode(line: string): number | null {
+  const m = /^1:(\d*):(.*)$/.exec(line.trim()); if (!m) return null
+  if (m[1]) return Number(m[1])
+  const signal = m[2]!.toLowerCase().replace(/^sig/, '')
+  return 128 + (SIGNALS[signal] ?? (/^\d+$/.test(signal) ? Number(signal) : 0))
+}
 export async function paneDeadStatus(name: string): Promise<number | null> {
-  const out = (await tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}').catch(() => '')).trim()
-  const m = /^1:(\d*):(.*)$/.exec(out); if (!m) return null
-  return m[1] ? Number(m[1]) : 128 + (SIGNALS[m[2]!.toLowerCase().replace(/^sig/, '')] ?? 0)
+  return deadPaneCode(await tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}').catch(() => ''))
 }
 /** Pid of the pane's command; it leads the process group its children run in. */
 export async function panePid(name: string): Promise<number | null> { const n = Number((await tmux('display-message', '-p', '-t', name, '#{pane_pid}').catch(() => '')).trim()); return n > 0 ? n : null }

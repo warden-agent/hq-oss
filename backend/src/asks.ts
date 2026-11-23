@@ -7,7 +7,7 @@ import { one, q, run, now } from './db.ts'
 import { emit, patch } from './events.ts'
 import { id } from './util.ts'
 import type { Agent } from './agents.ts'
-import { getTicket, liveTpm } from './records.ts'
+import { getTicket, liveTpm, notClearing } from './records.ts'
 import { cancelTicket, fillSlots } from './tickets.ts'
 import { sendMessage } from './delivery.ts'
 import { messageTpm } from './tpm.ts'
@@ -37,24 +37,27 @@ function close(a: Ask, answer: string | null): void {
   emit({ agentId: null, source: 'ui', kind: 'ask.closed', payload: { id: a.id, answer } })
 }
 
-/** The user answered from a choice button or the Answer box: closed, and the TPM gets it as the user's message. */
-export async function answerAsk(askId: string, answer: string): Promise<Ask> {
+/** The user answered from a choice button or the Answer box: closed, and the TPM gets it as the user's message. `message_id`: that
+ *  message, so the tab that answered knows it sent it (Bug 286: only that tab's Chat jumps to it). */
+export async function answerAsk(askId: string, answer: string): Promise<Ask & { message_id?: string }> {
   const a = one<Ask>('SELECT * FROM asks WHERE id = ?', askId); if (!a) throw new Error('unknown question')
   if (a.answered_at) throw new Error('That question is already answered.')
+  notClearing(a.repo_id) // Bug 294: the TPM is writing its note, and the answer and the question go with the board
   const text = answer.trim(); if (!text) throw new Error('Write an answer first.'); if (text.length > 2000) throw new Error('That answer is too long (2000 characters at most).')
   const act = actionOf(a); if (act) return answerAction(a, act, text)
   const body = `You asked: "${a.question}"\nThe user's answer: ${text}`, tpm = liveTpm(a.repo_id)
   close(a, text)
-  if (tpm) sendMessage({ repoId: a.repo_id, channel: 'dm', from: 'user', to: tpm.id, reason: 'answer', body })
-  else await messageTpm(a.repo_id, body, { keepAsks: true }) // an ask outlives the TPM that asked it: the answer brings the TPM back
-  return { ...a, answered_at: now(), answer: text }
+  const m = tpm ? sendMessage({ repoId: a.repo_id, channel: 'dm', from: 'user', to: tpm.id, reason: 'answer', body })
+    : (await messageTpm(a.repo_id, body, { keepAsks: true })).message // an ask outlives the TPM that asked it: the answer brings the TPM back
+  return { ...a, answered_at: now(), answer: text, message_id: m.id }
 }
 /** A choice on an ask with an action: HQ does it (whether or not the TPM runs now; a later TPM sees the result in list_tickets). */
-async function answerAction(a: Ask, act: AskAction, choice: string): Promise<Ask> {
+async function answerAction(a: Ask, act: AskAction, choice: string): Promise<Ask & { message_id?: string }> {
   const choices = JSON.parse(a.choices) as string[]
   if (!choices.includes(choice)) throw new Error(`Choose ${choices.map((c) => `"${c}"`).join(' or ')}.`)
   const tpm = liveTpm(a.repo_id), t = getTicket(act.ticket)
-  const tell = (body: string) => { if (tpm) sendMessage({ repoId: a.repo_id, channel: 'dm', from: 'user', to: tpm.id, reason: 'answer', body }) }
+  let told: string | undefined
+  const tell = (body: string) => { if (tpm) told = sendMessage({ repoId: a.repo_id, channel: 'dm', from: 'user', to: tpm.id, reason: 'answer', body }).id }
   if (choice === REMOVE && t && t.status !== 'merged' && t.status !== 'cancelled') {
     await cancelTicket(t.id, { asked: true }) // it tells the TPM; if it can't (an engineer is starting right now), the question stays open
     close(a, choice)
@@ -63,7 +66,7 @@ async function answerAction(a: Ask, act: AskAction, choice: string): Promise<Ask
     if (choice === REMOVE) tell(`You asked to remove ${t?.key ?? 'a ticket'}; it is ${t?.status ?? 'gone'} already, so nothing changed.`)
     else { tell(`You asked: "${a.question}"\nThe user's answer: ${choice}. Leave ${t?.key ?? 'it'} as it is.`); void fillSlots().catch(() => {}) } // it may start now
   }
-  return { ...a, answered_at: now(), answer: choice }
+  return { ...a, answered_at: now(), answer: choice, message_id: told }
 }
 /** The user wrote to the TPM directly (Talk to TPM): that's their answer to whatever it asked, so nothing stays "your turn".
  *  Not to an ask with an action: removing a ticket takes a press of "Remove it", never a reply that happens to be sent. */

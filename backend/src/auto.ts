@@ -18,7 +18,7 @@ import { restoreMain } from './localmerge.ts'
 import { writeFeatureMd } from './projectmd.ts'
 import { parseGithubRemote } from './reposync.ts'
 import { sendMessage } from './delivery.ts'
-import { resumeRepo } from './freshstart.ts'
+import { resumeRepo, switchNotes } from './freshstart.ts'
 import { AUTO_OFF_WORDS, autoOnWords } from './handover.ts'
 import { checkPlan, planChecks, planLine, stopPlanChecks } from './plancheck.ts'
 import { inMergeQueue, mergeNow } from './mergewatch.ts'
@@ -49,6 +49,7 @@ import { runUiTest } from './uitester.ts'
 import { uiTestLines, uiTestOf, type UiTest } from './uitesterrules.ts'
 import { afterUiTest, beforeUiTest, findingsSection, stageDone, stageFailed, testingOn } from './findings.ts'
 import type { Retry } from './loopinputs.ts'
+import { beat } from './beats.ts'
 
 /** Times HQ sends one ticket back (conflicts, failed tests, a lost engineer, a failed start) before parking it. */
 export const MAX_TRIES = 2
@@ -151,6 +152,7 @@ export async function readNotices(repo: Repo, all: Ticket[]): Promise<void> {
     // parked before this look: skipped. Parked earlier in this look: its other notices are resolved below (park does nothing twice)
     const t = before && !before.auto_parked_why ? getTicket(before.id) : undefined; if (!t) continue
     if (STOP_KINDS.includes(a.kind)) stopProject(repo, a.detail)
+    else if (t.auto_parked_why) resolveAttention(a.id) // Bug 355: parked by a notice before this one: no retry or fresh engineer for it
     else if (PARK_KINDS.includes(a.kind)) { resolveAttention(a.id); await park(t, a.detail) }
     else if (a.kind === 'launch_failed') { resolveAttention(a.id); await retry(t, a.detail, async () => {}) } // the next start tries again
     else if (REPLACE_KINDS.includes(a.kind)) { resolveAttention(a.id); await retry(t, a.detail, () => replaceEngineer(t, agent)) }
@@ -163,13 +165,16 @@ async function replaceEngineer(t: Ticket, a: Agent | undefined): Promise<void> {
 /** Engineers that ended their turn with the ticket unfinished: nothing else notices them, and they'd hold a slot and the run forever.
  *  One with a message or a run in the background on its way isn't one of them (bgruns.ts idleTooLong). */
 async function idleEngineers(all: Ticket[]): Promise<void> {
-  for (const t of all.filter((x) => x.assignee_agent_id)) {
-    const a = getAgent(t.assignee_agent_id!); if (idleTooLong(t, a)) await retry(t, 'Its engineer stopped before finishing.', () => replaceEngineer(t, a))
+  for (const t0 of all.filter((x) => x.assignee_agent_id)) {
+    const t = getTicket(t0.id); if (!t?.assignee_agent_id) continue // read after the last one's wait (Bug 355)
+    const a = getAgent(t.assignee_agent_id); if (idleTooLong(t, a)) await retry(t, 'Its engineer stopped before finishing.', () => replaceEngineer(t, a))
   }
 }
 /** Engineers that went away with work left: one fresh start each, within the ticket's tries. */
 async function lostEngineers(all: Ticket[]): Promise<void> {
-  for (const t of all.filter((x) => RESUMABLE.includes(x.status) && x.assignee_agent_id && !x.parked_at && !x.auto_parked_why)) {
+  const lost = (x: Ticket | undefined): x is Ticket => !!x && RESUMABLE.includes(x.status) && !!x.assignee_agent_id && !x.parked_at && !x.auto_parked_why
+  for (const t0 of all.filter(lost)) {
+    const t = getTicket(t0.id); if (!lost(t)) continue // read after the last one's wait (Bug 355)
     const a = getAgent(t.assignee_agent_id!); if (!a || a.status !== 'exited' || a.fresh_start_at) continue
     await retry(t, `Its engineer stopped working on it (${a.id}).`, () => resumeEngineer(t.id, { replace: true }))
   }
@@ -185,6 +190,7 @@ const tpmSettled = (repoId: string): boolean => {
   return tpm.status === 'idle' && !one("SELECT 1 AS x FROM messages WHERE to_id = ? AND from_id = 'user' AND delivered_at IS NULL", tpm.id) // HQ's own notices don't change a split
 }
 async function startReady(repo: Repo): Promise<void> {
+  const cur = getRepo(repo.id); if (!cur?.auto_mode || cur.auto_stopped_why || cur.clearing_at) return // Bug 355: keepTpm's wait may have stopped it
   const asking = new Set(openAsks().map((a) => actionOf(a)?.ticket))
   for (const f of liveFeatures(repo.id)) {
     for (const t of readyTickets(tickets(f.id), j<string[]>(f.merge_order, []))) if (!t.go_ahead && !t.auto_parked_why && !asking.has(t.id)) setTicket(t.id, { go_ahead: 1 })
@@ -643,7 +649,8 @@ export async function undoRun(runId: string): Promise<{ sha: string }> {
 async function tickRepo(repo0: Repo): Promise<void> {
   const all = repoTickets(repo0.id); let repo = getRepo(repo0.id)!
   approvePlans(all) // even when stopped: running engineers finish
-  await readNotices(repo, all); await lostEngineers(all); await idleEngineers(repoTickets(repo.id))
+  // Bug 355: read the tickets again after each step: the one before may have parked a ticket and stopped its engineer
+  await readNotices(repo, all); await lostEngineers(repoTickets(repo.id)); await idleEngineers(repoTickets(repo.id))
   repo = getRepo(repo.id)!
   const left = moving(repo, repoTickets(repo.id))
   if (left.length && !openRun(repo.id)) {
@@ -695,7 +702,7 @@ export function autoTick(): Promise<void> {
       for (const r of q<Repo>('SELECT * FROM repos WHERE auto_mode = 1 AND clearing_at IS NULL')) {
         await tickRepo(r).catch((e) => { emit({ agentId: null, source: 'system', kind: 'auto.error', payload: { repo: r.id, error: String(e) } }) })
       }
-      keepAwake()
+      keepAwake(); beat('auto')
     } while (again)
   })().finally(() => { ticking = null })
   return ticking
@@ -719,7 +726,8 @@ function keepAwake(): void {
   if (!want && awake) { try { process.kill(-awake.pid!) } catch { /* gone */ } awake = null } // the group: systemd-inhibit's tail goes too
 }
 
-const rules = (base: string): string => `HQ: the user turned auto mode on for this project. From now on ${autoOnWords(base)}. Finish each split before you end your turn. `
+const going = (base: string): string => `From now on ${autoOnWords(base)}. Finish each split before you end your turn.`
+const rules = (base: string): string => `HQ: the user turned auto mode on for this project. ${going(base)} `
   + 'Make product choices yourself and record each one with write_feature, section "Decided in auto mode". '
   + 'Only something hard to undo goes to ask_user, with hard_to_undo: true. '
   + 'HQ won\'t merge without tests it can run, and it checks that each acceptance criterion of a ticket has a test: in a project with none the first ticket adds them.'
@@ -730,7 +738,7 @@ export async function setAuto(repoId: string, on: boolean): Promise<{ on: boolea
   if (on) {
     const problem = await sandboxProblem(); if (problem) throw new Error(problem) // now, not at the first merge with the tokens spent
     setRepo(repo, { auto_mode: 1, auto_stopped_why: null, auto_waiting: null })
-    if (repo.tpm_parked_at) await resumeRepo(repoId).catch(() => {}) // it can't work parked
+    if (repo.tpm_parked_at || switchNotes(repoId).length) await resumeRepo(repoId).catch(() => {}) // it can't work parked (nor be parked: Bug 350)
     tellTpm(repoId, rules(repo.default_branch))
   } else {
     const r = openRun(repoId); setRepo(repo, { auto_mode: 0, auto_stopped_why: null, auto_waiting: null }); clearGoAhead(repoId)
@@ -745,12 +753,17 @@ export async function setAuto(repoId: string, on: boolean): Promise<{ on: boolea
   keepAwake(); if (on) autoSoon()
   return { on }
 }
-/** Resume after a stop: HQ looks again, and stops again if the reason is still there. */
+/** Resume after a stop: HQ looks again, and stops again if the reason is still there (stopProject then tells the TPM why). Bug 279: the TPM is told
+ *  it's running again, once, or its last word stays "Nothing new starts or merges until the user resumes it" until a merge. Read after the sandbox
+ *  check: a second press, or auto going off meanwhile, has nothing to resume and says nothing. A new TPM needs no note: its prompt says (handover.ts autoLine). */
 export async function autoResume(repoId: string): Promise<{ ok: true }> {
-  const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
+  if (!getRepo(repoId)) throw new Error('unknown repo')
   const problem = await sandboxProblem(); if (problem) throw new Error(problem)
+  const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
+  const stopped = !!repo.auto_mode && !!repo.auto_stopped_why
   setRepo(repo, { auto_stopped_why: null })
   for (const a of openAttention().filter((x) => x.kind === `auto_stopped:${repoId}`)) resolveAttention(a.id)
+  if (stopped) tellTpm(repoId, `HQ: the user resumed auto mode, so it's running again. ${going(repo.default_branch)} If what stopped it is still there, it stops again and HQ tells you.`)
   autoSoon(); return { ok: true }
 }
 /** Engineers at work when the test command changes: otherwise they keep running the old one, which may never finish. Bug 147:
@@ -875,6 +888,7 @@ export async function answerTestCommand(repoId: string, use: boolean): Promise<{
 /** Another go for a parked ticket. */
 export function autoRetry(ticketId: string): { ok: true } {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
+  notClearing(getFeature(t.feature_id)?.repo_id ?? '') // Bug 335: the ticket goes with the board, and nothing starts meanwhile
   setTicket(t.id, { auto_parked_why: null, auto_tries: 0 }); resolveForTicket(t.id); autoSoon(); return { ok: true }
 }
 /** What the Auto dialog shows: the user's test command, or the one HQ found in the checkout, and why this machine can't do it, if so. */

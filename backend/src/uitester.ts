@@ -13,6 +13,7 @@
 // hooks given with --settings run with --setting-sources ''; a hook's deny holds. One small scenario: 10 s, about 30,000 tokens.
 import fs from 'node:fs'
 import path from 'node:path'
+import type { Owner } from './testrun.ts'
 import { createRequire } from 'node:module'
 import { PATHS } from './config.ts'
 import { call, PLAIN } from './checker.ts'
@@ -43,8 +44,9 @@ const SESSION_MS = (Number(process.env.HQ_UITEST_SESSION_S) || 900) * 1000, HOST
  *  later backend can sweep a dead one's (sweepUiTmp). */
 const TMP_ROOT = '/private/tmp', TMP_PREFIX = 'hq-ut-'
 
-export type RunInput = { repoPath: string; repoId: string; runId: string; sha: string; plan: LookPlan; gen: number;
-  tickets: { key: string; title: string; criteria: Criterion[] }[]; retry?: Retry[] }
+export type RunInput = { repoPath: string; repoId: string; runId: string; sha: string; plan: LookPlan; gen: Owner;
+  tickets: { key: string; title: string; criteria: Criterion[] }[]; retry?: Retry[]
+  ticketId?: string } // one ticket's check (hqcheck.ts): the board shows the tester on its box
 
 const skipped = (why: string, quiet?: boolean): UiTest => ({ at: Date.now(), state: 'skipped', why, ...(quiet ? { quiet } : {}) })
 /** Where a run's scenarios, logs and findings are kept: HQ's own folder for the project, never the user's repo. Part 5 (findings) reads them from here. */
@@ -72,7 +74,7 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
   let tokens = 0, cost = 0
   // 1. The scenarios
   // Auto going off or stopping ends the planning call too, and the board says what HQ is doing meanwhile
-  const work = autoWork(o.repoPath, o.gen), page = showing({ repoId: o.repoId, ticketId: null, what: 'tester' })
+  const work = autoWork(o.repoPath, o.gen), page = showing({ repoId: o.repoId, ticketId: o.ticketId ?? null, what: 'tester' })
   const planned = await call({ args: ['--model', model, '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', ...PLAIN, '--json-schema', PLAN_SCHEMA,
     '--system-prompt', PLAN_SYSTEM], prompt: planPrompt(map, news.lines, SCENARIOS), signal: work.signal }).finally(() => { work.done(); page.over() })
   if (planned.kind === 'error') return skipped(`the tester couldn't plan its scenarios (${planned.why})`)
@@ -90,7 +92,7 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
   fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify(scenarios, null, 1))
 
   // 2–4. The app, and the scenarios in batches
-  const r = await inCheckout(o.repoPath, o.sha, 'uitest', o.gen, { repoId: o.repoId, ticketId: null, what: 'tester' }, async (wt, signal): Promise<UiTest | 'stopped'> => {
+  const r = await inCheckout(o.repoPath, o.sha, 'uitest', o.gen, { repoId: o.repoId, ticketId: o.ticketId ?? null, what: 'tester' }, async (wt, signal): Promise<UiTest | 'stopped'> => {
     const cant = await prepareApp(wt, o.plan, { signal, run: runSandboxed })
     if (cant?.kind === 'stopped') return 'stopped'
     if (cant) return skipped(cant.kind === 'no_start' ? `the app couldn't be started (${cant.why})` : cant.why)

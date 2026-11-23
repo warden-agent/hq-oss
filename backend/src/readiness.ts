@@ -7,6 +7,8 @@ export type TicketStatus = (typeof TICKET_STATUSES)[number]
 export type TicketLike = { key: string; status: string; assignee_agent_id: string | null; deps: string }
 /** Statuses where the ticket's engineer is finished; those engineers don't use a parallel slot. */
 export const FINISHED: string[] = ['pr_ready', 'pr_open', 'merged', 'cancelled'] satisfies TicketStatus[]
+/** How a refused launch starts when every parallel slot is taken (scheduler.ts canLaunch). The page's red bar saying it goes once a slot is free (Bug 305). */
+export const LIMIT_REACHED = 'Parallel limit reached'
 const keys = (s: string): string[] => { try { const v = JSON.parse(s || '[]'); return Array.isArray(v) ? v.map(String) : [] } catch { return [] } }
 /** Dependencies of `t` (keys within its feature) that aren't merged yet. A key with no ticket counts as not merged. */
 export function unmergedDeps(t: TicketLike, siblings: TicketLike[]): string[] { return keys(t.deps).filter((k) => siblings.find((s) => s.key === k)?.status !== 'merged') }

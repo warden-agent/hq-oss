@@ -62,7 +62,8 @@ test('Bug 9 on GitHub: flagged, fixed against origin/main, pushed onto the same 
   const msg = (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === e2.id)
   assert.match(msg.body, /conflicts with origin\/main in version\.txt\. Fix it now, in your worktree:\n1\. git merge --no-edit origin\/main /)
   // The watcher sees PR #2 still open while the engineer works: the ticket stays resolving.
-  await hq.api(`repos/${repo.id}/sync`, {}); await new Promise((res) => setTimeout(res, 500))
+  const looked = await hq.beat('merges'); await hq.api(`repos/${repo.id}/sync`, {}); await hq.api(`repos/${repo.id}/sync`, {})
+  await hq.beats('merges', 2, { from: looked }) // a sync sets the watcher off: it has looked again since the first
   assert.equal((await tk(t2)).status, 'resolving')
   try { sh(wt(t2), 'merge', '--no-edit', 'origin/main') } catch { /* the conflict */ }
   fs.writeFileSync(path.join(wt(t2), 'version.txt'), 'v1\norders\ninvoices\n'); sh(wt(t2), 'add', 'version.txt'); sh(wt(t2), 'commit', '--no-edit', '-q')

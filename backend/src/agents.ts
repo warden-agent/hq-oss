@@ -4,7 +4,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { agentTmpDir, PATHS, PORTS, CLAUDE_BIN, newToken } from './config.ts'
 import { db, one, q, run, now } from './db.ts'
-import { emit, patch } from './events.ts'
+import { bus, emit, patch, type Patch } from './events.ts'
 import { id, sha, shq } from './util.ts'
 import * as tmux from './tmux.ts'
 import { buildMcp, buildSettings, roleFlags, rolePromptPath, HOOK_HEADER_FILE, hookHeaderLine, type Role } from './roles.ts'
@@ -21,6 +21,9 @@ export type Agent = {
   fresh_start_at: number | null; fresh_start_then: string | null; fresh_start_msg: string | null; interrupted_at: number | null; ended_why: string | null
   /** Why a `blocked` agent is blocked (Bug 72): 'dialog', or 'api_error' (its turn ended with an API error). Read only while the status is `blocked`; any other status clears it (update, Bug 218). */
   blocked_why: 'dialog' | 'api_error' | null
+  /** The line its box shows ("Thinking", the tool it uses), as the last patch that carried one said it (keepLine, Bug 337). Read back at start-up only (ui.ts
+   *  seedExtras); while HQ runs the page has it from the patches. */
+  activity: string | null
 }
 /** A dialog or menu is on its terminal (or HQ must assume so), so Enter would pick an option there: blocked by anything but an API error (Bug 72), or
  *  paused on a usage limit. */
@@ -34,7 +37,14 @@ export function agentByToken(token: string): Agent | undefined {
 export function agentBySession(sessionId: string): Agent | undefined { return one<Agent>('SELECT * FROM agents WHERE claude_session_id = ?', sessionId) }
 /** An agent as the page gets it: without its token's hash, and without its launch prompt (long, and nothing shows it: it's the
  *  agent's prompt.md). */
-export const pageAgent = (a: Agent) => ({ ...a, token_hash: undefined, launch_prompt: undefined })
+export const pageAgent = ({ activity: _line, ...a }: Agent) => ({ ...a, token_hash: undefined, launch_prompt: undefined }) // the line: from patches (Bug 337)
+/** Bug 337: the box's line went with a restart (it was kept in memory only, ui.ts extras), so a working agent said "working" and nothing else until its next
+ *  hook. Every patch that says it is kept with the agent, whoever sends it (a hook, a build's turn, a helper, the stuck loop). */
+bus.on('patch', (p: Patch) => { if (p.entity === 'agent' && p.patch && p.patch.activity !== undefined) keepLine(p.id, p.patch.activity) })
+function keepLine(agentId: string, line: unknown): void {
+  const said = typeof line === 'string' && line ? line : null
+  run('UPDATE agents SET activity = ? WHERE id = ? AND activity IS NOT ?', said, agentId, said) // the same line again (a build's beat): nothing written
+}
 export function liveAgents(): Agent[] { return q<Agent>("SELECT * FROM agents WHERE status != 'exited' ORDER BY started_at") }
 /** Writes agent columns (a key that isn't one is a type error, not a failed UPDATE at runtime). `shown`: fields the page shows that
  *  aren't columns (a hook's activity line), sent in the same patch (Bug 98). */
@@ -77,7 +87,7 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   fs.writeFileSync(path.join(dir, 'prompt.md'), spec.launchPrompt)
   const sessionId = randomUUID(), tmp = agentTmp(agentId) // made in the same tick as the agent's row below: a sweep never sees one without the other
   const env: Record<string, string> = { HQ_AGENT_ID: agentId, HQ_BACKEND: `http://127.0.0.1:${PORTS.hooks}`, HQ_TOKEN_FILE: path.join(dir, 'token'), DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_ENABLE_TODO_TOOLS: '1',
-    ...(tmp ? { CLAUDE_CODE_TMPDIR: tmp } : {}), ...(spec.extraEnv ?? {}) }
+    ...(tmp ? { CLAUDE_CODE_TMPDIR: tmp } : {}), ...spec.extraEnv }
   const flags = ['--session-id', sessionId, '--name', spec.displayName, '--settings', path.join(dir, 'settings.json'), '--strict-mcp-config', '--mcp-config', path.join(dir, 'mcp.json'),
     '--plugin-dir', PATHS.plugin, '--append-system-prompt-file', rolePromptPath(spec.role),
     ...roleFlags(spec.role, { worktreeName: spec.worktreeName, model: spec.model, permissionMode: spec.permissionMode }), ...(spec.extraFlags ?? [])]

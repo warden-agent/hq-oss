@@ -1,7 +1,8 @@
 // Where the board's view goes (Bug 119, frontend/src/fit.ts): everything while it's readable, else less, and never cut on both sides.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { fitSets, floorAt, LOWEST, NARROW, placePop, placeView, POP_EDGE, POP_FLOOR, READABLE, type Box } from '../../frontend/src/fit.ts'
+import { CORNERS, CROWDED_GIVE, edgeHints, fitSets, floorAt, HINT_H, HINT_W, LOWEST, NARROW, placeBoard, placePop, placeView, POP_EDGE,
+  POP_FLOOR, READABLE, wholeIn, type Box, type Corner } from '../../frontend/src/fit.ts'
 
 /** Which boxes a view shows whole in a w×h pane. */
 const whole = (boxes: Box[], v: { x: number; y: number; zoom: number }, w: number, h: number) => boxes.filter((b) =>
@@ -205,4 +206,261 @@ test('what it must not change: a narrow popover in a wide board keeps its width;
 test('a box panned off the board still gets a popover tall enough to use, and a pane too narrow for any gives width 0', () => {
   assert.equal(placePop({ x: 100, y: 900, w: 200, h: 100 }, 520, 900, 860).maxHeight >= POP_FLOOR, true)
   assert.equal(placePop({ x: 0, y: 0, w: 10, h: 10 }, 520, 10, 860).width, 0)
+})
+
+// Bug 284: boxes the view leaves wholly past an edge get a hint there ("‹ 1 more") that pans to the nearest of them.
+/** bug250demo's board as the page lays it out: the TPM, finished F-1 (folded), F-2 and F-3 with two tickets each. */
+const garden = (): Box[] => [
+  { id: 'tpm', x: 252, y: 0, w: 340, h: 282 }, { id: 'f1', x: 0, y: 338, w: 220, h: 66 },
+  { id: 'f2', x: 292, y: 338, w: 240, h: 50 }, { id: 't4', x: 300, y: 460, w: 224, h: 34 }, { id: 't5', x: 300, y: 510, w: 224, h: 98 },
+  { id: 'f3', x: 604, y: 338, w: 240, h: 50 }, { id: 't6', x: 612, y: 460, w: 224, h: 34 }, { id: 't7', x: 612, y: 510, w: 224, h: 94 },
+]
+const gardenSets = () => fitSets(garden().map((b) => b.id), [{ ids: ['f1'], done: true, needsYou: false },
+  { ids: ['f2', 't4', 't5'], done: false, needsYou: false }, { ids: ['f3', 't6', 't7'], done: false, needsYou: false }], true)
+const rectOf = (h: { x: number; y: number }) => ({ l: h.x, t: h.y, r: h.x + HINT_W, u: h.y + HINT_H })
+const overlaps = (a: { l: number; t: number; r: number; u: number }, b: { l: number; t: number; r: number; u: number }) =>
+  a.l < b.r && a.r > b.l && a.t < b.u && a.u > b.t
+const onScreen = (b: Box, v: { x: number; y: number; zoom: number }) =>
+  ({ l: v.x + b.x * v.zoom, t: v.y + b.y * v.zoom, r: v.x + (b.x + b.w) * v.zoom, u: v.y + (b.y + b.h) * v.zoom })
+
+test('Bug 284: at 820 px with the panel open the finished feature is left off the left edge, and a hint there says so', () => {
+  const bs = garden(), v = placeView(bs, gardenSets(), 414, 831)!
+  assert.equal(whole(bs, v, 414, 831).includes('f1'), false) // fitSets' second set, as Bug 119 meant: the work going on
+  const hs = edgeHints(bs, v, 414, 831)
+  assert.deepEqual(hs.map((h) => [h.side, h.ids]), [['left', ['f1']]])
+  const h = hs[0]!, r = rectOf(h)
+  assert.ok(r.l >= 0 && r.r <= 414 && r.t >= 0 && r.u <= 831, 'inside the board')
+  for (const b of bs.filter((o) => whole([o], v, 414, 831).length)) assert.equal(overlaps(r, onScreen(b, v)), false, `clear of ${b.id}`)
+  assert.equal(h.to.zoom, v.zoom) // a pan, not a zoom
+  assert.equal(whole(bs, h.to, 414, 831).includes('f1'), true)
+  assert.equal(h.to.y, v.y) // already level with the view: only sideways
+  assert.deepEqual(edgeHints(bs, h.to, 414, 831).filter((o) => o.side === 'left'), []) // nothing left past the left edge after it
+})
+
+test('Bug 284, what it must not show: no hint when every box is in view, or only cut at an edge', () => {
+  const bs = garden()
+  for (const w of [1440 - 400, 820]) { const v = placeView(bs, gardenSets(), w, 831)!; assert.deepEqual(whole(bs, v, w, 831).length, bs.length)
+    assert.deepEqual(edgeHints(bs, v, w, 831), []) }
+  assert.deepEqual(edgeHints(bs, { x: -100, y: 0, zoom: 1 }, 820, 831), []) // f1 cut at the left edge (it shows): no hint
+  assert.deepEqual(edgeHints(bs, { x: 0, y: 0, zoom: 1 }, 0, 831), []) // no size yet
+})
+
+test('Bug 284: a hint for each side with boxes past it, a corner box counted left or right, hints clear of each other and the zoom buttons', () => {
+  const bs: Box[] = [{ id: 'mid', x: 0, y: 0, w: 100, h: 50 }, { id: 'l', x: -400, y: 0, w: 100, h: 50 }, { id: 'r', x: 600, y: 0, w: 100, h: 50 },
+    { id: 'u', x: 0, y: -400, w: 100, h: 50 }, { id: 'd', x: 0, y: 700, w: 100, h: 50 }, { id: 'ld', x: -400, y: 700, w: 100, h: 50 }]
+  const v = { x: 200, y: 300, zoom: 1 }, w = 500, h = 600, buttons = { l: 0, t: h - 112, r: 52, u: h }
+  const hs = edgeHints(bs, v, w, h, [buttons])
+  assert.deepEqual(hs.map((o) => [o.side, o.ids]), [['left', ['l', 'ld']], ['right', ['r']], ['top', ['u']], ['bottom', ['d']]])
+  for (const a of hs) {
+    const r = rectOf(a); assert.ok(r.l >= 0 && r.r <= w && r.t >= 0 && r.u <= h, `${a.side} inside`)
+    assert.equal(overlaps(r, buttons), false, `${a.side} clear of the zoom buttons`)
+    assert.equal(overlaps(r, onScreen(bs[0]!, v)), false, `${a.side} clear of the box in view`)
+    for (const b of hs) if (b !== a) assert.equal(overlaps(r, rectOf(b)), false, `${a.side} clear of ${b.side}`)
+  }
+  // Each brings the nearest of its boxes whole into view (left: 'l' is level with the view, 'ld' is also low), and since Bug 345
+  // cuts no box on the way and zooms out (not below READABLE) where that shows more: 'l' and 'mid' side by side, not 'mid' cut
+  const near = { left: 'l', right: 'r', top: 'u', bottom: 'd' } as const
+  for (const a of hs) {
+    assert.ok(whole(bs, a.to, w, h).includes(near[a.side]), `${a.side} brings ${near[a.side]} in`)
+    assert.deepEqual(cut(bs, a.to, w, h), [], `${a.side} cuts nothing`); assert.ok(a.to.zoom <= 1 && a.to.zoom >= READABLE, `${a.side} zoom`)
+  }
+  assert.deepEqual(whole(bs, hs[0]!.to, w, h).filter((id) => id === 'l' || id === 'mid'), ['mid', 'l'])
+  assert.equal(hs[0]!.y + HINT_H / 2, 300 + 25) // level with 'l', the nearest
+})
+
+test('Bug 284: a hint moves along the edge off a box in view that sits at that edge, and stays put when nothing is in the way', () => {
+  const bs: Box[] = [{ id: 'edge', x: 0, y: 0, w: 200, h: 60 }, { id: 'gone', x: -500, y: 10, w: 200, h: 40 }]
+  const [h] = edgeHints(bs, { x: 8, y: 100, zoom: 1 }, 400, 600)
+  assert.ok(h && (h.y + HINT_H <= 100 || h.y >= 160), `off the box: ${h?.y}`)
+  const [free] = edgeHints(bs, { x: 300, y: 100, zoom: 1 }, 800, 600)
+  assert.equal(free!.y + HINT_H / 2, 100 + 30) // nothing at the edge: level with 'gone'
+})
+
+/** bug282demo's board: the TPM over four running features (F-1 and F-4 one ticket, F-2 and F-3 two). */
+const four = (): Box[] => [
+  { id: 'tpm', x: 418, y: 0, w: 340, h: 266 },
+  { id: 'f1', x: 0, y: 322, w: 240, h: 50 }, { id: 't1', x: 10, y: 428, w: 220, h: 66 },
+  { id: 'f2', x: 312, y: 322, w: 240, h: 50 }, { id: 't2', x: 322, y: 428, w: 220, h: 66 }, { id: 't3', x: 322, y: 510, w: 220, h: 66 },
+  { id: 'f3', x: 624, y: 322, w: 240, h: 50 }, { id: 't4', x: 634, y: 428, w: 220, h: 66 }, { id: 't5', x: 634, y: 510, w: 220, h: 94 },
+  { id: 'f4', x: 936, y: 322, w: 240, h: 50 }, { id: 't6', x: 946, y: 428, w: 220, h: 94 },
+]
+const fourSets = () => fitSets(four().map((b) => b.id), [{ ids: ['f1', 't1'], done: false, needsYou: false },
+  { ids: ['f2', 't2', 't3'], done: false, needsYou: false }, { ids: ['f3', 't4', 't5'], done: false, needsYou: false },
+  { ids: ['f4', 't6'], done: false, needsYou: false }], true)
+
+test('Bug 284 (seen with Bug 282): running features off both sides at 820 px with the panel open get a hint on each side', () => {
+  // (At 1100 px, 574 px of board, F-4 shows too since Bug 306: only F-1 is off, at the left.)
+  const bs = four(), v = placeView(bs, fourSets(), 414, 831)!
+  const hs = edgeHints(bs, v, 414, 831, [{ l: 0, t: 831 - 112, r: 52, u: 831 }])
+  assert.deepEqual(hs.map((h) => [h.side, h.ids]), [['left', ['f1', 't1']], ['right', ['f4', 't6']]])
+  for (const h of hs) {
+    assert.equal(whole(bs, h.to, 414, 831).includes(h.side === 'left' ? 'f1' : 'f4'), true, `${h.side} pans its nearest feature in`)
+    for (const b of bs.filter((o) => whole([o], v, 414, 831).length)) assert.equal(overlaps(rectOf(h), onScreen(b, v)), false, `clear of ${b.id}`)
+  }
+  assert.deepEqual(edgeHints(bs, placeView(bs, fourSets(), 574, 831)!, 574, 831).map((h) => [h.side, h.ids]), [['left', ['f1', 't1']]])
+})
+
+test('Bug 284: with no room clear of everything along an edge the hint covers as little as it can', () => {
+  // Two boxes cut at the bottom edge with a 64 px gap between them (less than a hint), and the zoom buttons in the corner
+  const bs: Box[] = [{ id: 'a', x: 8, y: 800, w: 240, h: 50 }, { id: 'b', x: 320, y: 800, w: 240, h: 50 }, { id: 'gone', x: 100, y: 1200, w: 100, h: 50 }]
+  const buttons = { l: 0, t: 831 - 112, r: 52, u: 831 }, [h] = edgeHints(bs, { x: 0, y: 0, zoom: 1 }, 414, 831, [buttons])
+  assert.equal(h!.side, 'bottom')
+  const r = rectOf(h!), area = (b: { l: number; t: number; r: number; u: number }) =>
+    Math.max(0, Math.min(r.r, b.r) - Math.max(r.l, b.l)) * Math.max(0, Math.min(r.u, b.u) - Math.max(r.t, b.t))
+  assert.equal(area(buttons), 0)
+  assert.ok(area(onScreen(bs[0]!, { x: 0, y: 0, zoom: 1 })) + area(onScreen(bs[1]!, { x: 0, y: 0, zoom: 1 })) <= 8 * HINT_H, `in the gap: ${r.l}`)
+})
+
+// Bug 306: at narrow widths with the panel open the board's own view hid most of the board.
+/** bug282demo's groups: engineers on F-1 to F-3, F-4 never launched (the newest, so Bug 119's focus with nothing waiting on the user). */
+const fourGroups = () => [{ ids: ['f1', 't1'], done: false, needsYou: false, working: true },
+  { ids: ['f2', 't2', 't3'], done: false, needsYou: false, working: true }, { ids: ['f3', 't4', 't5'], done: false, needsYou: false, working: true },
+  { ids: ['f4', 't6'], done: false, needsYou: false, working: false }]
+const fourAt = (turn: boolean, w: number, h = 831) => { const sets = fitSets(four().map((b) => b.id), fourGroups(), turn), v = placeView(four(), sets, w, h)!
+  return { v, whole: whole(four(), v, w, h), cut: cut(four(), v, w, h) } }
+const MIDDLE = ['tpm', 'f2', 't2', 't3', 'f3', 't4', 't5']
+
+test('Bug 306 (a): Your turn at 960/820 px with the panel open (434/414 px) shows the TPM high with two features under it, not alone at the bottom', () => {
+  for (const w of [434, 414]) {
+    const { v, whole, cut } = fourAt(true, w), at = `${w} px`
+    assert.deepEqual(whole, MIDDLE, at) // the old view: the TPM alone at zoom 1, its top at 509 px, ~500 px of empty board above it
+    assert.deepEqual(cut, [], at); assert.ok(v.zoom >= READABLE, `${at}: zoom ${v.zoom}`)
+    const top = v.y, bottom = 831 - (v.y + 604 * v.zoom) // the TPM's top and the lowest ticket's bottom: centred together
+    assert.ok(Math.abs(top - bottom) < 1, `${at}: ${top} px above, ${bottom} px below`)
+  }
+})
+test('Bug 306 (a), (b): with an app pane docked too (about 300 px of board) the TPM and the work show, just smaller (Bug 258)', () => {
+  for (const turn of [true, false]) {
+    const { v, whole, cut } = fourAt(turn, 300), at = `Your turn ${turn}`
+    for (const id of ['tpm', 'f3', 't4', 't5']) assert.ok(whole.includes(id), `${at}: ${id} in ${whole}`)
+    assert.deepEqual(cut, [], at); assert.ok(v.zoom >= floorAt(300) && v.zoom < READABLE, `${at}: zoom ${v.zoom}`)
+  }
+})
+test('Bug 306 (b): with nothing waiting on the user the newest feature an engineer is on is the focus, not a newer one never launched', () => {
+  assert.deepEqual(fitSets(four().map((b) => b.id), fourGroups(), false).slice(1), [['tpm', 'f3', 't4', 't5'], ['f3', 't4', 't5']])
+  const none = fourGroups().map((g) => ({ ...g, working: false })) // no engineer on any: the newest unfinished, as before
+  assert.deepEqual(fitSets(four().map((b) => b.id), none, false).at(-1), ['f4', 't6'])
+  for (const w of [434, 414]) { // Your turn hiding (Engineers at once reached) keeps the TPM and the work in view: the old view went to F-4 alone
+    const { whole, cut } = fourAt(false, w)
+    for (const id of ['tpm', 'f3', 't4', 't5']) assert.ok(whole.includes(id), `${w}: ${id} in ${whole}`)
+    assert.deepEqual(cut, [], String(w))
+  }
+})
+test('Bug 306: every board width from 300 px up, Your turn or not: nothing cut, the TPM and a running feature whole, readable from NARROW', () => {
+  for (let w = 300; w <= 1500; w += 7) for (const h of [600, 831, 900]) for (const turn of [true, false]) {
+    const { v, whole, cut } = fourAt(turn, w, h), at = `${w}x${h}, Your turn ${turn}`
+    assert.ok(v.zoom >= floorAt(w) - 1e-9, `${at}: zoom ${v.zoom}`); assert.deepEqual(cut, [], at)
+    assert.ok(whole.includes('tpm') && whole.includes('f3'), `${at}: ${whole}`)
+  }
+})
+test('Bug 306, what it must not change: a set smaller than everything isn\'t zoomed out when that shows no more (Bug 284\'s hints board)', () => {
+  const bs: Box[] = [{ id: 'a', x: 0, y: 0, w: 360, h: 100 }, { id: 'b', x: 400, y: 0, w: 300, h: 100 }]
+  assert.equal(placeView(bs, [['a', 'b'], ['b']], 400, 300)!.zoom, 1) // a can't join b at READABLE, so b stays its normal size
+  const v = placeView(garden(), gardenSets(), 414, 831)! // the TPM's Your turn: it and the running features, the done one a pan away
+  assert.deepEqual(whole(garden(), v, 414, 831), ['tpm', 'f2', 't4', 't5', 'f3', 't6', 't7']); assert.deepEqual(cut(garden(), v, 414, 831), [])
+})
+test('Bug 306 (c): a view panned so that no box is whole in it is told apart from one that shows the board', () => {
+  const tpm: Box[] = [{ id: 'tpm', x: 418, y: 0, w: 340, h: 266 }] // after a Clear: the TPM alone, the view panned to where F-4 was
+  assert.deepEqual(wholeIn(tpm, { x: -864, y: -100, zoom: 1 }, 414, 831), [])
+  assert.deepEqual(wholeIn(tpm, { x: -400, y: 50, zoom: 1 }, 414, 831), ['tpm'])
+  assert.deepEqual(wholeIn(four(), fourAt(true, 414).v, 414, 831), MIDDLE)
+})
+test('Bug 306 (d): a side hint brings its feature in with the tickets under it, not just sideways to the bottom edge', () => {
+  // F-4 past the right edge with its feature box at the bottom edge's height and its tickets below the board (the old view's look)
+  const bs = four(), v = { x: -240, y: 831 - 380, zoom: 1 }, h = edgeHints(bs, v, 414, 831).find((o) => o.side === 'right')!
+  assert.deepEqual(h.ids, ['f4', 't6'])
+  assert.deepEqual(whole(bs, h.to, 414, 831).filter((id) => h.ids.includes(id)), ['f4', 't6']) // the old pan: f4 at the bottom, t6 below
+  assert.ok(h.to.zoom <= 1 && h.to.zoom >= READABLE) // (zoomed out a little where that shows more: Bug 345)
+  // Already level, and nothing else that more room would show: sideways only, as little as it takes, at the same zoom
+  const far: Box[] = [{ id: 'a', x: 0, y: 0, w: 100, h: 50 }, { id: 'b', x: 2000, y: 0, w: 100, h: 50 }]
+  assert.deepEqual(edgeHints(far, { x: 200, y: 100, zoom: 1 }, 500, 600)[0]!.to, { x: 500 - 8 - 2100, y: 100, zoom: 1 })
+})
+test('Bug 345: a side pill moves the view on until no box is cut at the board\'s edge, zooming out a little where that shows more', () => {
+  // bug306demo's board (four running features) at 820 px with the panel open: "‹ 2 more" used to stop with F-1 at the left edge and
+  // the TPM and F-2 cut at the right one. At the same zoom (0.74) F-1 and F-2 don't fit side by side, so F-1 would stand alone
+  const bs = four(), v = placeView(bs, fourSets(), 414, 831)!, [left, right] = edgeHints(bs, v, 414, 831, [{ l: 0, t: 831 - 112, r: 52, u: 831 }])
+  assert.deepEqual([left!.side, right!.side], ['left', 'right'])
+  assert.deepEqual(whole(bs, left!.to, 414, 831), ['f1', 't1', 'f2', 't2', 't3']); assert.deepEqual(cut(bs, left!.to, 414, 831), [])
+  assert.deepEqual(whole(bs, right!.to, 414, 831), ['f3', 't4', 't5', 'f4', 't6']); assert.deepEqual(cut(bs, right!.to, 414, 831), [])
+  assert.ok(left!.to.zoom < v.zoom && left!.to.zoom > v.zoom - 0.05, `a little: ${left!.to.zoom}`)
+  const low = edgeHints(bs, { x: -300, y: 100, zoom: 0.4 }, 414, 831).find((o) => o.side === 'left')! // zoomed out by hand: never in
+  assert.equal(low.to.zoom, 0.4); assert.deepEqual(cut(bs, low.to, 414, 831), [])
+  // Every board size of the sweep (820/960/1100 px with the panel open, with and without the app pane, and 1440 with both)
+  for (const [w, h] of [[414, 831], [434, 831], [414, 420], [434, 420], [320, 831], [574, 831], [574, 420]] as const) {
+    const at = placeView(bs, fourSets(), w, h, [{ l: 0, t: h - 100, r: 45, u: h }])!
+    for (const p of edgeHints(bs, at, w, h, [{ l: 0, t: h - 112, r: 52, u: h }])) {
+      const what = `${w}x${h} ${p.side}`
+      assert.ok(p.to.zoom <= at.zoom && p.to.zoom >= Math.min(at.zoom, floorAt(w)) - 1e-9, `${what}: zoom never in, never under the floor`)
+      assert.deepEqual(cut(bs, p.to, w, h), [], `${what}: nothing cut`)
+      assert.ok(whole(bs, p.to, w, h).includes(p.side === 'left' ? 'f1' : 'f4'), `${what}: brings its feature in`)
+      assert.ok(!edgeHints(bs, p.to, w, h).some((o) => o.side === p.side), `${what}: nothing left past that edge`)
+    }
+  }
+})
+test('Bug 307: the view keeps boxes off the zoom buttons where a move that cuts nothing can', () => {
+  const bs: Box[] = [{ id: 'top', x: 0, y: 0, w: 1400, h: 100 }, { id: 'corner', x: 0, y: 600, w: 100, h: 100 }]
+  const buttons = { l: 0, t: 500, r: 45, u: 600 }, under = (v: { x: number; y: number; zoom: number }) => overlaps(onScreen(bs[1]!, v), buttons)
+  assert.equal(under(placeView(bs, [['top', 'corner']], 900, 600)!), true) // without them: the corner box under the buttons
+  const v = placeView(bs, [['top', 'corner']], 900, 600, [buttons])!
+  assert.equal(under(v), false); assert.deepEqual(whole(bs, v, 900, 600), ['top', 'corner']); assert.equal(v.zoom, READABLE)
+  for (const w of [914, 574, 414]) { // bug282demo at 1440/1100/820 px with the panel open: T-03 sat under them at 1100
+    const b = { l: 0, t: 831 - 100, r: 45, u: 831 }, view = placeView(four(), fourSets(), w, 831, [b])!
+    assert.deepEqual(four().filter((o) => overlaps(onScreen(o, view), b)).map((o) => o.id), [], String(w))
+  }
+})
+
+// Bug 344: e2e/uisweep.test.ts's board at 820 px with the side panel and the app pane open (a 414×390 px board), as the page laid it out:
+// F-1 waits on the user (T-05's plan), its four tickets in one column and T-02 in the next. Filling the board at the floor, no place
+// kept T-05 out from under the zoom buttons in the bottom left corner.
+const sweep = (): Box[] => [
+  { id: 'tpm', x: 149, y: 0, w: 340, h: 158 }, { id: 'f1', x: 141.5, y: 214, w: 355, h: 50 },
+  { id: 't1', x: 0, y: 320, w: 295, h: 114 }, { id: 't3', x: 0, y: 450, w: 295, h: 114 }, { id: 't4', x: 0, y: 580, w: 295, h: 94 },
+  { id: 't5', x: 0, y: 690, w: 295, h: 94 }, { id: 't2', x: 343, y: 320, w: 295, h: 82 },
+]
+const sweepSets = () => fitSets(sweep().map((b) => b.id), [{ ids: ['f1', 't1', 't3', 't4', 't5', 't2'], done: false, needsYou: true }], false)
+/** The zoom buttons in corner `c` of a `w`×`h` board, as Graph.tsx gives them (45×100 px). */
+const buttonsIn = (c: Corner, w: number, h: number) => {
+  const l = c.endsWith('left') ? 0 : w - 45, t = c.startsWith('top') ? 0 : h - 100; return { l, t, r: l + 45, u: t + 100 }
+}
+const underButtons = (bs: Box[], v: { x: number; y: number; zoom: number }, b: { l: number; t: number; r: number; u: number }) =>
+  bs.filter((o) => overlaps(onScreen(o, v), b)).map((o) => o.id)
+test('Bug 344: the bug: at 414×390 px the feature waiting on you fills the board at READABLE and T-05 sits under the zoom buttons', () => {
+  const b = buttonsIn('bottom-left', 414, 390), v = placeView(sweep(), sweepSets(), 414, 390, [b])!
+  assert.equal(v.zoom, READABLE); assert.deepEqual(underButtons(sweep(), v, b), ['t5'])
+})
+test('Bug 344: there the buttons move to a corner where they cover no box; the text keeps its size, nothing is cut, F-1 whole', () => {
+  const p = placeBoard(sweep(), sweepSets(), 414, 390, (c) => buttonsIn(c, 414, 390))!
+  assert.equal(p.corner, 'bottom-right'); assert.equal(p.view.zoom, READABLE)
+  assert.deepEqual(underButtons(sweep(), p.view, buttonsIn(p.corner, 414, 390)), [])
+  assert.deepEqual(cut(sweep(), p.view, 414, 390), [])
+  for (const id of ['f1', 't1', 't2', 't3', 't4', 't5']) assert.ok(whole(sweep(), p.view, 414, 390).includes(id), id)
+})
+test('Bug 344, the other way (CROWDED \'zoom\'): the buttons stay, the view zooms out just past the floor, no box under them', () => {
+  const p = placeBoard(sweep(), sweepSets(), 414, 390, (c) => buttonsIn(c, 414, 390), 'zoom')!, b = buttonsIn('bottom-left', 414, 390)
+  assert.equal(p.corner, 'bottom-left'); assert.deepEqual(underButtons(sweep(), p.view, b), [])
+  assert.ok(p.view.zoom < READABLE && p.view.zoom >= READABLE - CROWDED_GIVE - 1e-9, `zoom ${p.view.zoom}`)
+  assert.deepEqual(cut(sweep(), p.view, 414, 390), [])
+})
+test('Bug 344, what it must not change: where the bottom left corner can be kept clear, the buttons stay and the view is placeView\'s', () => {
+  const boards: [Box[], string[][]][] = [[sweep(), sweepSets()], [four(), fourSets()], [garden(), gardenSets()], [board(), fitSets(all(), groups(true), false)]]
+  for (const [bs, sets] of boards) for (let w = 300; w <= 1500; w += 37) for (const h of [600, 831, 900]) for (const how of ['move', 'zoom'] as const) {
+    const b = buttonsIn('bottom-left', w, h), v = placeView(bs, sets, w, h, [b])!, at = `${bs.length} boxes, ${w}x${h}, ${how}`
+    if (underButtons(bs, v, b).length) continue
+    assert.deepEqual(placeBoard(bs, sets, w, h, (c) => buttonsIn(c, w, h), how), { view: v, corner: 'bottom-left' }, at)
+  }
+  assert.equal(placeBoard([], [['tpm']], 414, 390, (c) => buttonsIn(c, 414, 390)), null)
+})
+test('Bug 344: wherever the buttons end up they cover fewer boxes than before, and the view cuts no more', () => {
+  const boards: [Box[], string[][]][] = [[sweep(), sweepSets()], [four(), fourSets()], [garden(), gardenSets()], [board(), fitSets(all(), groups(true), false)]]
+  let moved = 0
+  for (const [bs, sets] of boards) for (let w = 300; w <= 1500; w += 37) for (const h of [300, 390, 600]) {
+    const b = buttonsIn('bottom-left', w, h), v = placeView(bs, sets, w, h, [b])!, at = `${bs.length} boxes, ${w}x${h}`
+    const p = placeBoard(bs, sets, w, h, (c) => buttonsIn(c, w, h))!
+    assert.ok(CORNERS.includes(p.corner), at)
+    if (p.corner === 'bottom-left') { assert.deepEqual(p.view, v, at); continue }
+    moved++
+    assert.deepEqual(underButtons(bs, p.view, buttonsIn(p.corner, w, h)), [], at); assert.ok(underButtons(bs, v, b).length > 0, at)
+    assert.ok(cut(bs, p.view, w, h).length <= cut(bs, v, w, h).length, at); assert.equal(p.view.zoom >= floorAt(w) - 1e-9, true, at)
+  }
+  assert.ok(moved > 0, 'some short boards move the buttons')
 })

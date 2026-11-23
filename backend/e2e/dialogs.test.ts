@@ -121,7 +121,10 @@ const MENU = '\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n'
 test('Bug 62: a dialog answered with no hook clears itself after two looks, and the agent goes back to what its status file says', async () => {
   const idle = await tpm(), busy = await tpm()
   for (const a of [idle, busy]) { await hq.session(a.id, 'waiting'); await note(a, 'permission_prompt'); assert.equal((await now(a)).status, 'blocked') }
-  await new Promise((r) => setTimeout(r, 2500)); assert.ok(await open(idle), 'still waiting: it stays') // denied, say: no hook comes
+  // Written again, after the alert: from here only the word "waiting" keeps the notice, not a file older than it (which the next test is about).
+  // Without this the check below passed with the "waiting" rule taken out of HQ.
+  await hq.session(idle.id, 'waiting')
+  await hq.beats('stuck', 3); assert.ok(await open(idle), 'still waiting: it stays') // HQ has looked again and again (denied, say: no hook comes)
   await hq.session(idle.id, 'idle'); await hq.session(busy.id, 'busy')
   await waitFor('both to clear', async () => !(await open(idle)) && !(await open(busy)), 6000)
   assert.equal((await now(idle)).status, 'idle'); assert.equal((await now(busy)).status, 'working')
@@ -136,7 +139,7 @@ test('Bug 62: doubt never clears: a status file older than the alert, or a menu 
   const stale = await tpm(), menu = await tpm()
   await hq.session(stale.id, 'idle', Date.now() - 60_000); await note(stale, 'permission_prompt')
   await note(menu, 'permission_prompt'); await hq.session(menu.id, 'idle'); await hq.screen(menu.id, MENU)
-  await new Promise((r) => setTimeout(r, 3500))
+  await hq.beats('stuck', 4) // more looks than a clear takes
   assert.ok(await open(stale), 'the file says nothing since the alert'); assert.ok(await open(menu), 'the screen still shows the dialog')
   await hq.screen(menu.id, 'all done\n'); await waitFor('it to clear once the menu has gone', async () => !(await open(menu)), 6000)
 })

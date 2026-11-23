@@ -12,21 +12,22 @@ import { RUN_MARK, parseRunMark, runMark } from './apprun.ts'
 import { bashLimitMs, PATHS } from './config.ts'
 import { q } from './db.ts'
 import { bus, emit, type HqEvent } from './events.ts'
+import { beat } from './beats.ts'
 import { attention, resolveKind } from './attention.ts'
 import { AGENT_TMP } from './config.ts'
 import { repos } from './records.ts'
-import { cwdsOf, elapsedMs } from './procs.ts'
+import { cwdsOf, lstartMs, psEnv } from './procs.ts'
 import { runsOf } from './bgruns.ts'
 import { testRunDirs } from './testrun.ts'
 import { real, sleep } from './util.ts'
 
 export type Proc = { pid: number; ppid: number; pgid: number; uid: number; tty: string; stat: string; start: number }
-const PS = 'pid=,ppid=,pgid=,uid=,tty=,stat=,etime='
-/** `ps -axo` with the fields of PS: fixed ones only (macOS's comm is a path and can hold spaces). `start` is when the process
- *  began, from its elapsed time (whole seconds, so up to a second late; `now` when ps doesn't say). */
+const PS = 'pid=,ppid=,pgid=,uid=,tty=,stat=,lstart='
+/** `ps -axo` with the fields of PS, read with psEnv: fixed ones only (macOS's comm is a path and can hold spaces). `start` is when the process
+ *  began, from ps's own date for it (Bug 319: whole seconds, so up to a second or two early, however long ps took; `now` when ps doesn't say). */
 export const parsePs = (s: string, now = Date.now()): Proc[] => s.split('\n').map((l) => l.trim().split(/\s+/)).filter((f) => f.length >= 7 && Number(f[0]) > 0)
-  .map(([pid, ppid, pgid, uid, tty, stat, etime]) => { const ms = elapsedMs(etime!)
-    return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), uid: Number(uid), tty: tty!, stat: stat!, start: Number.isFinite(ms) ? now - ms : now } })
+  .map(([pid, ppid, pgid, uid, tty, stat, ...began]) => { const ms = lstartMs(began)
+    return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), uid: Number(uid), tty: tty!, stat: stat!, start: Number.isFinite(ms) ? ms : now } })
 const noTty = (p: Proc): boolean => /^\?+$/.test(p.tty) // macOS shows ??, Linux ?
 const zombie = (p: Proc): boolean => p.stat.startsWith('Z')
 
@@ -45,8 +46,9 @@ export function inHq(dirs: HqDirs, cwd: string): { name: string; busy: number; a
   }
   return null
 }
-/** ps gives start times in whole seconds: an orphan that began within this long before a command did may be that command's. */
-const SLACK_MS = 2000
+/** ps gives start times in whole seconds, cut down (up to 2 s early on Linux, Bug 319): an orphan that began within this long before a command did may be
+ *  that command's. 2 s left no margin on Linux (a command's own server taken for a leftover now and then, in Docker); keeping one a little longer is harmless. */
+const SLACK_MS = 3000
 
 /** The process groups that are leftovers, and what's in them. A leftover is a process orphaned to init (its parent gone) with no
  *  terminal, working in one of HQ's folders, plus everything it started. Spared: anything with a terminal in its tree (the
@@ -76,21 +78,25 @@ export function leftoverGroups(procs: Proc[], cwds: Map<number, string>, dirs: H
 }
 
 type Ran = { ok: boolean; out: string; missing: boolean }
-const exec = (cmd: string, args: string[]): Promise<Ran> => new Promise((resolve) => execFile(cmd, args, { maxBuffer: 16 * 1024 * 1024 }, (err, stdout) =>
+const exec = (cmd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<Ran> => new Promise((resolve) => execFile(cmd, args, { maxBuffer: 16 * 1024 * 1024, env }, (err, stdout) =>
   resolve({ ok: !err, out: String(stdout ?? ''), missing: (err as NodeJS.ErrnoException | null)?.code === 'ENOENT' }))) // lsof exits 1 when a pid is gone
 /** The orphans whose working folder a look asks lsof for: no terminal, parent gone. `since` (a narrowed look, Bug 100): only
  *  those that began after a command did (less ps's slack), the only ones that command can have left. Most of the time none. */
 export function rootsToAsk(procs: Proc[], since?: number): number[] {
   return procs.filter((p) => p.ppid === 1 && noTty(p) && !zombie(p) && (since === undefined || p.start >= since - SLACK_MS)).map((p) => p.pid)
 }
+/** This user's processes, from one ps. */
+export async function readPs(): Promise<{ procs: Proc[]; missing: boolean }> {
+  const ps = await exec('ps', ['-axo', PS], psEnv()), uid = process.getuid?.() ?? -1
+  return { procs: parsePs(ps.out).filter((p) => p.uid === uid), missing: ps.missing }
+}
 /** This user's processes, and the working folders of those that could be leftovers. Null: HQ can't look. HQ's own folder is
  *  asked for too: an lsof that doesn't give it isn't working, and every look would quietly find nothing. A narrowed look
  *  (`since`) with no orphan to ask about doesn't run lsof at all, and leaves raising the alert to the full look. */
 async function look(since?: number): Promise<{ procs: Proc[]; cwds: Map<number, string> } | null> {
   const narrow = since !== undefined, cant = (why: string) => { if (!narrow) cantCheck(why); return null }
-  const ps = await exec('ps', ['-axo', PS])
-  const uid = process.getuid?.() ?? -1, procs = parsePs(ps.out).filter((p) => p.uid === uid)
-  if (!procs.length) return cant(ps.missing ? "`ps` isn't installed" : '`ps` listed no programs')
+  const { procs, missing } = await readPs()
+  if (!procs.length) return cant(missing ? "`ps` isn't installed" : '`ps` listed no programs')
   const roots = rootsToAsk(procs, since); if (narrow && !roots.length) return { procs, cwds: new Map() }
   const lsof = await exec('lsof', ['-a', '-d', 'cwd', '-p', [...roots, process.pid].join(','), '-Fpn'])
   const cwds = cwdsOf(lsof.out)
@@ -282,7 +288,7 @@ let going: Promise<unknown> | null = null
 async function serial(job: () => Promise<unknown>): Promise<void> {
   while (going) await going.catch(() => {})
   going = job().catch((e) => emit({ agentId: null, source: 'system', kind: 'procs.leftovers_error', payload: { error: String(e) } }))
-  try { await going } finally { going = null }
+  try { await going } finally { going = null; beat('leftovers') }
 }
 /** A fresh look now. Callers about to remove a worktree await it; one already under way may have looked before their agents
  *  stopped, so this waits for it and then looks again. */
@@ -343,5 +349,5 @@ export function startLeftoverSweeps(): void {
   const exited = (e: HqEvent) => { if (e.payload.reason === 'clear') return; inFlight.delete(at(e)); setTimeout(() => sweepSoon(), 5000).unref() }
   for (const k of ['agent.stopped', 'agent.lost', 'hook.SessionEnd']) bus.on(`event:${k}`, exited)
   for (const k of ['agent.stopped', 'agent.lost', 'hook.SessionEnd']) bus.on(`event:${k}`, () => void setTimeout(() => void sweepAgentTmp(), 5000).unref())
-  setInterval(() => { void sweepNow(); void sweepAgentTmp() }, 60_000).unref()
+  setInterval(() => { void sweepNow(); void sweepAgentTmp() }, Number(process.env.HQ_LEFTOVER_TICK_S ?? 60) * 1000).unref() // the setting is for tests, as the other loops have
 }

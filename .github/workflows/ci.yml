@@ -1,5 +1,5 @@
-# Typecheck, unit tests and lint on every PR and on main. Of the e2e suite (tmux + fake Claude Code) only auto mode runs here, because it
-# needs a real sandbox: Linux's in `check`, macOS's in `sandbox-mac`. The rest stays local for now.
+# On every PR and on main: typecheck, unit tests and lint in `check`; the whole end-to-end suite (tmux + fake Claude Code, auto mode in
+# Linux's real sandbox) in `e2e`; macOS's sandbox tests in `sandbox-mac`.
 name: CI
 on:
   pull_request:
@@ -20,14 +20,10 @@ jobs:
       - run: npm ci
       - name: Backend typecheck
         run: npm --workspace @hq/backend run typecheck
+      - name: Backend lint
+        run: npm --workspace @hq/backend run lint -- --deny-warnings
       - name: Backend unit tests
         run: npm --workspace @hq/backend test
-      - name: Auto mode end to end, in the real sandbox
-        working-directory: backend
-        # Bug 113: once every test had ended, the test file never exited and held the job 16 minutes, with the failure's details unprinted. --test-force-exit
-        # ends each file when its tests are done; the harness itself fails a test whose HQ leaves its output held. The step limit is the backstop (a normal run takes ~3 min).
-        timeout-minutes: 10
-        run: node --experimental-strip-types --test --test-timeout=120000 --test-force-exit e2e/auto.test.ts e2e/auto-github.test.ts
       - name: Frontend typecheck
         working-directory: frontend
         run: npx tsc -b
@@ -35,6 +31,29 @@ jobs:
         run: npm --workspace frontend run lint -- --deny-warnings
       - name: No new lines over 200 characters
         run: node scripts/long-lines.mjs
+      - name: No new fixed waits in tests
+        run: node scripts/fixed-waits.mjs
+      - name: Every tmux call names its socket
+        run: node scripts/tmux-socket.mjs
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 25
+          cache: npm
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat tmux
+      - run: npm ci
+      - name: Build the page
+        run: npm --workspace frontend run build # e2e/build.test.ts reads frontend/dist
+      - name: End-to-end suite
+        working-directory: backend
+        # Bug 113: once every test had ended, a test file never exited and held the job 16 minutes, with the failure's details unprinted. --test-force-exit
+        # (in the npm script) ends each file when its tests are done; the harness itself fails a test whose HQ leaves its output held. The step limit is the
+        # backstop (a normal run takes about 4 min on Linux).
+        timeout-minutes: 20
+        run: npm run e2e
   sandbox-mac:
     runs-on: macos-latest
     steps:

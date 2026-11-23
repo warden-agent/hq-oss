@@ -1,0 +1,16 @@
+{
+  "$schema": "../node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "oxc", "unicorn"],
+  "rules": {
+    // Style only: `/^x/.test(s)` and `s.startsWith('x')` say the same.
+    "unicorn/prefer-string-starts-ends-with": "off",
+    // The regexes that strip a terminal's colour codes need control characters.
+    "no-control-regex": "off",
+    // `then:` keys are HQ's fresh-start choices ("then": "launch"), plain data, never awaited.
+    "unicorn/no-thenable": "off",
+    // `for (const w of [...line])` copies what its loop body changes (heavy.ts takes entries out as it goes; wake.ts guards against it): the copy is the point.
+    "unicorn/no-useless-spread": "off",
+    // `({ output: _, ...rest }) => rest` is how HQ leaves one field out, and a `catch (err)` that has no use for the error says so in its body.
+    "no-unused-vars": ["warn", { "ignoreRestSiblings": true, "caughtErrors": "none" }]
+  }
+}

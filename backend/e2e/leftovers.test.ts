@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { startHq, waitFor, type Hq } from './harness.ts'
+import { sh, startHq, waitFor, type Hq } from './harness.ts'
 
 let hq: Hq
 const pids: number[] = []
@@ -15,7 +15,23 @@ before(async () => { hq = await startHq({ env: { HQ_FRESH_START_TIMEOUT_S: '3' }
 after(async () => { for (const p of pids) try { process.kill(p, 'SIGKILL') } catch { /* gone */ } await hq?.stop() })
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
+/** How long a process must have run before a command begins for HQ to take it, for sure, as older than that command. It counts as the command's
+ *  own when ps's date for it is within 3 s before the command (leftovers.ts SLACK_MS), and that date is in whole seconds, never late but up to 2 s
+ *  early on Linux (Bug 319). 3 s + 2 s, and 1 s to spare: at 3 s the Try it test failed 2 runs in 6 in Docker. */
+const OLDER_MS = 6000
+async function older(): Promise<void> {
+  await new Promise((r) => setTimeout(r, OLDER_MS)) // real-time: ps dates a process in whole seconds, so only time makes one older (see OLDER_MS)
+}
 let n = 0
+/** HQ has looked for leftovers once more since the test's last action, from start to end: a full look at every folder of its own, which stops
+ *  whatever it takes for a leftover before it is over. For "this one is KEPT": the tests used to sleep 3 or 4 s, in which HQ's clock (a look a
+ *  minute) seldom looked at all. Removing a project sets a full look off and waits for it (remove.ts), so a throwaway project is added and
+ *  removed. HQ's own count of its looks is read as well: should a removal ever stop looking, this fails. The clock stays at a minute, so the
+ *  "it goes" checks still show that the look after a command does the work. */
+async function looked(): Promise<void> {
+  const before = await hq.beat('leftovers'), spare = (await hq.api('repos', { path: hq.repo(`left-look-${++n}`) })).json
+  assert.equal((await hq.api(`repos/${spare.id}/remove`, {})).status, 200); assert.ok(await hq.beat('leftovers') > before, 'the removal looked for leftovers')
+}
 /** `sleep …` started with `&` from a shell that then ends, in `cwd`: orphaned to init, like a test's server. */
 function orphan(cwd: string): Promise<number> {
   const arg = `61.${process.pid % 1000}${++n}`
@@ -43,7 +59,7 @@ test('a command\'s leftover goes once the command ends; nothing in use, and noth
   const held = spawn('sleep', ['61.9'], { cwd: wt, detached: true, stdio: 'ignore' }); pids.push(held.pid!) // its parent is alive
 
   await bash(eng.id, 'PreToolUse'); const left = await orphan(wt) // orphaned while the engineer's command still runs
-  await new Promise((r) => setTimeout(r, 4000)); assert.ok(alive(left), 'kept while a command of its engineer runs')
+  await looked(); assert.ok(alive(left), 'kept while a command of its engineer runs')
   await bash(eng.id, 'PostToolUse'); await gone(left)
   const ev = await waitFor('the clean-up in the event log', async () => (await hq.api('events?limit=200')).json.find((e: any) => e.kind === 'procs.leftovers_stopped'))
   assert.ok(JSON.parse(ev.payload).stopped.some((x: any) => x.pids.includes(left) && x.folder === wt.split('/').at(-1)), ev.payload)
@@ -54,19 +70,19 @@ test('a command\'s leftover goes once the command ends; nothing in use, and noth
 test('commands one after another: an earlier one\'s leftover goes while the next runs; the next one\'s own waits for it to end', async () => {
   const { eng, wt } = await engineer('left-next')
   await bash(eng.id, 'PreToolUse', 'npm test', 'u1'); const first = await orphan(wt)
-  await new Promise((r) => setTimeout(r, 3500)) // ps gives start times in whole seconds: clearly older than the next command
+  await older() // clearly older than the next command
   await bash(eng.id, 'PostToolUse', 'npm test', 'u1'); await bash(eng.id, 'PreToolUse', 'npm run lint', 'u2') // no gap, as when Claude Code runs a list of commands
   const own = await orphan(wt); await gone(first)
-  await new Promise((r) => setTimeout(r, 3000)); assert.ok(alive(own), 'what the running command started is kept')
+  await looked(); assert.ok(alive(own), 'what the running command started is kept')
   await bash(eng.id, 'PostToolUse', 'npm run lint', 'u2'); await gone(own)
 })
 
 test('Bug 100: commands that overlap end by their ids; the look after each finds what that one left, not the one still running', async () => {
   const { eng, wt } = await engineer('left-ids')
   await bash(eng.id, 'PreToolUse', 'npm run dev', 'a1'); const daemon = await orphan(wt) // a long command (a subagent's, say) and its daemon
-  await new Promise((r) => setTimeout(r, 3500)) // ps gives start times in whole seconds: clearly older than a2
+  await older() // clearly older than a2
   await bash(eng.id, 'PreToolUse', 'npm test', 'a2'); await bash(eng.id, 'PostToolUse', 'npm test', 'a2') // a2 ends first: by its id, a1 still runs
-  await new Promise((r) => setTimeout(r, 4000)); assert.ok(alive(daemon), 'a1 still runs: what it started is its own')
+  await looked(); assert.ok(alive(daemon), 'a1 still runs: what it started is its own')
   await bash(eng.id, 'PostToolUse', 'npm run dev', 'a1'); await gone(daemon) // the look after a1 asks about everything since a1 began
 })
 
@@ -74,13 +90,13 @@ test('a command HQ never hears the end of (refused, or its hook lost) puts the c
   const { eng, wt } = await engineer('left-refused')
   await bash(eng.id, 'PreToolUse', 'git push'); const left = await orphan(wt) // no PostToolUse follows
   await bash(eng.id, 'PreToolUse'); await bash(eng.id, 'PostToolUse')
-  await new Promise((r) => setTimeout(r, 4000)); assert.ok(alive(left), 'kept: for all HQ knows the first command is still running')
+  await looked(); assert.ok(alive(left), 'kept: for all HQ knows the first command is still running')
   await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' }); await gone(left)
 })
 
 test("Try it on a ticket: what the app put in the background stays; what the engineer's commands leave there still goes", async () => {
   const { repo, eng, wt } = await engineer('left-try')
-  execFileSync('git', ['-C', wt, 'commit', '-q', '--allow-empty', '-m', 'done'])
+  sh(wt, 'commit', '-q', '--allow-empty', '-m', 'done') // sh names an author: CI's git has none set, and a bare `git commit` fails there
   assert.equal((await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'done' })).isError, false)
   assert.equal((await hq.mcp(eng.id, 'open_pr', { title: 'done', body: 'done\n\n## Deviations from approved plan\nNone' })).isError, false)
   const ticket = (await hq.state()).tickets.find((t: any) => t.worktree_path === wt).id
@@ -89,7 +105,7 @@ test("Try it on a ticket: what the app put in the background stays; what the eng
   const apps = await orphan(wt) // began while the app was starting: for all HQ knows, the app's own database
   const preview = async () => (await hq.state()).previews.find((p: any) => p.id === repo.id)
   const p = await waitFor('the app to answer', async () => { const x = await preview(); return x?.status === 'running' ? x : null }, 20_000)
-  await new Promise((r) => setTimeout(r, 4000)) // ps gives start times in whole seconds: clearly after the start-up
+  await older() // clearly after the start-up
 
   await bash(eng.id, 'PreToolUse'); const left = await orphan(wt); await bash(eng.id, 'PostToolUse') // the user asked for a change: tests run again
   await gone(left); assert.ok(alive(apps), "the app's own"); assert.equal((await fetch(p.url)).status, 200)
@@ -128,7 +144,7 @@ test('what was left while HQ was down goes when it starts again; what a command 
   await hq.down(); const left = await orphan(wt); await hq.up(); await gone(left, 20_000) // nothing running claims it
   // a restart in the middle of a command: HQ reads back from its events log that the command still runs (it used to forget it, and stop what it started)
   await bash(eng.id, 'PreToolUse', 'npm test', 'r2'); const own = await orphan(wt)
-  await hq.restart(); await new Promise((r) => setTimeout(r, 2000)); assert.ok(alive(own), 'kept while the command that started it runs')
+  await hq.restart(); await looked(); assert.ok(alive(own), 'kept while the command that started it runs')
   await bash(eng.id, 'PostToolUse', 'npm test', 'r2'); await gone(own)
 })
 

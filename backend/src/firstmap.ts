@@ -14,7 +14,7 @@ import { emit } from './events.ts'
 import { mapProblem, mapText, parseMap, type Screen } from './featuremap.ts'
 import { firstMapState, mapOf, saveMap, showMap, type FirstView } from './mapstore.ts'
 import { row as previewRow, runnableRecipe } from './preview.ts'
-import { getRepo } from './records.ts'
+import { getRepo, notClearing } from './records.ts'
 import { git } from './repos.ts'
 import { lookHow, prepareApp, type LookPlan } from './smoke.ts'
 import { serverCommand, testerModel } from './tester.ts'
@@ -68,9 +68,11 @@ function plan(repoId: string): LookPlan | string {
   const repo = getRepo(repoId)!, recipe = runnableRecipe(previewRow(repoId), repo.path)
   return recipe ? { recipe, repoPath: repo.path, how: lookHow(recipe) } : 'HQ has no start steps for this app yet: press Launch app once, then try again.'
 }
-/** Starts the session for a project with no map. Refused, with why, when it has one, a session is running, or HQ can't start the app. */
+/** Starts the session for a project with no map. Refused, with why, when it has one, a session is running, HQ can't start the app, or the project is being
+ *  cleared or removed (Bug 333: the session starts the app the Clear stopped). */
 export function startFirstMap(repoId: string): { started: true } {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown project')
+  notClearing(repoId)
   if (mapOf(repoId).length) throw new Error('This project has a feature map already; engineers keep it up to date as their tickets merge.')
   if (running.has(repoId)) throw new Error('HQ is already writing this project\'s first map.')
   const p = plan(repoId); if (typeof p === 'string') throw new Error(p)

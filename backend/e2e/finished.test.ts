@@ -7,12 +7,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, sh, exitPlanMode, type Hq } from './harness.ts'
 
 let hq: Hq
-// A finished engineer stops 0.3 s after its turn ends here (2 s for real), and the backstop looks every second (every minute for real).
-before(async () => { hq = await startHq({ env: { HQ_FINISHED_STOP_MS: '300', HQ_FINISHED_TICK_S: '1' } }) })
+// A finished engineer stops 0.3 s after its turn ends here (2 s for real), and the backstop looks four times a second (every minute for real).
+const STOP_MS = 300
+before(async () => { hq = await startHq({ env: { HQ_FINISHED_STOP_MS: String(STOP_MS), HQ_FINISHED_TICK_S: '0.25' } }) })
 after(async () => { await hq?.stop() })
 
 async function setup(name: string): Promise<{ dir: string; repo: any; f: any; tpm: string }> {
@@ -44,8 +44,12 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const agent = async (id: string) => (await hq.state()).agents.find((a: any) => a.id === id)
 const turnEnds = (id: string) => hq.hook(id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' })
 const stopped = (e: any) => waitFor(`${e.id} to stop`, async () => (await agent(e.id)).status === 'exited', 8000)
-/** Still there, as `status`, after longer than the stop's delay and its backstop take here: HQ is keeping it. */
-const kept = async (e: any, status: string) => { await wait(1600); assert.equal((await agent(e.id)).status, status) }
+/** Still there, as `status`, once HQ has had every chance to stop it: the stop's delay has passed since its turn ended, and the backstop has
+ *  looked at every engineer since then. HQ is keeping it. */
+async function kept(e: any, status: string): Promise<void> {
+  await wait(STOP_MS + 100) // limit: HQ leaves a finished engineer alone for HQ_FINISHED_STOP_MS after its turn ends; no look stops it sooner
+  await hq.beats('finished', 2); assert.equal((await agent(e.id)).status, status)
+}
 const sessions = () => hq.tmux('list-sessions', '-F', '#{session_name}').split('\n')
 /** Why HQ stopped it. */
 const why = async (e: any) => JSON.parse((await hq.api(`events?agent=${e.id}`)).json.find((x: any) => x.kind === 'agent.stopped').payload).reason
@@ -141,7 +145,8 @@ test('an engineer whose ticket is finished stops once its turn has ended; the ti
   await turnEnds(e.id); await stopped(e)
   assert.equal(await why(e), 'finished'); assert.ok(!sessions().includes(`hq-${e.id}`), 'its terminal is gone')
   // The ticket is as finished as it was: same engineer on record, worktree and branch in place, and nothing new asks for the user.
-  await hq.api(`repos/${repo.id}/sync`, {}); await wait(300)
+  // A sync sets off the merge watcher's look, which checks every waiting ticket. Two syncs: the look's second end began after the first sync.
+  const looked = await hq.beat('merges'); await hq.api(`repos/${repo.id}/sync`, {}); await hq.api(`repos/${repo.id}/sync`, {}); await hq.beats('merges', 2, { from: looked })
   const now = await tk(t); assert.deepEqual([now.status, now.assignee_agent_id, now.worktree_path, now.branch], ['pr_ready', e.id, wtOf(dir, t), 'hq/s3/T-01-orders'])
   assert.equal(fs.readFileSync(path.join(wtOf(dir, t), 'version.txt'), 'utf8'), 'v1\norders\n'); assert.ok(sh(dir, 'rev-parse', '--verify', 'hq/s3/T-01-orders'))
   assert.deepEqual((await hq.state()).attention.filter((a: any) => !before.includes(a.id)).map((a: any) => a.detail), [])
@@ -188,7 +193,7 @@ test('Bug 103: a finished engineer the Stop hook hands a message to is kept whil
   const first = (await hq.modNext(e.id)).batch; await hq.modEvent(e.id, { kind: 'batch_received', id: first.id })
   await hq.hook(e.id, { hook_event_name: 'UserPromptSubmit', prompt: first.text })
   await finish(e, wtOf(dir, t), 'v1\norders\n')
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 }) // its mod has gone quiet, so the Stop hook carries the message
+  const db = hq.db() // its mod has gone quiet, so the Stop hook carries the message
   try { db.prepare('UPDATE agents SET mod_seen_at = ? WHERE id = ?').run(Date.now() - 300_000, e.id) } finally { db.close() }
   assert.equal((await hq.api(`agents/${e.id}/message`, { body: 'Is the list sorted?', reason: 'fyi' })).status, 200)
   const r = await hq.hookOnce(e.id, { hook_event_name: 'Stop', last_assistant_message: 'Done.' }); assert.equal(r.decision, 'block'); assert.match(r.reason, /Is the list sorted\?/)
@@ -210,7 +215,8 @@ test("the wait after its turn ends is each engineer's own: the backstop and anot
     const t = await ticket(f, 'Orders'); await launch(t); const e = await liveEngineer(t)
     await finish(e, wtOf(dir, t), 'v1\norders\n')
     // The TPM's turn ends 1.2 s before the engineer's, so the look that follows it comes 1.3 s into the engineer's wait, like two looks of the backstop.
-    await turnEnds(tpm); await wait(1200); await turnEnds(e.id)
+    await turnEnds(tpm); await wait(1200) // real-time: the two turns must end 1.2 s apart, for the look after the TPM's to fall inside the engineer's own 2.5 s
+    await turnEnds(e.id)
     await stopped(e); assert.equal(await why(e), 'finished'); assert.equal((await tk(t)).status, 'pr_ready')
     // Measured on HQ's own clock, so a slow machine can't fail it: from the end of its turn to its stop took the whole wait
     const evs = (await hq.api(`events?agent=${e.id}`)).json, at = (kind: string): number => evs.find((x: any) => x.kind === kind).created_at
@@ -220,10 +226,14 @@ test("the wait after its turn ends is each engineer's own: the backstop and anot
 
 /** Runs `fn` against a second HQ whose `tmux kill-session` takes two seconds, so "its engineer is being stopped" lasts long enough
  *  to act in the middle of it. The stand-in only waits; then the real tmux runs with the very same arguments. */
+let killing = '' // where the slow tmux below notes each kill-session as it begins
+/** HQ has begun stopping this agent: its terminal's kill-session is under way, and takes three seconds here. */
+const stopBegun = (e: any) => waitFor(`HQ to begin stopping ${e.id}`, () => fs.existsSync(killing) && fs.readFileSync(killing, 'utf8').includes(`hq-${e.id}`))
+/** A second HQ on which stopping an agent takes three seconds (its tmux is slow to end a session), so a test can act in the middle of one. */
 async function slowStops(fn: () => Promise<void>): Promise<void> {
   const real = process.env.PATH!.split(':').map((d) => path.join(d, 'tmux')).find((p) => fs.existsSync(p)); assert.ok(real, 'tmux is installed')
-  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-slow-tmux-'))
-  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh\ncase " $* " in *" kill-session "*) sleep 2;; esac\nexec "${real}" "$@"\n`, { mode: 0o755 })
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-slow-tmux-')); killing = path.join(bin, 'killing')
+  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh\ncase " $* " in *" kill-session "*) echo "$*" >> '${killing}'; sleep 3;; esac\nexec "${real}" "$@"\n`, { mode: 0o755 })
   const env = { PATH: `${bin}:${process.env.PATH}`, HQ_FINISHED_STOP_MS: '100', HQ_FINISHED_TICK_S: '3600', HQ_AUTO_SOON_MS: '100', HQ_AUTO_TICK_MS: '500' }
   try { await otherHq(env, fn) } finally { fs.rmSync(bin, { recursive: true, force: true }) }
 }
@@ -236,7 +246,7 @@ test('a ticket that comes back while its engineer is being stopped gets a fresh 
     await finish(e1, wtOf(dir, t1), 'v1\norders\n'); await finish(e2, wtOf(dir, t2), 'v1\ninvoices\n')
     assert.equal((await merge(t1)).status, 200); await waitFor('T-02 flagged', async () => (await tk(t2)).conflict_files === '["version.txt"]')
     // Its turn ends and HQ starts stopping it (two seconds here). In the middle of that the TPM writes to it and the user presses Fix conflicts.
-    await turnEnds(e2.id); await wait(500); assert.equal((await agent(e2.id)).status, 'idle')
+    await turnEnds(e2.id); await stopBegun(e2); assert.equal((await agent(e2.id)).status, 'idle')
     const said = await hq.mcp(tpm, 'send_message', { to: e2.id, reason: 'fyi', body: 'T-01 merged.' })
     assert.equal(said.text, gone(e2, t2, 'To change T-02, call update_ticket_spec (user_asked: true when the user asked for it): HQ starts an engineer to build the change.'))
     const r = await fix(t2); assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.via, 'launch')
@@ -253,7 +263,7 @@ test('a ticket that comes back while its engineer is being stopped gets a fresh 
     // The same for a spec the TPM changes just as the finished ticket's engineer is on its way out.
     const t3 = await ticket(f, 'Totals'); await launch(t3); const e4 = await liveEngineer(t3)
     await finish(e4, wtOf(dir, t3), 'v1\norders\ninvoices\ntotals\n')
-    await turnEnds(e4.id); await wait(500); assert.equal((await agent(e4.id)).status, 'idle')
+    await turnEnds(e4.id); await stopBegun(e4); assert.equal((await agent(e4.id)).status, 'idle')
     const changed = await spec(tpm, t3, { spec: 'Totals, with tax.' }); assert.equal(changed.isError, false, changed.text)
     const e5 = await liveEngineer(t3, e4.id)
     assert.equal(changed.text, `Updated. T-03 was already finished, so HQ started an engineer (${e5.id}) to build the change. It can't be merged until that's done; HQ tells you when it is.`)

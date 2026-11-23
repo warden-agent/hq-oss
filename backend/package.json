@@ -9,8 +9,11 @@
     "dev": "node --experimental-strip-types --watch src/index.ts",
     "start": "node --experimental-strip-types src/index.ts",
     "typecheck": "tsc --noEmit",
+    "lint": "cd .. && oxlint -c backend/.oxlintrc.json backend/src backend/e2e scripts plugin",
     "test": "node ../scripts/own-tmp.mjs --tests='src/**/*.test.ts' node --experimental-strip-types --test --test-timeout=120000 --test-force-exit",
-    "e2e": "node ../scripts/own-tmp.mjs --tests='e2e/*.test.ts' node --experimental-strip-types --test --test-timeout=120000 --test-force-exit"
+    "e2e": "node ../scripts/own-tmp.mjs --tests='e2e/*.test.ts' node --experimental-strip-types --test --test-timeout=120000 --test-force-exit",
+    "coverage": "node ../scripts/own-tmp.mjs --tests='src/**/*.test.ts' node --experimental-strip-types --test --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-exclude='src/**/*.test.ts' --test-timeout=120000 --test-force-exit",
+    "coverage:all": "node ../scripts/own-tmp.mjs --tests='src/**/*.test.ts' --tests='e2e/*.test.ts' node --experimental-strip-types --test --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-exclude='src/**/*.test.ts' --test-timeout=120000 --test-force-exit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
@@ -23,6 +26,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
+    "oxlint": "^1.81.0",
     "typescript": "^5.9.0"
   }
 }

@@ -4,8 +4,6 @@
 // something that happened (a report of being blocked, the agent's own exit) stay. The tests act as the agents (fake Claude Code).
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, type Hq } from './harness.ts'
 
 let hq: Hq
@@ -21,7 +19,7 @@ const agentOf = async (id: string) => (await hq.state()).agents.find((a: any) =>
 const open = async (id: string): Promise<string[]> => (await hq.state()).attention.filter((a: any) => a.agent_id === id && !a.resolved_at).map((a: any) => a.kind).sort()
 const has = (id: string, kind: string) => async () => (await open(id)).includes(kind)
 function sql(text: string, ...args: (string | number)[]): void {
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite')); try { db.prepare(text).run(...args) } finally { db.close() }
+  const db = hq.db(); try { db.prepare(text).run(...args) } finally { db.close() }
 }
 /** As if it had started two minutes ago and its mod never reported in: the stuck loop's next look raises "Agent not connected". */
 async function modMissing(id: string): Promise<void> {
@@ -101,9 +99,9 @@ test('Bug 153: alerts left open on an agent that has already ended (saved before
     sql('INSERT INTO needs_attention(id, agent_id, ticket_id, kind, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)', `att-old-${kind}`, eng.id, t.id, kind, `${eng.id}: ${kind}`, Date.now())
   }
   await waitFor('the old alerts to go', async () => {
-    const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'))
+    const db = hq.db()
     try { return kinds.slice(0, 4).every((k) => db.prepare('SELECT resolved_at FROM needs_attention WHERE id = ?').get(`att-old-${k}`)?.resolved_at) } finally { db.close() }
   }, 10_000)
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'))
+  const db = hq.db()
   try { assert.equal(db.prepare("SELECT resolved_at FROM needs_attention WHERE id = 'att-old-blocked'").get()?.resolved_at, null, 'a report of being blocked stays') } finally { db.close() }
 })

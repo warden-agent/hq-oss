@@ -58,6 +58,8 @@ function relay(port: number, file = tokenFile) {
   return { p, got, err: () => err, send: (m: Msg) => p.stdin!.write(JSON.stringify({ jsonrpc: '2.0', ...m }) + '\n'),
     answer: (id: number) => until(`the answer to ${id}`, () => got.find((m) => m.id === id && ('result' in m || 'error' in m))) }
 }
+/** The relay has found the backend down and is holding what it was sent: it says so on its stderr, once. */
+const holding = (r: ReturnType<typeof relay>) => until('the relay to say it holds calls', () => r.err().includes('holding calls until it does'))
 const call = (id: number, name = 'read_inbox') => ({ id, method: 'tools/call', params: { name, arguments: {}, _meta: { progressToken: id } } })
 
 test('a call goes to the backend with the agent\'s token, and its answer comes back', async () => {
@@ -115,16 +117,18 @@ test('a token HQ no longer takes, and any other refusal, come back as errors; th
 
 test('a cancelled call stops waiting and never reaches the backend', async () => {
   const port = await freePort(), r = relay(port)
-  r.send(call(5, 'open_pr')); await sleep(120)
-  r.send({ method: 'notifications/cancelled', params: { requestId: 5, reason: 'the user pressed Escape' } }); await sleep(120)
-  const b = backend(port, () => ({ result: {} })); await b.up; await sleep(250)
+  r.send(call(5, 'open_pr')); await holding(r)
+  r.send({ method: 'notifications/cancelled', params: { requestId: 5, reason: 'the user pressed Escape' } })
+  await sleep(120) // real-time: the relay reads the cancel from its stdin, and nothing shows that it has
+  const b = backend(port, () => ({ result: {} })); await b.up
+  await sleep(250) // limit: the relay asks the backend again every 50 ms here (HQ_RELAY_RETRY_MS); five of those go by
   assert.equal(b.seen.length, 0); assert.equal(r.got.some((m) => m.id === 5), false)
   r.send(call(6)); await r.answer(6); assert.equal(b.calls().length, 1)
 })
 
 test('it ends when its Claude Code closes stdin, and not before', async () => {
   const port = await freePort(), r = relay(port)
-  r.send(call(1)); await sleep(300); assert.equal(r.p.exitCode, null) // still holding a call for a backend that's down
+  r.send(call(1)); await holding(r); assert.equal(r.p.exitCode, null) // still holding a call for a backend that's down
   const gone = new Promise<number | null>((res) => r.p.once('exit', (c) => res(c)))
   r.p.stdin!.end(); assert.equal(await gone, 0)
 })

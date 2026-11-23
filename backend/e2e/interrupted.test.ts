@@ -5,14 +5,13 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startHq, waitFor, sh, type Hq } from './harness.ts'
 
 let hq: Hq
 // A finished engineer stops 0.3 s after its turn ends here, and the stuck loop and the finished backstop look every second. The screen check that sets a
 // quiet "working" agent idle (Bug 25) keeps its 3 minutes: these tests must see the interrupt do it, not that.
 before(async () => {
-  hq = await startHq({ env: { HQ_STUCK_TICK_S: '1', HQ_FINISHED_STOP_MS: '300', HQ_FINISHED_TICK_S: '1' } })
+  hq = await startHq({ env: { HQ_STUCK_TICK_S: '1', HQ_FINISHED_STOP_MS: '300', HQ_FINISHED_TICK_S: '0.25' } })
   await hq.api('settings', { key: 'concurrency_cap', value: 20 })
 })
 after(async () => { await hq?.stop() })
@@ -25,7 +24,7 @@ const turnComplete = (id: string, aborted: boolean, helper: string | null = null
 const escape = (id: string) => turnComplete(id, true)
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const db = <T,>(query: string, ...args: (string | number)[]): T[] => {
-  const d = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite')); try { return d.prepare(query).all(...args) as T[] } finally { d.close() }
+  const d = hq.db(); try { return d.prepare(query).all(...args) as T[] } finally { d.close() }
 }
 
 async function tpmOf(name: string): Promise<any> {
@@ -103,7 +102,8 @@ test("Bug 148: an engineer interrupted on a finished ticket isn't stopped as fin
   await hq.hook(eng.id, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_use_id: 'toolu_s', tool_input: { command: 'git log --oneline' } })
   await escape(eng.id)
   assert.deepEqual(await seen(eng.id), ['idle', null, true])
-  await wait(1600) // longer than the stop's delay and its backstop take here
+  await wait(400) // limit: HQ leaves a finished engineer alone for HQ_FINISHED_STOP_MS (0.3 s here) after its last sign of life; no look stops it sooner
+  await hq.beats('finished', 2) // and the backstop has looked at every engineer since
   assert.equal((await agentOf(eng.id)).status, 'idle', 'kept: somebody stopped it mid-turn, and may type to it')
   await hq.hook(eng.id, { hook_event_name: 'UserPromptSubmit', prompt: 'never mind, you are done' })
   await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'OK.' })
@@ -115,7 +115,7 @@ test("Bug 148: an interrupted engineer's idle time starts at the interrupt, not 
   await hq.hook(eng.id, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_use_id: 'toolu_p', tool_input: { command: "perl -e 'sleep 75'" } })
   await hq.api('settings', { key: 'stuck_idle_min', value: 0.05 }) // 3 s
   try {
-    await wait(3500) // a long command: no hooks for longer than the idle limit
+    await wait(3500) // limit: the idle limit is 3 s here (stuck_idle_min 0.05), and the command has to have run longer than that with no hook
     const at = Date.now(); await escape(eng.id)
     assert.deepEqual(await seen(eng.id), ['idle', null, true])
     const [row] = db<{ last_event_at: number }>('SELECT last_event_at FROM agents WHERE id = ?', eng.id)

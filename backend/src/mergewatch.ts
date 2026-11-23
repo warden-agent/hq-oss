@@ -1,12 +1,14 @@
 // Finished tickets: open_pr (push + PR, or wait for "Merge into main"), and noticing merges and conflicts with main by themselves.
 import fs from 'node:fs'
+import { checkOf, testedFor } from './hqcheckrules.ts'
 import path from 'node:path'
-import { attention, resolveForTicket, resolveKind } from './attention.ts'
+import { attention, resolveForTicket, resolveKind, resolveKindForTicket } from './attention.ts'
 import { branchMerged, parseGithubRemote } from './reposync.ts'
-import { createPr, decidingPr, mergePr, openOrLink, prsForBranch, pushBranch, type Pr } from './github.ts'
+import { decidingPr, mergePr, openOrLink, prsForBranch, pushBranch, type Pr } from './github.ts'
 import { FINISHED, readyDependents } from './readiness.ts'
 import { one, q, run, now } from './db.ts'
 import { bus, emit } from './events.ts'
+import { beat } from './beats.ts'
 import { j } from './util.ts'
 import { conflictsWith, mergeIntoMain, names } from './localmerge.ts'
 import { clearConflict, clearStalled, fixButton, fixWords, forTests, mergeBase, setConflict, stalledKind, whoMergedFirst } from './conflicts.ts'
@@ -17,9 +19,9 @@ import { autoGoing, getFeature, getRepo, getTicket, sweepNotices, setTicket, tic
 import { countWords, took } from './testcounts.ts'
 import { ghOpts, git, syncRepo } from './repos.ts'
 import { releaseWorktree } from './slots.ts'
-import { writeFeatureMd } from './projectmd.ts'
 import { criteriaOf, proofOf, type ProofEntry } from './criteria.ts'
 import { checkProof } from './proof.ts'
+import { canLaunch } from './scheduler.ts'
 import { applyMapOnMerge, mapWanted, markUnchanged, pendingMapChange } from './mapstore.ts'
 
 /** Bug 184: the part of a ticket HQ has merged already: it merged the commit an open_pr handed over, and the branch got more after it (more than once, even).
@@ -74,41 +76,55 @@ export async function finishTicket(agent: Agent, title: string, body: string, na
   const tests = fixed && forTests(t.fixing) // it went back for its tests, not conflicts (Bug 84)
   const fixedWhat = t.fixing === 'look' ? 'what went wrong when HQ opened the app' : t.fixing === 'review' ? 'what a fresh reader of its changes found' : 'its tests'
   const changed = fixed && t.fixing === 'changes' // or for a spec the TPM changed after it was finished
-  // Bug 246: HQ tests and merges it only while auto mode is going: stopped, or with the ticket parked, the user does until Resume (as the board says)
-  let auto = hqMoves(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t)
+  const why = { tests, changed, fixed, fixedWhat }
   clearConflict(t.id); clearStalled(t.id)
   run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
     `ticket:${t.id}`, 'pr', `# ${title}\n\n${body}`, now())
   if (!slug) {
     setTicket(t.id, { status: 'pr_ready', pr_url: null, pr_state: 'local', prior_status: null, fixing: null })
     emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: false, fixed } })
-    if (fixed && !tests && !changed && !auto) attention('conflicts_fixed', `${t.key}: conflicts fixed (${repo.default_branch} merged in). Ready to merge again.`, { agentId: agent.id, ticketId: t.id })
-    tellTpm(f, auto ? `HQ: ${t.key} is finished (${t.branch}). HQ tests it on ${repo.default_branch} and merges it; you'll be told when it merges.`
-      : tests ? `HQ: ${t.key}'s engineer fixed ${fixedWhat} on ${repo.default_branch}. The user merges it from HQ; you'll be told when it merges.`
-      : changed ? `HQ: ${t.key}'s engineer built the change to its spec (${t.branch}). The user merges it from HQ; you'll be told when it merges.`
-      : fixed ? `HQ: ${t.key}'s conflicts with ${repo.default_branch} are fixed. The user merges it from HQ; you'll be told when it merges.`
-      : `HQ: ${t.key} is finished (${t.branch}). The user merges it into ${repo.default_branch} from HQ; you'll be told when it merges.`)
+    const w = finishWords(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t, { ...why, base: repo.default_branch, pushed: false })
+    if (w.notice) attention('conflicts_fixed', w.notice, { agentId: agent.id, ticketId: t.id })
+    tellTpm(f, w.tpm)
     bus.emit('slot.freed') // its parallel slot is free now (listeners.ts)
-    return auto ? `Done. HQ tests ${t.branch} on ${repo.default_branch} and merges it. You're done: stop now.` :
-      `Done. The user merges ${t.branch} into ${repo.default_branch} from HQ. You're done: stop now.`
+    return w.reply
   }
   try { await pushBranch(repo.path, slug, t.branch, ghOpts()) } catch (e) {
     attention('push_failed', `${t.key}: ${(e as Error).message}`, { agentId: agent.id, ticketId: t.id })
     throw new Error(`HQ could not push ${t.branch}: ${(e as Error).message}. The user has been told; stop and wait for a message.`)
   }
-  auto = hqMoves(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t) // read after the push: auto may have stopped, gone off or come back meanwhile
-  const hasPr = !!t.pr_number && t.pr_state === 'open' // fixed after a conflict: the push updated its open PR
-  setTicket(t.id, hasPr ? { status: 'pr_open', prior_status: null, fixing: null } : { status: 'pr_ready', pr_url: null, pr_state: 'waiting', prior_status: null, fixing: null })
+  pushed(t)
+  const p = getTicket(t.id) ?? t, hasPr = !!p.pr_number && p.pr_state === 'open' // fixed after a conflict: the push updated its open PR (read after the push)
+  // Bug 334: a PR closed on GitHub stays the ticket's closed PR (the box's Merge and Make PR open a new one); as 'waiting' the watcher saw it as newly closed
+  // and raised "PR #N was closed" again after the user had dismissed it
+  const closedPr = !hasPr && p.pr_state === 'closed'
+  setTicket(t.id, hasPr || closedPr ? { status: hasPr ? 'pr_open' : 'pr_ready', prior_status: null, fixing: null }
+    : { status: 'pr_ready', pr_url: null, pr_state: 'waiting', prior_status: null, fixing: null })
   emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: true, waiting: !hasPr, fixed } })
-  if (fixed && !tests && !changed && !auto) attention('conflicts_fixed', `${t.key}: conflicts fixed (${base.name} merged in). Ready to merge again.`, { agentId: agent.id, ticketId: t.id })
-  tellTpm(f, auto ? `HQ: ${t.key} is finished (${t.branch}, pushed). HQ tests it on ${base.name} and merges it; you'll be told when it merges.`
-    : tests ? `HQ: ${t.key}'s engineer fixed ${fixedWhat} on ${base.name}. The user merges it from HQ; you'll be told when it merges.`
-    : changed ? `HQ: ${t.key}'s engineer built the change to its spec (${t.branch}, pushed). The user merges it from HQ; you'll be told when it merges.`
-    : fixed ? `HQ: ${t.key}'s conflicts with ${base.name} are fixed. The user merges it from HQ; you'll be told when it merges.`
-    : `HQ: ${t.key} is finished (${t.branch}, pushed). The user tries it, then merges it or makes a PR from HQ; you'll be told when it merges.`)
+  // read after the push: auto may have stopped, gone off or come back meanwhile
+  const w = finishWords(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t, { ...why, base: base.name, pushed: true })
+  if (w.notice) attention('conflicts_fixed', w.notice, { agentId: agent.id, ticketId: t.id })
+  tellTpm(f, w.tpm)
   bus.emit('slot.freed') // its parallel slot is free now (listeners.ts)
-  return auto ? `Pushed ${t.branch}. HQ tests it on ${base.name} and merges it. You're done: stop now.`
-    : `Pushed ${t.branch}. The user tries it and merges it (or makes a PR) from HQ; HQ tells the TPM when it merges. You're done: stop now.`
+  return w.reply
+}
+/** What HQ says as a ticket is finished (open_pr): to the TPM, back to the engineer, and the user's notice when its conflicts are fixed. Bug 246: HQ tests and
+ *  merges it only while auto mode is going (hqMoves); stopped, or with the ticket parked, the user does until Resume, as the board says. `repo` and `t` as read
+ *  after the last wait. `pushed`: the branch went to GitHub, where the user can also make a PR. */
+export function finishWords(repo: Repo, t: Ticket, o: { base: string; pushed: boolean; tests: boolean; changed: boolean; fixed: boolean; fixedWhat: string }):
+  { tpm: string; reply: string; notice: string | null } {
+  const hq = hqMoves(repo, t), { base, pushed } = o, at = `${t.branch}${pushed ? ', pushed' : ''}`, told = "you'll be told when it merges."
+  const tpm = hq ? `HQ: ${t.key} is finished (${at}). HQ tests it on ${base} and merges it; ${told}`
+    : o.tests ? `HQ: ${t.key}'s engineer fixed ${o.fixedWhat} on ${base}. The user merges it from HQ; ${told}`
+    : o.changed ? `HQ: ${t.key}'s engineer built the change to its spec (${at}). The user merges it from HQ; ${told}`
+    : o.fixed ? `HQ: ${t.key}'s conflicts with ${base} are fixed. The user merges it from HQ; ${told}`
+    : pushed ? `HQ: ${t.key} is finished (${at}). The user tries it, then merges it or makes a PR from HQ; ${told}`
+    : `HQ: ${t.key} is finished (${at}). The user merges it into ${base} from HQ; ${told}`
+  const reply = pushed ? (hq ? `Pushed ${t.branch}. HQ tests it on ${base} and merges it. You're done: stop now.`
+    : `Pushed ${t.branch}. The user tries it and merges it (or makes a PR) from HQ; HQ tells the TPM when it merges. You're done: stop now.`)
+    : hq ? `Done. HQ tests ${t.branch} on ${base} and merges it. You're done: stop now.` : `Done. The user merges ${t.branch} into ${base} from HQ. You're done: stop now.`
+  const notice = o.fixed && !o.tests && !o.changed && !hq ? `${t.key}: conflicts fixed (${base} merged in). Ready to merge again.` : null
+  return { tpm, reply, notice }
 }
 /** HQ's own notice to the project's TPM about a feature (from 'hq': the TPM can tell it from the user's words). Only to a running
  *  TPM: one that starts later is briefed with the board as it stands then (Bug 52). */
@@ -123,20 +139,32 @@ async function openTicketPr(t: Ticket, repo: Repo, slug: string, title: string, 
   if ('pr' in r) {
     setTicket(t.id, { status: 'pr_open', pr_number: r.pr.number, pr_url: r.pr.url, pr_state: 'open', prior_status: null })
     emit({ agentId: t.assignee_agent_id, source: 'system', kind: 'ticket.pr_open', payload: { ticket: t.id, key: t.key, branch, pr: r.pr.number } })
-    for (const k of ['pr_ready', 'pr_failed']) resolveKind(k, t.assignee_agent_id) // an older link or failure note is moot now
-    const cur = getRepo(repo.id) ?? repo, hq = hqMoves(cur, getTicket(t.id) ?? t) // read after GitHub answered: auto may have gone on, off or stopped meanwhile
-    tellTpm(f, `HQ: PR #${r.pr.number} is open for ${t.key} (${branch}). ${hq ? `HQ tests it on ${mergeBase(cur).name} and merges it` : 'The user merges it'};`
-      + " you'll be told when it merges.")
+    prOpened(t)
+    const cur = getRepo(repo.id) ?? repo // read after GitHub answered: auto may have gone on, off or stopped meanwhile
+    tellTpm(f, prWords(cur, getTicket(t.id) ?? t, { pr: r.pr.number, branch, base: mergeBase(cur).name }))
     return r.pr
   }
   const first = t.status !== 'pr_ready' // a watcher retry doesn't re-announce
   setTicket(t.id, { status: 'pr_ready', pr_url: r.link, pr_state: 'not_opened', prior_status: null })
   emit({ agentId: t.assignee_agent_id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch, pushed: true, error: r.error } })
   attention('pr_failed', `${t.key}: HQ pushed ${branch} but couldn't open the PR (${r.error}). Open it yourself → ${r.link}`, { agentId: t.assignee_agent_id, ticketId: t.id })
-  if (first) tellTpm(f, `HQ: ${t.key} is finished and pushed (${branch}). The user opens and merges the PR; you'll be told when it merges.`)
+  if (first) tellTpm(f, prWords(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t, { pr: null, branch, base: mergeBase(repo).name }))
   return null
 }
+/** HQ's word to the TPM on the PR it opened (`pr`) or that GitHub refused (null), by hqMoves: on auto HQ merges it, and opens a refused one itself as it
+ *  merges (Bug 280); otherwise the user does (Bug 292). */
+export function prWords(repo: Repo, t: Ticket, o: { pr: number | null; branch: string; base: string }): string {
+  const hq = hqMoves(repo, t)
+  return o.pr !== null ? `HQ: PR #${o.pr} is open for ${t.key} (${o.branch}). ${hq ? `HQ tests it on ${o.base} and merges it` : 'The user merges it'}; you'll be told when it merges.`
+    : `HQ: ${t.key} is finished and pushed (${o.branch}). ${hq ? `HQ tests it on ${o.base}, opens the PR and merges it` : 'The user opens and merges the PR'};`
+      + " you'll be told when it merges."
+}
 
+/** Bug 266: the branch is on GitHub now, so an older "couldn't push" notice is moot (on auto it stopped the project again at every Resume). */
+const pushed = (t: Ticket): void => resolveKindForTicket('push_failed', t.id)
+/** The ticket has an open PR, opened by HQ or by the user by hand (Bug 265): an older link, "couldn't open the PR" or "PR closed" notice is moot. By ticket, not
+ *  engineer: the notice outlives the engineer that finished it. */
+const prOpened = (t: Ticket): void => { for (const k of ['pr_ready', 'pr_failed', 'pr_closed']) resolveKindForTicket(k, t.id) } // a new PR: the closed one is moot (Bug 301)
 /** The PR title and body the engineer wrote at open_pr. */
 function prText(t: Ticket): { title: string; body: string } {
   const m = one<{ text: string }>('SELECT text FROM docs WHERE scope = ? AND key = ?', `ticket:${t.id}`, 'pr')?.text.match(/^# (.*)\n\n([\s\S]*)$/)
@@ -146,12 +174,26 @@ const repoOfTicket = (t: Ticket): Repo | undefined => { const f = getFeature(t.f
 /** Make PR (Bug 45): the user wants a PR to look at on GitHub before merging. Opened → `pr_open`; refused → the "Create PR" link. */
 export async function makePr(ticketId: string): Promise<Ticket> {
   const t = getTicket(ticketId), repo = t && repoOfTicket(t); if (!t || !repo) throw new Error('unknown ticket')
+  const shut = closedWhy(repo.id); if (shut) throw new Error(shut) // Bug 294: no PR opens while the project is cleared or removed
   const slug = usesGithub(repo) ? parseGithubRemote(repo.remote ?? '') : null
   if (!slug || t.pr_state === 'local') throw new Error(`${repo.name} isn't on GitHub: merge ${t.key} from HQ.`)
-  if (t.status !== 'pr_ready' || !t.branch) throw new Error(t.status === 'pr_open' ? `${t.key} already has PR #${t.pr_number}.` : `${t.key} isn't finished yet (${t.status}).`)
+  const closed = t.pr_state === 'closed' && ['pr_ready', 'pr_open'].includes(t.status) // Bug 301: its PR was closed on GitHub, so it has none open
+  if ((t.status !== 'pr_ready' && !closed) || !t.branch) throw new Error(t.status === 'pr_open' ? `${t.key} already has PR #${t.pr_number}.` : `${t.key} isn't finished yet (${t.status}).`)
+  if (closed) { await pushBranch(repo.path, slug, t.branch, ghOpts()); pushed(t) } // GitHub's Delete branch sits by a closed PR; never forced (as Merge pushes)
   const { title, body } = prText(t), pr = await openTicketPr(t, repo, slug, title, body)
-  if (!pr) throw new Error(`GitHub wouldn't open the PR for ${t.key}. Create PR ↗ on its box opens GitHub's own form, filled in.`) // the button board.ts mergeActs gives a refused one (Bug 244)
+  if (!pr) throw new Error(`GitHub wouldn't open the PR for ${t.key}. ${FORM_WORDS}`) // the button board.ts mergeActs gives a refused one (Bug 244)
   return getTicket(t.id)!
+}
+const FORM_WORDS = "Create PR ↗ on its box opens GitHub's own form, filled in."
+/** Bug 280: GitHub refused the PR HQ opens to merge a finished ticket (auto mode's merge, or the user's Merge into main). The ticket lands as after a refused
+ *  Make PR: `not_opened` with GitHub's pre-filled form, so the box offers Create PR ↗ at once, not a Make PR that fails again. Read after GitHub answered: a
+ *  ticket that moved meanwhile (a PR opened by hand, merged, sent back) or one whose PR was closed keeps what it has. No notice here: the caller shows the
+ *  error it returns (auto's stop, the Merge's error). */
+function prRefused(t0: Ticket, link: string, why: string): string {
+  const t = getTicket(t0.id), lands = t?.status === 'pr_ready' && t.branch === t0.branch && (t.pr_state === 'waiting' || t.pr_state === 'not_opened')
+  if (lands) setTicket(t.id, { pr_url: link, pr_state: 'not_opened' })
+  emit({ agentId: null, source: 'system', kind: 'ticket.merge_refused', payload: { ticket: t0.id, key: t0.key, why, link: lands ? link : null } })
+  return `HQ couldn't open a PR to merge ${t0.key}: ${lands ? `${why.replace(/[.\s]+$/, '')}. ${FORM_WORDS}` : why}` // the link only where the box has it (Bug 244)
 }
 
 let checking: Promise<void> | null = null, again = false
@@ -160,7 +202,7 @@ let checking: Promise<void> | null = null, again = false
  *  one more pass after it, so a merge that just happened is always looked at. */
 export function checkMerges(): Promise<void> {
   if (checking) { again = true; return checking }
-  checking = (async () => { do { again = false; await checkOnce() } while (again) })().finally(() => { checking = null })
+  checking = (async () => { do { again = false; try { await checkOnce() } finally { beat('merges') } } while (again) })().finally(() => { checking = null })
   return checking
 }
 async function checkOnce(): Promise<void> {
@@ -170,16 +212,17 @@ async function checkOnce(): Promise<void> {
   for (const t of waiting) {
     const repo = getRepo(t.repo_id); if (!repo || !t.branch) continue
     const slug = usesGithub(repo) ? parseGithubRemote(repo.remote ?? '') : null
-    if (!slug) { if (await branchMerged(repo.path, t.branch, `refs/heads/${repo.default_branch}`)) markMerged(t, null); else await checkConflict(t, repo); continue }
+    if (!slug) { if (await branchMerged(repo.path, t.branch, `refs/heads/${repo.default_branch}`)) markMerged(t, null, ownMerge(t)); else await checkConflict(t, repo); continue }
     const prs = await prsForBranch(slug, t.branch, ghOpts()).catch(() => null) // null: GitHub couldn't be asked
     if (!getTicket(t.id)) continue // removed from HQ while GitHub was being asked
     const pr = decidingPr(prs ?? [])
-    if (pr?.state === 'MERGED') { markMerged(t, pr); continue }
+    if (pr?.state === 'MERGED') { markMerged(t, pr, ownMerge(t)); continue }
     if (pr?.state === 'OPEN') {
       const resolving = t.status === 'resolving' // its engineer is merging main in: only the PR fields change
       if ((!resolving && t.status !== 'pr_open') || t.pr_number !== pr.number || t.pr_state !== 'open') {
         setTicket(t.id, { ...(resolving ? {} : { status: 'pr_open' as const }), pr_number: pr.number, pr_url: pr.url, pr_state: 'open' })
       }
+      prOpened(t) // the user may have opened it by hand, as the notice says (Bug 265)
     } else if (pr?.state === 'CLOSED') {
       if (t.pr_state !== 'closed') {
         setTicket(t.id, { pr_number: pr.number, pr_url: pr.url, pr_state: 'closed' })
@@ -237,7 +280,21 @@ function saveMergeTest(ticketId: string, m: MergeTest, output: string | null): v
     `ticket:${ticketId}`, 'merge_test_output', output, now())
   setTicket(ticketId, { merge_test: JSON.stringify(m) })
 }
-/** `byUser`: they pressed Merge in HQ, so a plain "X merged" tells them nothing. "Start ready" still does. `tested`: auto mode's passing test that let it merge;
+/** Bug 293: HQ is about to merge `t` itself (the user's Merge, or auto mode's, `tested` by it). Kept in the events log: a backend restart between git (or GitHub)
+ *  merging it and HQ hearing so leaves the merge for the watcher to notice at start-up, and it is still HQ's merge, not one made outside HQ. */
+const mergeStarted = (t: Ticket, tested?: Tested): void => {
+  emit({ agentId: null, source: 'system', kind: 'ticket.merge_started', payload: { ticket: t.id, key: t.key, tested: tested ? passed(tested) : null } })
+}
+/** How the watcher marks a merge it notices: as HQ's own when HQ began merging the ticket and never heard how that ended (the backend went down meanwhile; a refusal,
+ *  or a merge of part of it, Bug 212, is heard). One the user made by hand has none. */
+function ownMerge(t: Ticket): { byUser?: boolean; tested?: Tested } {
+  const began = one<{ id: number; payload: string }>(`SELECT id, payload FROM events WHERE kind = 'ticket.merge_started' AND json_extract(payload, '$.ticket') = ?
+    ORDER BY id DESC LIMIT 1`, t.id); if (!began) return {}
+  if (one(`SELECT 1 AS x FROM events WHERE kind IN ('ticket.merge_refused', 'ticket.merged_late') AND id > ? AND json_extract(payload, '$.ticket') = ?`, began.id, t.id)) return {}
+  const tested = j<{ tested?: MergeTest | null }>(began.payload, {}).tested // its output isn't kept with it: the Ticket tab has none to show
+  return { byUser: true, ...(tested?.ran === 'pass' ? { tested: tested as Tested } : {}) }
+}
+/** `byUser`: they pressed Merge in HQ, so a plain "X merged" tells them nothing. What's ready now still does (startWords). `tested`: auto mode's passing test that let it merge;
  *  without one HQ did not test it as it merged, and the ticket says so (Bug 126). */
 function markMerged(t: Ticket, pr: Pr | null, o: { byUser?: boolean; tested?: Tested } = {}): void {
   const m: MergeTest = o.tested ? passed(o.tested) : { ran: 'none', by: o.byUser ? 'user' : 'outside', at: now() }
@@ -254,13 +311,24 @@ function markMerged(t: Ticket, pr: Pr | null, o: { byUser?: boolean; tested?: Te
   if (a && a.status !== 'exited') void stopAgent(a.id, 'merged') // its work is in main now; once it's gone its worktree goes too
   else void releaseWorktree(t).catch(() => {})
   const f = getFeature(t.feature_id)!; applyMapOnMerge(t, f.repo_id) // its change to the feature map goes in with its work (mapstore.ts)
-  writeFeatureMd(f) // "Built so far" in PROJECT.md grows (Bug 52)
   const ready = readyDependents(t.key, tickets(f.id), j<string[]>(f.merge_order, [])).map((x) => x.key)
   const what = `${t.key} merged${pr ? ` (PR #${pr.number})` : ''}.${ready.length ? ` Ready now: ${ready.join(', ')}.` : ''}`
   const cur = getRepo(f.repo_id), auto = !!cur && autoGoing(cur) // auto mode starts what's ready and sums the run up at the end; stopped, the user does (Bug 246)
-  if (!auto && (ready.length || !o.byUser)) attention('merged', ready.length ? `${what} Start them with "Start ready".` : what, { agentId: t.assignee_agent_id, ticketId: t.id })
+  if (!auto && (ready.length || !o.byUser)) {
+    attention('merged', ready.length ? `${what} ${startWords(ready.length, !!cur?.auto_mode, !canLaunch().free)}` : what, { agentId: t.assignee_agent_id, ticketId: t.id })
+  }
   const tested = `${t.key} merged${pr ? ` (PR #${pr.number})` : ''}. ${testedWords(m, getRepo(f.repo_id)?.default_branch ?? 'main')}` // what HQ ran on it first (Bug 126)
   tellTpm(f, `HQ: ${tested}${ready.length ? ` Ready now: ${ready.join(', ')}.${auto ? ' HQ starts them.' : ' The user starts them from HQ.'}` : ''}`)
+}
+/** Bug 264: where the user starts tickets that are ready, by the buttons' own names: Start under Your turn (the TPM box and the ⚠ menu; its label names the
+ *  tickets) and Launch engineer on a ticket's box (frontend/src/Nodes.tsx, App.tsx, board.ts). Only said while auto mode isn't going (markMerged): `stopped`, it is
+ *  on but stopped, so Resume on its bar lets HQ start them instead (Auto.tsx AutoBanner). `full`: no engineer slot is free as it merges, so Your turn has no Start
+ *  and Launch engineer is refused (scheduler.ts canLaunch) until an engineer finishes: said, or the user looks for a button that isn't there. */
+export function startWords(n: number, stopped: boolean, full = false): string {
+  const it = n === 1 ? 'it' : 'them'
+  return `Start ${it} with Start under Your turn, or Launch engineer on ${n === 1 ? 'its box' : 'each box'}.`
+    + (full ? ' The parallel limit is reached now, so that waits until an engineer finishes.' : '')
+    + (stopped ? ` Or press Resume on the "Auto mode stopped" bar and HQ starts ${it}.` : '')
 }
 const merging = new Map<string, Promise<unknown>>() // one merge per repo at a time
 /** Merge for a finished ticket. GitHub repos: mergeOnGithub. Local repos (or a GitHub one HQ can't push to): HQ merges its branch with fixed rules (localmerge.ts: refuses,
@@ -273,7 +341,10 @@ export function mergeTicket(ticketId: string): Promise<{ merged: true; sha: stri
   return inMergeQueue(repo.id, async () => {
     // Bug 212: the branch as it is now, by its commit, and the branch looked at again after: a commit that lands while it merges is said, never left unsaid
     const t = getTicket(ticketId), head = t?.branch ? await tipOf(repo.path, t.branch) : ''
-    const m = await mergeNow(ticketId, repo, undefined, head || undefined)
+    // "Have HQ test this" passed on these very commits, the ticket's and main's: the merge records that test, as auto mode's merge records its own (Bug 126)
+    const baseSha = await git(repo.path, 'rev-parse', '--verify', '--quiet', `${mergeBase(repo).ref}^{commit}`).catch(() => '')
+    const ok = head && baseSha ? testedFor(checkOf(getTicket(ticketId) ?? {}), head, baseSha) : null
+    const m = await mergeNow(ticketId, repo, ok ? { ran: 'pass', ...ok } : undefined, head || undefined)
     const cur = getTicket(ticketId); if (!cur?.branch || !head) return m
     if (m.behind) await lateWhileMerging(repo, cur, head, m.behind, false)
     else if (cur.status === 'merged' && !m.already) { const after = await tipOf(repo.path, cur.branch); if (after && after !== head) await lateWhileMerging(repo, cur, head, after, true) }
@@ -317,6 +388,7 @@ export async function mergeNow(ticketId: string, repo: Repo, tested?: Tested, he
     if (t.status !== 'pr_ready' || t.pr_state !== 'local' || !t.branch) throw new Error(`${t.key} isn't finished yet (${t.status}).`)
     const doc = one<{ text: string }>('SELECT text FROM docs WHERE scope = ? AND key = ?', `ticket:${t.id}`, 'pr')?.text ?? ''
     const body = doc.replace(/^# .*\n?/, '').trim() // the engineer's PR text, without its title line
+    mergeStarted(t, tested)
     const r = await mergeIntoMain(repo.path, { branch: t.branch, sha: head, into: repo.default_branch,
       subject: `Merge ${t.key}: ${t.title}`, body: [body, `HQ ticket ${t.key} · ${t.branch}`].filter(Boolean) })
     if (!r.ok) {
@@ -352,16 +424,18 @@ async function mergeOnGithub(t: Ticket, repo: Repo, tested?: Tested, head?: stri
     const first = await whoMergedFirst(repo, t, files, base.ref); setConflict(t, files, first, base.name)
     throw new Error(`${t.key} conflicts with ${base.name} in ${names(files)}${first.length ? ` (${first.join(', ')} merged first)` : ''}. Nothing was merged. Press Fix conflicts.`)
   }
-  await pushBranch(repo.path, slug, t.branch, { ...o, sha: head }) // GitHub merges the commits HQ ran in Try it, or the one auto mode tested
+  await pushBranch(repo.path, slug, t.branch, { ...o, sha: head }); pushed(t) // GitHub merges the commits HQ ran in Try it, or the one auto mode tested
   let pr = decidingPr(await prsForBranch(slug, t.branch, o))
   if (pr?.state === 'MERGED') { markMerged(t, pr, { byUser: true, tested }); return { merged: true, sha: '', already: true } }
   if (pr?.state !== 'OPEN') {
-    const { title, body } = prText(t)
-    try { pr = await createPr(slug, repo.default_branch, t.branch, title, body, o) } catch (e) { throw new Error(`HQ couldn't open a PR to merge ${t.key}: ${(e as Error).message}`) }
-    setTicket(t.id, { status: 'pr_open', pr_number: pr.number, pr_url: pr.url, pr_state: 'open' })
+    const { title, body } = prText(t), r = await openOrLink(slug, repo.default_branch, t.branch, title, body, o)
+    if (!('pr' in r)) throw new Error(prRefused(t, r.link, r.error))
+    pr = r.pr
+    setTicket(t.id, { status: 'pr_open', pr_number: pr.number, pr_url: pr.url, pr_state: 'open' }); prOpened(t)
     emit({ agentId: t.assignee_agent_id, source: 'system', kind: 'ticket.pr_open', payload: { ticket: t.id, key: t.key, branch: t.branch, pr: pr.number } })
   }
   let sha: string
+  mergeStarted(t, tested)
   try { sha = await mergePr(slug, pr.number, o, head) } catch (e) {
     const why = (e as Error).message; emit({ agentId: null, source: 'ui', kind: 'ticket.merge_refused', payload: { ticket: t.id, key: t.key, why, pr: pr.number } }); throw e
   }

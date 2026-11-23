@@ -186,3 +186,180 @@ test('Bug 247: a PR the user opened by hand after a refused Make PR is merged af
   await waitFor('the merge after Resume', async () => (await tk())?.status === 'merged', 20_000)
   assert.deepEqual([(await tk()).pr_number, gh.read().merged], [41, [41]], 'HQ merged the PR the user opened')
 })
+// Bug 265: the user opened the PR by hand after GitHub refused HQ's (the notice says to); the watcher sees it open, so the notice that says to open it goes too.
+test('Bug 265: a PR the user opened by hand after a refused Make PR takes down "Open it yourself"', async () => {
+  const { repo, t, tk } = await finishedByHand('agm')
+  gh.write({ ...gh.read(), refuseCreate: 'Resource not accessible by integration' })
+  assert.equal((await hq.api(`tickets/${t.id}/make-pr`, {})).status, 409)
+  const open = async () => (await hq.state()).attention.find((a: any) => a.ticket_id === t.id && a.kind === 'pr_failed' && !a.resolved_at)
+  assert.match((await open())?.detail ?? '', /Open it yourself/)
+  const s = gh.read(), branch = (await tk()).branch
+  gh.write({ ...s, prs: { ...s.prs, [branch]: [{ number: 52, url: 'https://github.com/e2e/agm/pull/52', state: 'OPEN', mergeable: 'MERGEABLE' }] } })
+  assert.equal((await hq.api(`repos/${repo.id}/sync`, {})).status, 200) // Sync: the watcher looks at once
+  await waitFor('the PR seen', async () => (await tk())?.status === 'pr_open', 15_000)
+  await waitFor('the notice to go', async () => !(await open()), 5_000)
+  assert.deepEqual([(await tk()).pr_number, (await tk()).pr_state], [52, 'open'])
+})
+
+// Bug 266: a push GitHub refused leaves a push_failed notice, which stops auto mode. Once a later push of the same ticket goes through, the notice is moot:
+// it goes, and Resume goes on (before, it stopped auto again at every Resume until someone ticked it off or the ticket merged).
+test('Bug 266: a refused push\'s notice goes with the next good push, and Resume goes on', async () => {
+  const dir = hq.repo('agr'), bare = path.join(hq.root, 'bare', 'agr.git')
+  sh(hq.root, 'clone', '-q', '--bare', dir, bare)
+  gh.write({ prs: {}, next: 1, bares: { 'e2e/agr': bare } })
+  sh(dir, 'remote', 'add', 'origin', 'git@github.com:e2e/agr.git')
+  fs.writeFileSync(path.join(hq.home, '.gitconfig'), `[url "file://${bare}"]\n\tinsteadOf = https://github.com/e2e/agr.git\n`)
+  const repo = (await hq.api('repos', { path: dir })).json, f = (await hq.api('features', { repoId: repo.id, title: 'agr', request: 'Build' })).json
+  const tpm = await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
+  assert.equal((await hq.api(`repos/${repo.id}/test-cmd`, { cmd: 'true' })).status, 200)
+  await hq.api(`repos/${repo.id}/auto`, { on: true })
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'one', size: 'S', spec: 'one.' })).json
+  await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'ok' })
+  const e = await waitFor(`an engineer on ${t.key}`, async () => (await hq.state()).agents.find((a: any) => a.role === 'engineer' && a.ticket_id === t.id && a.status === 'working'))
+  await hq.hook(e.id, exitPlanMode('Plan'))
+  const wt = path.join(dir, '.claude', 'worktrees', t.key); fs.writeFileSync(path.join(wt, 'one.txt'), 'x\n'); sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', 'one')
+  const hook = path.join(bare, 'hooks', 'pre-receive') // GitHub refusing the push, as for an account without Write access
+  fs.writeFileSync(hook, '#!/bin/sh\necho "remote: Permission to e2e/agr.git denied to warden-agent." >&2\nexit 1\n', { mode: 0o755 })
+  await hq.hook(e.id, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'true' }, tool_use_id: `toolu_${e.id}_1` })
+  await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
+  const pr = () => hq.mcp(e.id, 'open_pr', { title: 'one', body: 'one.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true })
+  const refused = await pr(); assert.equal(refused.isError, true); assert.match(refused.text, /HQ could not push/)
+  const notice = async () => (await hq.state()).attention.find((a: any) => a.ticket_id === t.id && a.kind === 'push_failed' && !a.resolved_at)
+  assert.ok(await notice(), 'the user is told')
+  const stopped = () => waitFor('the stop', async () => (await hq.state()).repos.find((r: any) => r.id === repo.id).auto_stopped_why, 15_000)
+  assert.match(await stopped(), /can't push to e2e\/agr/)
+  fs.rmSync(hook) // the user gave the account Write access; the engineer is told and calls open_pr again
+  const ok = await pr(); assert.equal(ok.isError, false, ok.text)
+  assert.equal(await notice(), undefined, 'the good push takes the notice down')
+  assert.equal((await hq.api(`repos/${repo.id}/auto-resume`, {})).status, 200)
+  await waitFor('the merge after Resume', async () => (await hq.state()).tickets.find((x: any) => x.id === t.id)?.status === 'merged', 20_000)
+  assert.equal((await hq.state()).repos.find((r: any) => r.id === repo.id).auto_stopped_why, null)
+})
+
+// Bug 280: HQ's own PR try on auto was refused, auto stopped with "HQ couldn't open a PR to merge T-01", but the ticket stayed `waiting`, so the box offered a
+// Make PR that failed once more before the link came. The ticket now lands as after a refused Make PR: `not_opened` with GitHub's form, Create PR ↗ on the box.
+const BOARD: string = '../../frontend/src/board.ts' // a plain string: the backend's typecheck stays out of the frontend's files (as src/prformlink.test.ts)
+const boardActs = async (t: any): Promise<string[]> => {
+  const { register } = await import('node:module') // the frontend imports its own files without an extension (Vite finds them)
+  register(`data:text/javascript,${encodeURIComponent(`export async function resolve(s, c, next) {
+    if (/^\\.\\.?\\//.test(s) && !/\\.[a-z]+$/.test(s)) { try { return await next(s + '.ts', c) } catch { /* not a .ts file */ } }
+    return next(s, c) }`)}`)
+  ;(globalThis as any).document ??= { createElement: () => ({ getContext: () => null }) }
+  const { mergeActs } = await import(BOARD) as { mergeActs: (t: any, base: string, eng: any) => any[] }
+  return mergeActs(t, 'main', null).map((a) => a.kind === 'link' ? `link:${a.label}` : a.kind)
+}
+test('Bug 280: after HQ\'s own PR try is refused on auto, the ticket is as after a refused Make PR: Create PR ↗ on its box at once', async () => {
+  const dir = hq.repo('agx'), bare = path.join(hq.root, 'bare', 'agx.git')
+  sh(hq.root, 'clone', '-q', '--bare', dir, bare)
+  gh.write({ prs: {}, next: 1, bares: { 'e2e/agx': bare }, refuseCreate: 'Resource not accessible by integration' })
+  sh(dir, 'remote', 'add', 'origin', 'git@github.com:e2e/agx.git')
+  fs.writeFileSync(path.join(hq.home, '.gitconfig'), `[url "file://${bare}"]\n\tinsteadOf = https://github.com/e2e/agx.git\n`)
+  const repo = (await hq.api('repos', { path: dir })).json, f = (await hq.api('features', { repoId: repo.id, title: 'agx', request: 'Build' })).json
+  const tpm = await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
+  assert.equal((await hq.api(`repos/${repo.id}/test-cmd`, { cmd: 'true' })).status, 200)
+  assert.equal((await hq.api(`repos/${repo.id}/auto`, { on: true })).status, 200)
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'one', size: 'S', spec: 'one.' })).json
+  await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'ok' })
+  const e = await waitFor(`an engineer on ${t.key}`, async () => (await hq.state()).agents.find((a: any) => a.role === 'engineer' && a.ticket_id === t.id && a.status === 'working'))
+  await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'more to come' })
+  await hq.hook(e.id, exitPlanMode('Plan'))
+  const wt = path.join(dir, '.claude', 'worktrees', t.key); fs.writeFileSync(path.join(wt, 'one.txt'), 'x\n'); sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', 'one')
+  await hq.mcp(e.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
+  const r = await hq.mcp(e.id, 'open_pr', { title: 'one', body: 'one.\n\n## Deviations from approved plan\nNone' }); assert.equal(r.isError, false, r.text)
+  const tk = async () => (await hq.state()).tickets.find((x: any) => x.id === t.id)
+  const why = await waitFor('the stop', async () => (await hq.state()).repos.find((x: any) => x.id === repo.id).auto_stopped_why, 20_000)
+  assert.match(why, new RegExp(`^HQ couldn't open a PR to merge ${t.key}: .*can't open PRs on e2e/agx.*\\. Create PR ↗ on its box opens GitHub's own form, filled in\\.$`))
+  const x = await tk() // at once: the stop and the ticket's state come together
+  assert.deepEqual([x.status, x.pr_state], ['pr_ready', 'not_opened']); assert.match(x.pr_url, /^https:\/\/github\.com\/e2e\/agx\/compare\/main\.\.\./)
+  assert.deepEqual(await boardActs(x), ['merge', 'link:Create PR ↗'], 'the box: Merge into main and GitHub\'s own form, no Make PR')
+  const db = hq.db() // the Events tab's record of it
+  try {
+    const ev = db.prepare("SELECT payload FROM events WHERE kind = 'ticket.merge_refused' AND payload LIKE ?").all(`%${t.id}%`).map((v: any) => JSON.parse(v.payload))
+    assert.equal(ev.length, 1); assert.match(ev[0].why, /can't open PRs on e2e\/agx/); assert.equal(ev[0].link, x.pr_url)
+  } finally { db.close() }
+  // The user's own Merge into main, refused the same way, keeps it so and says the same (the error the page shows)
+  const m = await hq.api(`tickets/${t.id}/merge`, {}); assert.equal(m.status, 409)
+  assert.match(m.json.error, /^HQ couldn't open a PR to merge .*Create PR ↗ on its box/); assert.equal((await tk()).pr_state, 'not_opened')
+  gh.write({ ...gh.read(), refuseCreate: undefined })
+  assert.equal((await hq.api(`repos/${repo.id}/auto-resume`, {})).status, 200)
+  await waitFor('the merge after Resume', async () => (await tk())?.status === 'merged', 20_000)
+  assert.equal(gh.read().merged.length, 1)
+})
+// What it must not catch: a ticket whose PR was closed on GitHub keeps its "closed" state when HQ's try is refused, and the words name no button it hasn't got.
+test('Bug 280: a refused try on a ticket whose PR was closed keeps it closed and names no Create PR ↗', async () => {
+  const { repo, t, tk } = await finishedByHand('agc')
+  const s = gh.read(), branch = (await tk()).branch
+  gh.write({ ...s, refuseCreate: 'Resource not accessible by integration', prs: { ...s.prs, [branch]: [{ number: 9, url: 'https://github.com/e2e/agc/pull/9', state: 'CLOSED' }] } })
+  await hq.api(`repos/${repo.id}/sync`, {}) // the watcher reads the closed PR
+  await waitFor('the closed PR', async () => (await tk())?.pr_state === 'closed', 15_000)
+  const m = await hq.api(`tickets/${t.id}/merge`, {}); assert.equal(m.status, 409)
+  assert.match(m.json.error, /^HQ couldn't open a PR to merge .*can't open PRs/); assert.doesNotMatch(m.json.error, /Create PR/)
+  const x = await tk(); assert.deepEqual([x.pr_state, x.pr_url], ['closed', 'https://github.com/e2e/agc/pull/9'])
+})
+
+// Bug 301: a finished ticket whose PR was closed on GitHub offered only "Create PR ↗", which opened the closed PR; once HQ had opened a PR for it (pr_open),
+// a closed one left the box with no button at all. It has no open PR, so Make PR and Merge each open a new one (Make PR pushes the branch first, since GitHub's
+// Delete branch sits by a closed PR), and the "closed" notice goes once a new PR is open.
+test('Bug 301: a ticket whose PR was closed: Make PR opens a new one (branch pushed again), and Merge merges through a new one', async () => {
+  const { repo, t, tk } = await finishedByHand('b301x'), bare = path.join(hq.root, 'bare', 'b301x.git'), branch = (await tk()).branch
+  const closedNotice = async () => (await hq.state()).attention.find((a: any) => a.ticket_id === t.id && a.kind === 'pr_closed' && !a.resolved_at)
+  const close = (n: number) => { const s = gh.read(); gh.write({ ...s, prs: { ...s.prs, [branch]: (s.prs[branch] ?? []).map((p: any) => p.number === n ? { ...p, state: 'CLOSED' } : p) } }) }
+  const s0 = gh.read(); gh.write({ ...s0, next: 10, prs: { [branch]: [{ number: 9, url: 'https://github.com/e2e/b301x/pull/9', state: 'CLOSED' }] } })
+  await hq.api(`repos/${repo.id}/sync`, {}) // the watcher reads the closed PR
+  await waitFor('the closed PR', async () => (await tk())?.pr_state === 'closed', 15_000)
+  let x = await tk(); assert.deepEqual([x.status, x.pr_number], ['pr_ready', 9]); assert.ok(await closedNotice())
+  assert.deepEqual(await boardActs(x), ['merge', 'make-pr', 'link:PR #9 ↗'], 'Merge and Make PR, the closed PR as its own link, no Create PR ↗')
+
+  sh(bare, 'branch', '-D', branch) // the user pressed GitHub's Delete branch by the closed PR
+  const made = await hq.api(`tickets/${t.id}/make-pr`, {}); assert.equal(made.status, 200, JSON.stringify(made.json))
+  x = await tk(); assert.deepEqual([x.status, x.pr_state, x.pr_number], ['pr_open', 'open', 10])
+  assert.equal(sh(bare, 'rev-parse', `refs/heads/${branch}`), x.finished_sha, 'the branch is on GitHub again')
+  assert.equal(await closedNotice(), undefined, 'a new PR is open: the closed one\'s notice is moot')
+
+  close(10) // closed again, now from pr_open: the box had no button at all
+  await hq.api(`repos/${repo.id}/sync`, {})
+  await waitFor('the second closed PR', async () => (await tk())?.pr_state === 'closed', 15_000)
+  x = await tk(); assert.deepEqual([x.status, x.pr_number], ['pr_open', 10])
+  assert.deepEqual(await boardActs(x), ['merge', 'make-pr', 'link:PR #10 ↗'])
+  const m = await hq.api(`tickets/${t.id}/merge`, {}); assert.equal(m.status, 200, JSON.stringify(m.json))
+  x = await tk(); assert.deepEqual([x.status, x.pr_state, x.pr_number], ['merged', 'merged', 11])
+  assert.deepEqual(gh.read().merged, [11]); assert.ok(sh(bare, 'ls-tree', '--name-only', 'main').includes('one.txt'))
+})
+// Bug 334: finishing again (here a Fix conflicts) set a ticket whose PR was closed back to "waiting", so the watcher saw the same old closed PR as new and raised
+// "PR #9 was closed" again after the user had dismissed it. The ticket keeps its closed PR: no notice again, and the box still offers Merge and Make PR.
+test('Bug 334: a ticket whose PR was closed, fixed and finished again, doesn\'t raise "PR #9 was closed" again', async () => {
+  const { dir, repo, t, tk } = await finishedByHand('b334x'), bare = path.join(hq.root, 'bare', 'b334x.git'), branch = (await tk()).branch
+  const closedNotices = async () => (await hq.state()).attention.filter((a: any) => a.ticket_id === t.id && a.kind === 'pr_closed' && !a.resolved_at)
+  gh.write({ ...gh.read(), next: 10, prs: { [branch]: [{ number: 9, url: 'https://github.com/e2e/b334x/pull/9', state: 'CLOSED' }] } })
+  await hq.api(`repos/${repo.id}/sync`, {})
+  await waitFor('the closed PR', async () => (await tk())?.pr_state === 'closed', 15_000)
+  const [notice] = await closedNotices(); assert.ok(notice); await hq.api(`attention/${notice.id}/resolve`, {}) // the user dismisses it
+  const gc = path.join(hq.root, 'b334x-clone'); sh(hq.root, 'clone', '-q', bare, gc) // main moves on: the same file, other words
+  fs.writeFileSync(path.join(gc, 'one.txt'), 'y\n'); sh(gc, 'add', '.'); sh(gc, 'commit', '-qm', 'other one'); sh(gc, 'push', '-q', 'origin', 'main')
+  await hq.api(`repos/${repo.id}/sync`, {})
+  await waitFor('the conflict', async () => (await tk())?.conflict_files != null, 15_000)
+  const r = await hq.api(`tickets/${t.id}/fix-conflicts`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  const e = await waitFor('its engineer', async () => (await hq.state()).agents.find((a: any) => a.role === 'engineer' && a.ticket_id === t.id && a.status === 'working'))
+  const wt = path.join(dir, '.claude', 'worktrees', t.key)
+  try { sh(wt, 'merge', '--no-edit', 'origin/main') } catch { /* the conflict */ }
+  fs.writeFileSync(path.join(wt, 'one.txt'), 'x\ny\n'); sh(wt, 'add', 'one.txt'); sh(wt, 'commit', '--no-edit', '-q')
+  const done = await hq.mcp(e.id, 'open_pr', { title: 'one', body: 'one.\n\n## Deviations from approved plan\nNone' }); assert.equal(done.isError, false, done.text)
+  const looked = await hq.beat('merges'); await hq.api(`repos/${repo.id}/sync`, {}); await hq.api(`repos/${repo.id}/sync`, {})
+  await hq.beats('merges', 2, { from: looked }) // a whole look of the watcher after open_pr
+  const x = await tk(); assert.deepEqual([x.status, x.pr_state, x.pr_number, x.conflict_files], ['pr_ready', 'closed', 9, null])
+  assert.deepEqual(await closedNotices(), [], 'the closed PR is the one the user already dismissed')
+  assert.deepEqual(await boardActs(x), ['merge', 'make-pr', 'link:PR #9 ↗'])
+  const m = await hq.api(`tickets/${t.id}/merge`, {}); assert.equal(m.status, 200, JSON.stringify(m.json)) // and Merge still opens a new PR and merges it
+  assert.deepEqual([(await tk()).status, gh.read().merged], ['merged', [10]])
+})
+// The box and the TPM's board say that on auto "HQ opens a new PR and merges it": it does.
+test('Bug 301: on auto, a ticket whose PR was closed is merged through a new PR', async () => {
+  const { repo, tk } = await finishedByHand('b301y'), branch = (await tk()).branch
+  gh.write({ ...gh.read(), next: 10, prs: { [branch]: [{ number: 9, url: 'https://github.com/e2e/b301y/pull/9', state: 'CLOSED' }] } })
+  await hq.api(`repos/${repo.id}/sync`, {})
+  await waitFor('the closed PR', async () => (await tk())?.pr_state === 'closed', 15_000)
+  assert.equal((await hq.api(`repos/${repo.id}/test-cmd`, { cmd: 'true' })).status, 200)
+  assert.equal((await hq.api(`repos/${repo.id}/auto`, { on: true })).status, 200)
+  await waitFor('the merge', async () => (await tk())?.status === 'merged', 20_000)
+  assert.deepEqual([(await tk()).pr_number, gh.read().merged], [10, [10]])
+})

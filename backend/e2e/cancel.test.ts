@@ -98,8 +98,9 @@ test('Bug 50: the TPM removes a ticket only on the user\'s "Remove it", then rew
   const sound = await make('RT-3', 'Sound')
   await hq.mcp(tpm.id, 'cancel_ticket', { key: 'RT-3', why: 'Maybe not needed.' })
   const [keep] = await asks()
-  assert.equal((await hq.api(`asks/${keep.id}/answer`, { answer: 'Keep it' })).status, 200)
-  assert.equal((await row(sound)).status, 'queued'); assert.equal((await toTpm(/The user's answer: Keep it\. Leave RT-3 as it is\./)).length, 1)
+  const kept = await hq.api(`asks/${keep.id}/answer`, { answer: 'Keep it' }); assert.equal(kept.status, 200)
+  const keptMsg = await toTpm(/The user's answer: Keep it\. Leave RT-3 as it is\./)
+  assert.equal((await row(sound)).status, 'queued'); assert.equal(keptMsg.length, 1); assert.equal(kept.json.message_id, keptMsg[0].id, 'Bug 286: the answer names it')
 
   // A started ticket's dependencies no longer matter; a merged or removed one can't be removed
   const eng = (await hq.api(`tickets/${sound.id}/launch`, {})).json

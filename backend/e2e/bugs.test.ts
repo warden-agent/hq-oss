@@ -3,7 +3,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { startHq, waitFor, sh, exitPlanMode, pendingAfter, lockOf, type Hq } from './harness.ts'
+import { startHq, waitFor, sh, exitPlanMode, lockOf, type Hq, pending } from './harness.ts'
 
 let hq: Hq
 before(async () => { hq = await startHq() })
@@ -40,7 +40,8 @@ test('Bug 4: one engineer per ticket, whoever asks and however fast', async () =
   assert.equal((await engineers(t1)).length, 1); assert.equal(hq.tmux('ls').split('\n').filter((l) => l.startsWith('hq-eng-')).length, 1)
   // Launch engineer racing Start ready on the same ticket: still one engineer, and no false "could not start" alert.
   await Promise.all([launch(t2), hq.api(`features/${f.id}/start-ready`, {})])
-  await liveEngineer(t2); await new Promise((r) => setTimeout(r, 300))
+  await liveEngineer(t2)
+  await new Promise((r) => setTimeout(r, 300)) // real-time: both calls have answered; a late "could not start" would come from what they set off, and nothing shows when that is over
   assert.equal((await engineers(t2)).length, 1)
   assert.equal((await hq.state()).attention.filter((a: any) => a.kind === 'launch_failed').length, 0)
   // Room for exactly one more engineer, two different tickets launched together: the limit counts the launch under way.
@@ -64,7 +65,8 @@ test('Bug 5: a changed plan closes the old review, which can then not be approve
   const rA = await waitFor('review A', async () => (await hq.state()).reviews.find((r: any) => r.ticket_id === t.id && r.status === 'open'))
   drop.abort(); assert.equal(await a, 'dropped') // the engineer was interrupted; it then sends a changed plan
   const b = hq.hook(eng.id, exitPlanMode('Plan B'))
-  assert.equal(await pendingAfter(b, 300), true)
+  await waitFor('plan B to be up for review', async () => (await hq.state()).reviews.some((r: any) => r.ticket_id === t.id && r.status === 'open' && r.id !== rA.id))
+  assert.equal(await pending(b), true)
   const s = await hq.state(), mine = s.reviews.filter((r: any) => r.ticket_id === t.id)
   assert.deepEqual(mine.map((r: any) => [r.round, r.status, r.closed_reason]).sort(), [[1, 'abandoned', 'superseded'], [2, 'open', null]])
   assert.deepEqual((await hq.api(`reviews/${rA.id}/answer`, { verdict: 'approve', by: 'user' })).json, { ok: false, held: false, error: 'review not open' })
@@ -124,7 +126,8 @@ test('Bug 6: Merge into main for a local repo: refuses with the reason and chang
   assert.equal(fs.readFileSync(path.join(dir, 'api.txt'), 'utf8'), 'api.txt\n')
   s = await hq.state()
   assert.equal(s.tickets.find((x: any) => x.id === t1.id).status, 'merged')
-  assert.match(s.attention.find((a: any) => a.kind === 'merged' && a.ticket_id === t1.id).detail, /^T-01 merged\. Ready now: T-02\. Start them with "Start ready"\.$/)
+  assert.match(s.attention.find((a: any) => a.kind === 'merged' && a.ticket_id === t1.id).detail,
+    /^T-01 merged\. Ready now: T-02\. Start it with Start under Your turn, or Launch engineer on its box\.$/) // the buttons' names (Bug 264)
   assert.ok(s.messages.some((m: any) => m.to_id === f.tpm_agent_id && /T-01 merged/.test(m.body)))
   await waitFor('the engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === e1.id).status === 'exited')
   await waitFor('the merged worktree to go', () => !fs.existsSync(wtOf(dir, t1)))

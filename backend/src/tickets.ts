@@ -1,7 +1,6 @@
 // Features and tickets: creating them, starting TPM and engineer sessions, Start ready, Fix conflicts, and cancelling.
 import fs from 'node:fs'
 import path from 'node:path'
-import { PATHS } from './config.ts'
 import { attention, resolveForTicket, resolveKind, resolveKindForTicket } from './attention.ts'
 import { depsProblem, launchBlocker, readyTickets, unmergedDeps } from './readiness.ts'
 import { canLaunch, starting } from './scheduler.ts'
@@ -10,7 +9,7 @@ import { emit, patch } from './events.ts'
 import { id, j } from './util.ts'
 import type { TicketStatus } from './readiness.ts'
 import { getAgent, launchAgent, liveAgents, stopAgent, type Agent } from './agents.ts'
-import { pendingFor, sendMessage, type Message } from './delivery.ts'
+import { pendingFor, sendMessage } from './delivery.ts'
 import { modelFor } from './roles.ts'
 import { autoGoing, closedWhy, features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTicket, sweepNotices, ticketInRepo, tickets, type Feature, type Fixing, type Ticket }
   from './records.ts'
@@ -88,7 +87,7 @@ export function createTicket(featureId: string, t: { key?: string; title: string
     id: id('tkt'), feature_id: featureId, key, slug: slugify(t.title), title: t.title, size: (t.size || 'M').toUpperCase(), status: 'queued',
     prior_status: null, assignee_agent_id: null, expected_files: JSON.stringify(t.expected_files ?? []), deps: JSON.stringify(t.depends_on ?? []),
     edit_overrides: '[]', branch: null, worktree_path: null, pr_number: null, pr_url: null, pr_state: null, plan_round: 0, handoff_updated_at: null,
-    last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, repairs_main: t.repairs_main ?? null,
+    last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, hq_check: null, repairs_main: t.repairs_main ?? null,
     repairs_cmd: t.repairs_cmd ?? null, fixing: null, merge_test: null, criteria: JSON.stringify(t.criteria ?? []), proof: null, diff_check: null,
     finished_sha: null, parked_at: null, created_at: ts, updated_at: ts,
   }
@@ -96,7 +95,7 @@ export function createTicket(featureId: string, t: { key?: string; title: string
        updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec,
     row.repairs_main, row.repairs_cmd, row.criteria, ts, ts)
   if (row.repairs_main) keepHqSpec(row.id, t.spec)
-  patch('ticket', row.id, row as unknown as Record<string, unknown>); writeFeatureMd(f)
+  patch('ticket', row.id, row as unknown as Record<string, unknown>) // and its feature's file is rewritten (projectmd.ts, Bug 269)
   return row
 }
 /** Bug 108: a ticket HQ opened by itself (a repair of main's tests) keeps HQ's spec, with its steps and rules, and its title. What the TPM
@@ -394,13 +393,13 @@ export function setDependencies(ticketId: string, keys: string[]): string[] {
   const want = [...new Set(keys.map((k) => k.trim()).filter(Boolean))]
   const bad = depsProblem(t.key, want, tickets(t.feature_id)); if (bad) throw new Error(bad)
   setTicket(t.id, { deps: JSON.stringify(want) })
-  const f = getFeature(t.feature_id); if (f) writeFeatureMd(f)
   emit({ agentId: null, source: 'mcp', kind: 'ticket.deps_changed', payload: { ticket: t.id, key: t.key, depends_on: want } })
   return want
 }
 
 export async function cancelTicket(ticketId: string, opts: { tell?: boolean; asked?: boolean } = {}): Promise<{ key: string; stopped: string | null }> {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
+  notClearing(getFeature(t.feature_id)?.repo_id ?? '') // Bug 347: it would stop an engineer writing its Clear note, and the board goes anyway
   if (t.status === 'merged') throw new Error(`${t.key} is already merged`)
   if (t.status === 'cancelled') return { key: t.key, stopped: null }
   if (starting.has(t.id)) throw new Error(`${t.key} is starting an engineer right now; try again in a moment`)
@@ -417,7 +416,7 @@ export async function cancelTicket(ticketId: string, opts: { tell?: boolean; ask
   const stopped = eng && eng.status !== 'exited' ? eng.id : null
   if (stopped) await stopAgent(stopped, 'cancelled')
   emit({ agentId: stopped, source: 'ui', kind: 'ticket.cancelled', payload: { ticket: t.id, key: t.key, stopped } })
-  const f = getFeature(t.feature_id); if (f) writeFeatureMd(f)
+  const f = getFeature(t.feature_id)
   if (f && opts.tell !== false) {
     const waiting = waitingOn(f.id, t.key), them = waiting.length === 1 ? 'it' : 'them'
     tellTpm(f, `HQ: ${opts.asked ? `The user OK'd removing ${t.key}; it is cancelled` : `The user cancelled ${t.key}`}${stopped ? ` and its engineer ${stopped} was stopped` : ''}.`
@@ -428,6 +427,7 @@ export async function cancelTicket(ticketId: string, opts: { tell?: boolean; ask
 /** Cancel a feature: every ticket not merged yet is cancelled (engineers stop). The project's TPM stays (Bug 52) and is told. */
 export async function cancelFeature(featureId: string): Promise<{ tickets: string[]; stopped: string[] }> {
   const f = getFeature(featureId); if (!f) throw new Error('unknown feature')
+  notClearing(f.repo_id) // Bug 347: as cancelTicket
   if (f.status === 'cancelled') return { tickets: [], stopped: [] }
   const done: string[] = [], stopped: string[] = []
   for (const t of tickets(f.id)) {

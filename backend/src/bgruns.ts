@@ -15,6 +15,7 @@ import { beingStopped, getAgent, liveAgents, update, type Agent } from './agents
 import { resolveKind } from './attention.ts'
 import { sendMessage } from './delivery.ts'
 import { heavyKind } from './heavy.ts'
+import { lstartMs, psEnv } from './procs.ts'
 import { getRepo, repoOfAgent, type Ticket } from './records.ts'
 import * as tmux from './tmux.ts'
 import { sleep } from './util.ts'
@@ -45,10 +46,12 @@ export function addRun(agentId: string, r: { task: string; use: string; command:
   mine(agentId).set(r.task, { task: r.task, use: r.use, command: r.command, at, cpu: -1, bytes: -1, quietSince: now(), missed: 0 })
   emit({ agentId, source: 'system', kind: 'bg.started', payload: { task: r.task, use: r.use, command: r.command.slice(0, 300), at } })
 }
-/** `tasks`: the ones that ended, or all of the agent's. */
+/** `tasks`: the ones that ended, or all of the agent's. The event names the run's command (Bug 289: the Events tab says which run ended). */
 export function endRuns(agentId: string, tasks: string[] | 'all', why: string): void {
   const m = runs.get(agentId); if (!m) return
-  for (const task of tasks === 'all' ? [...m.keys()] : tasks) if (m.delete(task)) emit({ agentId, source: 'system', kind: 'bg.ended', payload: { task, why } })
+  for (const task of tasks === 'all' ? [...m.keys()] : tasks) {
+    const r = m.get(task); if (r && m.delete(task)) emit({ agentId, source: 'system', kind: 'bg.ended', payload: { task, why, command: r.command.slice(0, 300) } })
+  }
   if (!m.size) runs.delete(agentId)
 }
 /** After a restart: each live agent's runs from the events log, since its session last began. */
@@ -83,11 +86,13 @@ export function clockMs(s: string): number {
   const [sec = 0, min = 0, h = 0] = clock.split(':').map(Number).reverse()
   return Math.round((((Number(days) * 24 + h) * 60 + min) * 60 + sec) * 1000)
 }
-export const PS_ARGS = ['-axo', 'pid=,ppid=,pgid=,etime=,time=']
+/** Read with psEnv. `start`: ps's own date for when the process began (Bug 319: not "now less the elapsed time", late by however long ps took). */
+export const PS_ARGS = ['-axo', 'pid=,ppid=,pgid=,time=,lstart=']
 export const parseRows = (s: string, t = Date.now()): PsRow[] => s.split('\n').map((l) => l.trim().split(/\s+/)).filter((f) => f.length >= 5 && Number(f[0]) > 0)
-  .map(([pid, ppid, pgid, etime, time]) => ({ pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), start: t - clockMs(etime!), cpu: clockMs(time!) }))
-/** ps gives start times in whole seconds. */
-const SLACK_MS = 2000
+  .map(([pid, ppid, pgid, time, ...began]) => { const ms = lstartMs(began)
+    return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), start: Number.isFinite(ms) ? ms : t, cpu: clockMs(time!) } })
+/** ps gives start times in whole seconds, cut down (up to 2 s early on Linux). */
+const SLACK_MS = 3000 // ps's dates are whole seconds, up to 2 s early on Linux (Bug 319): as leftovers.ts
 /** The process group a run's command is, under the agent's Claude Code: Claude Code starts each command as a shell in a process group of its own, a child of
  *  itself, the second its PreToolUse is answered. `pane` is the agent's tmux pane: Claude Code itself (launch.sh execs it) or a wrapper around it, and either
  *  way the pane's process group is Claude Code's side. Never by name. With the CPU time of everything under the command. */
@@ -107,7 +112,8 @@ export function outputBytes(a: Pick<Agent, 'id' | 'claude_session_id'>, task: st
   for (const d of dirs) { try { return fs.statSync(path.join(base, d, a.claude_session_id ?? '', 'tasks', `${task}.output`)).size } catch { /* not this one */ } }
   return -1
 }
-const ps = (): Promise<PsRow[]> => new Promise((resolve) => execFile('ps', PS_ARGS, { maxBuffer: 16 * 1024 * 1024 }, (_e, out) => resolve(parseRows(String(out ?? '')))))
+export const ps = (): Promise<PsRow[]> => new Promise((resolve) =>
+  execFile('ps', PS_ARGS, { maxBuffer: 16 * 1024 * 1024, env: psEnv() }, (_e, out) => resolve(parseRows(String(out ?? '')))))
 
 /** CPU time a run must use, or output it must write, to count as moving: a frozen node process still ticks a few ms now and then. */
 const MOVED_CPU_MS = 1000

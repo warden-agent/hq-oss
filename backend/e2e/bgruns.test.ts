@@ -81,7 +81,7 @@ test('Bug 181: an engineer HQ stops while its frozen run is being stopped gets n
 test('a busy run is never frozen; once its process ends unheard, the engineer goes back to idle', async () => {
   const { eng } = await engineer('busy')
   const { pid } = await runTimesOut(eng.id, BUSY)
-  await new Promise((r) => setTimeout(r, 12_000)) // twice the frozen limit
+  await new Promise((r) => setTimeout(r, 12_000)) // limit: twice the frozen limit; a busy run must not be called frozen in that time, and HQ looks every second
   assert.equal((await alerts(eng.id)).length, 0); assert.equal((await agentOf(eng.id)).status, 'working')
   process.kill(-pid, 'SIGKILL') // and its notice never arrives
   await waitFor('the agent idle', async () => (await agentOf(eng.id)).status === 'idle', 20_000)
@@ -94,13 +94,15 @@ test("Bug 233: a run whose process ends unheard leaves the box's line; with anot
   await hq.api('settings', { key: 'heavy_at_once', value: 2 }) // a run in the background keeps its turn (Bug 96 gap 3): the build would wait for it
   const tests = await runTimesOut(eng.id, BUSY)
   // runs are matched to their process by start time, in ps's whole seconds (bgruns.ts groupOf): the two start well apart
-  await new Promise((r) => setTimeout(r, 4000))
+  await new Promise((r) => setTimeout(r, 4000)) // real-time: see above; ps gives a start in whole seconds, and only time puts two starts apart
   const build = await runTimesOut(eng.id, BUSY, 'npm run build').finally(() => hq.api('settings', { key: 'heavy_at_once', value: 1 }))
   assert.equal((await agentOf(eng.id)).activity, 'Waiting on: npm run build (+1 more)')
   process.kill(-build.pid, 'SIGKILL') // and its notice never arrives
   await waitFor('the line to name the run left', async () => (await agentOf(eng.id)).activity === 'Waiting on: npm run test-backend', 20_000)
   assert.equal((await agentOf(eng.id)).status, 'working', 'it still waits on the test run')
   assert.ok((await events('bg.ended')).some((e: any) => e.agent_id === eng.id && JSON.parse(e.payload).task === build.task && JSON.parse(e.payload).why === 'gone'))
+  const said = ((await hq.api(`agents/${eng.id}/events`)).json.events as any[]).map((e) => e.text) // Bug 289: the Events tab names the run that ended
+  assert.ok(said.includes('Background run ended: npm run build (its process is gone)'), said.slice(0, 5).join(' | '))
   // one in its turn: its line is what it does now, and a run that goes leaves it alone
   await hq.hook(eng.id, { hook_event_name: 'UserPromptSubmit', prompt: 'look at the code meanwhile' })
   await hq.hook(eng.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_use_id: 'toolu_read233', tool_input: { file_path: '/r/src/app.ts' } })
@@ -118,7 +120,8 @@ test('a server started in the background on purpose is never watched, however qu
     tool_response: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bsrv' } })
   await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'The dev server is up.' })
   assert.equal((await agentOf(eng.id)).status, 'idle')
-  await new Promise((r) => setTimeout(r, 10_000)); assert.equal((await alerts(eng.id)).length, 0)
+  await new Promise((r) => setTimeout(r, 10_000)) // limit: well past the frozen limit and the idle-fix wait (2 s here); HQ looks every second and must alert about nothing
+  assert.equal((await alerts(eng.id)).length, 0)
 })
 
 test('HQ restarts in the middle of the wait: it still knows the run, and still sees it freeze', async () => {
@@ -131,11 +134,13 @@ test('HQ restarts in the middle of the wait: it still knows the run, and still s
     tool_response: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: `bt${n}m` } })
   await hq.hook(mid.eng.id, { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_use_id: other, tool_input: { file_path: '/r/src/app.ts' } })
   assert.ok((await events('bg.started')).some((e: any) => e.agent_id === mid.eng.id), 'its build is watched in the background')
+  const midLine = (await agentOf(mid.eng.id)).activity ?? null
   await hq.restart()
   assert.equal((await agentOf(eng.id)).status, 'working')
   assert.equal((await agentOf(eng.id)).activity, 'Waiting on: npm run test-backend', 'the line is back without a new hook')
   const m = await agentOf(mid.eng.id); assert.equal(m.status, 'working')
-  assert.equal(m.activity ?? null, null, 'one still in its turn when HQ went is not said to be waiting: its next hook says what it does')
+  // Bug 337: it keeps the line it had (its last tool), not "Waiting on" its background build
+  assert.equal(m.activity ?? null, midLine, 'one still in its turn when HQ went keeps its own line, and is not said to be waiting')
   await waitFor('the frozen run notice after the restart', () => alerted(eng.id), 30_000)
   assert.equal((await hq.api(`agents/${eng.id}/stop-frozen-runs`, {})).status, 200)
   await waitFor('the run to be stopped', () => !alive(pid), 5000)

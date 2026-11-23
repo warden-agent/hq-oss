@@ -1,7 +1,8 @@
 // The UI's "needs you" list (Bug 24, frontend/src/needs.ts): what counts in the tab title and what pops up a notification.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { askedWho, claudeLine, firstLine, forRepo, goodNews, keysText, needsYou, newNeeds, plainNews, splitNeeds, ticketBase, ticketQuestion, titleFor, turnQuestionText, uncountedQuestions,
+import { askedWho, claudeLine, firstLine, forRepo, goodNews, keysText, needsYou, newNeeds, plainNews, projectNeeds, splitNeeds,
+  ticketBase, ticketQuestion, titleFor, turnQuestionText, uncountedQuestions,
   yourTurn }
   from '../../frontend/src/needs.ts'
 
@@ -72,6 +73,17 @@ test('Bug 107: a test command engineers can\'t run counts for its project, shows
   const s = { ...state(), messages: [], reviews: [], attention: [att] }
   assert.deepEqual(needsYou(s, () => null).map((n) => [n.key, n.repoId, n.text]), [['attention:12', 'r2', att.detail]])
   assert.deepEqual(forRepo(s, 'r1').attention, []); assert.deepEqual(forRepo(s, 'r2').attention, [att])
+})
+
+test('Bug 285: a Clear that left worktrees, or whose TPM didn\'t start again, counts for its project; a clean one and the other project notices don\'t', () => {
+  const att = (id: number, kind: string) => ({ id, kind, detail: `demo: ${kind}` })
+  const s = { ...state(), messages: [], reviews: [], attention: [att(20, 'repo_cleared_left:r1'), att(21, 'repo_clear_tpm:r1'), att(22, 'repo_cleared:r1'),
+    att(23, 'repo_clear_failed:r1'), att(24, 'repo_sync:r1'), att(25, 'repo_launch:r1'), att(26, 'repo_testsetup_ok:r1'), att(27, 'repo_cleared_left:r2')] }
+  const needs = needsYou(s, () => null)
+  assert.deepEqual(needs.map((n) => [n.key, n.repoId]), [['attention:20', 'r1'], ['attention:21', 'r1'], ['attention:27', 'r2']])
+  assert.deepEqual(splitNeeds(needs, 'r1').here.map((n) => n.key), ['attention:20', 'attention:21']) // the ⚠ count of the project on screen
+  for (const k of ['repo_cleared_left:r1', 'repo_clear_tpm:r1']) assert.equal(projectNeeds(k), true, k)
+  for (const k of ['repo_cleared:r1', 'repo_clear_failed:r1', 'repo_cleared_left', 'repo_cleared_leftover:r1']) assert.equal(projectNeeds(k), false, k)
 })
 
 test('goodNews (Bug 61): finished and merged are green; anything that may need the user is not', () => {

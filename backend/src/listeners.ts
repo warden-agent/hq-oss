@@ -12,6 +12,7 @@ import { waitsOnQuestion } from './delivery.ts'
 import { startTurns } from './heavy.ts'
 import { checkPlan, onRetry } from './plancheck.ts'
 import { dropLateNotes } from './delivery.ts'
+import { beat } from './beats.ts'
 
 const FINISHED_TICK_MS = Number(process.env.HQ_FINISHED_TICK_S ?? 60) * 1000 // the backstop for stopping finished engineers
 
@@ -20,7 +21,9 @@ export function startListeners(): void {
   if (started) return
   started = true
   const freed = (agentId: string | null) => { if (agentId) releaseSlot(agentId); void fillSlots().catch(() => {}) }
-  bus.on('event:agent.stopped', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onSetupAgentGone(e.agentId) })
+  bus.on('event:agent.stopped', (e: HqEvent) => { // a Launch helper stopped from its Agent tab too (Bug 276)
+    freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId, typeof e.payload.reason === 'string' ? e.payload.reason : null); onSetupAgentGone(e.agentId)
+  })
   bus.on('event:agent.lost', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId); onSetupAgentGone(e.agentId) })
   bus.on('event:hook.SessionEnd', (e: HqEvent) => {
     if (e.payload.reason === 'clear') return
@@ -42,7 +45,7 @@ export function startListeners(): void {
   const leave = () => { setTimeout(stopFinished, FINISHED_STOP_MS + 50).unref() }
   for (const kind of ['hook.Stop', 'hook.SubagentStop', 'ticket.pr_ready', 'ticket.pr_open', 'agent.idle_fixed']) bus.on(`event:${kind}`, leave)
   bus.on('event:ticket.pr_ready', (e: HqEvent) => dropLateNotes(e.agentId)) // before the turn that called open_pr ends (Bug 147)
-  setInterval(stopFinished, FINISHED_TICK_MS).unref()
+  setInterval(() => { try { stopFinished() } finally { beat('finished') } }, FINISHED_TICK_MS).unref()
   bus.on('event:ticket.merged', onTicketMerged)
   bus.on('event:ticket.merged', onMergedSetup) // an engineer's change to the test setup applies with its ticket
   bus.on('event:ticket.cancelled', (e: HqEvent) => { const t = getTicket(String(e.payload.ticket ?? '')), f = t ? getFeature(t.feature_id) : undefined; if (t && f) dropSetupChange(f.repo_id, t.id) })

@@ -42,6 +42,10 @@ export async function startMod(o: { backend: string; agentId: string; tokenFile:
     unanswered: (): number => unanswered,
     /** One of Claude Code's events, as the mod's hooks get it (e.g. `turn.complete`). */
     fire: (event: string, e: object): Promise<unknown> => hooks.get(event)!($, e, async (x: unknown) => x),
+    /** A model request of a turn (`turn.step`, a streaming hook), answered with `result` (e.g. `{ toolUses: [{ name: 'Read' }] }`). */
+    step: async (e: object, result: object): Promise<void> => {
+      const g = hooks.get('turn.step')!($, e, async function* () { yield* []; return result }); while (!(await g.next()).done) { /* to its end */ }
+    },
     /** The session is over: its open requests end. */
     stop: (): void => over.abort(),
   }

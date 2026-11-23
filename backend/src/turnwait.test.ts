@@ -66,7 +66,8 @@ test('HQ up: the hook\'s JSON goes to HQ with the agent\'s token in the header, 
   assert.equal(r.code, 0); assert.equal(r.out, HELD); assert.deepEqual(b.seen, [`tok-112|${input}`])
   assert.ok(!r.out.includes('tok-112') && !r.err.includes('tok-112'), 'the token is never shown') // Bug 87
   const held = hook(port, f, input) // HQ keeps it in its line (Bug 76): the hook waits as long as HQ does, and asks only once
-  assert.equal(await pendingAfter(held, 600), true); b.release()
+  assert.equal(await pendingAfter(held, 600), true) // hold: the hook must go on waiting while HQ keeps its request open, and only time shows that it does
+  b.release()
   assert.equal((await held).out, '{}'); assert.equal(b.seen.length, 2)
 })
 

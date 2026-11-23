@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { DatabaseSync } from 'node:sqlite'
+import { WebSocket } from 'ws'
 import { startHq, waitFor, sh, type Hq } from './harness.ts'
 
 let hq: Hq
@@ -20,6 +20,8 @@ const freePort = (): Promise<number> => new Promise((resolve) => {
   const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = (s.address() as net.AddressInfo).port; s.close(() => resolve(p)) })
 })
 const preview = async (repoId: string) => (await hq.state()).previews.find((p: any) => p.id === repoId)
+/** One app at a time: the earlier tests' apps stop, as the UI's one-app dialog would stop them before this test's Launch. */
+const stopOthers = async () => { for (const p of (await hq.state()).previews.filter((x: any) => x.status !== 'stopped')) await hq.api(`previews/${p.id}/stop`, {}) }
 const page = async (url: string) => (await fetch(url)).text()
 const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
 /** A server that just holds `port`, run from `cwd` in its own process group (like a test server the helper left behind). */
@@ -218,7 +220,7 @@ test('Bug 41: two Launches at once start one helper; a helper HQ lost track of i
   const old = a.json.helper_agent_id, wt = a.json.helper_worktree, port = await freePort()
   await waitFor('the helper', async () => (await hq.state()).agents.find((x: any) => x.id === old && x.status !== 'launching'))
   const stray = holder(path.join(wt), port); await waitFor('the stray server', async () => (await fetch(`http://127.0.0.1:${port}`).catch(() => null))?.ok)
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'), { timeout: 5000 })
+  const db = hq.db()
   db.prepare('UPDATE previews SET helper_agent_id = NULL, helper_worktree = NULL, helper_state = NULL WHERE id = ?').run(repo.id); db.close()
   const next = (await hq.api(`previews/${repo.id}/setup`, {})).json.helper_agent_id
   assert.ok(next && next !== old)
@@ -332,7 +334,7 @@ test('Bug 156: npm steps that would write a package-lock.json are refused, and O
   await waitFor('the helper to go', async () => (await preview(repo.id)).helper_agent_id === null)
 
   // Steps OK'd before the check (or a lockfile removed since): Launch doesn't run them; a helper is briefed to fix them
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'))
+  const db = hq.db()
   db.prepare('UPDATE previews SET recipe = ? WHERE id = ?').run(JSON.stringify(steps('npm install', 'package-lock.json')), repo.id); db.close()
   const re = await hq.api(`previews/${repo.id}/command`, { command: null }); assert.equal(re.status, 409) // a restart with no helper (as after a merge): the pane says so
   let p = await preview(repo.id); assert.equal(p.status, 'stopped'); assert.match(p.detail, /saved start steps would write a package-lock\.json.*Start it again/)
@@ -369,7 +371,7 @@ test('Bugs 238, 239: refused uv steps name uv.lock, and a lockless project\'s in
   await waitFor('the helper to go', async () => (await preview(repo.id)).helper_agent_id === null)
 
   // the entry's case: OK'd steps `cd server && uv sync` with server/uv.lock, Launch pressed
-  const db = new DatabaseSync(path.join(hq.hqHome, 'hq.sqlite'))
+  const db = hq.db()
   db.prepare('UPDATE previews SET recipe = ? WHERE id = ?').run(JSON.stringify(steps('cd server && uv sync')), repo.id); db.close()
   assert.equal((await hq.api(`previews/${repo.id}/command`, { command: null })).status, 409)
   const p = await preview(repo.id); assert.match(p.detail, /saved start steps would write a uv\.lock into the project, or not follow the one it has\. Start it again/)
@@ -382,4 +384,383 @@ test('Bugs 238, 239: refused uv steps name uv.lock, and a lockless project\'s in
   assert.equal((await hq.mcp(h2, 'save_launch', steps('cd server && uv sync --locked'))).isError, false)
   assert.equal((await hq.api(`previews/${repo.id}/dismiss`, {})).status, 200)
   assert.equal(sh(dir, 'status', '--porcelain'), '') // nothing written into the project
+})
+
+test('Bugs 303, 316: an install whose output was deleted runs again; an own ⚙ command that would rewrite a lockfile is warned about', async () => {
+  const dir = hq.repo('b303x'); const repo = (await hq.api('repos', { path: dir })).json
+  fs.mkdirSync(path.join(dir, 'tools')); fs.writeFileSync(path.join(dir, 'yarn.lock'), '__metadata:\n  version: 8\n') // Yarn 2+: Plug'n'Play
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'b303x', private: true, dependencies: { ms: '2.1.3' } }))
+  fs.writeFileSync(path.join(dir, 'tools', 'yarn'), '#!/bin/sh\necho "module.exports = 1" > .pnp.cjs\n', { mode: 0o755 }) // stands in for Yarn 4's install
+  sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'an app that needs its install')
+  const steps = { parts: [{ name: 'app', dir: '.', install: 'tools/yarn install --immutable', install_when: 'yarn.lock', run: 'node -r ./.pnp.cjs server.js',
+    port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  const installs = async () => (await hq.api('events?limit=400')).json.filter((e: any) => e.kind === 'preview.started')
+    .map((e: any) => JSON.parse(e.payload)).filter((e: any) => e.repo === 'b303x').map((e: any) => e.install) // newest first
+  const h = (await hq.api(`previews/${repo.id}/start`, {})).json.helper_agent_id
+  await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching'))
+  assert.equal((await hq.mcp(h, 'save_launch', steps)).isError, false); assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  await waitFor('the app', async () => (await preview(repo.id)).status === 'running', 20_000)
+  assert.equal((await hq.mcp(h, 'launch_ok')).isError, false)
+  await waitFor('the helper to go', async () => (await preview(repo.id)).helper_agent_id === null)
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+
+  // Bug 303: .pnp.cjs deleted, yarn.lock unchanged: the next Start installs again (it crashed with "Cannot find module" before)
+  fs.rmSync(path.join(dir, '.pnp.cjs')); const before = (await installs()).length
+  assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200)
+  await waitFor('the app again', async () => (await preview(repo.id)).status === 'running', 20_000)
+  assert.ok(fs.existsSync(path.join(dir, '.pnp.cjs'))); assert.equal((await installs())[0], 'tools/yarn install --immutable')
+  assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200) // what it must not catch: a restart with everything there
+  await waitFor('the restart', async () => (await installs()).length === before + 2); assert.equal((await installs())[0], null)
+  await waitFor('the app again', async () => (await preview(repo.id)).status === 'running', 20_000)
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+
+  // Bug 316: the user's own `uv run app.py` with a uv.lock is warned about (Claude's would be refused), and runs as written
+  fs.writeFileSync(path.join(dir, 'pyproject.toml'), '[project]\nname = "b303x"\nversion = "0.1.0"\n'); fs.writeFileSync(path.join(dir, 'uv.lock'), 'version = 1\n')
+  sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'a uv project too')
+  let r = await hq.api(`previews/${repo.id}/command`, { command: 'uv run app.py' }); assert.equal(r.status, 200, JSON.stringify(r.json))
+  assert.equal(r.json.command_warning, '`uv run app.py` would write a uv.lock into the project, or not follow the one it has: use `uv run --locked` '
+    + '(there is a uv.lock, and `uv run app.py` rewrites it when it is out of date). If it then says the uv.lock needs to be updated, run `uv lock` '
+    + 'yourself first, where the command runs, and commit the new uv.lock.') // Bug 343: an out-of-date uv.lock stops `uv run --locked`
+  assert.equal((await preview(repo.id)).command_warning, r.json.command_warning)
+  r = await hq.api(`previews/${repo.id}/command`, { command: 'uv run --locked app.py' }); assert.equal(r.json.command_warning, null)
+  r = await hq.api(`previews/${repo.id}/command`, { command: null }); assert.equal(r.json.command_warning, null) // Claude's steps again: refused, not warned
+})
+
+test('Bugs 276, 299: a helper stopped from its Agent tab ends as after "Stop Claude": its ports and worktree go, Launch works again, a restart says nothing', async () => {
+  const dir = hq.repo('stopped'); fs.rmSync(path.join(dir, 'package.json')); sh(dir, 'commit', '-qam', 'nothing to guess from')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const one = { parts: [{ name: 'app', dir: '.', run: 'node server.js', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  const helperUp = async (h: string) => waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching'))
+  const gone = async (h: string) => waitFor('the helper to go', async () => (await hq.state()).agents.find((a: any) => a.id === h)?.status === 'exited')
+  const r = (await hq.api(`previews/${repo.id}/start`, {})).json, h = r.helper_agent_id, wt = r.helper_worktree, given = r.helper_ports as number[]
+  assert.equal(r.helper_state, 'working'); assert.ok(given.length)
+  await helperUp(h)
+  const test = holder(wt, given[0]!); await waitFor('its test server', async () => (await fetch(`http://127.0.0.1:${given[0]}`).catch(() => null))?.ok)
+
+  // the Agent tab's Stop: the agent's own stop, not the pane's "Stop Claude"
+  assert.equal((await hq.api(`agents/${h}/stop`, {})).status, 200)
+  await gone(h)
+  let p = await waitFor('the pane to stop waiting on it', async () => { const x = await preview(repo.id); return x.helper_agent_id === null ? x : null })
+  // Bug 299: no red "You stopped Claude" (and no second ask under the App tab's): the user stopped it, as with the pane's own "Stop Claude"
+  assert.equal(p.helper_state, null); assert.equal(p.helper_note, null); assert.equal(p.helper_ports, null)
+  await waitFor('its worktree to go', () => !fs.existsSync(wt))
+  await waitFor('its branch to go', () => sh(dir, 'branch', '--list', 'hq-launch/*') === '')
+  await waitFor('its test server to stop', () => !alive(test.pid!))
+  const done = (await hq.api('events?limit=200')).json.filter((e: any) => e.kind === 'launch.helper_done' && e.agent_id === h).map((e: any) => JSON.parse(e.payload))
+  assert.deepEqual(done, [{ repo: 'stopped', state: null, note: null }])
+
+  // a restart finds nothing left to finish and says nothing either
+  await hq.restart()
+  p = await preview(repo.id); assert.equal(p.helper_state, null); assert.equal(p.helper_note, null)
+
+  // Launch again: a new helper, on ports that are free again
+  const again = (await hq.api(`previews/${repo.id}/start`, {})).json, h2 = again.helper_agent_id
+  assert.ok(h2 && h2 !== h); assert.equal(again.helper_state, 'working'); assert.deepEqual(again.helper_ports, given)
+  await helperUp(h2)
+
+  // steps waiting for the user's OK stay waiting, with no helper on them (as "Not now")
+  assert.equal((await hq.mcp(h2, 'save_launch', one)).isError, false)
+  assert.equal((await hq.api(`agents/${h2}/stop`, {})).status, 200); await gone(h2)
+  p = await waitFor('the pane to keep the steps', async () => { const x = await preview(repo.id); return x.helper_agent_id === null ? x : null })
+  assert.equal(p.helper_state, 'needs_ok'); assert.equal(p.helper_note, null); assert.equal(p.draft_recipe.parts[0].run, 'node server.js')
+  await waitFor('its worktree to go', () => !fs.existsSync(again.helper_worktree))
+
+  // stopped while HQ runs its OK'd steps: the run's outcome doesn't make it "working" again
+  const h3 = (await hq.api(`previews/${repo.id}/setup`, { why: 'fix' })).json.helper_agent_id; await helperUp(h3)
+  const slow = { ...one, parts: [{ ...one.parts[0], run: 'sleep 2 && node server.js' }] }
+  assert.equal((await hq.mcp(h3, 'save_launch', slow)).isError, false)
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200); assert.equal((await preview(repo.id)).helper_state, 'trying')
+  assert.equal((await hq.api(`agents/${h3}/stop`, {})).status, 200); await gone(h3)
+  await waitFor('the app', async () => (await preview(repo.id)).status === 'running', 20_000)
+  // A check that nothing happens: HQ's run looks at the app once a second and would tell the helper (and say "working") right after
+  await new Promise((res) => setTimeout(res, 2500)) // limit: that look comes once a second; two go by
+  // Bug 299: nothing red over the app that runs
+  p = await preview(repo.id); assert.equal(p.helper_state, null); assert.equal(p.helper_note, null); assert.equal(p.helper_agent_id, null); assert.equal(sentTo(h3), 0)
+  await hq.api(`previews/${repo.id}/stop`, {})
+
+  // what the rule must not catch: a helper that ends by itself (no Stop from the user) still says so
+  const h4 = (await hq.api(`previews/${repo.id}/setup`, { why: 'fix' })).json.helper_agent_id; await helperUp(h4)
+  await hq.hook(h4, { hook_event_name: 'SessionEnd', reason: 'other' })
+  p = await waitFor('the pane to stop waiting on it', async () => { const x = await preview(repo.id); return x.helper_agent_id === null ? x : null })
+  assert.equal(p.helper_state, 'failed'); assert.equal(p.helper_note, 'Claude stopped before it finished.')
+
+})
+/** How many messages HQ sent an agent. */
+function sentTo(agentId: string): number {
+  const db = hq.db()
+  try { return (db.prepare("SELECT count(*) AS n FROM messages WHERE to_id = ? AND from_id = 'hq'").get(agentId) as { n: number }).n } finally { db.close() }
+}
+
+test('Bug 302: an app that ends at once keeps its output: the helper gets its last lines, and the Server tab shows them', async () => {
+  const dir = hq.repo('b302x'); fs.rmSync(path.join(dir, 'package.json'))
+  fs.writeFileSync(path.join(dir, 'quick.js'), "for (let i = 1; i <= 8; i++) console.log('B302 line ' + i)\nconsole.error('B302 error: no such table')\nprocess.exit(3)\n")
+  sh(dir, 'add', '-A'); sh(dir, 'commit', '-qm', 'an app that ends at once')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const h = (await hq.api(`previews/${repo.id}/start`, {})).json.helper_agent_id
+  await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching'))
+  await nextBatch(h) // its brief
+  const quick = { parts: [{ name: 'app', dir: '.', run: 'node quick.js', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  assert.equal((await hq.mcp(h, 'save_launch', quick)).isError, false)
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  await waitFor('the app to crash', async () => (await preview(repo.id)).status === 'crashed', 20_000)
+
+  // the helper's "Last output": the app's lines, then tmux's own, with no screenful of blank lines between (was 40 blank lines and "Pane is dead")
+  const told = await nextBatch(h)
+  assert.match(told, /it stopped with code 3\. Last output:\n[^]*\nB302 line 1\n(B302 line \d\n){7}B302 error: no such table\nstopped \(3\)\nPane is dead \(status 3\b[^\n]*\n\nFix the steps/, told)
+
+  // the Server tab, opened after the crash in a terminal smaller than the pane (attaching shrank the pane, and the output went out of sight)
+  const w = new WebSocket(`ws://127.0.0.1:${hq.ports.ui}/ws`, { headers: { authorization: `Bearer ${fs.readFileSync(path.join(hq.hqHome, 'ui-token'), 'utf8').trim()}` } })
+  try {
+    const seen: any[] = []; w.on('message', (raw) => seen.push(JSON.parse(String(raw))))
+    await new Promise<void>((ok, no) => { w.once('open', () => ok()); w.once('error', no) })
+    w.send(JSON.stringify({ type: 'term.open', agentId: `preview:${repo.id}`, cols: 100, rows: 20 }))
+    const drawn = () => seen.filter((m) => m.type === 'term' && m.agentId === `preview:${repo.id}`).map((m) => m.data).join('').replace(/\x1b\[[0-9;:]*m/g, '')
+    await waitFor('the Server tab to show the output', () => drawn().includes('Pane is dead') || null)
+    assert.match(drawn(), /HQ preview: node quick\.js[^]*\r\nB302 line 1\r\n(B302 line \d\r\n){7}B302 error: no such table\r\nstopped \(3\)\r\nPane is dead \(status 3[^\r]*\r\n$/,
+      JSON.stringify(drawn()))
+    assert.equal(seen.some((m) => m.type === 'term.exit'), false)
+  } finally { w.close() }
+
+  // "Ask Claude to fix it": the next helper's brief has the output too, without the blank lines
+  assert.equal((await hq.mcp(h, 'report_cant_start', { reason: 'b302 stand-in' })).isError, false)
+  await waitFor('the helper to go', async () => (await hq.state()).agents.find((a: any) => a.id === h)?.status === 'exited')
+  const h2 = (await hq.api(`previews/${repo.id}/setup`, { why: 'fix' })).json.helper_agent_id; assert.ok(h2 && h2 !== h)
+  await waitFor('the fix helper', async () => (await hq.state()).agents.find((a: any) => a.id === h2 && a.status !== 'launching'))
+  assert.match(await nextBatch(h2), /The app's last output:\n[^]*\nB302 line 1\n(B302 line \d\n){7}B302 error: no such table\nstopped \(3\)\nPane is dead \(status 3[^\n]*\n\nFind out why/)
+  assert.equal((await hq.api(`agents/${h2}/stop`, {})).status, 200)
+})
+
+test('Bugs 262, 263: a `uv run` must follow uv.lock, and what a Yarn 2+ install leaves never shows in git status', async () => {
+  const dir = hq.repo('yarnapp'); const repo = (await hq.api('repos', { path: dir })).json
+  fs.mkdirSync(path.join(dir, 'server')); fs.mkdirSync(path.join(dir, 'tools'))
+  fs.writeFileSync(path.join(dir, 'server', 'pyproject.toml'), '[project]\nname = "api"\nversion = "0.1.0"\n'); fs.writeFileSync(path.join(dir, 'server', 'uv.lock'), 'version = 1\n')
+  fs.writeFileSync(path.join(dir, 'yarn.lock'), '__metadata:\n  version: 8\n')
+  // stands in for Yarn 4: what `yarn install --immutable` leaves (checked on 4.5.3), not covered by this project's .gitignore
+  fs.writeFileSync(path.join(dir, 'tools', 'yarn'), '#!/bin/sh\nmkdir -p .yarn/unplugged/x node_modules/ms && echo pnp > .pnp.cjs && echo s > .yarn/install-state.gz'
+    + ' && echo u > .yarn/unplugged/x/i.js && echo m > node_modules/ms/index.js\n', { mode: 0o755 })
+  sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'a uv server and Yarn')
+  const steps = (install: string, when: string, run: string) => ({ parts: [{ name: 'app', dir: '.', install, install_when: when, run, port: 'auto' }],
+    show: 'app', worktree_files: [], notes: '' })
+  const h = (await hq.api(`previews/${repo.id}/start`, {})).json.helper_agent_id
+  await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching'))
+  const bad = await hq.mcp(h, 'save_launch', steps('cd server && uv sync --locked', 'server/uv.lock', 'cd server && uv run app.py')); assert.ok(bad.isError) // Bug 262
+  assert.match(bad.text, /`uv run app.py` runs in server: use `uv run --locked` \(there is a uv.lock, and `uv run app.py` rewrites it when it is out of date\)/)
+  const ok = await hq.mcp(h, 'save_launch', steps('tools/yarn install --immutable', 'yarn.lock', 'node server.js')); assert.equal(ok.isError, false, ok.text)
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  await waitFor('the app', async () => (await preview(repo.id)).status === 'running', 20_000)
+  assert.ok(fs.existsSync(path.join(dir, '.pnp.cjs')) && fs.existsSync(path.join(dir, '.yarn', 'install-state.gz')), 'the install ran')
+  assert.equal(sh(dir, 'status', '--porcelain', '--untracked-files=all'), '') // Bug 263: nothing new in the project
+  const excl = fs.readFileSync(path.join(dir, '.git', 'info', 'exclude'), 'utf8')
+  assert.match(excl, /^\/\.pnp\.cjs$/m); assert.match(excl, /^\/\.yarn\/install-state\.gz$/m); assert.doesNotMatch(excl, /node_modules/) // .gitignore has it
+  const ev = (await hq.api('events?limit=100')).json.find((e: any) => e.kind === 'preview.started' && JSON.parse(e.payload).repo === 'yarnapp')
+  assert.ok(JSON.parse(ev.payload).hidden.includes('/.pnp.cjs'), ev.payload)
+  assert.equal((await hq.mcp(h, 'launch_ok')).isError, false)
+  await hq.api(`previews/${repo.id}/stop`, {})
+})
+
+test('Bugs 300, 329: steps a helper saves again unchanged start the app only while it is on or crashed and no other app is; else they wait for the OK', async () => {
+  await stopOthers()
+  const dir = hq.repo('b329x'); fs.rmSync(path.join(dir, 'package.json'))
+  fs.writeFileSync(path.join(dir, 'crash.js'),
+    "require('http').createServer((q, s) => { s.end('up'); if (q.url === '/crash') setTimeout(() => process.exit(3), 50) }).listen(process.env.PORT)\n")
+  sh(dir, 'add', '-A'); sh(dir, 'commit', '-qm', 'an app that can crash')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const one = { parts: [{ name: 'app', dir: '.', run: 'node crash.js', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  const started = async () => (await hq.api('events?limit=400')).json.filter((e: any) => e.kind === 'preview.started' && JSON.parse(e.payload).repo === 'b329x').length
+  const status = (s: string) => waitFor(`the app ${s}`, async () => { const x = await preview(repo.id); return x.status === s ? x : null }, 20_000)
+  const notice = async () => (await hq.state()).attention.find((a: any) => a.kind === `repo_launch:${repo.id}`)?.detail ?? null
+  const h = (await hq.api(`previews/${repo.id}/start`, {})).json.helper_agent_id
+  await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching'))
+  assert.match(await nextBatch(h), /Project: b329x/)
+  const again = (n: number) => hq.mcp(h, 'save_launch', { ...one, notes: `the same steps, save ${n}` })
+  assert.equal((await hq.mcp(h, 'save_launch', one)).isError, false)
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  await status('running'); assert.match(await nextBatch(h), /the page answered/)
+
+  // Bug 329: the user stops the app between the OK and the helper's next save; that save doesn't start it again
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  const n = await started()
+  const held = await again(2); assert.equal(held.isError, false); assert.match(held.text, /doesn't run them by itself now: it is stopped\. HQ asks the user/)
+  let p = await preview(repo.id) // the old code had already marked it 'trying' and was starting it
+  assert.equal(p.status, 'stopped'); assert.equal(p.helper_state, 'needs_ok'); assert.equal(p.draft_recipe.notes, 'the same steps, save 2')
+  assert.equal(p.helper_note, 'Claude saved the steps you OK\'d again, unchanged. HQ didn\'t start the app by itself: it is stopped.')
+  assert.match(await notice(), /^b329x: Claude saved the steps you OK'd again, unchanged\. .*: it is stopped\. OK them in the preview to run them\.$/)
+  // the user's OK runs them (the UI asks the one-app question first), and the helper hears how it went
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  p = await status('running'); assert.equal(p.helper_note, null); assert.equal(await started(), n + 1); assert.equal(await notice(), null)
+  assert.match(await nextBatch(h), /the page answered/)
+
+  // What it must not hold: the app crashed ("Ask Claude to fix it") and no other app is on, so the same steps run at once, as before
+  await fetch(`${p.url}crash`).catch(() => null); await status('crashed')
+  assert.match((await again(3)).text, /so HQ runs them now/); assert.equal((await preview(repo.id)).helper_state, 'trying')
+  p = await status('running'); assert.match(await nextBatch(h), /the page answered/)
+
+  // Bug 300: it crashed again, and meanwhile the user started another project's app (the one-app dialog stops only apps that are on)
+  await fetch(`${p.url}crash`).catch(() => null); await status('crashed')
+  const other = (await hq.api('repos', { path: hq.repo('b300x') })).json
+  assert.equal((await hq.api(`previews/${other.id}/command`, { command: 'node server.js' })).status, 200)
+  assert.equal((await hq.api(`previews/${other.id}/start`, {})).status, 200)
+  await waitFor('the other app', async () => (await preview(other.id)).status === 'running', 20_000)
+  const n2 = await started()
+  const beside = await again(4); assert.equal(beside.isError, false); assert.match(beside.text, /b300x's app is running, and only one app runs at a time/)
+  p = await preview(repo.id); assert.equal(p.status, 'crashed'); assert.equal(p.helper_state, 'needs_ok'); assert.match(p.helper_note, /b300x's app is running/)
+
+  // Not now: Claude goes, and steps that only repeat the OK'd ones don't stay waiting for an OK
+  assert.equal((await hq.api(`previews/${repo.id}/dismiss`, {})).status, 200)
+  await waitFor('the helper to go', async () => (await hq.state()).agents.find((a: any) => a.id === h)?.status === 'exited')
+  p = await preview(repo.id); assert.equal(p.draft_recipe, null); assert.equal(p.helper_state, null); assert.equal(p.recipe.parts[0].run, 'node crash.js')
+  assert.equal(await started(), n2); assert.equal(await notice(), null)
+  await hq.api(`previews/${other.id}/stop`, {}); await hq.api(`previews/${repo.id}/stop`, {})
+})
+
+test('Bug 314: a Clear stops the app and leaves the Launch helper working, as its dialog says, and the helper\'s next save doesn\'t start the app again', async () => {
+  await stopOthers()
+  const dir = hq.repo('b314x'); fs.rmSync(path.join(dir, 'package.json')); sh(dir, 'commit', '-qam', 'nothing to guess from')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const one = { parts: [{ name: 'app', dir: '.', run: 'node server.js', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  const h = (await hq.api(`previews/${repo.id}/start`, {})).json.helper_agent_id
+  await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching')); await nextBatch(h)
+  assert.equal((await hq.mcp(h, 'save_launch', one)).isError, false); assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  await waitFor('the app', async () => (await preview(repo.id)).status === 'running', 20_000); assert.match(await nextBatch(h), /the page answered/)
+
+  const r = await hq.api(`repos/${repo.id}/clear`, {}); assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.done, true)
+  let p = await waitFor('the clear', async () => { const x = await preview(repo.id); return !(await hq.state()).repos.find((y: any) => y.id === repo.id).clearing_at ? x : null })
+  assert.equal(p.status, 'stopped'); assert.equal(p.helper_agent_id, h); assert.equal(p.helper_state, 'working') // the helper goes on: start steps aren't the board
+  assert.match((await hq.mcp(h, 'save_launch', { ...one, notes: 'after the clear' })).text, /it is stopped/)
+  p = await preview(repo.id); assert.equal(p.status, 'stopped'); assert.equal(p.helper_state, 'needs_ok')
+  assert.equal((await hq.api(`previews/${repo.id}/dismiss`, {})).status, 200)
+  await waitFor('the helper to go', async () => (await hq.state()).agents.find((a: any) => a.id === h)?.status === 'exited')
+})
+
+test('Bug 332: a Stop during HQ\'s first run of the OK\'d steps doesn\'t send the helper back to save them again; the steps stay', async () => {
+  await stopOthers()
+  const dir = hq.repo('b332x'); fs.rmSync(path.join(dir, 'package.json'))
+  fs.writeFileSync(path.join(dir, 'crash.js'),
+    "require('http').createServer((q, s) => { s.end('b332 up'); if (q.url === '/crash') setTimeout(() => process.exit(3), 50) }).listen(process.env.PORT)\n")
+  sh(dir, 'add', '-A'); sh(dir, 'commit', '-qm', 'an app that can crash')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const steps = (run: string) => ({ parts: [{ name: 'app', dir: '.', run, port: 'auto' }], show: 'app', worktree_files: [], notes: '' })
+  const status = (s: string) => waitFor(`the app ${s}`, async () => { const x = await preview(repo.id); return x.status === s ? x : null }, 20_000)
+  const gone = (h: string) => waitFor('the helper to go', async () => (await hq.state()).agents.find((a: any) => a.id === h)?.status === 'exited')
+  const helper = async (why?: 'fix') => {
+    const h = (await hq.api(`previews/${repo.id}/${why ? 'setup' : 'start'}`, why ? { why } : {})).json.helper_agent_id
+    await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching')); await nextBatch(h)
+    return h as string
+  }
+  const done = async (h: string) => (await hq.api('events?limit=400')).json.filter((e: any) => e.kind === 'launch.helper_done' && e.agent_id === h)
+    .map((e: any) => JSON.parse(e.payload))
+
+  // Stopped while it starts: the helper isn't told "it stopped… fix the steps" (it saved the same ones again, and the OK card came back); it goes
+  const h1 = await helper(), slow = steps('sleep 3 && node crash.js')
+  assert.equal((await hq.mcp(h1, 'save_launch', slow)).isError, false)
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  let p = await status('starting'); assert.equal(p.helper_state, 'trying')
+  const told = sentTo(h1)
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  await gone(h1)
+  p = await waitFor('the pane to let it go', async () => { const x = await preview(repo.id); return x.helper_agent_id === null ? x : null })
+  assert.equal(p.status, 'stopped'); assert.equal(p.helper_state, null); assert.equal(p.helper_note, null); assert.equal(p.draft_recipe, null) // no OK card
+  assert.equal(p.recipe.parts[0].run, 'sleep 3 && node crash.js') // the steps the user OK'd stay
+  assert.equal(sentTo(h1), told) // nothing more for the helper to do (was "Real run …: it stopped. … Fix the steps and call save_launch again.")
+  assert.deepEqual(await waitFor('its end on record', async () => { const d = await done(h1); return d.length ? d : null }),
+    [{ repo: 'b332x', state: null, note: null, why: 'app_stopped' }])
+  assert.ok(!(await hq.state()).attention.some((a: any) => a.kind === `repo_launch:${repo.id}`))
+  const lines = (await hq.api(`agents/${h1}/events`)).json.events.map((e: any) => e.text) // its Events tab says why it went
+  assert.ok(lines.includes('Done with the launch steps: the app was stopped before it answered; the steps you OK\'d stay'), JSON.stringify(lines))
+  // the next Launch runs them, with no helper
+  assert.equal((await hq.api(`previews/${repo.id}/start`, {})).json.helper_agent_id, null)
+  p = await status('running'); assert.equal(await page(p.url), 'b332 up')
+  await hq.api(`previews/${repo.id}/stop`, {})
+
+  // Stopped after the page answered: launch_ok is taken (it was refused: "Save them with save_launch")
+  const h2 = await helper('fix')
+  assert.equal((await hq.mcp(h2, 'save_launch', steps('node crash.js'))).isError, false)
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  await status('running'); assert.match(await nextBatch(h2), /the page answered/)
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  const ok = await hq.mcp(h2, 'launch_ok'); assert.equal(ok.isError, false, ok.text); assert.match(ok.text, /^Done\. The user stopped the app after it answered/)
+  await gone(h2)
+  p = await preview(repo.id); assert.equal(p.status, 'stopped'); assert.equal(p.helper_state, null); assert.equal(p.draft_recipe, null)
+  assert.equal(p.recipe.parts[0].run, 'node crash.js')
+  assert.deepEqual(await waitFor('its end on record', async () => { const d = await done(h2); return d.length ? d : null }), [{ repo: 'b332x', state: null, note: null }])
+
+  // What it must not take: the app crashed by itself after it answered; a Stop on the crashed app doesn't make that a working run
+  const h3 = await helper('fix')
+  assert.equal((await hq.mcp(h3, 'save_launch', steps('node crash.js --b332'))).isError, false)
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+  p = await status('running'); assert.match(await nextBatch(h3), /the page answered/)
+  await fetch(`${p.url}crash`).catch(() => null); await status('crashed')
+  assert.match((await hq.mcp(h3, 'launch_ok')).text, /no working run of your steps yet/)
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  assert.match((await hq.mcp(h3, 'launch_ok')).text, /no working run of your steps yet/)
+  assert.equal((await preview(repo.id)).helper_agent_id, h3)
+  assert.equal((await hq.api(`previews/${repo.id}/dismiss`, {})).status, 200); await gone(h3)
+})
+
+test('Bug 351: a restart during HQ\'s first run of the OK\'d steps; the helper still hears how it went (or goes, after a Stop)', async () => {
+  await stopOthers()
+  const dir = hq.repo('b351x'); fs.rmSync(path.join(dir, 'package.json'))
+  fs.writeFileSync(path.join(dir, 'crash.js'), "console.log('B351 boom: no such table'); process.exit(3)\n")
+  fs.writeFileSync(path.join(dir, 'up.js'), "require('http').createServer((q, s) => s.end('b351 up')).listen(process.env.PORT)\n")
+  fs.writeFileSync(path.join(dir, 'slow.js'), "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 1500)); setInterval(() => {}, 1000)\n") // never answers
+  sh(dir, 'add', '-A'); sh(dir, 'commit', '-qm', 'apps that crash, answer, or stop slowly')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const steps = (run: string) => ({ parts: [{ name: 'app', dir: '.', run, port: 'auto' }], show: 'app', worktree_files: [], notes: '' })
+  const status = (s: string) => waitFor(`the app ${s}`, async () => { const x = await preview(repo.id); return x.status === s ? x : null }, 20_000)
+  const gone = (h: string) => waitFor('the helper to go', async () => (await hq.state()).agents.find((a: any) => a.id === h)?.status === 'exited')
+  const helper = async (why?: 'fix') => {
+    const h = (await hq.api(`previews/${repo.id}/${why ? 'setup' : 'start'}`, why ? { why } : {})).json.helper_agent_id
+    await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching')); await nextBatch(h)
+    return h as string
+  }
+  /** Saves the steps, OKs them, and waits for HQ's run to be under way: the pane says "Running Claude's steps…". */
+  const okd = async (h: string, run: string) => {
+    assert.equal((await hq.mcp(h, 'save_launch', steps(run))).isError, false)
+    assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+    const p = await status('starting'); assert.equal(p.helper_state, 'trying'); return p
+  }
+  const starts = async () => (await hq.api('events?limit=400')).json.filter((e: any) => e.kind === 'preview.started' && JSON.parse(e.payload).repo === 'b351x').length
+
+  // The app crashes after the restart: the helper gets the crash and its output (it was never told, and the pane said "Running Claude's steps…")
+  const h1 = await helper()
+  const run1 = await okd(h1, 'sleep 4 && node crash.js')
+  await hq.restart()
+  assert.equal((await preview(repo.id)).started_at, run1.started_at) // the same run, still starting
+  const told = await nextBatch(h1)
+  assert.match(told, /Real run on the user's checkout: it stopped with code 3\. Last output:\n[^]*B351 boom: no such table[^]*\n\nFix the steps and call save_launch again\.$/, told)
+  let p = await preview(repo.id); assert.equal(p.helper_state, 'working'); assert.equal(p.status, 'crashed')
+  const lines = (await hq.api(`agents/${h1}/events`)).json.events.map((e: any) => e.text) // its Events tab says what HQ did
+  assert.ok(lines.includes('HQ restarted during the first run of the steps you OK\'d: it picks that run up again'), JSON.stringify(lines))
+
+  // The page answers after the restart: the helper is told so, and launch_ok is taken
+  const run2 = await okd(h1, 'sleep 4 && node up.js')
+  await hq.restart()
+  assert.match(await nextBatch(h1), /Real run on the user's checkout: the page answered at http:\/\/localhost:\d+\/\. Last output:[^]*call launch_ok/)
+  p = await preview(repo.id); assert.equal(p.started_at, run2.started_at); assert.equal(p.status, 'running'); assert.equal(await page(p.url), 'b351 up')
+  assert.equal((await hq.mcp(h1, 'launch_ok')).isError, false); await gone(h1)
+  p = await preview(repo.id); assert.equal(p.helper_state, null); assert.equal(p.recipe.parts[0].run, 'sleep 4 && node up.js')
+
+  // A Stop the restart cut short: once HQ finishes it, the helper goes as after a Stop with no restart (Bug 332), and the steps stay
+  const h2 = await helper('fix'); await okd(h2, 'node slow.js')
+  const before = sentTo(h2), call = hq.api(`previews/${repo.id}/stop`, {}).catch(() => null)
+  await waitFor('HQ to begin stopping it', async () => (await preview(repo.id)).stopping === 'stop')
+  await hq.down(); await call; await hq.up()
+  await gone(h2)
+  p = await preview(repo.id); assert.equal(p.status, 'stopped'); assert.equal(p.helper_state, null); assert.equal(p.helper_note, null); assert.equal(p.draft_recipe, null)
+  assert.equal(p.recipe.parts[0].run, 'node slow.js'); assert.equal(sentTo(h2), before) // not sent back to save the same steps
+  const done = async () => (await hq.api('events?limit=400')).json.filter((e: any) => e.kind === 'launch.helper_done' && e.agent_id === h2).map((e: any) => JSON.parse(e.payload))
+  assert.deepEqual(await waitFor('its end on record', async () => { const d = await done(); return d.length ? d : null }),
+    [{ repo: 'b351x', state: null, note: null, why: 'app_stopped' }])
+
+  // The backend went while it was starting the run (the old app ended, the new one's start not saved): the run starts once, as the try's, and is told
+  const h3 = await helper('fix'); await okd(h3, 'sleep 2 && node up.js')
+  const was = await starts()
+  await hq.down()
+  const db = hq.db(); try { db.prepare("UPDATE previews SET stopping = 'restart', helper_run = NULL WHERE id = ?").run(repo.id) } finally { db.close() }
+  await hq.up()
+  assert.match(await nextBatch(h3), /the page answered at http:\/\/localhost:\d+\//)
+  assert.equal(await starts(), was + 1) // the try's own start, and no second one from the restart list (which would leave the helper waiting again)
+  p = await preview(repo.id); assert.equal(p.status, 'running'); assert.equal(p.helper_run, p.started_at)
+  assert.equal((await hq.mcp(h3, 'launch_ok')).isError, false); await gone(h3)
+  await hq.api(`previews/${repo.id}/stop`, {})
 })

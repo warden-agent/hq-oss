@@ -60,7 +60,6 @@ let ui: { scenarios: ScenarioRun[]; findings: any[] } | null = {
 let replayed: Recorded | { why: string } = { why: 'not yet' }, replays = 0
 plugIn({ uiRun: () => ui, recording: (_r, id) => recs.get(id) ?? null, endpoints: () => [{ method: 'POST', path: '/api/reading/fill', kind: 'normal' }],
   runScenario: async () => { replays++; return replayed } })
-const fid = (re: RegExp) => F.findingsOf('r1').find((k) => re.test(k.what))!
 
 test('as a run ends: the UI tester\'s findings and the checker\'s are kept; the checker reads recordings with read tools only, in a checkout, batch by batch', async () => {
   assert.equal(await F.afterUiTest(repo(), 'run1', autoGen(repoDir)), 'done')

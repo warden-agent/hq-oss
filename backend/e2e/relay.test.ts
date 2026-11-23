@@ -36,7 +36,7 @@ test('Bug 78: an agent keeps HQ\'s tools while the backend is away, and a call m
 
     await hq.down()
     const held = client.callTool({ name: 'update_handoff', arguments: { kind: 'milestone', text: 'written while HQ was away' } })
-    assert.equal(await pendingAfter(held, 2500), true) // it waits: no error, no lost connection
+    assert.equal(await pendingAfter(held, 2500), true) // hold: it waits (no error, no lost connection); with HQ down nothing shows that it does
     await hq.up()
     assert.equal(said(await held), 'Handoff recorded.')
 

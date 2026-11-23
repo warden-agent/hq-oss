@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { startHq, waitFor, pendingAfter, type Hq } from './harness.ts'
+import { startHq, waitFor, pendingAfter, type Hq, pending } from './harness.ts'
 
 let hq: Hq
 /** Hook commands still running, by the process group each has to itself: a test that fails halfway leaves none waiting for an HQ that's gone. */
@@ -29,6 +29,16 @@ const roomForEngineers = async () => assert.equal((await hq.api('settings', { ke
 const launch = async (ticketId: string) => {
   const r = await hq.api(`tickets/${ticketId}/launch`, {}); assert.equal(r.status, 200, `launch refused: ${JSON.stringify(r.json)}`); return r.json
 }
+/** HQ has let none of these commands start after a wait in its line. Its own record says so (turns.started), and it is there the moment HQ
+ *  lets one go, before the hook's script has had time to exit: so a look at it needs no wait. HQ writes that record only for a command it
+ *  held first, so each use is preceded by a wait for the record that it is held (turns.waiting; `inLine` for one asked again after a restart). */
+const notStarted = async (...uses: string[]) => {
+  const started = ((await hq.api('events?limit=300')).json as any[]).filter((e) => e.kind === 'turns.started').map((e) => JSON.parse(e.payload).use)
+  assert.deepEqual(started.filter((u) => uses.includes(u)), [])
+}
+/** HQ has put this command in its line `times` times (once when it first asked, again each time its hook asks after a restart). */
+const inLine = (use: string, times: number) => waitFor(`${use} in HQ's line (${times})`, async () =>
+  ((await hq.api('events?limit=300')).json as any[]).filter((e) => e.kind === 'turns.waiting' && JSON.parse(e.payload).use === use).length === times)
 const fromHq = async (agentId: string) => (await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === agentId && /HQ is back/.test(m.body))
 
 test('Bug 85: a request for HQ\'s OK made while the backend is away waits for it, and an agent told to wait hears when HQ is back', async () => {
@@ -50,7 +60,7 @@ test('Bug 85: a request for HQ\'s OK made while the backend is away waits for it
 
   await hq.down()
   const held = runHook(other.command, ask)
-  assert.equal(await pendingAfter(held, 2500), true) // no refusal while HQ is away
+  assert.equal(await pendingAfter(held, 2500), true) // hold: no refusal while HQ is away; with HQ down nothing shows that the hook waits, so it is given this long to give up
   await hq.up()
   assert.equal(JSON.parse(await held).hookSpecificOutput.decision.behavior, 'allow')
   assert.ok(!fs.existsSync(mark)); assert.deepEqual(await fromHq(eng.id), []) // it went through: nothing to tell the agent
@@ -93,14 +103,14 @@ test('Bug 112: with the backend away, engineers\' builds and test runs wait for 
   assert.equal(await runHook(a.hook, pre('u2', 'git status')), '{}') // a small command doesn't wait for HQ
   assert.equal(await runHook(a.hook, pre('u3', './verify.sh')), '{}') // nor does another project's test command
   const runA = runHook(a.hook, pre('u4', 'npm test')), runB = runHook(b.hook, pre('u5', './verify.sh 2>&1 | tail -20'))
-  assert.equal(await pendingAfter(Promise.race([runA, runB]), 2500), true) // before: both began here, at the same moment
+  assert.equal(await pendingAfter(Promise.race([runA, runB]), 2500), true) // hold: with HQ down nothing shows that they wait. Before: both began here, at the same moment
   await hq.up()
   const first = await Promise.race([runA.then((out) => ({ out, x: a, use: 'u4', other: runB, y: b })), runB.then((out) => ({ out, x: b, use: 'u5', other: runA, y: a }))])
   assert.equal(first.out, '{}') // HQ is back: one of them has the turn…
-  assert.equal(await pendingAfter(first.other, 1500), true) // …and the other waits in HQ's line, where the board shows it
   const waiting = await waitFor('the other in HQ\'s line', async () => (await events('turns.waiting')).find((e) => e.agent === first.y.eng.id))
+  await notStarted(first.use === 'u4' ? 'u5' : 'u4'); assert.equal(await pending(first.other), true) // …and the other waits in HQ's line, where the board shows it
   assert.deepEqual(waiting.behind, [`eng ${first.x.t.key}`])
-  assert.match((await hq.state()).agents.find((x: any) => x.id === first.y.eng.id).activity, /^Waiting its turn to run tests$/)
+  assert.equal((await hq.state()).agents.find((x: any) => x.id === first.y.eng.id).activity, `Waiting its turn to run tests behind eng ${first.x.t.key}`)
   await ended(first.x.eng.id, first.use); assert.equal(await first.other, '{}') // the first run ends: the other begins
   await ended(first.y.eng.id, first.use === 'u4' ? 'u5' : 'u4')
 
@@ -109,10 +119,11 @@ test('Bug 112: with the backend away, engineers\' builds and test runs wait for 
   const held = runHook(b.hook, pre('u7', 'npm run build'))
   await waitFor('b in HQ\'s line', async () => (await events('turns.waiting')).some((e) => e.use === 'u7'))
   await hq.down()
-  assert.equal(await pendingAfter(held, 2500), true)
+  assert.equal(await pendingAfter(held, 2500), true) // hold: with HQ down nothing shows that it still waits; a cut connection must not start it
   await hq.up()
   assert.ok((await waitFor('b asking again', async () => (await events('hook.PreToolUse:Bash')).filter((e) => e.use === 'u7').length === 2)))
-  assert.equal(await pendingAfter(held, 1500), true) // Bug 145: a restarted HQ still counts a's run, so b's waits for it…
+  await inLine('u7', 2) // Bug 145: a restarted HQ still counts a's run, so it puts b's in line again (one it let start would not be: it used to sleep 1.5 s here)…
+  await notStarted('u7'); assert.equal(await pending(held), true) // …where b's waits for it…
   await ended(a.eng.id, 'u6'); assert.equal(await held, '{}') // …and begins when it ends
   await ended(b.eng.id, 'u7')
 })
@@ -145,7 +156,7 @@ test('Bug 145: after a restart HQ still counts the run that was going, and the l
   const rRun = hookRun(r.hook, pre('o3'))
   await waitFor('r in HQ\'s line behind q', async () => (await events('turns.waiting')).some((e) => e.use === 'o3'))
   const said = async () => { const as = (await hq.state()).agents; return [p, q, r].map((x) => as.find((a: any) => a.id === x.eng.id).activity) }
-  const boxes = ['Running: npm test', 'Waiting its turn to run tests', 'Waiting its turn to run tests']
+  const boxes = ['Running: npm test', ...[1, 2].map(() => `Waiting its turn to run tests behind eng ${p.t.key}`)] // Bug 289: behind whom
   assert.deepEqual(await said(), boxes)
 
   await hq.down()
@@ -158,10 +169,11 @@ test('Bug 145: after a restart HQ still counts the run that was going, and the l
   await waitFor('r asking again', async () => await asked('o3') === 2)
   const qRun = hookRun(q.hook, pre('o2'))
   await waitFor('q asking again', async () => await asked('o2') === 2)
-  assert.equal(await pendingAfter(Promise.race([qRun.out, rRun.out]), 1500), true) // p's run still holds the turn: neither began
+  await inLine('o3', 2); await inLine('o2', 2) // p's run still holds the turn, so HQ has put both in line again: one it let start would not be
+  await notStarted('o2', 'o3'); assert.equal(await pending(Promise.race([qRun.out, rRun.out])), true) // neither began
   await ended(p.eng.id, 'o1')
   assert.equal(await qRun.out, '{}') // q waited longest: it goes first…
-  assert.equal(await pendingAfter(rRun.out, 1500), true) // …and r waits for it, though r asked again first
+  await notStarted('o3'); assert.equal(await pending(rRun.out), true) // …and r waits for it, though r asked again first
   await ended(q.eng.id, 'o2'); assert.equal(await rRun.out, '{}')
   await ended(r.eng.id, 'o3')
 })

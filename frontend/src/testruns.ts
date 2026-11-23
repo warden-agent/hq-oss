@@ -12,7 +12,11 @@
  *  steps of a finding whose fix merged (replay.ts).
  *  `state`: in line for its turn (builds and test runs take turns, Bug 76) or running. `since`: when that began. */
 export type TestRun = { id: string; repo_id: string; ticket_id: string | null; what: 'ticket' | 'main' | 'command' | 'look' | 'look_main' | 'review' | 'tester' | 'map'
-  | 'scenario' | 'setup_check' | 'checker' | 'replay'; state: 'waiting' | 'running'; since: number }
+  | 'scenario' | 'setup_check' | 'checker' | 'replay'; state: 'waiting' | 'running'; since: number; behind?: string[] }
+/** Bug 289: whom a run in line waits behind ("eng T-02", "eng T-02 and HQ's test of T-01", "eng T-02 and 2 more"), as heavy.ts behindWords says it. */
+export const behindWords = (who: unknown): string => {
+  const b = Array.isArray(who) ? who.map(String).filter(Boolean) : []; return b.length > 2 ? `${b[0]} and ${b.length - 1} more` : b.join(' and ')
+}
 
 /** How long something has been going: 0:42, 12:05, 1:02:03. A clock that is a little behind HQ's reads 0:00, never a minus. */
 export function clock(ms: number): string {
@@ -21,10 +25,10 @@ export function clock(ms: number): string {
 }
 /** A run in words. `box`: on its ticket's own box, so the ticket is "it". `bar`: in the top bar, which names the ticket (`key`; null when the run has none,
  *  or its ticket is gone). `base`: the branch tickets merge into. */
-export function runWords(r: Pick<TestRun, 'what' | 'state'>, key: string | null, base: string): { box: string; bar: string } {
-  const go = r.state === 'running', turn = 'is waiting its turn'
-  if (r.what === 'command') { const tryIt = go ? 'HQ is trying' : 'HQ is waiting its turn to try'
-    return { box: `${tryIt} its new test command`, bar: `${tryIt} ${key ? `${key}'s` : 'a'} new test command` } }
+export function runWords(r: Pick<TestRun, 'what' | 'state' | 'behind'>, key: string | null, base: string): { box: string; bar: string } {
+  const go = r.state === 'running', b = behindWords(r.behind), turn = `is waiting its turn${b ? ` behind ${b}` : ''}`
+  if (r.what === 'command') { const tryIt = go ? 'HQ is trying' : 'HQ is waiting its turn to try', after = !go && b ? ` behind ${b}` : ''
+    return { box: `${tryIt} its new test command${after}`, bar: `${tryIt} ${key ? `${key}'s` : 'a'} new test command${after}` } }
   // short enough for one row of the narrowest box, like the line they take the place of: the box keeps its height as a run waits, starts and ends
   if (r.what === 'tester') return go ? { box: 'HQ\'s tester is using the app', bar: 'HQ\'s tester is using the app in a browser, as a person would' }
     : { box: `HQ's tester ${turn}`, bar: `HQ's tester ${turn}` }
@@ -69,7 +73,8 @@ export function mergeTestWords(m: MergeTest | null): { box: string; long: string
   if (!m) return null
   if (m.ran === 'none') return { box: 'no HQ test', passed: false,
     long: m.by === 'user'
-      ? 'You merged it with Merge, which runs no tests: HQ did not test it as it merged (only auto mode tests before it merges).' : 'It was merged outside HQ, so HQ did not test it as it merged.' }
+      ? 'You merged it with Merge, which runs no tests: HQ did not test this version as it merged (Have HQ test this, or auto mode, tests before a merge).'
+      : 'It was merged outside HQ, so HQ did not test it as it merged.' }
   return { box: 'tests passed', passed: true, long: `HQ's tests passed on ${m.on} with it merged in, before it merged · ${m.counts ? `${countWords(m.counts)} · ` : ''}${took(m.ms)}` }
 }
 /** A finished feature folds its tickets away (one "✓ done" box), so it says what HQ ran on them right before they merged (Bug 126: after F-4's six merges, none of them
