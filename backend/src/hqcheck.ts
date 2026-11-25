@@ -13,7 +13,7 @@ import { mergeBase, setConflict, whoMergedFirst } from './conflicts.ts'
 import { ensureFresh, git } from './repos.ts'
 import { failedLine, failReport, lookAtBase, showing, testBase, testCombined, type Failed, type Shown, type TestResult } from './testrun.ts'
 import { combinedCommit } from './localmerge.ts'
-import { confirm, criteriaOf, proofOf, proofWords, ranWords, unproven, watchFor } from './criteria.ts'
+import { confirm, criteriaOf, outsideParts, proofOf, proofWords, ranWords, unproven, watchFor } from './criteria.ts'
 import { judge, lookReport, lookWords, movedWords, needsBase, type Look, type Seen } from './smokerules.ts'
 import { lookHow, type LookPlan } from './smoke.ts'
 import { row as previewRow, runnableRecipe } from './preview.ts'
@@ -24,7 +24,9 @@ import { runUiTest } from './uitester.ts'
 import { uiTestOn } from './auto.ts'
 import { fixConflicts, fixTests } from './tickets.ts'
 import { countWords, took } from './testcounts.ts'
-import { checkOf, FINISHED, outOfDate, pastChecks, pastWith, STEP_NAME, unseenCount, unseenWords, type CheckStep, type HqCheck, type SendBack, type StepKind,
+import { stepsOf } from './teststepsstore.ts'
+import { stepsDone, stepsReady } from './teststeps.ts'
+import { commandGap, checkOf, FINISHED, outOfDate, pastChecks, pastWith, STEP_NAME, unseenCount, unseenWords, type CheckStep, type HqCheck, type SendBack, type StepKind,
   type StepLine } from './hqcheckrules.ts'
 
 /** The checks under way, by ticket: what stops each one, and why it was stopped (the results say it). */
@@ -82,7 +84,8 @@ export function stopChecksIn(repoId: string, why: string): void {
 export function endLeftChecks(): number {
   const left = q<{ id: string; hq_check: string }>(`SELECT id, hq_check FROM tickets WHERE hq_check LIKE '%"state":"running"%'`)
   for (const r of left) {
-    const c = checkOf(r); if (c?.state === 'running' && !going.has(r.id)) save(r.id, { ...c, state: 'stopped', why: 'HQ restarted while it was testing', now: undefined, ended_at: now() })
+    const c = checkOf(r)
+    if (c?.state === 'running' && !going.has(r.id)) save(r.id, { ...c, state: 'stopped', why: 'HQ restarted while it was testing', now: undefined, prep: undefined, ended_at: now() })
   }
   return left.length
 }
@@ -127,7 +130,7 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
   const step = (s: CheckStep): void => { c.steps.push(s) }
   const at = (k: StepKind): void => { c.now = k; save(t0.id, c) }
   const end = (state: HqCheck['state'], why?: string, send?: SendBack): void => {
-    Object.assign(c, { state, ended_at: now(), now: undefined }, why ? { why } : {}, send ? { send } : {}); save(t0.id, c)
+    Object.assign(c, { state, ended_at: now(), now: undefined, prep: undefined }, why ? { why } : {}, send ? { send } : {}); save(t0.id, c)
     const unseen = unseenCount(c) // Bug 373: nothing failed, HQ just didn't see named tests run: the Events tab says that, not "found a problem"
     emit({ agentId: null, source: 'system', kind: 'check.ended', payload: { ticket: t0.id, key: t0.key, check: c.id, state, why: why ?? null, ...(unseen ? { unseen } : {}) } })
   }
@@ -135,9 +138,17 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
   const fix = (f: Omit<Extract<SendBack, { kind: 'fix' }>, 'kind'>): SendBack => ({ kind: 'fix', ...f })
   try {
     const t = getTicket(t0.id) ?? t0, proof = proofOf(t), lp = lookPlanFor(repo)
+    // Bug 411: are the test steps settled for main with this ticket merged in? When the command HQ would run leaves test files out, a helper works the steps
+    // out first (once), and the check goes on when it is done: twice at most, for a helper already at work on something else and the one this starts
+    const merged0 = await combinedCommit(repo.path, c.base_sha, c.sha).catch(() => null)
+    for (let n = 0; n < 2 && merged0 && 'sha' in merged0 && await stepsReady(repo, merged0.sha, { ticketId: t0.id }) === 'working'; n++) {
+      c.prep = 'Claude is working out how to test this project first (once, a few minutes)'; save(t0.id, c)
+      await stepsDone(repo.id, signal); if (signal.aborted) return stopped()
+    }
+    if (c.prep) { delete c.prep; save(t0.id, c) }
     // 1. The tests, with it merged into main as it was when the check began, and once they pass, the app opened in the same checkout (testrun.ts runAt)
     let r: TestResult = await testCombined(repo.path, c.base_sha, c.sha, key, repo.test_cmd, signal, show('ticket'),
-      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null })
+      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null, steps: stepsOf(repo.id) })
     if (r.kind === 'stopped' || signal.aborted) return stopped()
     if (r.kind === 'error') return end('error', `HQ couldn't test it: ${r.why}`)
     if (r.kind === 'conflicts') {
@@ -157,7 +168,8 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
       }
     } else if (r.kind === 'fail') {
       // was main already like that? Then it isn't this ticket's fault, and there's nothing to send its engineer
-      at('tests'); const b = await testBase(repo.path, c.base_sha, key, repo.test_cmd, signal, show('main')); if (b.kind === 'stopped' || signal.aborted) return stopped()
+      at('tests'); const b = await testBase(repo.path, c.base_sha, key, repo.test_cmd, signal, show('main'), { steps: stepsOf(repo.id) })
+      if (b.kind === 'stopped' || signal.aborted) return stopped()
       const words = r.hung ? `They froze and were stopped after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes` : `They failed: ${failedLine(`${r.earlier}\n${r.output}`)}`
       if (b.kind === 'fail') {
         step({ kind: 'tests', state: 'fail', words: `${words} · ${c.base} fails them too, without ${t.key}.`, output: failReport(r, 4000) })
@@ -172,16 +184,22 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
       if (proof?.tests.length) {
         at('criteria')
         const names = r.names, tests = proof.tests.map((e) => ({ ...e, state: confirm(e, names) }))
-        const missing = unproven(tests, r.test)
+        const leftOut = repo.test_cmd?.trim() ? [] : stepsOf(repo.id)?.left_out ?? [] // what the saved steps leave out on purpose
+        const missing = unproven(tests, r.test, names.parts, leftOut)
+        // Bug 411: a named test in a folder the test command runs nothing in. The user is told it's the command, in the step's words and on each line
+        const out = tests.filter((e) => e.state === 'not_run' && outsideParts(e, names.parts, leftOut)), where = [...new Set(out.map((e) => e.file!.slice(0, e.file!.indexOf('/') + 1)))]
         setTicket(t0.id, { proof: JSON.stringify({ ...proof, tests, confirmed_at: now() }) }) // HQ's own run: the Ticket tab shows each one's result too
         const lines = tests.map((e): StepLine => {
-          const w = proofWords(e); return { text: `${e.criterion}: ${w.text}`, tone: e.state === 'skipped' || e.state === 'not_run' ? 'bad' : w.tone === 'ok' ? 'ok' : 'plain' }
+          const w = out.includes(e) ? { text: `${e.file} · "${e.name}" · HQ's test command runs nothing in ${e.file!.slice(0, e.file!.indexOf('/') + 1)}`, tone: 'look' as const } : proofWords(e)
+          return { text: `${e.criterion}: ${w.text}`, tone: e.state === 'skipped' || e.state === 'not_run' ? 'bad' : w.tone === 'ok' ? 'ok' : 'plain' }
         })
         if (missing.length) {
           // Bug 373: what HQ knows, no more: the run passed and it didn't see these by name ("didn't run" was untrue when the runner printed no names, Bug 372)
           const n = missing.length, words = unseenWords(n)
-          step({ kind: 'criteria', state: 'fail', words: `${words[0]!.toUpperCase()}${words.slice(1)}. The tests themselves passed: none failed.`, lines })
-          return end('fail', undefined, fix({ test: r.test, unproven: true, missing: n, earlier: '', output: `The tests that didn't run:\n${missing.map((m) => `- ${m}`).join('\n')}` }))
+          const gap = out.length ? ` HQ's test command (\`${r.test}\`) runs nothing in ${where.join(', ')}: set one that runs those tests too, in the Auto box, then test again.` : ''
+          step({ kind: 'criteria', state: 'fail', words: `${words[0]!.toUpperCase()}${words.slice(1)}. The tests themselves passed: none failed.${gap}`, lines })
+          return end('fail', undefined, fix({ test: r.test, unproven: true, missing: n, ...(out.length ? { outside: out.length } : {}), earlier: '',
+            output: `The tests that didn't run:\n${missing.map((m) => `- ${m}`).join('\n')}` }))
         }
         const named = tests.some((e) => !e.cant_test)
         step(named ? { kind: 'criteria', state: 'pass', words: ranWords(tests), lines }
@@ -290,9 +308,12 @@ export async function sendCheck(ticketId: string): Promise<{ engineer: string | 
   if (!c || c.state !== 'fail' || !c.send) throw new Error(`HQ's test of ${t.key} found nothing to send to its engineer.`)
   if (c.sent_at) throw new Error(`What HQ's test of ${t.key} found was sent to its engineer already.`)
   if (outOfDate(t, c)) throw new Error(`${t.key} changed after HQ tested it: press Test again first.`)
+  if (commandGap(c)) throw new Error(`HQ's test command doesn't run the folder ${t.key}'s tests are in, and its engineer can't change that. ` // Bug 411
+    + 'Set a test command that runs them (Auto box), then press Test again.')
   const s = c.send
   const r = s.kind === 'conflicts' ? await fixConflicts(ticketId) : await fixTests(ticketId, { kind: 'fail', asked: true, test: s.test, output: s.output, earlier: s.earlier,
-    ...(s.hung ? { hung: true } : {}), ...(s.unproven ? { unproven: true } : {}), ...(s.missing ? { missing: s.missing } : {}), ...(s.look ? { look: true } : {}),
+    ...(s.hung ? { hung: true } : {}), ...(s.unproven ? { unproven: true } : {}), ...(s.missing ? { missing: s.missing } : {}), ...(s.outside ? { outside: s.outside } : {}),
+    ...(s.look ? { look: true } : {}),
     ...(s.review ? { review: true } : {}),
     ...(s.tester ? { tester: true } : {}) } satisfies Failed)
   const now0 = getTicket(ticketId), c2 = now0 && checkOf(now0)

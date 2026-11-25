@@ -20,6 +20,7 @@ import { shq, sleep } from './util.ts'
 import { excludeLeftovers } from './worktrees.ts'
 import { copyMainData, tryable } from './trydata.ts'
 import { setupView } from './testsetupstore.ts'
+import { stepsView } from './teststepsstore.ts'
 import * as tmux from './tmux.ts'
 
 export type PreviewStatus = 'stopped' | 'starting' | 'running' | 'crashed'
@@ -74,6 +75,8 @@ type PreviewView = Omit<Preview, 'recipe' | 'draft_recipe' | 'port_holders' | 'h
   helper_ticket_key: string | null
   /** How HQ tests this app (testsetupstore.ts), and its helper. */
   test_setup: ReturnType<typeof setupView>
+  /** How HQ tests this project when its rules can't run every test (teststepsstore.ts, Bug 411), and its helper. */
+  test_steps: ReturnType<typeof stepsView>
   /** Bug 316: what the user's own ⚙ command would do to the lockfile, checked in the checkout it runs in; null when fine or with no command. */
   command_warning: string | null }
 const holdersOf = (json: string | null): PortHolder[] | null => { try { return json ? JSON.parse(json) as PortHolder[] : null } catch { return null } }
@@ -81,7 +84,7 @@ export function previewView(repo: Repo): PreviewView {
   const p = row(repo.id) ?? blank(repo.id), t = p.ticket_id ? getTicket(p.ticket_id) : undefined, cwd = t?.worktree_path ?? repo.path
   return { ...p, recipe: parse(p.recipe), draft_recipe: parse(p.draft_recipe), port_holders: holdersOf(p.port_holders), helper_ports: p.helper_ports ? helperPorts(p) : null,
     auto_command: detectCommand(repo.path), default_branch: repo.default_branch, path: cwd,
-    helper_ticket_key: p.helper_ticket_id ? getTicket(p.helper_ticket_id)?.key ?? null : null, test_setup: setupView(repo.id),
+    helper_ticket_key: p.helper_ticket_id ? getTicket(p.helper_ticket_id)?.key ?? null : null, test_setup: setupView(repo.id), test_steps: stepsView(repo.id),
     command_warning: p.command ? commandWarning(p.command, cwd) : null }
 }
 /** Sends the UI the repo's preview again: something it shows besides the row changed (the test setup). */

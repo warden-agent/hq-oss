@@ -58,14 +58,18 @@ export function same(c: string[], p: string[]): boolean {
   return i === p.length
 }
 
+/** Bug 411: `cd backend`, `cd "backend"` and `cd 'backend'` go to the same folder. HQ writes the folders of a command it builds in quotes, engineers mostly
+ *  type them without, and their run of the project's tests didn't count. Only a plain folder name: nothing the shell would work out as it runs. */
+const cdBare = (c: string): string => c.replace(/^cd (?:"([^"\\$`]+)"|'([^'\\$`]+)')$/, (_m, a: string | undefined, b: string | undefined) => `cd ${a ?? b}`)
 /** What a shell line runs of the project's test command. Null: something else is in the line that Claude Code could have refused (a
  *  here-document, a git command, a file written somewhere), or none of it is the test command's. Otherwise:
  *  - `whole`: every command of the test command is in the line;
  *  - `hard`: how many of the test command's commands that aren't plain it runs, of `hardInCmd`. Those are the ones Claude Code may refuse. */
 export function testCmdParts(line: string, testCmd: string, worktree: string | null): { whole: boolean; hard: number; hardInCmd: number } | null {
   const parts = commands(testCmd).map(bare).filter(Boolean), hard = parts.map((p) => !plain(p, worktree)), seen = new Set<number>()
+  const folders = parts.map(cdBare) // only to compare with: whether a `cd` is plain goes by the command as it was typed (a worktree path with a space keeps its quotes)
   for (const c of commands(line).map(bare).filter(Boolean)) {
-    const i = parts.findIndex((p) => same(c.split(' '), p.split(' ')))
+    const i = folders.findIndex((p) => same(cdBare(c).split(' '), p.split(' ')))
     if (i >= 0) seen.add(i); else if (!plain(c, worktree)) return null
   }
   if (!seen.size) return null
@@ -84,8 +88,8 @@ export const ranTestCmd = (line: string, testCmd: string, worktree: string | nul
 /** Bug 213: the commands of a Bash line that come after its last command of the test command's (as `commands` splits it, pipes included), so
  *  `npm test && sed -i … && git commit` gives the sed and the commit. Empty: the line ends with the test command, or HQ can't place it. */
 export function afterTestCmd(line: string, testCmd: string): string[] {
-  const parts = commands(testCmd).map(bare).filter(Boolean), cs = commands(line)
-  const isPart = (c: string): boolean => { const b = bare(c); return parts.some((p) => b === p || b.startsWith(`${p} `) || same(b.split(' '), p.split(' '))) }
+  const parts = commands(testCmd).map(bare).filter(Boolean).map(cdBare), cs = commands(line)
+  const isPart = (c: string): boolean => { const b = cdBare(bare(c)); return parts.some((p) => b === p || b.startsWith(`${p} `) || same(b.split(' '), p.split(' '))) }
   let last = -1; cs.forEach((c, i) => { if (isPart(c)) last = i })
   return last < 0 ? [] : cs.slice(last + 1)
 }

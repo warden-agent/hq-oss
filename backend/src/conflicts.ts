@@ -88,7 +88,8 @@ export function keepTestsFailed(t: Ticket, failed: Failed): void {
   run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
     `ticket:${t.id}`, 'tests_failed',
     JSON.stringify({ test: failed.test, output: failed.output, earlier: failed.earlier, hung: !!failed.hung, unproven: !!failed.unproven, look: !!failed.look, review: !!failed.review,
-      asked: !!failed.asked, tester: !!failed.tester, ...(failed.missing ? { missing: failed.missing } : {}), noted: handoffOf(t.id).length }), now())
+      asked: !!failed.asked, tester: !!failed.tester, ...(failed.missing ? { missing: failed.missing } : {}), ...(failed.outside ? { outside: failed.outside } : {}),
+      noted: handoffOf(t.id).length }), now())
 }
 const NO_OUTPUT = "(HQ doesn't have what they printed any more: run them to see.)"
 /** That kept failure; `test` (the project's command) and a note stand in for it if it's gone. */
@@ -96,7 +97,7 @@ export function testsFailed(t: Ticket, test: string | null): Failed {
   const kept = keptFor(t.id)
   return { kind: 'fail', test: kept?.test ?? test ?? 'the tests', output: kept?.output ?? NO_OUTPUT,
     earlier: kept?.earlier ?? '', hung: kept?.hung ?? t.fixing === 'tests_hung', ...(kept?.unproven ?? t.fixing === 'tests_unseen' ? { unproven: true } : {}),
-    ...(kept?.missing ? { missing: kept.missing } : {}), ...(kept?.look ?? t.fixing === 'look' ? { look: true } : {}),
+    ...(kept?.missing ? { missing: kept.missing } : {}), ...(kept?.outside ? { outside: kept.outside } : {}), ...(kept?.look ?? t.fixing === 'look' ? { look: true } : {}),
     ...(kept?.review ?? t.fixing === 'review' ? { review: true } : {}), ...(kept?.asked ? { asked: true } : {}), ...(kept?.tester ? { tester: true } : {}) }
 }
 /** Bug 373: what the ticket's engineer wrote in its handoff log since the ticket went back to it (update_handoff's entries without their date lines, oldest
@@ -108,12 +109,15 @@ export function notedSince(ticketId: string): string {
 }
 /** Bug 373: why a finished ticket went back to its engineer, in HQ's own words: one clause that reads after "because". For the TPM, which tells the user: from
  *  "to fix its tests" alone it guessed "its tests didn't pass" when they had passed. Only what HQ saw: tests it didn't see by name "weren't seen running". */
+/** Bug 411: every named test HQ didn't see run is in a folder its test command runs nothing in: the command's gap, and nothing the engineer can fix in the ticket. */
+export const allOutside = (r: Failed): boolean => !!r.unproven && !!r.outside && r.outside >= (r.missing ?? r.outside)
 export function backWords(r: Failed, base: string): string {
   const line = r.output === NO_OUTPUT ? '' : failedLine(`${r.earlier}\n${r.output}`)
   return r.review ? 'a fresh reader of its changes found problems'
     : r.tester ? `HQ's UI tester found problems when it used the app in a browser with it merged into ${base}`
     : r.look ? `the app had problems when HQ opened it with it merged into ${base}`
     : r.unproven ? `its tests passed with it merged into ${base} and none failed, but ${unseenWords(r.missing ?? 0)}`
+      + (r.outside ? `${allOutside(r) ? '' : `, ${r.outside} of them`} in a folder HQ's test command runs nothing in` : '')
     : r.hung ? `its tests never finished with it merged into ${base}: HQ stopped \`${r.test}\` after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes`
     : `its tests failed with it merged into ${base}${line ? `: ${line}` : ''}`
 }
@@ -148,9 +152,17 @@ export function fixTestsText(o: { t: Ticket; base: string; failed: Failed; launc
       + ' app prints when you start it, and by what its server answers (curl). Then run the tests.'
     : r.unproven
     ? `Make each test listed above run and pass under \`${r.test}\` (HQ reads that command's output), or name a test that does. Don't drop a criterion's test.`
+      + (r.outside ? ' For a test in a folder HQ\'s test command runs nothing in (the list says which), don\'t move it and don\'t wrap it in or call it from another test '
+        + 'runner: call report_blocked and say which folder HQ\'s test command doesn\'t run.' : '')
     : r.hung ? `Run \`${r.test}\` with a time limit, find what never finishes and fix it, keeping your ticket's work and what is on ${base}.`
     : `Run \`${r.test}\` and fix what fails, keeping your ticket's work and what is on ${base}.`,
   'Commit.', 'Call update_handoff(kind: before_pr) saying what was wrong.', `Call open_pr again with the same title and body, keeping the "## Deviations from approved plan" section${again(t)}`]
+  // Bug 411: sent back with "put it where that command runs it", an engineer wrapped its backend's tests in the frontend's runner. A test where the command
+  // runs nothing is the command's gap: the engineer changes nothing and says so (checked on a real engineer, 2026-11-25: report_blocked, no change)
+  if (allOutside(r)) return `${intro}HQ: ${what}\n\n${r.output}\n\nThat is a gap in HQ's test command, not in your ticket. Do this:\n`
+    + `1. Leave your code and your tests as they are. Don't move these tests, and don't wrap them in or call them from another test runner to get them seen.\n`
+    + `2. Call report_blocked and say which folder HQ's test command doesn't run. Then end your turn. HQ tells you when its test command has changed: run it `
+    + `then, and call open_pr again with the same title and body${again(t)}`
   return `${intro}HQ: ${what}\n\n${r.unproven || r.look || r.review ? r.output : failReport(r, 4000)}\n\n`
     + `Fix it now, in your worktree:\n${steps.map((x, i) => `${i + 1}. ${x}`).join('\n')}\nIf you can't fix it from this ticket, call report_blocked and say why.`
 }

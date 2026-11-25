@@ -2,7 +2,7 @@
 // a merge may record the check as its test. Pure (hqcheckrules.ts), so the page shows what these say.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { allSteps, canSend, changedWords, checkButton, checkFacts, checkHeadline, checkOf, checksOf, checkTone, outOfDate, pastChecks, pastWith, testedFor, unseenCount,
+import { allSteps, canSend, changedWords, checkButton, checkFacts, checkHeadline, checkOf, checksOf, checkTone, commandGap, outOfDate, pastChecks, pastWith, testedFor, unseenCount,
   unseenOnly, unseenWords, type HqCheck } from './hqcheckrules.ts'
 
 const base: HqCheck = { id: 'check-1', state: 'pass', sha: 'aaaaaaa1', base: 'main', base_sha: 'bbbbbbb2', finished_sha: 'aaaaaaa1', started_at: 1_000, ended_at: 66_000,
@@ -124,4 +124,31 @@ test('Bug 373: Test again keeps the check before it: the last few, without a pas
 test('Bug 373: what the engineer changed, in words', () => {
   assert.equal(changedWords([]), 'changed no files'); assert.equal(changedWords(['package.json']), 'changed 1 file: package.json')
   assert.equal(changedWords(['a.js', 'b.js', 'c.js']), 'changed 3 files: a.js, b.js, c.js'); assert.equal(changedWords(['a.js', 'b.js'], 9), 'changed 11 files: a.js, b.js and 9 more')
+})
+
+// Bug 411: every named test HQ didn't see run is in a folder its test command runs nothing in. That is the command's gap: nothing goes to the engineer.
+test('Bug 411: a check that ended on tests where the command runs nothing says so, stays amber, and has nothing to send the engineer', () => {
+  const gap = { ...base, ...UNSEEN, send: { ...UNSEEN.send!, missing: 2, outside: 2 } } as HqCheck
+  assert.equal(commandGap(gap), true); assert.equal(canSend({ finished_sha: 'aaaaaaa1' }, gap), false)
+  assert.equal(checkHeadline(gap), "The tests passed, but HQ's test command doesn't run the folder the tests named for its criteria are in")
+  assert.equal(checkHeadline({ ...gap, send: { ...gap.send!, missing: 1, outside: 1 } } as HqCheck),
+    "The tests passed, but HQ's test command doesn't run the folder a test named for its criteria is in")
+  assert.equal(checkTone(gap), 'amber'); assert.equal(unseenOnly(gap), true)
+  const b = checkButton(tk({ ...UNSEEN, send: gap.send }), true)!
+  assert.deepEqual([b.label, b.tone, b.start], ['View results ⚠', 'amber', false])
+  assert.match(b.tip, /but HQ's test command doesn't run the folder the tests named for its criteria are in\. Click for which\. Its engineer can't change the test command/)
+  assert.doesNotMatch(b.tip, /send it to its engineer/)
+  // what it must not catch: some of them the engineer's to fix, none outside, a failed test
+  const some = { ...gap, send: { ...gap.send!, missing: 3, outside: 2 } } as HqCheck, none = { ...base, ...UNSEEN } as HqCheck
+  for (const c of [some, none]) { assert.equal(commandGap(c), false); assert.equal(canSend({ finished_sha: 'aaaaaaa1' }, c), true) }
+  assert.equal(checkHeadline(some), "The tests passed, but 3 tests named for its criteria weren't seen running")
+  assert.equal(commandGap({ ...base, state: 'fail', send: { kind: 'fix', test: 'x', output: '✖', earlier: '', outside: 1 } } as HqCheck), false)
+  assert.equal(commandGap({ ...gap, state: 'error' } as HqCheck), false)
+})
+
+test('Bug 411: a check that waits for the project\'s test steps says so, on its button and in its heading', () => {
+  const waiting = { ...base, state: 'running', prep: 'Claude is working out how to test this project first (once, a few minutes)' } as HqCheck
+  assert.equal(checkHeadline(waiting), 'Testing… Claude is working out how to test this project first (once, a few minutes)')
+  assert.match(checkButton(tk(waiting), true)!.tip, /^HQ is testing T-01: Claude is working out how to test this project first \(once, a few minutes\)\. Click to watch it or stop it\.$/)
+  assert.equal(checkHeadline({ ...waiting, prep: undefined, now: 'tests' } as HqCheck), 'Testing… running the tests') // and nothing else changes
 })

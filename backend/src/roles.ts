@@ -141,6 +141,11 @@ export const cacheEnv = (): Record<string, string> => ({
   CARGO_HOME: path.join(ENGINEER_CACHE, 'cargo'), // where crates download to; cargo itself is still found on PATH (~/.cargo/bin, readable: rustReads), and rustup's toolchains stay put
   UV_CACHE_DIR: path.join(ENGINEER_CACHE, 'uv'), PIP_CACHE_DIR: path.join(ENGINEER_CACHE, 'pip'),
   UV_PYTHON_INSTALL_DIR: path.join(ENGINEER_CACHE, 'python'), UV_PYTHON_DOWNLOADS: 'never',
+  // Bug 411: Poetry, Pipenv and PDM, when a project's test steps use them: their caches out of the home (a sandboxed run can't write there: Poetry's
+  // install failed on `mkdir` in a real run, 2026-11-25), and the environments they make inside the project's folder, where the run can write and HQ's
+  // throwaway checkout takes them with it
+  POETRY_CACHE_DIR: path.join(ENGINEER_CACHE, 'poetry'), POETRY_VIRTUALENVS_IN_PROJECT: 'true', PIPENV_CACHE_DIR: path.join(ENGINEER_CACHE, 'pipenv'), PIPENV_VENV_IN_PROJECT: '1',
+  PDM_CACHE_DIR: path.join(ENGINEER_CACHE, 'pdm'),
 })
 
 const RELAY = path.join(import.meta.dirname, 'mcprelay.mjs')

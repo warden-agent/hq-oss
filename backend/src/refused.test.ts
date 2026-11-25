@@ -62,3 +62,18 @@ test('anything else in the line could be what was refused, and a narrowed run is
   assert.equal(refusedTestCmd(`cd "${WT}" && npm test`, 'npm test', null), false, 'no worktree known: a cd could go anywhere')
   assert.equal(refusedTestCmd('npm test', '  ', WT), false, 'no saved command'); assert.equal(refusedTestCmd('npm test:unit', 'npm test', WT), false, 'a longer script name')
 })
+
+// Bug 411: HQ writes the folders of a command it builds in quotes (`(cd "backend" && …)`); engineers mostly type them without, and their run of the project's
+// tests didn't count, so open_pr kept asking for it. Checked on a real engineer session (Claude Code 2.1.322, 2026-11-25): the unquoted line runs.
+const SPLIT = '(cd "backend" && uv run pytest -v) && (cd "web app" && npm test)'
+test('Bug 411: a folder typed with or without quotes is the same folder', () => {
+  for (const c of [SPLIT, "(cd backend && uv run pytest -v) && (cd 'web app' && npm test)", `(cd backend && uv run pytest -v -x) && (cd "web app" && npm test) 2>&1 | tail -40`,
+    `cd "${WT}" && (cd backend && uv run pytest -v) && (cd "web app" && npm test)`]) assert.equal(ranTestCmd(c, SPLIT, WT), true, c)
+  assert.equal(ranTestCmd('(cd "api" && npm test)', '(cd api && npm test)', WT), true) // and a saved command typed without them
+})
+test('Bug 411, what the quotes rule must not catch: another folder, a folder worked out as it runs, half the command', () => {
+  for (const c of ['(cd backend && uv run pytest -v) && (cd web && npm test)', '(cd "$HOME" && uv run pytest -v) && (cd "web app" && npm test)',
+    '(cd backend/ && uv run pytest -v) && (cd "web app" && npm test)', '(cd "back""end" && uv run pytest -v) && (cd "web app" && npm test)']) assert.equal(ranTestCmd(c, SPLIT, WT), false, c)
+  assert.equal(ranTestCmd('(cd backend && uv run pytest -v)', SPLIT, WT), false) // one part only: the other suite never ran
+  assert.equal(testCmdParts("cd 'web app' && npm test", SPLIT, WT)?.whole, false)
+})

@@ -22,6 +22,8 @@ import { noteProblem, saveNote } from './notes.ts'
 import { completeFreshStart } from './freshstart.ts'
 import { cantStart, launchOk, saveLaunch } from './launchhelper.ts'
 import { cantTest, proposeSetupChange, saveTestSetup } from './testsetup.ts'
+import { cantSteps, saveTestSteps } from './teststeps.ts'
+import { stepsShape } from './teststepsstore.ts'
 import { setupShape } from './testsetupstore.ts'
 import { recipeShape } from './apprun.ts'
 import { actionOf, askUser, KEEP, openAsks, REMOVE } from './asks.ts'
@@ -291,6 +293,13 @@ function registerTools(s: McpServer, agent: Agent): void {
       async (a) => { logCall('save_test_setup', { parts: a.start.length, snapshot: a.snapshot, endpoints: a.endpoints?.length ?? 0 }); return done(saveTestSetup(agent, a)) })
     s.registerTool('report_cant_test', { description: 'Test setup job only. Tell the user, in one plain sentence, why HQ can\'t test this app here. HQ ends your session.',
       inputSchema: { reason: z.string().min(1).max(500) } }, async (a) => { logCall('report_cant_test', a); return done(cantTest(agent, a.reason)) })
+    // The test steps job (teststeps.ts, Bug 411): the same role, its own two tools
+    s.registerTool('save_test_steps', { description: 'Test steps job only. Save how HQ tests this project: one part per folder with tests of its own (its install and its test '
+      + 'command), and what you leave out and why. HQ runs the steps for real in its sandbox and messages you the result.', inputSchema: stepsShape },
+      async (a) => { logCall('save_test_steps', { parts: a.parts.map((p) => p.dir), left_out: a.left_out?.length ?? 0 }); return done(saveTestSteps(agent, a)) })
+    s.registerTool('report_cant_test_steps', { description: 'Test steps job only. Tell the user, in one plain sentence, why none of this project\'s tests can be run in HQ\'s '
+      + 'sandbox. HQ ends your session.', inputSchema: { reason: z.string().min(1).max(500) } },
+      async (a) => { logCall('report_cant_test_steps', a); return done(cantSteps(agent, a.reason)) })
   }
   if (agent.role === 'engineer') {
     s.registerTool('get_ticket', { description: 'Your ticket: spec, acceptance criteria, status, review state, handoff so far.', inputSchema: {} }, async () => {

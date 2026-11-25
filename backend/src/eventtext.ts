@@ -176,6 +176,13 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'testsetup.saved': return `Saved how HQ tests the app${Number(p.saves) > 1 ? ` (save ${p.saves})` : ''}: HQ is checking it`
     case 'testsetup.helper_done': return p.state === 'cant_test' ? `Done with the test setup: it says HQ can't test this app${p.note ? `: ${one(p.note, 100)}` : ''}`
       : p.state === 'failed' ? `Done with the test setup, with no setup that works${p.note ? `: ${one(p.note, 100)}` : ''}` : 'Done with the test setup'
+    // Bug 411: the test steps helper
+    case 'teststeps.helper_started': return `Started working out how HQ tests the project${p.why === 'gap' ? ': its test steps left some tests out' : p.why === 'again' ? ' again' : ''}`
+    case 'teststeps.saved': return `Saved test steps${Number(p.saves) > 1 ? ` (save ${p.saves})` : ''}: HQ is running them in its sandbox`
+    case 'teststeps.checked': return `HQ's check of the test steps passed: ${one(p.cmd, 160)}`
+    case 'teststeps.helper_done': return p.state === 'cant' ? `Done with the test steps: it says HQ can't run this project's tests${p.note ? `: ${one(p.note, 100)}` : ''}`
+      : p.state === 'failed' ? `Done with the test steps, with none that pass in HQ's sandbox${p.note ? `: ${one(p.note, 100)}` : ''}` : 'Done with the test steps'
+    case 'teststeps.not_started': return `HQ couldn't start Claude on the test steps${p.error ? `: ${one(p.error, 120)}` : ''}`
     case 'testsetup.change_proposed': return `Proposed a change to how HQ tests the app${p.ticket ? `, with ${p.ticket}` : ''}`
     case 'ticket.launched': return `${p.fix ? 'Back on' : 'Started on'} ${keyOf(p.ticket, p.key)}`
     case 'ticket.resumed': return `Picked up ${keyOf(p.ticket, p.key)} again`

@@ -25,6 +25,7 @@ import { TOKEN_HEADER } from './roles.ts'
 import { sawTestCmd } from './auto.ts'
 import { overPause, pauseLevels } from './scheduler.ts'
 import { keepBefore, keepState, suiteRan } from './suiteran.ts'
+import { gateCmds, stepsOf } from './teststepsstore.ts'
 import { dialogMayBeOver } from './dialogclear.ts'
 
 const TAKEOVER_ATTACHED_MS = 365 * 86_400_000 // "until they detach"
@@ -48,7 +49,8 @@ const trim = (v: unknown, n = 400): string => { const s = typeof v === 'string' 
  *  ran it this way first (auto.ts ranByEngineer): its own sandbox runs commands that Claude Code refuses in an engineer's session. A refused
  *  command fires PostToolUseFailure with Claude Code's reason; one that ran and failed says "Exit code N" (both seen on 2.1.300). */
 const ranBash = (agent: Agent, tool: string, input: Record<string, unknown>, error?: unknown): string | undefined => {
-  if (tool !== 'Bash' || (error !== undefined && !/^Exit code \d/.test(String(error))) || !getTicket(agent.ticket_id ?? '')?.repairs_main) return undefined
+  // a repair's commands (may it propose this test command? Bug 83), and a helper's (Bug 411: which test steps an agent's session can run)
+  if (tool !== 'Bash' || (error !== undefined && !/^Exit code \d/.test(String(error))) || !(agent.role === 'launcher' || getTicket(agent.ticket_id ?? '')?.repairs_main)) return undefined
   return String(input.command ?? '').slice(0, 8000)
 }
 
@@ -301,7 +303,7 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
         if (r.isAsync && typeof r.agentId === 'string') {
           const what = trim(r.description ?? input.description, 60); bg.set(r.agentId, what); Object.assign(payload, { helper: r.agentId, helperWhat: what }) } }
       if (tool === 'Bash' && !sub) { // Bug 95: still running in the background, and the agent waits on it
-        const task = watchedTask(input, body.tool_response, getRepo(repoOfAgent(agent) ?? '')?.test_cmd ?? null)
+        const its = getRepo(repoOfAgent(agent) ?? ''), task = watchedTask(input, body.tool_response, its ? gateCmds(its.test_cmd, stepsOf(its.id)) : null)
         if (task) { addRun(agent.id, { task, use: String(body.tool_use_id ?? ''), command: String(input.command ?? '') }); payload.bg = task } }
       payload.ran = ranBash(agent, tool, input); if (tool === 'Bash') payload.suite = suiteRan(agent, String(input.command ?? '')); break
     case 'PostToolUseFailure': Object.assign(payload, { input: trim(input, 200), use: body.tool_use_id, error: trim(body.error, 300), is_interrupt: body.is_interrupt })

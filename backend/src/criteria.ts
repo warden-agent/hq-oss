@@ -147,8 +147,10 @@ const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 // cargo (test path::name ... ok), go test -v (--- PASS: Name), pytest -rA / -v (PASSED file::name, file::name PASSED); 2026-11-23 (Bug 372): vitest 1.6, 2.1,
 // 3.2 and 4.1 (✓ file (8 tests) 5ms, ✓ name 452ms), jest 30 (PASS file, ✓ name (1 ms)), mocha 11 (✔ name); by its docs: TAP (ok 1 - name). `pytest -q`
 // and plain `go test` print none of these: HQ can't confirm a name there, and says so.
-const PASS_LINE = [/^\s*[✔✓√]\s/, /^\s*--- PASS: /, /^test .+ \.\.\. ok$/, /^\s*PASS(ED)?\s/, /\sPASSED(\s|$)/, /^\s*ok \d+ /]
-const SKIP_LINE = [/# (SKIP|TODO)\b/i, /^\s*[﹣↓○]\s/, /^\s*--- SKIP: /, /^test .+ \.\.\. ignored/, /^\s*SKIPPED\s/, /\sSKIPPED(\s|$)/,
+// Bug 411, through HQ's sandbox, 2026-11-25: pytest 9.2 -v (file::name PASSED / SKIPPED (reason)); Python 3.14's unittest -v and Django 5.2's `manage.py test -v 2`
+// (`name (module.Class.name) ... ok`, `... skipped 'reason'`; Django's first one comes glued to the end of a migration's line, so these match at the line's end).
+const PASS_LINE = [/^\s*[✔✓√]\s/, /^\s*--- PASS: /, /^test .+ \.\.\. ok$/, /^\s*PASS(ED)?\s/, /\sPASSED(\s|$)/, /^\s*ok \d+ /, /\) \.\.\. ok$/]
+const SKIP_LINE = [/# (SKIP|TODO)\b/i, /^\s*[﹣↓○]\s/, /^\s*--- SKIP: /, /^test .+ \.\.\. ignored/, /^\s*SKIPPED\s/, /\sSKIPPED(\s|$)/, /\) \.\.\. skipped\b/,
   /^ {2,}- \S/] // mocha's pending test (`it.skip`): `  - name`, indented two more for each suite it's in (mocha 11.8 spec and list reporters; Bug 377)
 // A line for a whole test file, not for one test. It proves that file ran and names no test, so it's never a sign that the runner lists tests by name
 // (Bug 372: vitest's were read as that, and every named test "never ran"). Jest's `PASS test/a.test.js`; vitest's `✓ src/a.test.ts (8 tests | 1 skipped) 5ms`,
@@ -174,8 +176,20 @@ export function namesFile(s: string, file: string, folders: string[] | null = nu
 }
 /** What to look for in a run's output: the names of a map's tests, and the files they are in. */
 export type Watch = { names: string[]; files: string[] }
-/** `unsure`: files a line showed with a skipped test in them, so their passing says nothing about a named test that isn't printed by name (Bug 375). */
-export type Watched = { prints: boolean; passed: string[]; skipped: string[]; unsure: string[] }
+/** `unsure`: files a line showed with a skipped test in them, so their passing says nothing about a named test that isn't printed by name (Bug 375).
+ *  `parts` (Bug 411): when HQ ran the test command part by part (one folder's suite at a time, testrun.ts), each part's folder ('.' for the project's root)
+ *  and whether that part's own output listed its tests by name. `prints` is then true only when every part's did. */
+export type Watched = { prints: boolean; passed: string[]; skipped: string[]; unsure: string[]; parts?: WatchedPart[] }
+export type WatchedPart = { dir: string; prints: boolean }
+/** The parts whose folder holds this file: the suites that could have run it. */
+export const partsFor = (file: string, parts: WatchedPart[]): WatchedPart[] => parts.filter((p) => p.dir === '.' || file.startsWith(`${p.dir}/`))
+/** Bug 411: what several parts' watchers saw, as one. One suite's output says nothing about another's tests: a part that lists names can't make a quiet
+ *  part's tests read "never ran", and a part that counts many tests can't hide that another's named test didn't run. */
+export function mergeWatched(seen: { dir: string; seen: Watched }[]): Watched {
+  const all = (pick: (w: Watched) => string[]): string[] => [...new Set(seen.flatMap((s) => pick(s.seen)))], passed = all((w) => w.passed)
+  return { prints: seen.length > 0 && seen.every((s) => s.seen.prints), passed, skipped: all((w) => w.skipped).filter((x) => !passed.includes(x)), unsure: all((w) => w.unsure),
+    parts: seen.map((s) => ({ dir: s.dir, prints: s.seen.prints })) }
+}
 /** Watches a test run's output as it streams in for the tests a ticket's map names: which names (and which files) showed up on a line that says "passed", and
  *  which names on a line that says "skipped". `prints`: the runner listed the tests it ran by name, so a name that never showed up wasn't run. One passing
  *  test printed by name shows that, unless the runner's own file lines counted more tests than it named (vitest naming just its slow ones). A file that a
@@ -215,12 +229,33 @@ export function confirm(e: ProofEntry, w: Watched): Confirmed | undefined {
   if (w.skipped.includes(e.name)) return 'skipped'
   if (w.passed.includes(e.name) || (!!e.file && w.passed.includes(e.file))) return 'passed'
   if (e.file && w.unsure.includes(e.file)) return 'unconfirmed'
-  return w.prints ? 'not_run' : 'unconfirmed'
+  // Bug 411: run part by part, a name that never showed up wasn't run only when the suites that could hold its file listed their tests by name. A file in no
+  // part's folder was run by nobody.
+  const own = w.parts && e.file ? partsFor(e.file, w.parts) : null
+  return (own ? own.every((p) => p.prints) : w.prints) ? 'not_run' : 'unconfirmed'
 }
-/** The entries HQ's passing run didn't prove: skipped, or never run. One line each, for the engineer the ticket goes back to. */
-export function unproven(tests: Proof['tests'], cmd: string): string[] {
+/** Bug 411: is this entry's file in a folder none of the test command's parts runs (and so the command, not the ticket, is what leaves it out)? Only known
+ *  when HQ ran the command part by part. */
+export const outsideParts = (e: ProofEntry, parts: WatchedPart[] | undefined, leftOut: LeftOut[] = []): boolean =>
+  !!parts?.length && !!e.file && !partsFor(e.file, parts).length && !leftOutOf(e.file, leftOut)
+/** What a project's test steps leave out on purpose, and why (teststepsstore.ts). */
+export type LeftOut = { path: string; why: string }
+/** The left-out entry this file is under, if any: its test can't be seen running, and no command of HQ's is missing a part for it. */
+export const leftOutOf = (file: string | undefined, leftOut: LeftOut[]): LeftOut | undefined =>
+  file ? leftOut.find((l) => l.path === '.' || file === l.path || file.startsWith(`${l.path}/`)) : undefined
+const top = (file: string): string => file.includes('/') ? `${file.slice(0, file.indexOf('/'))}/` : 'the project\'s top folder'
+const ranIn = (parts: WatchedPart[]): string => parts.map((p) => p.dir === '.' ? 'the top folder' : `${p.dir}/`).join(', ')
+/** The entries HQ's passing run didn't prove: skipped, or never run. One line each, for the engineer the ticket goes back to. `parts`: the folders the
+ *  command's parts ran in, when HQ ran it part by part: a test in none of them gets told so (Bug 411: "put it where that command runs it" had an engineer wrap
+ *  a backend's tests in the frontend's runner). `leftOut`: what the project's test steps leave out on purpose: a test there can't be seen, and says why. */
+export function unproven(tests: Proof['tests'], cmd: string, parts?: WatchedPart[], leftOut: LeftOut[] = []): string[] {
+  const left = (e: ProofEntry): LeftOut | undefined => leftOutOf(e.file, leftOut)
   return tests.flatMap((e) => e.state === 'skipped' ? [`${e.criterion}: "${e.name}" in ${e.file} was skipped, so nothing proved ${e.criterion}. Make it run, or name a test that does.`]
-    : e.state === 'not_run' ? [`${e.criterion}: "${e.name}" in ${e.file} never ran. \`${cmd}\` listed other tests and not this one: put it where that command runs it.`] : [])
+    : e.state !== 'not_run' ? []
+    : left(e) ? [`${e.criterion}: "${e.name}" in ${e.file} never ran: HQ's test steps leave ${left(e)!.path} out (${left(e)!.why}), so HQ can't see it run. `
+      + `Name a test for ${e.criterion} that HQ's test command runs, or give the reason it can't be tested (cant_test).`]
+    : outsideParts(e, parts) ? [`${e.criterion}: "${e.name}" in ${e.file} never ran: HQ's test command runs nothing in ${top(e.file!)} (it runs ${ranIn(parts!)}).`]
+    : [`${e.criterion}: "${e.name}" in ${e.file} never ran. \`${cmd}\` listed other tests and not this one: put it where that command runs it.`])
 }
 
 /** The check's words for named tests that are no reason to send the ticket back: every one ran, or the run passed and HQ couldn't see some by name

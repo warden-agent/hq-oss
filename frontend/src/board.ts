@@ -9,7 +9,7 @@ import { featureTestsLine, mergeTestOf, mergeTestWords, runWords } from './testr
 import { planWaitsWhy } from '../../backend/src/checks.ts'
 import { autoRetries, nextMover } from '../../backend/src/mover.ts'
 import { boxCriteria, criteriaOf } from '../../backend/src/criteria.ts'
-import { checkButton, checkOf, outOfDate, unseenCount, unseenOnly, unseenWords } from '../../backend/src/hqcheckrules.ts'
+import { checkButton, checkOf, commandGap, gapWords, outOfDate, unseenCount, unseenOnly, unseenWords } from '../../backend/src/hqcheckrules.ts'
 import { archiveName } from '../../backend/src/projectname.ts'
 import { fitSets } from './fit.ts'
 import { MORE, replyPreview } from './reply.ts'
@@ -169,6 +169,7 @@ export function checkWords(t: any): string {
   const c = checkOf(t)
   if (c?.state === 'running') return 'HQ is still testing it (Have HQ test this): merging now stops that test.'
   if (c && !outOfDate(t, c)) return c.state === 'pass' ? "HQ's test of this version passed (View results on the box)."
+    : commandGap(c) ? `HQ's test of this version passed its tests, but ${gapWords(c)} (View results on the box).` // Bug 411: the command's gap
     : unseenOnly(c) ? `HQ's test of this version passed its tests, but ${unseenWords(unseenCount(c))} (View results on the box).` // Bug 373: nothing failed
     : c.state === 'fail' ? "HQ's test of this version found a problem (View results on the box)." : "HQ's test of this version didn't finish."
   return 'HQ runs no tests as it merges: to have it tested first, press Have HQ test this.'
@@ -326,7 +327,7 @@ export const kindLabel = (k: string): string => k.startsWith('auto_stopped:') ? 
 const projectLabel = (k: string): string | null => !k.startsWith('repo_') ? null : ({ repo_cleared: 'Project cleared',
   repo_cleared_left: 'Cleared, worktrees left', repo_clear_tpm: "TPM didn't start after Clear", repo_clear_failed: "Clear didn't finish",
   repo_sync: "Couldn't sync", repo_local: 'Pushing to GitHub', repo_launch: 'Starting the app', repo_testsetup: 'Test setup problem',
-  repo_testsetup_ok: 'Test setup ready' } as Record<string, string>)[k.split(':')[0]!]
+  repo_testsetup_ok: 'Test setup ready', repo_teststeps: 'Test steps problem', repo_teststeps_ok: 'Test steps ready' } as Record<string, string>)[k.split(':')[0]!]
   ?? 'Project'
 const steps = (a: Agent) => a.steps_total ? ` · step ${a.steps_done}/${a.steps_total}` : ''
 // "Your turn" on the TPM box (Bug 43, Bug 52): the TPM's questions with a button per choice, and the tickets ready to start.

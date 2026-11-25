@@ -1,0 +1,8 @@
+test_discount_is_applied (tests.test_cart.CartTests.test_discount_is_applied) ... skipped 'not built yet'
+test_empty_cart_is_zero (tests.test_cart.CartTests.test_empty_cart_is_zero) ... ok
+test_total_adds_prices (tests.test_cart.CartTests.test_total_adds_prices) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK (skipped=1)

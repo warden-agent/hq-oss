@@ -20,7 +20,7 @@ export type StepLine = { text: string; tone: 'ok' | 'bad' | 'plain' }
 export type CheckStep = { kind: StepKind; state: 'pass' | 'fail' | 'skipped'; words: string; lines?: StepLine[]; output?: string; trouble?: boolean }
 /** What Send to engineer sends: its conflicts (Fix conflicts), or a report of what failed, as auto mode sends one (tickets.ts fixTests; testrun.ts Failed). */
 export type SendBack = { kind: 'conflicts' } | { kind: 'fix'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; missing?: number
-  look?: boolean; review?: boolean; tester?: boolean }
+  outside?: number; look?: boolean; review?: boolean; tester?: boolean }
 /** Bug 373: what the ticket's engineer did with a check the user sent it, kept on that check once the engineer finishes the ticket again (mergewatch.ts
  *  finishTicket): when, the commit it handed over, the files it changed since the commit HQ tested (`more`: how many more the list leaves out) and what it wrote
  *  in its handoff log meanwhile ('' when nothing). What it found used to stay in its terminal. */
@@ -33,7 +33,7 @@ export type CheckTested = { test: string; counts: Counts | null; ms: number; out
  *  UI tester cost; `read_tokens`: the reader's tokens. `sent_at`: when the user sent the failure to its engineer; `back`: what that engineer did with it. */
 export type HqCheck = { id: string; state: 'running' | 'pass' | 'fail' | 'error' | 'stopped'; sha: string; base: string; base_sha: string; finished_sha: string | null
   started_at: number; ended_at?: number; why?: string; now?: StepKind; steps: CheckStep[]; cost_usd?: number; read_tokens?: number; send?: SendBack; sent_at?: number
-  back?: CheckBack; tested?: CheckTested }
+  back?: CheckBack; tested?: CheckTested; prep?: string } // prep (Bug 411): what HQ waits for before its first step (a helper working out the project's test steps)
 
 /** The ticket's check, or null: never tested, or a record HQ can't read. */
 export function checkOf(t: { hq_check?: string | null }): HqCheck | null {
@@ -97,10 +97,13 @@ export function checkButton(t: { key: string; status: string; finished_sha?: str
     + 'main, the tests for its criteria, the app, a reader of its changes (bigger tickets) and the UI tester. It only reports: nothing is merged or sent back unless '
     + 'you say so. The tests and the app are free; the reader and the UI tester use Claude, usually under $1.' }
   if (!c) return fresh
-  if (c.state === 'running') return { label: 'Testing…', tone: 'plain', start: false, tip: `HQ is testing ${t.key}: ${c.now ? STEP_DOING[c.now] : 'starting'}. Click to watch it or stop it.` }
+  if (c.state === 'running') return { label: 'Testing…', tone: 'plain', start: false,
+    tip: `HQ is testing ${t.key}: ${c.prep ?? (c.now ? STEP_DOING[c.now] : 'starting')}. Click to watch it or stop it.` }
   if (outOfDate(t, c)) return { label: 'Results out of date', tone: 'grey', start: false,
     tip: `${t.key}'s engineer finished it again after HQ's test, so the results are about older code. Click to read them or test again.` }
   if (c.state === 'pass') return { label: 'View results ✓', tone: 'green', start: false, tip: `Everything HQ tested on ${t.key} passed. Click for the results.` }
+  if (commandGap(c)) return { label: 'View results ⚠', tone: 'amber', start: false, tip: `The tests passed when HQ tested ${t.key}, and none failed, but ${gapWords(c)}. `
+    + 'Click for which. Its engineer can\'t change the test command: set one that runs them (Auto box), then test again.' } // Bug 411
   if (unseenOnly(c)) return { label: 'View results ⚠', tone: 'amber', start: false, tip: `The tests passed when HQ tested ${t.key}, and none failed, but `
     + `${unseenWords(unseenCount(c))}. Click for which, and to send it to its engineer.` }
   if (c.state === 'fail') return { label: 'View results ✗', tone: 'red', start: false, tip: `Something failed when HQ tested ${t.key}. Click for what, and to send it to its engineer.` }
@@ -109,8 +112,9 @@ export function checkButton(t: { key: string; status: string; finished_sha?: str
 
 /** The results' heading line. */
 export function checkHeadline(c: HqCheck): string {
-  if (c.state === 'running') return `Testing… ${c.now ? STEP_DOING[c.now] : 'starting'}`
+  if (c.state === 'running') return `Testing… ${c.prep ?? (c.now ? STEP_DOING[c.now] : 'starting')}`
   if (c.state === 'pass') return 'Everything HQ tested passed'
+  if (commandGap(c)) return `The tests passed, but ${gapWords(c)}`
   if (unseenOnly(c)) return `The tests passed, but ${unseenWords(unseenCount(c))}`
   if (c.state === 'fail') { const f = c.steps.find((s) => s.state === 'fail'); return `${f ? STEP_NAME[f.kind] : 'A check'} failed` }
   if (c.state === 'stopped') return `Stopped: ${c.why ?? 'before it finished'}`
@@ -131,7 +135,12 @@ export function checkFacts(c: HqCheck): string {
   return `${c.sha.slice(0, 7)} merged into ${c.base} (${c.base_sha.slice(0, 7)})${c.state === 'running' ? '' : ` · took ${took}`}${cost}${read}`
 }
 /** Send to engineer is offered: something failed that its engineer can fix, and it hasn't gone to them yet. */
-export const canSend = (t: { finished_sha?: string | null }, c: HqCheck): boolean => c.state === 'fail' && !!c.send && !c.sent_at && !outOfDate(t, c)
+/** Bug 411: every named test HQ didn't see run is in a folder its test command runs nothing in. The command is what's missing, so there is nothing to send
+ *  the ticket's engineer: the user sets a command that runs those tests, and tests again. */
+/** "HQ's test command doesn't run the folder the tests named for its criteria are in" (or "a test … is in"). */
+export const gapWords = (c: HqCheck): string => `HQ's test command doesn't run the folder ${unseenCount(c) === 1 ? 'a test named for its criteria is' : 'the tests named for its criteria are'} in`
+export const commandGap = (c: HqCheck): boolean => unseenOnly(c) && c.send?.kind === 'fix' && !!c.send.outside && c.send.outside >= (c.send.missing ?? c.send.outside)
+export const canSend = (t: { finished_sha?: string | null }, c: HqCheck): boolean => c.state === 'fail' && !!c.send && !c.sent_at && !outOfDate(t, c) && !commandGap(c)
 /** What the merge records when the user merges a ticket HQ's check passed: only for the very commits it tested, the ticket's and main's. */
 export function testedFor(c: HqCheck | null, head: string, baseSha: string): (CheckTested & { on: string; at: number }) | null {
   if (!c || c.state !== 'pass' || !c.tested || c.sha !== head || c.base_sha !== baseSha) return null

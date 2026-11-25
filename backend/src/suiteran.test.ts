@@ -13,7 +13,9 @@ migrate()
 const { emit } = await import('./events.ts')
 const { getAgent } = await import('./agents.ts')
 const { getTicket } = await import('./records.ts')
-const { changerAfter, keepBefore, keepState, runsSuite, suiteProblem, suiteRan, worktreeState } = await import('./suiteran.ts')
+const { changerAfter, keepBefore, keepState, runsSuite, suiteCmd, suiteProblem, suiteRan, worktreeState } = await import('./suiteran.ts')
+const { getRepo } = await import('./records.ts')
+const { readSteps, writeSteps } = await import('./teststepsstore.ts')
 
 const WT = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-suiteran-wt-')), now = Date.now()
 const pkg = (scripts: Record<string, string>) => fs.writeFileSync(path.join(WT, 'package.json'), JSON.stringify({ name: 'shop', private: true, scripts }))
@@ -181,4 +183,26 @@ test('Bug 213: `npm test && sed -i … && git commit` in one line asks for a run
   bash('npm test && git commit -qam y', undefined, 'eng-3', 'u9'); handoff('before_pr', 'eng-3'); assert.equal(await suiteProblem(t2()), null, 'no PreToolUse, only a commit after')
   bash("npm test && sed -i 's/1/2/' list.js", undefined, 'eng-3', 'u10'); bash('npm test', undefined, 'eng-3', 'u11'); handoff('before_pr', 'eng-3')
   assert.equal(await suiteProblem(t2()), null, 'only the last run counts')
+})
+
+// Bug 411: a project with saved test steps. An engineer's command is the steps as its own session can run them, in its own worktree.
+test('Bug 411: an engineer\'s test command is the saved steps: the parts with tests in its worktree, without one only HQ\'s sandbox can run', () => {
+  const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-suiteran-steps-')), g = (...a: string[]) => execFileSync('git', a, { cwd: wt, stdio: 'ignore' })
+  const put = (f: string, text = '') => { fs.mkdirSync(path.dirname(path.join(wt, f)), { recursive: true }); fs.writeFileSync(path.join(wt, f), text) }
+  g('init', '-q', '-b', 'main'); put('web/package.json', '{"scripts":{"test":"node --test"}}'); put('web/list.test.js'); put('api/main.py'); put('.gitignore', 'node_modules/\n')
+  put('web/node_modules/x/x.test.js'); g('add', '.'); g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base')
+  const repo = () => getRepo('r1')!, part = (dir: string, test: string, more = {}) => ({ dir, test, tests: true, engineers: true, ...more })
+  const save = (parts: ReturnType<typeof part>[]) => writeSteps('r1', { ...readSteps('r1'), steps: { parts, left_out: [], notes: '' } })
+  assert.equal(suiteCmd(repo(), wt), '(cd "web" && npm test)') // no steps: the rules, as before
+  save([part('api', 'uv run pytest -v'), part('web', 'npm test')])
+  assert.equal(suiteCmd(repo(), wt), '(cd "web" && npm test)') // api/ has no test files in this worktree yet: its part is left out here
+  put('api/tests/test_app.py') // a new test file, not committed yet: it counts
+  const later = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-suiteran-steps2-')); fs.cpSync(wt, later, { recursive: true }) // another worktree: the first one's list is kept for a second
+  assert.equal(suiteCmd(repo(), later), '(cd "api" && uv run pytest -v) && (cd "web" && npm test)')
+  save([part('api', 'poetry run pytest -v', { engineers: false }), part('web', 'npm test')])
+  assert.equal(suiteCmd(repo(), later), '(cd "web" && npm test)') // a part an engineer's session can't run is HQ's alone
+  save([part('api', 'poetry run pytest -v', { engineers: false })])
+  assert.equal(suiteCmd(repo(), later), '(cd "web" && npm test)') // nothing of the steps left for an engineer: what the rules find
+  setRepo('test_cmd = ?', 'make check'); assert.equal(suiteCmd(repo(), later), 'make check'); setRepo('test_cmd = NULL') // the user's own command comes first
+  assert.equal(suiteCmd(repo(), null), null); writeSteps('r1', { ...readSteps('r1'), steps: null })
 })

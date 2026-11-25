@@ -54,6 +54,13 @@ async function commitAndOpen(p: P, t: any, eng: any, files: Record<string, strin
   await waitFor(`${t.key} finished`, async () => (await tk(t))?.status === 'pr_ready')
 }
 const check = (t: any) => hq.api(`tickets/${t.id}/check`, {})
+/** Bug 411: when HQ's command would leave test files out, HQ first asks a helper for the project's test steps (teststeps.ts; its own tests are in
+ *  teststeps.test.ts). Here the helper says it can't, so HQ tests with what its rules find. */
+async function noSteps(p: P): Promise<void> {
+  const id = await waitFor('a test steps helper', async () => (await hq.state()).previews.find((x: any) => x.id === p.repo.id)?.test_steps?.helper_agent_id, 30_000)
+  await waitFor('the helper to be running', async () => (await hq.state()).agents.find((a: any) => a.id === id && a.status === 'working'), 30_000)
+  assert.equal((await hq.mcp(id, 'report_cant_test_steps', { reason: 'Nothing here can run that folder\'s tests.' })).isError, false)
+}
 /** HQ's own notice to the project's TPM that matches `re` (Bug 373: what it hears when a ticket goes back, and when it is finished again). */
 const toTpm = (p: P, re: RegExp) => waitFor(`HQ to tell the TPM ${re}`, async () =>
   (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === p.f.tpm_agent_id && re.test(m.body)))
@@ -123,13 +130,51 @@ test('Bug 376: a file line from web/\'s run doesn\'t count for admin/\'s file at
   const { t } = await finished(p, 'Due dates', { 'web/src/api.test.ts': "test('has due_on', () => {})\n", 'admin/src/api.test.ts': "test('lists the users', () => {})\n" },
     '(cd "web" && npm test)', { criteria, tests })
   const states = async () => JSON.parse((await tk(t)).proof).tests.map((e: any) => e.state)
-  assert.equal((await check(t)).status, 200); const c = await ended(t)
-  assert.equal(c.state, 'pass', JSON.stringify(c)); assert.match(c.steps[0]!.words, /^`\(cd "web" && npm test\)` passed/)
-  assert.deepEqual(c.steps[1]!.lines![1], { text: 'A2: admin/src/api.test.ts · "lists the users" · in a passing run; the test command doesn\'t print every test\'s name, so HQ '
-    + 'couldn\'t confirm it', tone: 'plain' }) // before the fix: "passed in HQ's test run"
-  assert.deepEqual(await states(), ['passed', 'unconfirmed'])
+  assert.equal((await check(t)).status, 200); await noSteps(p); const c = await ended(t) // admin/'s test file is one the command runs nothing of: a helper is asked first
+  // Bug 376: web/'s line no longer made admin/'s test read "passed in HQ's test run". Bug 411: HQ runs the command part by part and knows it runs nothing in
+  // admin/, so it says that, where it used to say it couldn't confirm the test: the command is what's missing, and the check is amber, not green
+  assert.equal(c.state, 'fail', JSON.stringify(c)); assert.match(c.steps[0]!.words, /^`\(cd "web" && npm test\)` passed/)
+  assert.deepEqual(c.steps[1]!.lines![1], { text: 'A2: admin/src/api.test.ts · "lists the users" · HQ\'s test command runs nothing in admin/', tone: 'bad' })
+  assert.deepEqual(await states(), ['passed', 'not_run']); assert.equal(checkHeadline(c), "The tests passed, but HQ's test command doesn't run the folder a test named for its criteria is in")
   // the user's own command, which HQ doesn't build: where its runner starts is the user's to know, so the line counts for both files, as before Bug 376
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'cd web && npm test' })).status, 200)
+  assert.equal((await check(t)).status, 200)
+  const again = await waitFor('the second check to end', async () => { const x = checkOf(await tk(t)); return x && x.id !== c.id && x.state !== 'running' ? x : null })
+  assert.equal(again.state, 'pass', JSON.stringify(again)); assert.deepEqual(await states(), ['passed', 'passed'])
+})
+
+// Bug 411: a frontend/ with a test script beside a backend/ of pytest tests. HQ's rules stop at the frontend, so a ticket's tests in backend/ never ran, and the
+// ticket went back to its engineer with "put it where that command runs it" (it wrapped pytest in the frontend's runner). The command is what's missing.
+test('Bug 411: a named test where HQ\'s test command runs nothing is the command\'s gap: amber, said on the check and in the Auto box, with nothing to send the engineer', async () => {
+  const pkg = JSON.stringify({ name: 'frontend', private: true, scripts: { test: 'node --test' } })
+  const p = await project('b411', { 'frontend/package.json': pkg, 'frontend/ok.test.js': PASS, 'backend/pyproject.toml': '[project]\nname = "api"\nversion = "0.1.0"\n',
+    'backend/tests/test_app.py': 'def test_answers():\n    assert True\n', 'backend/print.js': "console.log('tests/test_downloads.py::test_download_is_listed PASSED')\n" })
+  const CMD = '(cd "frontend" && npm test)'
+  // the Auto box: the command HQ found, and the tests it runs nothing of
+  const box = (await hq.api(`repos/${p.repo.id}/auto-check`, {})).json
+  assert.equal(box.found, CMD); assert.deepEqual(box.not_run, ['backend/ (1 Python test file)'])
+  const criteria = [{ kind: 'backend', text: 'A downloaded file is in the list of downloads.' }, { kind: 'ui', text: 'The list shows each item.' }]
+  const tests = [{ criterion: 'A1', file: 'backend/tests/test_downloads.py', name: 'test_download_is_listed' }, { criterion: 'A2', file: 'frontend/list.test.js', name: 'shows the list' }]
+  const { t, eng } = await finished(p, 'Downloads', { 'backend/tests/test_downloads.py': 'def test_download_is_listed():\n    assert True\n',
+    'frontend/list.test.js': "require('node:test').test('shows the list',()=>{})\n" }, CMD, { criteria, tests })
+  const states = async () => JSON.parse((await tk(t)).proof).tests.map((e: any) => e.state)
+  assert.equal((await check(t)).status, 200); await noSteps(p); const c = await ended(t) // the helper HQ asks first can't: the rules' command it is
+  assert.equal(c.state, 'fail', JSON.stringify(c)); assert.deepEqual(await states(), ['not_run', 'passed'])
+  assert.equal(checkHeadline(c), "The tests passed, but HQ's test command doesn't run the folder a test named for its criteria is in"); assert.deepEqual(await button(t), ['View results ⚠', 'amber'])
+  assert.match(c.steps[0]!.words, /^`\(cd "frontend" && npm test\)` passed/)
+  assert.equal(c.steps[1]!.words, "1 test named for its criteria wasn't seen running. The tests themselves passed: none failed. HQ's test command (`(cd \"frontend\" && npm test)`) runs nothing "
+    + 'in backend/: set one that runs those tests too, in the Auto box, then test again.')
+  assert.deepEqual(c.steps[1]!.lines, [{ text: 'A1: backend/tests/test_downloads.py · "test_download_is_listed" · HQ\'s test command runs nothing in backend/', tone: 'bad' },
+    { text: 'A2: frontend/list.test.js · "shows the list" · passed in HQ\'s test run', tone: 'ok' }])
+  const send = c.send as { outside?: number; output: string }
+  assert.equal(send.outside, 1); assert.match(send.output, /never ran: HQ's test command runs nothing in backend\/ \(it runs frontend\/\)\.$/)
+  // nothing goes to its engineer: it can't change the command
+  const sent = await hq.api(`tickets/${t.id}/check-send`, {})
+  assert.equal(sent.status >= 400, true)
+  assert.match(sent.json.error, /HQ's test command doesn't run the folder T-01's tests are in.*Set a test command that runs them \(Auto box\), then press Test again\./)
+  assert.equal((await tk(t)).status, 'pr_ready'); assert.equal((await hq.state()).messages.some((m: any) => m.to_id === eng.id && /didn't run every test/.test(m.body)), false)
+  // the user sets a command that runs the backend's tests too (their own: it runs whole, as before), and the same ticket passes
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'cd frontend && npm test && cd ../backend && node print.js' })).status, 200)
   assert.equal((await check(t)).status, 200)
   const again = await waitFor('the second check to end', async () => { const x = checkOf(await tk(t)); return x && x.id !== c.id && x.state !== 'running' ? x : null })
   assert.equal(again.state, 'pass', JSON.stringify(again)); assert.deepEqual(await states(), ['passed', 'passed'])

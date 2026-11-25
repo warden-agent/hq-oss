@@ -23,6 +23,7 @@ import { killUnder, listenersUnder, pgidOf } from './procs.ts'
 import { sendMessage } from './delivery.ts'
 import { one, q } from './db.ts'
 import { readSetup } from './testsetupstore.ts'
+import { readSteps } from './teststepsstore.ts'
 import { j, sleep } from './util.ts'
 import * as tmux from './tmux.ts'
 
@@ -387,7 +388,8 @@ export async function recoverHelpers(repos: Repo[]): Promise<void> {
  *  launch-* worktree that isn't the row's is removed along with the test servers still running in it. */
 export async function sweepStrays(repo: Repo): Promise<void> {
   const p = row(repo.id), setup = readSetup(repo.id).job?.agent_id // the test setup helper has the same role, and its own job (testsetup.ts)
-  for (const a of liveAgents().filter((x) => x.role === 'launcher' && x.cwd === repo.path && x.id !== p?.helper_agent_id && x.id !== setup)) {
+  const steps = readSteps(repo.id).job?.agent_id // and so has the test steps helper (teststeps.ts)
+  for (const a of liveAgents().filter((x) => x.role === 'launcher' && x.cwd === repo.path && x.id !== p?.helper_agent_id && x.id !== setup && x.id !== steps)) {
     await stopAgent(a.id, 'stray launch helper').catch(() => {})
   }
   for (const w of await listWorktrees(repo.path).catch(() => [])) {

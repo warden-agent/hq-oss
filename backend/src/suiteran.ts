@@ -10,7 +10,7 @@
 // run too would make any test that writes files look like a change. So only a line with a command after the test command that may change
 // files (changerAfter: anything but reading, printing and committing what is there) has its state taken before it starts too (keepBefore, at
 // its PreToolUse hook), and the run doesn't count at open_pr if the files changed during the line, or if HQ couldn't see them before it.
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -19,13 +19,30 @@ import type { Agent } from './agents.ts'
 import { getFeature, getRepo, hqMoves, repoOfAgent, ticketForAgent, type Repo, type Ticket } from './records.ts'
 import { afterTestCmd, bare, isRefusal, ranTestCmd, refusedTestCmd } from './refused.ts'
 import { detectTests } from './testrun.ts'
+import { chain, partsHere, stepsOf } from './teststepsstore.ts'
 import { j } from './util.ts'
 
 const squeezed = (s: string): string => s.trim().replace(/\s+/g, ' ')
 const unquoted = (s: string): string => s.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ' Q ') // `git commit -m "npm test"` runs no tests
 /** The test command HQ runs for this ticket: the saved one, else the one it finds in the worktree. Null: none. */
 export function suiteCmd(repo: Repo, worktree: string | null): string | null {
-  return repo.test_cmd?.trim() || (worktree ? detectTests(worktree)?.test ?? null : null)
+  if (repo.test_cmd?.trim()) return repo.test_cmd.trim()
+  // Bug 411: the project's saved test steps, as far as an engineer's session can run them and as far as this worktree has their tests. HQ runs the rest itself
+  const steps = worktree ? stepsOf(repo.id) : null
+  if (steps) { const parts = partsHere(steps.parts.filter((p) => p.engineers), filesIn(worktree!)); if (parts.length) return chain(parts) }
+  return worktree ? detectTests(worktree)?.test ?? null : null
+}
+/** A worktree's files as git sees them, the new ones not yet committed too. Asked for on every Bash call of an engineer's (the hooks), so kept for a second. */
+const listed = new Map<string, { at: number; files: string[] }>()
+function filesIn(wt: string): string[] {
+  const kept = listed.get(wt); if (kept && Date.now() - kept.at < 1000) return kept.files
+  let files: string[] = []
+  try {
+    files = execFileSync('git', ['--no-optional-locks', '-c', 'core.quotepath=off', 'ls-files', '--cached', '--others', '--exclude-standard'],
+      { cwd: wt, encoding: 'utf8', maxBuffer: 256 << 20, timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(Boolean)
+  } catch { /* no checkout to list: no part applies, and the rules decide */ }
+  if (listed.size > 200) listed.clear()
+  listed.set(wt, { at: Date.now(), files }); return files
 }
 /** Does this Bash line run the test command `cmd` (or try to, when Claude Code refused it)? Engineers add options, cut the output down and
  *  `cd` into their worktree first, so the line is taken apart as refused.ts does; a line that holds the command word for word also counts. */

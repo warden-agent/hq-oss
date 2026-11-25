@@ -42,7 +42,7 @@ function post(body, token) {
 }
 /** The project's test command as HQ last saved it; null when there's none, or no file to read. */
 function testCmd() {
-  try { const c = JSON.parse(fs.readFileSync(cmdsFile, 'utf8'))[repoId]; return typeof c === 'string' ? c : null } catch { return null }
+  try { const c = JSON.parse(fs.readFileSync(cmdsFile, 'utf8'))[repoId]; return typeof c === 'string' || Array.isArray(c) ? c : null } catch { return null } // saved steps: a list (Bug 411)
 }
 /** Would HQ hold this command for a turn? Anything that can't be read or worked out counts as no: the command goes ahead, as it did before this script. */
 async function heavy(body) {

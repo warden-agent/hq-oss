@@ -36,6 +36,7 @@ import { answerAsk, answerOpenAsks, openAsks } from './asks.ts'
 import { freePort, NeedsSetup, previews, setPreviewCommand, startPreview, StepsOutdated, stopPreview } from './preview.ts'
 import { approve, dismiss, launchWithoutRecipe, startHelper } from './launchhelper.ts'
 import { dismissSetup, startSetupHelper } from './testsetup.ts'
+import { dismissSteps, startStepsHelper } from './teststeps.ts'
 import { runScenario, type Step } from './scenario.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
 import { startFirstMap } from './firstmap.ts'
@@ -227,6 +228,10 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     }
     if (r0 === 'previews' && r1 && r2 === 'test-setup' && req.method === 'POST') { // Tester & Checker, Part 3
       const act = body.action === 'dismiss' ? () => dismissSetup(r1) : () => startSetupHelper(r1)
+      try { await act(); return json(res, 200, { ok: true }) } catch (e) { return json(res, 409, { error: e instanceof Error ? e.message : String(e) }) }
+    }
+    if (r0 === 'repos' && r1 && r2 === 'test-steps' && req.method === 'POST') { // Bug 411: the user asks Claude to work the test steps out (again), or stops it
+      const act = body.action === 'dismiss' ? () => dismissSteps(r1) : () => startStepsHelper(r1) // a first time, or again when there are steps already
       try { await act(); return json(res, 200, { ok: true }) } catch (e) { return json(res, 409, { error: e instanceof Error ? e.message : String(e) }) }
     }
     if (r0 === 'previews' && r1 && r2 === 'scenario' && req.method === 'POST') { // a scripted scenario: the app on its seed, these steps, the timeline

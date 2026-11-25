@@ -15,6 +15,7 @@ import { beingStopped, getAgent, liveAgents, update, type Agent } from './agents
 import { resolveKind } from './attention.ts'
 import { sendMessage } from './delivery.ts'
 import { heavyKind } from './heavy.ts'
+import { savedCmd, stepsOf } from './teststepsstore.ts'
 import { lstartMs, psEnv } from './procs.ts'
 import { getRepo, repoOfAgent, type Ticket } from './records.ts'
 import * as tmux from './tmux.ts'
@@ -33,7 +34,7 @@ export function waitingText(agentId: string): string | null {
 /** A command kept running and watched: --watch modes and dev servers never end by themselves, so they don't count even as tests or builds. */
 const WATCH = /(?:^|\s)(?:--watch(?:All)?(?:=(?!false|0)\S*)?|-w|watch|dev|serve|preview)(?=\s|$)/
 /** The background task a Bash call's PostToolUse says it left running, if HQ should watch it. */
-export function watchedTask(input: Record<string, unknown>, resp: unknown, testCmd: string | null): string | null {
+export function watchedTask(input: Record<string, unknown>, resp: unknown, testCmd: string | string[] | null): string | null {
   const task = (resp as { backgroundTaskId?: unknown } | null)?.backgroundTaskId; if (typeof task !== 'string' || !task) return null
   if (input.run_in_background !== true) return task // it was meant to finish: a timeout, or moved so a message could reach the agent
   const cmd = String(input.command ?? ''); return heavyKind(cmd, testCmd) && !WATCH.test(cmd) ? task : null
@@ -168,7 +169,7 @@ export async function stopFrozen(agentId: string, by: 'user' | 'auto'): Promise<
   const minutes = Math.max(1, Math.round((t - Math.min(...hit.map((x) => x.r.quietSince))) / 60_000)), cmds = hit.map((x) => `\`${cut(x.r.command, 120)}\``).join(', ')
   // Bug 181: read the agent again after the waits; one stopped, replaced or begun anew meanwhile isn't told about a run of a session that's over
   const still = getAgent(a.id), same = !!still && still.status !== 'exited' && !beingStopped(a.id) && still.claude_session_id === a.claude_session_id
-  const testCmd = getRepo(repoOfAgent(a) ?? '')?.test_cmd
+  const its = getRepo(repoOfAgent(a) ?? ''), testCmd = its ? savedCmd(its.test_cmd, stepsOf(its.id)) : null
   if (same) sendMessage({ repoId: a.repo_id, featureId: a.feature_id, channel: 'dm', from: 'hq', to: a.id, reason: 'fyi', body: `Your background run ${cmds} did nothing `
     + `for ${minutes} min (no CPU, no output), so HQ stopped it. Don't wait on a run in the background: run only the test files for what you changed, with the test `
     + "runner's force-exit and per-test time limit (for node --test: --test-force-exit --test-timeout=120000). "

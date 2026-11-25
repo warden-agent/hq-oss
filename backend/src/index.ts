@@ -16,6 +16,7 @@ import { startListeners } from './listeners.ts'
 import { recoverPreviews, resumeRestarts } from './preview.ts'
 import { recoverHelpers, resumeTries } from './launchhelper.ts'
 import { recoverSetupHelpers } from './testsetup.ts'
+import { recoverStepsHelpers } from './teststeps.ts'
 import { repos } from './records.ts'
 import { emit } from './events.ts'
 import { attention } from './attention.ts'
@@ -78,6 +79,7 @@ async function main(): Promise<void> {
   await recoverPreviews() // before the merge watcher: its first check can restart a preview
   await recoverHelpers(repos()).catch((e) => console.error('launch helper recovery failed', e))
   await recoverSetupHelpers(repos()).catch((e) => console.error('test setup helper recovery failed', e))
+  await recoverStepsHelpers(repos()).catch((e) => console.error('test steps helper recovery failed', e))
   startBgRuns() // before the first sweep and any hook: it reads back what agents wait on in the background (Bug 96)
   rebuildHelpers() // and the helpers they started in the background, after it: a helper's line comes first (Bug 232)
   rebuildTurns() // Bug 281: each agent's last turn start, prompt and Stop, so a quick Escape on a turn from before the restart still ends it

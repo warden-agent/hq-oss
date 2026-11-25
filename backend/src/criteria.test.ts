@@ -4,8 +4,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import { boxCriteria, byKind, confirm, covers, criteriaBlock, criteriaMd, criteriaOf, criteriaSummary,
-  flagsFor, isTestFile, lookLines, namesFile, nameWatch, proofProblem, proofWords, ranWords, readCriteria, tidyProof, unproven, watchFor,
-  type Changed, type Criterion, type Proof } from './criteria.ts'
+  flagsFor, isTestFile, leftOutOf, lookLines, mergeWatched, namesFile, nameWatch, outsideParts, proofProblem, proofWords, ranWords, readCriteria, tidyProof, unproven, watchFor,
+  type Changed, type Criterion, type Proof, type Watch } from './criteria.ts'
 
 const list = (r: ReturnType<typeof readCriteria>): Criterion[] => { assert.ok('list' in r, 'error' in r ? r.error : ''); return r.list }
 const error = (r: ReturnType<typeof readCriteria>): string => { assert.ok('error' in r); return r.error }
@@ -326,4 +326,70 @@ test('what goes back to the engineer, and what the summary lists as worth a look
   assert.deepEqual(proofWords(undefined), { text: 'no test named yet', tone: 'none' })
   assert.deepEqual(proofWords({ ...T1, state: 'passed' }), { text: 'test/list.test.js · "shows each due date" · passed in HQ\'s test run', tone: 'ok' })
   assert.equal(proofWords(T1).tone, 'none'); assert.equal(proofWords({ criterion: 'A2', cant_test: 'why' }).tone, 'look'); assert.equal(proofWords({ ...T1, state: 'unconfirmed' }).tone, 'look')
+})
+
+// Bug 411: a repo with frontend/ (npm) and backend/ (pytest) ran the frontend's tests only, and the backend's named tests "never ran". HQ now runs each
+// folder's suite as a part of its own and judges each part's output on its own. What the runners print, captured through HQ's sandbox on 2026-11-25:
+// pytest 9.2 -v, Python 3.14's unittest -v, Django 5.2's `manage.py test -v 2`.
+const cap411 = (name: string): string => readFileSync(new URL(`./testdata/bug411/${name}.txt`, import.meta.url), 'utf8')
+const st411 = (out: string, name: string, file: string, folders: string[] | null = null) => { const w = nameWatch({ names: [name], files: [file] }, folders); w.take(out)
+  return confirm({ criterion: 'A1', file, name }, w.seen()) }
+test('Bug 411: pytest -v, unittest -v and Django\'s own test runner name each test, and HQ reads the names', () => {
+  const py = cap411('pytest-9.2.0-v'), ut = cap411('unittest-3.14-v'), dj = cap411('django-5.2-test-v2'), B = 'backend/tests/test_downloads.py'
+  assert.equal(st411(py, 'test_download_is_listed', B, ['backend']), 'passed'); assert.equal(st411(py, 'test_lists_are_per_user', B, ['backend']), 'passed') // `test_lists_are_per_user[a]`
+  assert.equal(st411(py, 'test_downloads_survive_restart', B, ['backend']), 'skipped')
+  assert.equal(st411(py, 'test_never_written', 'backend/tests/test_other.py', ['backend']), 'not_run') // pytest -v lists every test, and not this one
+  assert.equal(st411(ut, 'test_total_adds_prices', 'tests/test_cart.py'), 'passed'); assert.equal(st411(ut, 'test_discount_is_applied', 'tests/test_cart.py'), 'skipped')
+  assert.equal(st411(ut, 'test_never_written', 'tests/test_cart.py'), 'not_run')
+  assert.equal(st411(dj, 'test_price_is_in_whole_units', 'catalog/tests.py'), 'passed') // printed glued to the end of a migration's line
+  assert.equal(st411(dj, 'test_products_are_saved', 'catalog/tests.py'), 'passed'); assert.equal(st411(dj, 'test_never_written', 'catalog/tests.py'), 'not_run')
+  // what must not be read as a test passing: a migration's own line, an install's
+  const w = nameWatch({ names: ['auth', 'packages'], files: [] })
+  w.take('  Applying auth.0001_initial... OK\n  Applying auth.0002_alter_permission_name_max_length... OK\nadded 3 packages ... ok\nok\n')
+  assert.deepEqual(w.seen(), { prints: false, passed: [], skipped: [], unsure: [] })
+})
+test('Bug 411: run part by part, each suite is judged by its own output, and a test in no part\'s folder is told apart', () => {
+  const part = (dir: string, out: string, w: Watch) => { const x = nameWatch(w, [dir]); x.take(out); return { dir, seen: x.seen() } }
+  const A1 = { criterion: 'A1', file: 'backend/tests/test_downloads.py', name: 'test_download_is_listed' }, A2 = { criterion: 'A2', file: 'backend/tests/test_other.py', name: 'test_never_written' }
+  const A3 = { criterion: 'A3', file: 'web/src/api.test.ts', name: 'has due_on' }, A4 = { criterion: 'A4', file: 'mobile/app/list.test.ts', name: 'shows the list' }
+  const map = [A1, A2, A3, A4], w = watchFor(map), py = cap411('pytest-9.2.0-v'), vi = cap372('vitest-4.1.11')
+  // the frontend's vitest counts 6 tests and names one; the backend's pytest names each of its 7
+  const both = mergeWatched([part('backend', py, w), part('web', vi, w)])
+  assert.deepEqual(both.parts, [{ dir: 'backend', prints: true }, { dir: 'web', prints: false }]); assert.equal(both.prints, false)
+  assert.deepEqual(map.map((e) => confirm(e, both)), ['passed', 'not_run', 'passed', 'not_run']) // A2: pytest listed its tests, and not this one. A4: nobody ran mobile/
+  // with one flag for the whole run a quiet suite's file lines could push a names-printing suite's missing test to "couldn't see it": 8 named, 506 counted
+  const big = `${vi} ✓ src/more.test.ts (500 tests) 9ms\n`, one = nameWatch(w, ['backend', 'web']); one.take(`${py}\n${big}`)
+  assert.equal(confirm(A2, one.seen()), 'unconfirmed'); assert.equal(confirm(A2, mergeWatched([part('backend', py, w), part('web', big, w)])), 'not_run')
+  // and a suite that prints no names can't have its tests read "never ran" because the suite beside it lists its own
+  const quiet = mergeWatched([part('backend', PYTEST_Q, w), part('web', NODE, w)])
+  assert.equal(confirm(A2, quiet), 'unconfirmed'); assert.equal(confirm({ ...A3, name: 'removes an item' }, quiet), 'not_run')
+  const flat = nameWatch(w, null); flat.take(`${PYTEST_Q}${NODE}`); assert.equal(confirm(A2, flat.seen()), 'not_run') // what one flag said of the quiet suite's test
+  // a part at the project's root holds every file; a name with no file goes by every part
+  const root = mergeWatched([part('web', NODE, w), { dir: '.', seen: { prints: false, passed: [], skipped: [], unsure: [] } }])
+  assert.equal(confirm({ ...A3, name: 'removes an item' }, root), 'unconfirmed'); assert.equal(confirm({ criterion: 'A5', name: 'no file given' }, both), 'unconfirmed')
+  assert.equal(outsideParts(A4, both.parts), true); assert.equal(outsideParts(A2, both.parts), false); assert.equal(outsideParts(A4, root.parts), false)
+  assert.equal(outsideParts(A4, undefined), false); assert.equal(outsideParts({ criterion: 'A5', name: 'x' }, both.parts), false) // nothing to go by: as before
+  // what the engineer is told: the command's gap for the one, today's words for the other
+  const lines = unproven(map.map((e) => ({ ...e, state: confirm(e, both) })), '(cd "backend" && uv run pytest -v) && (cd "web" && npm test)', both.parts)
+  assert.match(lines[0]!, /^A2: "test_never_written" in backend\/tests\/test_other\.py never ran\. `\(cd "backend" .*listed other tests and not this one: put it where that command runs it\.$/)
+  assert.equal(lines[1], 'A4: "shows the list" in mobile/app/list.test.ts never ran: HQ\'s test command runs nothing in mobile/ (it runs backend/, web/).'); assert.equal(lines.length, 2)
+  // skipped tests and what passed elsewhere carry over as before
+  const skip = mergeWatched([part('backend', py, { names: ['test_downloads_survive_restart'], files: [] }), part('web', NODE, { names: ['test_downloads_survive_restart'], files: [] })])
+  assert.deepEqual(skip.skipped, ['test_downloads_survive_restart']); assert.deepEqual(mergeWatched([]), { prints: false, passed: [], skipped: [], unsure: [], parts: [] })
+})
+
+test('Bug 411: a named test in something the project\'s test steps leave out says what is left out and why, and isn\'t the command\'s gap', () => {
+  const parts = [{ dir: 'backend', prints: true }, { dir: 'web', prints: true }]
+  const left = [{ path: 'backend/tests/integration', why: 'It needs a database server.' }, { path: 'mobile', why: 'It needs a phone.' }]
+  const A1 = { criterion: 'A1', file: 'backend/tests/integration/test_db.py', name: 'test_saves_to_the_database', state: 'not_run' as const }
+  const A2 = { criterion: 'A2', file: 'mobile/app/list.test.ts', name: 'shows the list', state: 'not_run' as const }
+  const A3 = { criterion: 'A3', file: 'docs/a.test.ts', name: 'x', state: 'not_run' as const }
+  const lines = unproven([A1, A2, A3], 'cmd', parts, left)
+  assert.equal(lines[0], 'A1: "test_saves_to_the_database" in backend/tests/integration/test_db.py never ran: HQ\'s test steps leave backend/tests/integration out (It needs a database server.), '
+    + "so HQ can't see it run. Name a test for A1 that HQ's test command runs, or give the reason it can't be tested (cant_test).")
+  assert.match(lines[1]!, /^A2: "shows the list" in mobile\/app\/list\.test\.ts never ran: HQ's test steps leave mobile out \(It needs a phone\.\)/)
+  assert.match(lines[2]!, /never ran: HQ's test command runs nothing in docs\/ \(it runs backend\/, web\/\)\.$/) // left out by nobody: the command's gap, as before
+  assert.deepEqual([A1, A2, A3].map((e) => outsideParts(e, parts, left)), [false, false, true]) // what is left out on purpose is the engineer's to answer for, not the command's
+  assert.equal(leftOutOf('mobile', left)?.path, 'mobile'); assert.equal(leftOutOf('mobiles/a.test.ts', left), undefined); assert.equal(leftOutOf(undefined, left), undefined)
+  assert.equal(leftOutOf('anything/at/all.py', [{ path: '.', why: 'w' }])?.why, 'w'); assert.equal(unproven([A1], 'cmd', parts).length, 1) // no list given: today's words
 })

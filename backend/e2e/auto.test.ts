@@ -1378,6 +1378,42 @@ test('Bug 372: tests in a folder, run by a runner that prints a line per test fi
   assert.match(r.summary, new RegExp(`- ${t.key}: tests passed, but HQ couldn't see A2, A3's by name: the test command doesn't print every test's name`))
 })
 
+// Bug 411: web/ has a test script, backend/ has tests the rules' command runs nothing of. A ticket whose named tests are in backend/ used to go back to its
+// engineer ("put it where that command runs it"), three times over. The command is the gap, so the ticket waits for the user with the reason, and nothing is
+// sent to the engineer.
+test('Bug 411: a ticket whose named tests are where the test command runs nothing is parked with that reason, not sent back; with a command that runs them it merges', async () => {
+  const p = await project('split', { tests: false, auto: false })
+  for (const [f, text] of Object.entries({ 'web/package.json': JSON.stringify({ name: 'web', private: true, scripts: { test: 'node --test' } }), 'web/ok.test.js': PASS,
+    'backend/tests/test_app.py': 'def test_answers():\n    assert True\n', 'backend/print.js': "console.log('tests/test_downloads.py::test_download_is_listed PASSED')\n" })) {
+    fs.mkdirSync(path.dirname(path.join(p.dir, f)), { recursive: true }); fs.writeFileSync(path.join(p.dir, f), text)
+  }
+  sh(p.dir, 'add', '.'); sh(p.dir, 'commit', '-qm', 'web/ and backend/'); assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
+  const t = await withCriteria(p, 'Downloads', [{ kind: 'backend', text: 'A downloaded file is in the list of downloads.' }, { kind: 'backend', text: 'The list says how many items it holds.' }])
+  await turnEnds(p)
+  const e = await engineer(t)
+  const tests = [{ criterion: 'A1', file: 'backend/tests/test_downloads.py', name: 'test_download_is_listed' }, { criterion: 'A2', file: 'web/list.test.js', name: 'counts the items' }]
+  await build(p, t, e, { 'backend/tests/test_downloads.py': 'def test_download_is_listed():\n    assert True\n', 'web/list.test.js': "require('node:test').test('counts the items',()=>{})\n" })
+  assert.equal((await finish(e, tests)).isError, false)
+  // HQ first asks a helper for the project's test steps (its own tests: teststeps.test.ts). This one can't, so the rules' command is what tests the ticket
+  const helper = await waitFor('a test steps helper', async () => (await hq.state()).previews.find((x: any) => x.id === p.repo.id)?.test_steps?.helper_agent_id, 30_000)
+  await waitFor('the helper to be running', async () => (await hq.state()).agents.find((a: any) => a.id === helper && a.status === 'working'), 30_000)
+  assert.equal((await hq.mcp(helper, 'report_cant_test_steps', { reason: 'Nothing here can run that folder\'s tests.' })).isError, false)
+  const why = await waitFor(`${t.key} to be parked`, async () => (await tk(t)).auto_parked_why, 40_000)
+  assert.equal(why, "HQ didn't see the tests named for its criteria run: its test command (`(cd \"web\" && npm test)`) doesn't run the folder they are in. "
+    + "A1: \"test_download_is_listed\" in backend/tests/test_downloads.py never ran: HQ's test command runs nothing in backend/ (it runs web/). "
+    + 'Set a test command that runs those tests too (Auto box), then press Try again.')
+  const now0 = await tk(t)
+  assert.equal(now0.status, 'pr_ready'); assert.equal(now0.auto_tries, 0); assert.deepEqual(await cameBack(e.id), []) // nothing went to its engineer
+  assert.deepEqual((await proofNow(t)).tests.map((x: any) => x.state), ['not_run', 'passed'])
+  // the run ends with the ticket parked, and its summary says which tests HQ didn't run, and that Claude couldn't make it
+  const r = await waitFor('the run to finish', async () => (await runs(p)).find((x: any) => x.status === 'finished'), 30_000)
+  assert.match(r.summary, /## Tests HQ didn't run\n- backend\/ \(1 Python test file\): HQ's test command runs nothing there\. Claude couldn't work out test steps that run them: Nothing here can /)
+  // the user's own command runs the backend's tests too: Try again, and it merges
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'cd web && npm test && cd ../backend && node print.js' })).status, 200)
+  assert.equal((await hq.api(`tickets/${t.id}/auto-retry`, {})).status, 200)
+  await until(t, 'merged'); assert.deepEqual((await proofNow(t)).tests.map((x: any) => x.state), ['passed', 'passed'])
+})
+
 test('the TPM gives criteria as a list: a ticket without them is refused, and criteria changed after a ticket finished send it back for the new one\'s test', async () => {
   const p = await project('tpmcriteria', { auto: false }), tpm = p.tpm.id
   const no = await hq.mcp(tpm, 'create_ticket', { title: 'Adding', size: 'S', spec: 'Add numbers. Done when add(2, 3) gives 5.' })

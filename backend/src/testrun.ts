@@ -6,7 +6,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR, PATHS } from './config.ts'
 import { getSetting, now } from './db.ts'
 import { emit, patch } from './events.ts'
@@ -20,8 +20,10 @@ import { id, real } from './util.ts'
 import { seedPackages } from './worktrees.ts'
 import { onPath, ownInstall, packageManager } from './apprun.ts'
 import { shownLine, summaryLines, testCounts, type Counts } from './testcounts.ts'
-import { nameWatch, type Watch, type Watched } from './criteria.ts'
+import { mergeWatched, nameWatch, type Watch, type Watched } from './criteria.ts'
 import { lookIn, type LookPlan } from './smoke.ts'
+import { notRun, ruleParts, type NotRun } from './testcensus.ts'
+import { chain, partCmd, partsHere, type SavedPart } from './teststepsstore.ts'
 import type { Seen } from './smokerules.ts'
 
 /** `stop`: HQ can't install the packages the project's own way (its package manager isn't installed, say), in words for the user: nothing runs (Bug 392). */
@@ -53,14 +55,21 @@ function nodePart(root: string, rel: string): { install: string | null; test: st
   return { install, test, ...(own.stop ? { stop: rel === '.' ? own.stop : `${rel}: ${own.stop}` } : {}) }
 }
 const partTest = (p: string, run: string): string => `(cd ${JSON.stringify(p)} && ${run})`
-/** Bug 376: the folders a test command starts its runners in, when it is the command HQ builds for a repo split into folders (detectTests:
- *  `(cd "web" && npm test) && …`, also when the user saved it as theirs). A runner prints its files from the folder it starts in, so a file line in its
- *  output counts only for a file in one of these (criteria.ts namesFile). null for any other command: HQ can't tell where the user's own command starts
- *  its runners (`npm test` at the root may run each workspace's), so a file line counts for every file whose path ends the same, as before. */
-export function testFolders(cmd: string): string[] | null {
+/** One part of a test command HQ builds for a repo split into folders: the folder, and what runs in it. */
+export type TestPart = { dir: string; run: string; install?: string | null }
+/** Bug 411: the parts of a test command, when it is the chain HQ builds for a repo split into folders (detectTests: `(cd "web" && npm test) && …`, also when
+ *  the user saved it as theirs). HQ runs such a command one part at a time and judges each part's output on its own (runParts). null for any other command:
+ *  HQ can't take the user's own command apart, so it runs whole, as before. */
+export function testParts(cmd: string): TestPart[] | null {
   const c = cmd.trim(), ms = [...c.matchAll(/\(cd ("[^"\\$`/]+") && (npm test|yarn test|pnpm test|bun run test)\)/g)], ds = ms.map((m) => JSON.parse(m[1]!) as string)
-  return ds.length && !ds.some((d) => d === '.' || d === '..') && ms.map((m, i) => partTest(ds[i]!, m[2]!)).join(' && ') === c ? ds : null // that command exactly, or none
+  return ds.length && !ds.some((d) => d === '.' || d === '..') && ms.map((m, i) => partCmd(ds[i]!, m[2]!)).join(' && ') === c // that command exactly, or none
+    ? ds.map((dir, i) => ({ dir, run: ms[i]![2]! })) : null
 }
+/** Bug 376: the folders a test command starts its runners in, when it is the command HQ builds for a repo split into folders (testParts). A runner prints
+ *  its files from the folder it starts in, so a file line in its output counts only for a file in one of these (criteria.ts namesFile). null for any other
+ *  command: HQ can't tell where the user's own command starts its runners (`npm test` at the root may run each workspace's), so a file line counts for every
+ *  file whose path ends the same, as before. */
+export const testFolders = (cmd: string): string[] | null => testParts(cmd)?.map((p) => p.dir) ?? null
 /** How to test the checkout at `root`, worked out from its files with no model and no tokens; null when it has no tests HQ can find.
  *  The root's own test script wins; a repo split into folders (server/, web/) runs each folder's. */
 export function detectTests(root: string): TestPlan | null {
@@ -82,6 +91,19 @@ export function detectTests(root: string): TestPlan | null {
   if (has(root, 'Makefile') && /^test:/m.test(fs.readFileSync(path.join(root, 'Makefile'), 'utf8'))) return { install: null, test: 'make test' }
   return null
 }
+
+/** Bug 411: the test files of commit `ref` in this checkout that the rules' command (detectTests) runs nothing of: a backend/ full of pytest tests beside
+ *  a frontend/ whose `npm test` is all the rules found. Read from git's list of the commit's files and the checkout's manifests; no tokens. [] when there are
+ *  none, and when git can't say (a folder that is no repo): the page then says nothing, which is what it said before. */
+export async function rulesSkip(checkout: string, ref = 'HEAD'): Promise<NotRun[]> {
+  try {
+    const files = await filesAt(checkout, ref), set = new Set(files), plan = detectTests(checkout)
+    return notRun(files, plan ? ruleParts(plan.test) : [], (p) => set.has(p), (p) => { try { return fs.readFileSync(path.join(checkout, p), 'utf8') } catch { return '' } })
+  } catch { return [] }
+}
+/** The files of commit `ref`, as git lists them (so nothing installed or ignored), from any checkout of the repo. A big repo's list is long: its own buffer. */
+export const filesAt = (checkout: string, ref = 'HEAD'): Promise<string[]> => new Promise((resolve, reject) => execFile('git', ['--no-optional-locks', '-c', 'core.quotepath=off',
+  'ls-tree', '-r', '--name-only', ref], { cwd: checkout, maxBuffer: 256 << 20, timeout: 30_000 }, (e, o) => e ? reject(e) : resolve(o.split('\n').filter(Boolean))))
 
 const q = (s: string): string => JSON.stringify(s)
 /** What a test run can't read: HQ's and Claude's own files and the user's credentials. The install step has the network on, so a
@@ -153,7 +175,10 @@ export async function sandboxProblem(): Promise<string | null> {
 }
 /** `output`: the last TAIL characters. `earlier`: the lines before those that named a failure or an error, '' when none did (Bug 82). `summary`: the test runners'
  *  summary lines from anywhere in the output, null when there were too many to keep (testcounts.ts, Bug 126). */
-export type RunResult = { code: number | null; output: string; earlier: string; timedOut: boolean; sandboxFailed: boolean; summary?: string[] | null; names?: Watched }
+export type RunResult = { code: number | null; output: string; earlier: string; timedOut: boolean; sandboxFailed: boolean; summary?: string[] | null; names?: Watched
+  cmd?: string; ran?: PartRan[] } // cmd (Bug 411): of a command run part by part, the part this result is of (the one that failed or was stopped); ran: when all passed, each part
+/** One part of a run that passed: its folder, its command, and the count its runner's summary gave (null: none HQ could read). */
+export type PartRan = { dir: string; cmd: string; counts: Counts | null }
 const TAIL = 8000, EARLIER = 4000
 /** How long a run past its time limit gets after Ctrl+C before it's killed: node's test runner names the tests still running when it
  *  gets one, and prints nothing when it's killed outright (Bug 82: one engineer got 3,000 characters of passing tests). Seen on
@@ -208,9 +233,10 @@ export function sweepRunTmp(): string[] {
   return gone
 }
 /** Runs `cmd` in `cwd` in the sandbox with a clean environment: no tokens, no agent ids, nothing of the backend's but PATH and HOME.
- *  With no sandbox nothing runs: HQ never runs this code bare. `env`: added to that (a test run's own ports, Bug 273). */
+ *  With no sandbox nothing runs: HQ never runs this code bare. `env`: added to that (a test run's own ports, Bug 273). `folders`: where the command starts
+ *  its runners, when the caller knows (a part of a command run part by part); else read from the command (testFolders). */
 export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; watch?: Watch; env?: Record<string, string>
-  block?: number[] }):
+  block?: number[]; folders?: string[] | null }):
   Promise<RunResult> {
   return new Promise((resolve) => {
     if (o.signal?.aborted) return resolve({ code: null, output: '', earlier: '', timedOut: false, sandboxFailed: false }) // stopped before it began: nothing runs
@@ -219,7 +245,7 @@ export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; ti
     const { bin, args } = sandboxCommand(cwd, cmd, o)
     const p = spawn(bin, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); if (p.pid) running.set(p.pid, cwd)
     let output = '', total = 0, timedOut = false, hard: NodeJS.Timeout | undefined
-    const fails = failureLines(), sums = summaryLines(), names = nameWatch(o.watch ?? { names: [], files: [] }, testFolders(cmd))
+    const fails = failureLines(), sums = summaryLines(), names = nameWatch(o.watch ?? { names: [], files: [] }, o.folders !== undefined ? o.folders : testFolders(cmd))
     const take = (s: string) => { total += s.length; output = (output + s).slice(-TAIL); fails.take(s); sums.take(s); names.take(s) }
     p.stdout.setEncoding('utf8').on('data', take); p.stderr.setEncoding('utf8').on('data', take)
     const signal = (s: NodeJS.Signals) => { try { process.kill(-p.pid!, s) } catch { /* gone */ } }, kill = () => signal('SIGKILL')
@@ -236,6 +262,32 @@ export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; ti
   })
 }
 
+/** Bug 411: a test command made of several folders' suites (testParts, or a project's saved test steps), one part after another, as its `&&` would: the first
+ *  part that fails ends it, and the result is that part's (its own command in `cmd`, its own output). They share one time limit. A part with an `install`
+ *  installs first, in its folder, with the network on (`installed: false` when that is what failed); its tests run with it off. Each part's output is
+ *  watched on its own, in its own folder, for the tests a ticket named (criteria.ts mergeWatched): one suite's output says nothing about another's tests.
+ *  When all pass, what they printed comes back in order, each under its command. */
+export async function runParts(cwd: string, parts: TestPart[], o: { timeoutMs: number; signal?: AbortSignal; watch?: Watch; env?: Record<string, string> }):
+  Promise<RunResult & { installed?: false }> {
+  const began = Date.now(), seen: { dir: string; seen: Watched }[] = [], out: string[] = [], ran: PartRan[] = []; let summary: string[] | null = []
+  const left = (): number => o.timeoutMs - (Date.now() - began)
+  const late = (cmd: string): RunResult => ({ code: null, output: 'The parts before it used up the time limit, so this one never started.', earlier: '', timedOut: true, sandboxFailed: false, cmd })
+  for (const p of parts) {
+    if (p.install) {
+      const cmd = partCmd(p.dir, p.install); if (left() <= 0) return late(cmd)
+      const i = await runSandboxed(cwd, cmd, { network: true, timeoutMs: left(), signal: o.signal, env: { ...o.env, ...toolCaches(p.install) } })
+      if (o.signal?.aborted || i.sandboxFailed || i.code !== 0) return { ...i, cmd, installed: false }
+    }
+    const cmd = partCmd(p.dir, p.run); if (left() <= 0) return late(cmd)
+    const r = await runSandboxed(cwd, cmd, { network: false, timeoutMs: left(), signal: o.signal, watch: o.watch, env: o.env, folders: p.dir === '.' ? null : [p.dir] })
+    if (o.signal?.aborted || r.sandboxFailed || r.code !== 0) return { ...r, cmd }
+    seen.push({ dir: p.dir, seen: r.names ?? { prints: false, passed: [], skipped: [], unsure: [] } }); out.push(`$ ${cmd}\n${r.output}`)
+    ran.push({ dir: p.dir, cmd, counts: testCounts(r.summary ?? null) })
+    summary = summary && r.summary ? [...summary, ...r.summary] : null // one part with too many to keep: no count for the whole
+  }
+  return { code: 0, output: out.join('\n\n').slice(-TAIL), earlier: '', timedOut: false, sandboxFailed: false, summary, names: mergeWatched(seen), ran }
+}
+
 export const testWorktree = (repoPath: string, key: string): string => path.join(repoPath, '.claude', 'worktrees', `hq-test-${key}`)
 async function dropWorktree(repoPath: string, wt: string): Promise<void> {
   if (fs.existsSync(wt)) await killUnder(wt).catch(() => []) // a run that outlived its backend: on a Mac its working folder is all that still names it (Bug 69)
@@ -249,14 +301,15 @@ export async function sweepTestWorktrees(repoPath: string): Promise<void> {
 }
 
 /** `hung`: it never finished, and HQ stopped it at the time limit. `unproven`: the run passed, but it skipped or never ran a test the ticket named for one of
- *  its criteria (criteria.ts); `output` is then HQ's own list of those, not the run's, and `missing` how many they are (Bug 373). `names`: what a passing run printed about the tests it was asked to
+ *  its criteria (criteria.ts); `output` is then HQ's own list of those, not the run's, and `missing` how many they are (Bug 373); `outside` (Bug 411): how many
+ *  of those are in a folder the test command runs nothing in, which is the command's gap and not the ticket's. `names`: what a passing run printed about the tests it was asked to
  *  watch for. `output` and `earlier` are a run's (RunResult). `stopped`: auto mode went off
  *  or stopped the project during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bugs 89, 115).
  *  `seen`: what HQ's look at the app showed, when the run was asked to look once the tests had passed (smoke.ts). `looked`: a look with no tests before it
  *  (main alone, to tell what a ticket changed). `look` on a failure: it's HQ's look that failed, not the tests, and `output` is HQ's report of it. `review`:
  *  likewise for what a fresh reader of the ticket's changes found (diffcheck.ts). */
-export type TestResult = { kind: 'pass'; test: string; output: string; counts: Counts | null; ms: number; names: Watched; seen?: Seen }
-  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; missing?: number; look?: boolean; review?: boolean
+export type TestResult = { kind: 'pass'; test: string; output: string; counts: Counts | null; ms: number; names: Watched; seen?: Seen; parts?: PartRan[] }
+  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; missing?: number; outside?: number; look?: boolean; review?: boolean
     asked?: boolean; tester?: boolean } | { kind: 'no_tests' } // asked: the user's check found it (hqcheck.ts), not auto mode; tester: the UI tester's findings (with look)
   | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' } | { kind: 'looked'; seen: Seen }
 /** Auto mode's own runs under way, by project folder (Bug 89). A repair's try of a test command isn't one: with auto off its result goes to the user. */
@@ -286,7 +339,7 @@ export type Failed = Extract<TestResult, { kind: 'fail' }>
  *  try of a test command. `state`: in line for its turn (heavy.ts), or running; `since`: when that began. Kept in memory, like the runs themselves: a backend that
  *  stops takes its runs with it, and the next snapshot a page gets has none. */
 export type Shown = { repoId: string; ticketId: string | null; what: 'ticket' | 'main' | 'command' | 'look' | 'look_main' | 'review' | 'tester' | 'map' | 'scenario'
-  | 'setup_check' | 'checker' | 'replay' }
+  | 'setup_check' | 'checker' | 'replay' | 'steps_check' }
 /** `behind`: while it waits, who holds the turns it waits for (heavy.ts; Bug 289: the board says behind whom). */
 export type TestRunView = { id: string; repo_id: string; ticket_id: string | null; what: Shown['what']; state: 'waiting' | 'running'; since: number; behind: string[] }
 const views = new Map<string, TestRunView>()
@@ -372,8 +425,10 @@ export function failReport(r: Pick<Failed, 'output' | 'earlier'>, max: number): 
  *  `auto`: auto mode's own run, which turning it off or a stop ends: autoGen's count as auto read it. `show`: whose run the page says this is (Bug 106),
  *  from when HQ knows there are tests to run; a run stopped before that is never shown. */
 /** `watch`: test names and files to look for in what the run prints (a ticket's map of its criteria's tests). `look`: once the tests pass, start the app in the
- *  same checkout and open its pages (smoke.ts). `only`: the look alone, with no tests before it. */
-export type RunOpts = { watch?: Watch; look?: LookPlan | null; only?: 'look' }
+ *  same checkout and open its pages (smoke.ts). `only`: the look alone, with no tests before it. `steps` (Bug 411): the project's saved test steps
+ *  (teststepsstore.ts). With no command of the user's own they are what runs, part by part, each part installing first; with one, their installs still run
+ *  before it (the user's command says what to test, not what it needs installed). */
+export type RunOpts = { watch?: Watch; look?: LookPlan | null; only?: 'look'; steps?: { parts: SavedPart[] } | null }
 async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: Owner, show: Shown | null, o: RunOpts = {}): Promise<TestResult> {
   const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto), stopped = { kind: 'stopped' } as const
   let page = onPage(null)
@@ -392,7 +447,11 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
         page.state('running'); const seen = await look(plan); return seen ? { kind: 'looked', seen } : stopped
       }, (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath })
     }
-    const found = detectTests(wt); const plan: TestPlan | null = custom ? { install: found?.install ?? null, test: custom, stop: found?.stop } : found
+    const found = detectTests(wt)
+    // Bug 411: saved steps come before the rules. A part whose folder has no tests on this commit is left out; with none left, the rules decide as before
+    const mine = o.steps ? partsHere(o.steps.parts, await filesAt(wt).catch(() => [])).map((p): TestPart => ({ dir: p.dir, run: p.test, install: p.install ?? null })) : []
+    const plan: TestPlan | null = custom ? (mine.length ? { install: null, test: custom } : { install: found?.install ?? null, test: custom, stop: found?.stop })
+      : mine.length ? { install: null, test: chain(mine.map((p) => ({ dir: p.dir, test: p.run }))) } : found
     if (!plan) return { kind: 'no_tests' }
     if (plan.stop) return { kind: 'error', why: plan.stop } // Bug 392: never npm in its place
     const timeoutMs = getSetting('test_timeout_min', DEFAULTS.test_timeout_min) * 60_000
@@ -412,17 +471,29 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
           if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
           if (i.code !== 0) return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier }
         }
-        const began = Date.now(), r = await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal, watch: o.watch, env })
+        // Bug 411: a command HQ built from several folders' suites runs one part at a time, each judged on its own output; any other runs whole
+        const late = (): string => `Installing packages took over ${timeoutMs / 60_000} minutes.`
+        if (custom && mine.length) { // the user's own command, after the saved steps' installs (each in its folder)
+          for (const p of mine.filter((x) => x.install)) {
+            const cmd = partCmd(p.dir, p.install!), i = await runSandboxed(wt, cmd, { network: true, timeoutMs, signal, env: { ...env, ...toolCaches(p.install!) } })
+            if (signal.aborted) return stopped
+            if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
+            if (i.code !== 0) return { kind: 'fail', test: cmd, output: i.timedOut ? late() : i.output, earlier: i.earlier }
+          }
+        }
+        const parts = custom ? testParts(plan.test) : mine.length ? mine : testParts(plan.test), began = Date.now()
+        const r = parts ? await runParts(wt, parts, { timeoutMs, signal, watch: o.watch, env }) : await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal, watch: o.watch, env })
         if (signal.aborted) return stopped
         if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
         if (r.code === 0) {
           const pass: TestResult = { kind: 'pass', test: plan.test, output: r.output.replace(ANSI, ''), counts: testCounts(r.summary ?? null), ms: Date.now() - began, // Bug 126
-            names: r.names ?? { prints: false, passed: [], skipped: [], unsure: [] } }
+            names: r.names ?? { prints: false, passed: [], skipped: [], unsure: [] }, ...(r.ran ? { parts: r.ran } : {}) }
           if (!o.look) return pass
           page.what(show?.what === 'main' ? 'look_main' : 'look'); const seen = await look(o.look) // the tests passed: now, does the app open?
           return seen ? { ...pass, seen } : stopped
         }
-        return { kind: 'fail', test: plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so
+        if ('installed' in r && r.installed === false) return { kind: 'fail', test: r.cmd ?? plan.test, output: r.timedOut ? late() : r.output, earlier: r.earlier } // a part's install
+        return { kind: 'fail', test: r.cmd ?? plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so; the part that failed, by its own command
       } finally { ports?.done() }
     }, (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath }) // Bugs 309, 312
   } catch (e) { return { kind: 'error', why: (e as Error).message.split('\n')[0] ?? 'unknown error' } }
@@ -440,5 +511,5 @@ export async function testCombined(repoPath: string, base: string, branch: strin
 export const lookAtBase = (repoPath: string, base: string, key: string, plan: LookPlan, auto: Owner = null, show: Shown | null = null): Promise<TestResult> =>
   runAt(repoPath, base, `${key}-main`, null, auto, show, { look: plan, only: 'look' })
 /** The tests on `base` alone: when a ticket fails, is it the ticket, or was main already broken? */
-export const testBase = (repoPath: string, base: string, key: string, custom: string | null, auto: Owner = null, show: Shown | null = null): Promise<TestResult> =>
-  runAt(repoPath, base, `${key}-main`, custom, auto, show)
+export const testBase = (repoPath: string, base: string, key: string, custom: string | null, auto: Owner = null, show: Shown | null = null, o: RunOpts = {}): Promise<TestResult> =>
+  runAt(repoPath, base, `${key}-main`, custom, auto, show, o)

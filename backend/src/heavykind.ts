@@ -28,13 +28,15 @@ const BY_NAME = /\s(?:-t|-k|-g|-run|--grep|--filter|--test-name-pattern|--testNa
 const narrow = (program: string): boolean => { const files = program.match(TEST_FILE)?.length ?? 0; return (files >= 1 && files <= 3 && !/[*?{]/.test(program)) || BY_NAME.test(program) }
 /** Is this shell command a full test run or a build? By the program it runs, or because it is the project's own test command. A guess both ways, and both
  *  are cheap: a small command taken for a big one waits a little, a big one missed runs alongside as before. */
-export function heavyKind(command: string, testCmd: string | null): Heavy | null {
-  if (testCmd?.trim() && squeezed(command).includes(squeezed(testCmd))) return 'tests'
+export function heavyKind(command: string, testCmd: string | string[] | null): Heavy | null {
+  // Bug 411: a project's saved test steps are several commands (one a folder), and a run of any one of them is a test run
+  const line = squeezed(command)
+  if ((Array.isArray(testCmd) ? testCmd : [testCmd]).some((c) => !!c?.trim() && line.includes(squeezed(c)))) return 'tests'
   const ps = programs(command)
   return ps.some((p) => TESTS.test(p) && !narrow(p)) ? 'tests' : ps.some((p) => BUILDS.test(p)) ? 'build' : null
 }
 /** A Bash command an agent is about to start: does it take a turn? Not a run_in_background command (a server, not a run), and nothing in plan mode (it's
  *  refused anyway). */
-export function heldKind(c: { command: string; background: boolean; plan: boolean }, testCmd: string | null): Heavy | null {
+export function heldKind(c: { command: string; background: boolean; plan: boolean }, testCmd: string | string[] | null): Heavy | null {
   return c.plan || c.background ? null : heavyKind(c.command, testCmd)
 }

@@ -198,3 +198,14 @@ test('Bug 112: what the Bash hook goes by while HQ is down: the same rules, and 
   assert.equal(q<{ n: number }>("SELECT COUNT(*) n FROM events WHERE kind = 'backend.error' AND payload LIKE '%test commands file%'")[0]!.n, 1)
   run('DELETE FROM repos')
 })
+
+// Bug 411: a project's saved test steps are several commands, one a folder. A run of any of them is a test run, also one the gate wouldn't know by its
+// program's name; and what the gate must not take for one.
+test('Bug 411: the turn gate knows each saved step\'s command as a test run', () => {
+  const steps = ['pdm run pytest -v', 'python manage.py test -v 2', 'npm test']
+  for (const c of ['(cd "backend" && pdm run pytest -v)', 'cd api && python manage.py test -v 2 2>&1 | tail -20', '(cd "backend" && pdm  run pytest -v) && (cd "web" && npm test)'])
+    assert.equal(heavyKind(c, steps), 'tests', c)
+  assert.equal(heavyKind('pdm run pytest -v', null), null); assert.equal(heavyKind('python manage.py test -v 2', []), null) // not known by their names alone
+  assert.equal(heavyKind('python manage.py migrate', steps), null); assert.equal(heavyKind('pdm run ruff check', steps), null); assert.equal(heavyKind('ls', ['', '  ']), null)
+  assert.equal(heavyKind('make check-all', 'make check-all'), 'tests') // one saved command, as before
+})

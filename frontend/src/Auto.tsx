@@ -46,9 +46,38 @@ function autoPreview(all: State, repoId: string): string[] {
   return [plans ? `${count(plans, 'plan')} approved` : '', ready ? `${count(ready, 'ticket')} started` : '',
     done ? `${count(done, 'finished ticket')} tested on ${base} and merged` : ''].filter(Boolean)
 }
+type StepsView = { steps: { parts: { dir: string; install?: string; test: string; engineers: boolean }[]; left_out: { path: string; why: string }[]; notes: string } | null
+  by: string | null; checked: { sha: string; at: number } | null; working: boolean; state: string | null; note: string | null; saves: number }
+const when = (at: number): string => new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+/** Bug 411: the project's test steps in the Auto box: the helper at work, the steps it worked out (a folder a line, what is left out and why), or why it
+ *  couldn't. `own`: the field holds a command of the user's, which is what HQ runs then. */
+function TestSteps({ ts, repo, own, busy, ask }: { ts: StepsView | undefined; repo: any; own: boolean; busy: boolean; ask: (action?: 'dismiss') => Promise<void> }) {
+  if (!ts) return null
+  const box = (tone: string, body: React.ReactNode) => <div className={`flex flex-col gap-1 break-words rounded-md border p-2 ${tone}`}>{body}</div>
+  const row = (body: React.ReactNode) => <div className="flex flex-wrap items-center gap-x-2 gap-y-1">{body}</div>
+  if (ts.working) return box('border-amber-500/40 bg-amber-950/30 text-amber-200', row(<><span className="min-w-0 grow">{ts.state === 'checking'
+    ? `HQ is running Claude's test steps for ${repo.name} in its sandbox (save ${ts.saves} of 4).` : `Claude is working out how to test ${repo.name} (once, a few minutes).`}</span>
+    <button type="button" className="btn-sm" disabled={busy} onClick={() => void ask('dismiss')}>Stop Claude</button></>))
+  const again = <button type="button" className="btn-sm" disabled={busy} onClick={() => void ask()}
+    title="A one-off Claude Code session works the test steps out afresh. HQ checks them in its sandbox before using them.">{ts.steps ? 'Work it out again' : 'Ask Claude again'}</button>
+  const failed = (ts.state === 'cant' || ts.state === 'failed') && box('border-amber-500/40 bg-amber-950/30 text-amber-200', row(<><span className="min-w-0 grow">
+    {ts.state === 'cant' ? `Claude couldn't work out test steps HQ can run: ${ts.note}` : `Claude didn't finish the test steps: ${ts.note}`}
+    {ts.steps ? ' HQ keeps the steps below.' : ' HQ tests with what its own rules find.'}</span>{again}</>))
+  if (!ts.steps) return failed || null
+  const s = ts.steps
+  return <>{failed}{box('border-zinc-700 bg-zinc-950/40 text-zinc-300', <>
+    {row(<><span className="min-w-0 grow text-zinc-400">{own ? 'With a command of your own HQ runs that, after these installs.' : 'HQ tests it with these steps.'}{' '}
+      Worked out by Claude{ts.checked ? `, checked in HQ's sandbox ${when(ts.checked.at)}` : ''}.</span>{!failed && again}</>)}
+    <ul className="flex flex-col gap-0.5">{s.parts.map((p) => <li key={`${p.dir} ${p.test}`}><span className="text-zinc-100">{p.dir === '.' ? 'top folder' : `${p.dir}/`}</span>{' '}
+      <span className="font-mono text-zinc-300">{p.test}</span>{p.install ? <span className="text-zinc-500"> · installs with <span className="font-mono">{p.install}</span></span> : null}
+      {!p.engineers && <span className="text-zinc-500"> · HQ runs this one itself: an engineer's session can't</span>}</li>)}</ul>
+    {s.left_out.length > 0 && <ul className="flex flex-col gap-0.5 text-amber-300/80">{s.left_out.map((l) => <li key={l.path}>Not run: {l.path} · {l.why}</li>)}</ul>}
+    {s.notes && <div className="text-zinc-500">{s.notes}</div>}</>)}</>
+}
 /** Turning auto mode on: what happens right now, and how HQ will test. */
 export function AutoDialog({ all }: { all: State }) {
-  const [repoId, setRepoId] = useState<string | null>(null), [check, setCheck] = useState<{ custom: string | null; found: string | null; sandbox: string | null } | null>(null)
+  const [repoId, setRepoId] = useState<string | null>(null)
+  const [check, setCheck] = useState<{ custom: string | null; found: string | null; sandbox: string | null; not_run?: string[]; asks?: boolean } | null>(null)
   const [cmd, setCmd] = useState(''), [busy, setBusy] = useState(false), [err, setErr] = useState(''), [away, setAway] = useState(false)
   const repo = all.repos.find((r) => r.id === repoId), [uiTest, setUiTest] = useState<boolean | null>(null) // null: as the project has it
   const testing = uiTest ?? repo?.ui_test !== 'off'
@@ -68,6 +97,15 @@ export function AutoDialog({ all }: { all: State }) {
   if (!repo) return null
   const now = autoPreview(all, repo.id), noTests = !!check && !check.found && !cmd.trim(), refused = !repo.auto_mode ? check?.sandbox : null
   const bad = refusedCmd(repo), cantRun = !!cmd.trim() && bad?.cmd === cmd.trim() // while the box holds that command: typing another one takes the line away
+  // Bug 411: the tests the command HQ found runs nothing of (a backend/ beside the frontend/ its rules stopped at). Only while the box is empty: HQ can't
+  // tell what the user's own command runs. A found command too long for the box is shown whole under it
+  const skipped = check && !cmd.trim() ? check.not_run ?? [] : [], long = !cmd.trim() && (check?.found?.length ?? 0) > 44
+  // The project's test steps (a helper worked them out, HQ checked them) and the helper at work on them, live from the page's state
+  const ts: StepsView | undefined = (all.previews ?? []).find((x: any) => x.id === repo.id)?.test_steps, shown = !!ts?.steps && !cmd.trim()
+  const askSteps = async (action?: 'dismiss') => {
+    setBusy(true); setErr('')
+    try { await api(`repos/${repo.id}/test-steps`, action ? { action } : {}) } catch (e) { setErr(errText(e as Error)) } finally { setBusy(false) }
+  }
   const go = async () => {
     setBusy(true); setErr('')
     try {
@@ -75,6 +113,13 @@ export function AutoDialog({ all }: { all: State }) {
       if (testing !== (repo.ui_test !== 'off')) await api(`repos/${repo.id}/ui-test`, { on: testing })
       await api(`repos/${repo.id}/auto`, { on: true }); close()
     } catch (e) { setErr(errText(e as Error)) } finally { setBusy(false) }
+  }
+  // Bug 411: HQ's check tells the user to set a test command that runs the folder it skipped, and this box was the only place to type one, with one button:
+  // Turn on auto. With auto off, the command can now be saved by itself
+  const changed = !!check && cmd.trim() !== (check.custom ?? '')
+  const saveOnly = async () => {
+    setBusy(true); setErr('')
+    try { await api(`repos/${repo.id}/test-cmd`, { cmd }); close() } catch (e) { setErr(errText(e as Error)) } finally { setBusy(false) }
   }
   return <Backdrop onClose={close} canClose={!busy}>
     <form role="dialog" aria-modal="true" aria-label="Turn on auto mode" onSubmit={(e) => { e.preventDefault(); void go() }}
@@ -87,11 +132,20 @@ export function AutoDialog({ all }: { all: State }) {
         <ul className="ml-4 list-disc break-words text-zinc-300">{now.map((x) => <li key={x}>{x}</li>)}</ul></div>}
       <label className="flex flex-col gap-1">Test command
         <input className="input" value={cmd} onChange={(e) => setCmd(e.target.value)} placeholder={check ? check.found ?? 'No tests found' : 'Looking…'} aria-label="Test command" /></label>
+      {long && !shown && <div className="break-words text-zinc-500">HQ runs: <span className="font-mono text-zinc-400">{check!.found}</span></div>}
+      <TestSteps ts={ts} repo={repo} own={!!cmd.trim()} busy={busy} ask={askSteps} />
+      {noTests && !skipped.length && !ts?.working && <div className="text-amber-300/80">HQ found no tests here, so it will build but not merge. The TPM can add tests, or write a command above.</div>}
+      {skipped.length > 0 && !ts?.working && <div role="note" className="flex flex-wrap items-center gap-x-2 gap-y-1 break-words text-amber-300/80"><span className="min-w-0 grow">
+        {ts?.steps ? "HQ's test steps don't run the tests in" : noTests ? "HQ's own rules found no way to run the tests in" : "HQ's own rules don't run the tests in"}{' '}
+        {skipped.join(', ')}. {check?.asks ? 'Claude works the test steps out the first time HQ tests this project (once, a few minutes). Or write a command above that runs them.'
+          : noTests ? 'So it will build but not merge. Write a command above that runs them.' : 'Write a command above that runs them too.'}</span>
+        {!ts?.steps && <button type="button" className="btn-sm" disabled={busy} onClick={() => void askSteps()}
+          title="A one-off Claude Code session reads the project and works out what to install and run in each folder. HQ checks its answer in its sandbox before using it.">
+          Work it out now</button>}</div>}
       <label className="flex items-start gap-2"><input type="checkbox" className="mt-0.5" checked={testing} onChange={(e) => setUiTest(e.target.checked)}
         aria-label="Test the app in a browser at the end of each run" />
         <span><span className="text-zinc-300">Test the app in a browser at the end of each run.</span> A tester that never sees the code tries about 30 everyday and odd
           things, and the run's summary lists where a person would get stuck. Nothing is changed for you. About $1–2 a run.</span></label>
-      {noTests && <div className="text-amber-300/80">HQ found no tests here, so it will build but not merge. The TPM can add tests, or write a command above.</div>}
       {cantRun && <div role="note" className="break-words text-amber-300/80">Claude Code refuses this command in an engineer's session, so engineers can't run the full tests.
         {bad?.ticket ? ` HQ opened ${bad.ticket} to fix it.` : ' With auto mode on, HQ opens a ticket that fixes it.'} Or write
         one that works above: the same line inside a script in the repo (an npm script, for one) does.</div>}
@@ -100,6 +154,8 @@ export function AutoDialog({ all }: { all: State }) {
       {away && <div role="status" className="text-amber-300/80">Can't reach HQ. It may be restarting. Trying again…</div>}
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex flex-wrap justify-end gap-1.5"><button type="button" className="btn" onClick={close} disabled={busy}>Cancel</button>
+        {!repo.auto_mode && changed && <button type="button" className="btn" disabled={busy} onClick={() => void saveOnly()}
+          title={cmd.trim() ? 'Saves this as the test command and leaves auto mode off' : "Goes back to the command HQ finds itself, and leaves auto mode off"}>Save command only</button>}
         <button type="submit" className="btn btn-primary" autoFocus disabled={busy || !check || !!refused}>{busy ? 'Saving…' : repo.auto_mode ? 'Save' : 'Turn on auto'}</button></div>
     </form>
   </Backdrop>

@@ -7,7 +7,8 @@ import { fillSlots, stopFinished, FINISHED_STOP_MS } from './tickets.ts'
 import { onTicketMerged } from './preview.ts'
 import { onAgentGone } from './launchhelper.ts'
 import { dropSetupChange, onMergedSetup, onSetupAgentGone } from './testsetup.ts'
-import { autoSoon } from './auto.ts'
+import { onStepsAgentGone } from './teststeps.ts'
+import { autoSoon, tellEngineersSteps } from './auto.ts'
 import { waitsOnQuestion } from './delivery.ts'
 import { startTurns } from './heavy.ts'
 import { checkPlan, onRetry } from './plancheck.ts'
@@ -23,14 +24,17 @@ export function startListeners(): void {
   const freed = (agentId: string | null) => { if (agentId) releaseSlot(agentId); void fillSlots().catch(() => {}) }
   bus.on('event:agent.stopped', (e: HqEvent) => { // a Launch helper stopped from its Agent tab too (Bug 276)
     freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId, typeof e.payload.reason === 'string' ? e.payload.reason : null); onSetupAgentGone(e.agentId)
+    onStepsAgentGone(e.agentId)
   })
-  bus.on('event:agent.lost', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId); onSetupAgentGone(e.agentId) })
+  bus.on('event:agent.lost', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId); onSetupAgentGone(e.agentId); onStepsAgentGone(e.agentId) })
   bus.on('event:hook.SessionEnd', (e: HqEvent) => {
     if (e.payload.reason === 'clear') return
     freed(e.agentId); setTimeout(() => releaseFor(e.agentId), 5000) // Claude Code may still be exiting
     onAgentGone(e.agentId) // a Launch helper that quit by itself
     onSetupAgentGone(e.agentId) // or a test setup helper
+    onStepsAgentGone(e.agentId) // or a test steps helper (Bug 411)
   })
+  bus.on('event:teststeps.checked', (e: HqEvent) => { if (typeof e.payload.repo === 'string') tellEngineersSteps(e.payload.repo) }) // Bug 411: the command they run before open_pr
   /** An engineer's question was answered: once none is left open, its ticket goes back to what it was doing before the first (Bug 157). */
   bus.on('event:question.answered', (e: HqEvent) => {
     const t = typeof e.payload.ticket === 'string' ? getTicket(e.payload.ticket) : undefined
@@ -39,7 +43,7 @@ export function startListeners(): void {
     setTicket(t.id, { status: back, prior_status: null })
   })
   for (const kind of ['hook.Stop', 'ticket.pr_ready', 'ticket.merged', 'question.answered', 'agent.stopped', 'agent.lost', 'hook.SessionEnd', 'attention.launch_failed',
-    'attention.blocked', 'attention.stuck']) bus.on(`event:${kind}`, autoSoon)
+    'attention.blocked', 'attention.stuck', 'teststeps.helper_done']) bus.on(`event:${kind}`, autoSoon) // the last: what waited for a project's test steps goes on (Bug 411)
   // An engineer whose ticket is finished stops once its turn has ended: it isn't kept (with its memory) until the merge. The look comes just
   // after the wait stopFinished gives it, and looks at every engineer, so it must not be what cuts another one's wait short (stopFinished checks).
   const leave = () => { setTimeout(stopFinished, FINISHED_STOP_MS + 50).unref() }

@@ -132,6 +132,7 @@ export default function App() {
       const a = 'attention' in n.ref ? all.attention.find((x) => x.id === (n.ref as { attention: string }).attention) : null
       if (a?.kind === `auto_finished:${repoNow?.id}`) return openSummary(repoNow!.id) // it has no box: what it's about is the summary
       if (a?.kind === `test_cmd_refused:${repoNow?.id}`) return openAuto(repoNow!.id) // nor has this: it's about the test command (Bug 107)
+      if (a && /^repo_teststeps(_ok)?:/.test(a.kind) && a.kind.endsWith(`:${repoNow?.id}`)) return openAuto(repoNow!.id) // nor these: the test steps are in that box (Bug 411)
       const node = r ? `t:${r.ticket_id}` : 'ticket' in n.ref ? `t:${n.ref.ticket}` : 'tpm' in n.ref ? 'tpm' : a ? board.attNode(a) : null
       if (!node || !board.has(node)) return
       const kind = r ? 'review' : a ? 'attention' : null
@@ -405,7 +406,7 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
   /** Where a notice's Show goes: this project's finished run has its summary, a test command engineers can't run the box it's written in (Bug 107), anything else its box. */
   const showAtt = (a: any, close: () => void) => {
     if (repo && a.kind === `auto_finished:${repo.id}`) return () => { openSummary(repo.id); close() }
-    if (repo && a.kind === `test_cmd_refused:${repo.id}`) return () => { openAuto(repo.id); close() }
+    if (repo && (a.kind === `test_cmd_refused:${repo.id}` || a.kind === `repo_teststeps:${repo.id}` || a.kind === `repo_teststeps_ok:${repo.id}`)) return () => { openAuto(repo.id); close() }
     const node = board.attNode(a); return node ? () => { b.focus(node, 'attention'); close() } : null
   }
   const tone = good ? 'border-emerald-500/50! text-emerald-300!' : count ? 'border-rose-500/50! text-rose-300!' : ''

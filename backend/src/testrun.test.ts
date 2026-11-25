@@ -20,8 +20,9 @@ const SECRETS = ['.ssh/id_rsa', '.netrc', '.npmrc', '.git-credentials', '.config
 for (const f of SECRETS) { fs.mkdirSync(path.dirname(path.join(home, f)), { recursive: true }); fs.writeFileSync(path.join(home, f), 'secret') }
 process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup') // the toolchain stays where it's installed, whatever HOME says
 process.env.HOME = home; process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_ENGINEER_CACHE = path.join(tmp, 'cache')
-const { bwrapArgs, detectTests, testFolders, failReport, failedLine, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase, testCombined, sweepTestWorktrees,
-  testRunViews, testWorktree } = await import('./testrun.ts')
+const { bwrapArgs, detectTests, testFolders, testParts, runParts, rulesSkip, failReport, failedLine, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase,
+  testCombined, sweepTestWorktrees, testRunViews, testWorktree } = await import('./testrun.ts')
+const { confirm, outsideParts } = await import('./criteria.ts')
 const { db, migrate } = await import('./db.ts'); migrate(); void db
 const { bus } = await import('./events.ts')
 
@@ -245,6 +246,93 @@ test('Bug 392: a pnpm project\'s run installs and tests with pnpm in the sandbox
   }
   assert.equal(fs.readFileSync(pmLog, 'utf8').trim().split('\n').length, 2); assert.equal(fs.existsSync(testWorktree(d, 'P2-main')), false)
 })
+// Bug 411: a repo split into folders ran as one command, and one suite's output was read as the whole run's. HQ takes the command it builds apart again
+// and runs each folder's suite as a part of its own.
+test('Bug 411: testParts reads the parts back from the command detectTests builds, and from no other', () => {
+  const two = detectTests(dir({ 'admin/package.json': '{"scripts":{"test":"x"}}', 'web/package.json': '{"scripts":{"test":"y"}}' }))!.test
+  assert.deepEqual(testParts(two), [{ dir: 'admin', run: 'npm test' }, { dir: 'web', run: 'npm test' }])
+  assert.deepEqual(testParts(' (cd "my app" && bun run test) && (cd "x" && yarn test) '), [{ dir: 'my app', run: 'bun run test' }, { dir: 'x', run: 'yarn test' }])
+  for (const c of ['npm test', 'cd web && npm test', '(cd web && npm test)', '(cd "web" && npm test) && npm run lint', '(cd "web" && npm test) || (cd "admin" && npm test)',
+    '(cd "web/app" && npm test)', '(cd ".." && npm test)', '(cd "$HOME" && npm test)', '(cd "web" && npm test -- src/api.test.ts)', '(cd "web" && uv run pytest -v)', ''])
+    assert.equal(testParts(c), null, c)
+})
+const PKG = '{"scripts":{"test":"node --test"}}'
+const splitRepo = (files: Record<string, string>): string => { const d = fs.mkdtempSync(path.join(tmp, 'r-')); sh(d, 'init', '-q', '-b', 'main')
+  write(d, { '.gitignore': 'node_modules/\n.claude/\n', ...files }); sh(d, 'add', '.'); sh(d, 'commit', '-qm', 'base'); return d }
+const API = { 'api/package.json': PKG, 'api/users.test.js': `${TEST}t.test('lists the users',()=>a.ok(1))` }
+const WEB = { 'web/package.json': PKG, 'web/list.test.js': `${TEST}t.test('shows the list',()=>a.ok(1))` }
+const named = (name: string, file: string) => ({ criterion: 'A1', name, file })
+test('Bug 411: a repo split into folders runs one part at a time, and each part\'s output answers for its own folder\'s tests', boxed, async () => {
+  const d = splitRepo({ ...API, ...WEB }), CMD = '(cd "api" && npm test) && (cd "web" && npm test)'
+  const tests = [named('lists the users', 'api/users.test.js'), named('shows the list', 'web/list.test.js'), named('removes a user', 'api/users.test.js'), named('opens the app', 'mobile/app.test.js')]
+  const watch = { names: tests.map((t) => t.name), files: tests.map((t) => t.file) }
+  for (const custom of [null, CMD]) { // the command HQ builds, and the same one saved by the user as theirs
+    const r = await testCombined(d, 'main', 'main', 'S1', custom, null, null, { watch })
+    assert.equal(r.kind, 'pass', JSON.stringify(r)); if (r.kind !== 'pass') return
+    assert.equal(r.test, CMD); assert.deepEqual(r.counts, { passed: 2, failed: 0, skipped: 0 }) // both parts' counts
+    assert.deepEqual(r.names.parts, [{ dir: 'api', prints: true }, { dir: 'web', prints: true }])
+    assert.match(r.output, /^\$ \(cd "api" && npm test\)\n[^]*lists the users[^]*\n\n\$ \(cd "web" && npm test\)\n[^]*shows the list/)
+    assert.deepEqual(tests.map((t) => confirm(t, r.names)), ['passed', 'passed', 'not_run', 'not_run'])
+    assert.deepEqual(tests.map((t) => outsideParts(t, r.names.parts)), [false, false, false, true]) // mobile/ is in no part's folder
+  }
+  // the user's own command, which HQ can't take apart, runs whole as before
+  const own = await testCombined(d, 'main', 'main', 'S2', 'cd api && npm test && cd ../web && npm test', null, null, { watch })
+  assert.equal(own.kind, 'pass', JSON.stringify(own)); assert.equal((own as { names: { parts?: unknown } }).names.parts, undefined)
+})
+test('Bug 411: the first part that fails ends the run and is named by its own command; a quiet part\'s tests don\'t read "never ran"', boxed, async () => {
+  const bad = splitRepo({ 'api/package.json': PKG, 'api/users.test.js': `${TEST}t.test('lists the users',()=>a.equal(1,2))`, ...WEB })
+  const f = await testBase(bad, 'main', 'S3', null)
+  assert.equal(f.kind, 'fail', JSON.stringify(f)); if (f.kind !== 'fail') return
+  assert.equal(f.test, '(cd "api" && npm test)'); assert.match(`${f.earlier}\n${f.output}`, /lists the users/); assert.doesNotMatch(`${f.earlier}\n${f.output}`, /shows the list/) // web/ never ran
+  // web/ prints no test names at all; api/ lists its own. Each is judged by its own output
+  const quiet = splitRepo({ ...API, 'web/package.json': '{"scripts":{"test":"node check.js"}}', 'web/check.js': 'console.log("all good")' })
+  const tests = [named('removes a user', 'api/users.test.js'), named('shows the list', 'web/list.test.js')]
+  const r = await testCombined(quiet, 'main', 'main', 'S4', null, null, null, { watch: { names: tests.map((t) => t.name), files: tests.map((t) => t.file) } })
+  assert.equal(r.kind, 'pass', JSON.stringify(r)); if (r.kind !== 'pass') return
+  assert.deepEqual(r.names.parts, [{ dir: 'api', prints: true }, { dir: 'web', prints: false }]); assert.deepEqual(tests.map((t) => confirm(t, r.names)), ['not_run', 'unconfirmed'])
+})
+test('Bug 411: the parts share one time limit, and the part it runs out in says so', boxed, async () => {
+  const d = dir({ 'a/t.js': 'setTimeout(() => console.log("a done"), 1500)', 'b/t.js': 'setTimeout(() => console.log("b done"), 30000)' })
+  const t0 = Date.now(), r = await runParts(d, [{ dir: 'a', run: 'node t.js' }, { dir: 'b', run: 'node t.js' }], { timeoutMs: 4000 })
+  assert.equal(r.timedOut, true); assert.equal(r.cmd, '(cd "b" && node t.js)'); assert.ok(Date.now() - t0 < 25_000, 'b was stopped when the shared limit ran out')
+  const none = await runParts(d, [{ dir: 'a', run: 'node t.js' }, { dir: 'a', run: 'node t.js' }], { timeoutMs: 1 }) // nothing left before the first part: it never starts
+  assert.equal(none.timedOut, true); assert.equal(none.code, null)
+})
+test('Bug 411: rulesSkip lists the test files the found command runs nothing of, from git\'s own list', async () => {
+  const d = splitRepo({ ...WEB, 'backend/pyproject.toml': '[project]\nname = "x"\n', 'backend/tests/test_app.py': 'def test_a(): pass\n', 'backend/tests/test_b.py': '',
+    'web/node_modules/x/x.test.js': '', 'notes/todo.md': '' })
+  assert.equal(detectTests(d)!.test, '(cd "web" && npm test)') // the rules stop at the folder with a test script
+  assert.deepEqual(await rulesSkip(d), [{ dir: 'backend', kind: 'python', count: 2, example: 'backend/tests/test_app.py' }])
+  assert.deepEqual(await rulesSkip(splitRepo({ ...API, ...WEB })), []); assert.deepEqual(await rulesSkip(dir({ 'a.test.js': '' })), []) // all run; and a folder that is no repo
+})
+
+// Bug 411: a project's saved test steps (teststepsstore.ts): what a helper worked out and HQ checked. They come before the rules.
+test('Bug 411: saved test steps run part by part, each part installing first; a part with no tests on the commit is left out, and a failed install is named', boxed, async () => {
+  const d = splitRepo({ ...WEB, 'api/app.js': '', 'api/tests/api.test.js': `${TEST}t.test('answers',()=>a.ok(require('node:fs').existsSync('installed.txt')))`, 'tools/README.md': '' })
+  const part = (dir: string, test: string, more: { install?: string; tests?: boolean } = {}) => ({ dir, test, tests: true, engineers: true, ...more })
+  const steps = { parts: [part('api', 'node --test', { install: 'echo ok > installed.txt' }), part('web', 'npm test'), part('tools', 'node --test')] }
+  const r = await testBase(d, 'main', 'K1', null, null, null, { steps })
+  assert.equal(r.kind, 'pass', JSON.stringify(r)); if (r.kind !== 'pass') return
+  assert.equal(r.test, '(cd "api" && node --test) && (cd "web" && npm test)') // tools/ has no test files on this commit: its part is left out
+  assert.deepEqual(r.parts, [{ dir: 'api', cmd: '(cd "api" && node --test)', counts: { passed: 1, failed: 0, skipped: 0 } },
+    { dir: 'web', cmd: '(cd "web" && npm test)', counts: { passed: 1, failed: 0, skipped: 0 } }])
+  assert.deepEqual(r.names.parts, [{ dir: 'api', prints: true }, { dir: 'web', prints: true }]); assert.deepEqual(r.counts, { passed: 2, failed: 0, skipped: 0 })
+  // a part HQ saw no test files under when it checked the steps always runs; a part at the project's root runs bare
+  const root = await testBase(d, 'main', 'K2', null, null, null, { steps: { parts: [part('.', 'node --test web/list.test.js'), part('tools', 'echo "✔ ok (1ms)"', { tests: false })] } })
+  assert.equal(root.kind, 'pass', JSON.stringify(root)); assert.equal((root as { test: string }).test, 'node --test web/list.test.js && (cd "tools" && echo "✔ ok (1ms)")')
+  // an install that fails ends the run, by its own command
+  const bad = await testBase(d, 'main', 'K3', null, null, null, { steps: { parts: [part('web', 'npm test'), part('api', 'node --test', { install: 'echo "no such package" >&2; exit 3' })] } })
+  assert.equal(bad.kind, 'fail', JSON.stringify(bad)); if (bad.kind !== 'fail') return
+  assert.equal(bad.test, '(cd "api" && echo "no such package" >&2; exit 3)'); assert.match(bad.output, /no such package/); assert.equal(bad.hung, undefined)
+  // the user's own command says what to test; the saved steps still install what it needs first, and it runs whole
+  const own = await testBase(d, 'main', 'K4', 'cd api && node --test', null, null, { steps })
+  assert.equal(own.kind, 'pass', JSON.stringify(own)); assert.equal((own as { names: { parts?: unknown } }).names.parts, undefined)
+  assert.equal((await testBase(d, 'main', 'K5', 'cd api && node --test', null, null)).kind, 'fail') // without the steps nothing installs it
+  // steps with no part that applies here: the rules decide, as before
+  const none = await testBase(d, 'main', 'K6', null, null, null, { steps: { parts: [part('tools', 'node --test')] } })
+  assert.equal(none.kind, 'pass', JSON.stringify(none)); assert.equal((none as { test: string }).test, '(cd "web" && npm test)')
+})
+
 const noCargo = (() => { try { execFileSync('cargo', ['--version'], { stdio: 'ignore' }); return false } catch { return 'no cargo here' } })()
 test('Bug 58: a Rust project with a dependency installs and tests in the sandbox, and nothing lands in ~/.cargo', { skip: boxed.skip || noCargo }, async () => {
   const d = fs.mkdtempSync(path.join(tmp, 'r-')); sh(d, 'init', '-q', '-b', 'main')

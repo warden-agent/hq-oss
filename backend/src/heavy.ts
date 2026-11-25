@@ -17,6 +17,7 @@ import { bus, emit, patch, type HqEvent } from './events.ts'
 import { getAgent, update, type Agent } from './agents.ts'
 import { getRepo, repoOfAgent, repos } from './records.ts'
 import { heldKind, type Heavy } from './heavykind.ts'
+import { gateCmds, stepsOf } from './teststepsstore.ts'
 
 export { heavyKind, programs, type Heavy } from './heavykind.ts'
 
@@ -117,7 +118,8 @@ export async function withTurn<T>(who: string, what: Heavy, fn: () => Promise<T>
 export function gateBash(agent: Agent, c: { use: string; command: string; timeout: unknown; background: boolean; lane: string; plan: boolean; activity: string },
   res: http.ServerResponse, answer: () => void): boolean {
   if (agent.role !== 'engineer' && agent.role !== 'launcher') return false
-  const what = heldKind(c, getRepo(repoOfAgent(agent) ?? '')?.test_cmd ?? null); if (!what) return false
+  const repo = getRepo(repoOfAgent(agent) ?? '')
+  const what = heldKind(c, repo ? gateCmds(repo.test_cmd, stepsOf(repo.id)) : null); if (!what) return false
   const who = agent.display_name ?? agent.id, id = `${agent.id}:${c.use || `?${++n}`}`
   let over = false, beat: NodeJS.Timeout | null = null
   const left = () => { // out of the line with no turn: the hook was dropped, or HQ heard the agent move on or go. A hook still held is answered, so nothing hangs on it
@@ -147,7 +149,7 @@ export function gateBash(agent: Agent, c: { use: string; command: string; timeou
  *  place, so the hook never reads half a file. A write that fails costs only this: with HQ down, a test command not known by its program's name goes ahead. */
 export function saveTestCmds(): void {
   try {
-    const cmds = Object.fromEntries(repos().filter((r) => r.test_cmd?.trim()).map((r) => [r.id, r.test_cmd]))
+    const cmds = Object.fromEntries(repos().map((r) => [r.id, gateCmds(r.test_cmd, stepsOf(r.id))] as const).filter(([, c]) => c.length).map(([id, c]) => [id, c.length === 1 ? c[0] : c]))
     const tmp = `${PATHS.testCmds}.${process.pid}`
     fs.writeFileSync(tmp, JSON.stringify(cmds), { mode: 0o600 }); fs.renameSync(tmp, PATHS.testCmds)
   } catch (e) { emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { what: 'test commands file', error: String(e) } }) }

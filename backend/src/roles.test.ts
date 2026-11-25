@@ -25,6 +25,9 @@ test('engineers\' package caches (npm, Go, Python) sit outside home; PyPI is rea
   assert.equal(s.env.UV_PYTHON_INSTALL_DIR, path.join(ENGINEER_CACHE, 'python')); assert.equal(s.env.UV_PYTHON_DOWNLOADS, 'never')
   assert.equal(s.env.npm_config_cache, path.join(ENGINEER_CACHE, 'npm')) // npm writes its _logs there too, not under ~/.npm
   for (const k of ['GOCACHE', 'GOMODCACHE', 'GOPATH', 'CARGO_HOME']) assert.ok(String(s.env[k]).startsWith(ENGINEER_CACHE), k)
+  // Bug 411: Poetry, Pipenv and PDM keep their caches there too, and make their environments inside the project's folder
+  for (const k of ['POETRY_CACHE_DIR', 'PIPENV_CACHE_DIR', 'PDM_CACHE_DIR']) assert.ok(String(s.env[k]).startsWith(ENGINEER_CACHE), k)
+  assert.equal(s.env.POETRY_VIRTUALENVS_IN_PROJECT, 'true'); assert.equal(s.env.PIPENV_VENV_IN_PROJECT, '1')
 })
 
 test('the test setup helper (localOnly) reaches localhost and nothing else: no package registry, not the repo\'s own allowlist', () => {

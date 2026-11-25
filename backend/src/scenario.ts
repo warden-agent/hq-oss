@@ -14,6 +14,7 @@ import { runnableRecipe, row } from './preview.ts'
 import { appSpec, blocked, browsersPrefix, prepareApp, startWhy, type LookPlan, lookHow } from './smoke.ts'
 import { moveLine } from './testports.ts'
 import { autoGen, detectTests, inCheckout, runSandboxed, type Shown } from './testrun.ts'
+import { savedCmd, stepsOf } from './teststepsstore.ts'
 import { buildTimeline, type Flag, type Row } from './timeline.ts'
 import { readSetup, type TestSetup } from './testsetupstore.ts'
 import { id, shq } from './util.ts'
@@ -49,7 +50,7 @@ export function recordingSpec(wt: string, plan: LookPlan, setup: TestSetup, out:
 /** Why there's no test setup, in words that can't be read as "the project has no tests" (Bug 223: a project with `npm test` was told it had "no test setup
  *  yet"). The setup is HQ's way of starting and recording the app for scenarios, not the project's own tests; when it has those, the words say so. */
 export function noSetupWhy(repoId: string): string {
-  const repo = getRepo(repoId); let tests: string | null = repo?.test_cmd ?? null
+  const repo = getRepo(repoId); let tests: string | null = repo ? savedCmd(repo.test_cmd, stepsOf(repo.id)) : null
   if (repo && !tests) { try { tests = detectTests(repo.path)?.test ?? null } catch { /* no checkout to read */ } }
   return `HQ isn't set up to record this app yet: Set up testing is under the preview's ⚙${tests ? `. This is separate from the project's own tests, \`${tests}\`,`
     + ' which still run as usual' : ''}`

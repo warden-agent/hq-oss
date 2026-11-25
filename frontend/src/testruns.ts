@@ -7,12 +7,13 @@
  *  wrong, and HQ is opening the app on main alone to see whether it was already like that; `review`: everything else passed and a fresh reader (one
  *  headless call, diffcheck.ts) has the ticket's changes before it merges; `tester`: the run's tickets are merged and an agent is trying what they built in
  *  a browser (tester.ts), with no ticket of its own; `map`: a one-time session clicks through the app to write its first feature map (firstmap.ts);
- *  `scenario`: HQ runs a scripted scenario against the app (scenario.ts); `setup_check`: HQ tries a test setup for real (testsetup.ts).
+ *  `scenario`: HQ runs a scripted scenario against the app (scenario.ts); `setup_check`: HQ tries a test setup for real (testsetup.ts);
+ *  `steps_check`: HQ runs test steps a helper worked out, for real (teststeps.ts).
  *  `checker`: a fresh reader (backendcheck.ts) has the tester's recordings and judges them against the backend criteria; `replay`: HQ replays the
  *  steps of a finding whose fix merged (replay.ts).
  *  `state`: in line for its turn (builds and test runs take turns, Bug 76) or running. `since`: when that began. */
 export type TestRun = { id: string; repo_id: string; ticket_id: string | null; what: 'ticket' | 'main' | 'command' | 'look' | 'look_main' | 'review' | 'tester' | 'map'
-  | 'scenario' | 'setup_check' | 'checker' | 'replay'; state: 'waiting' | 'running'; since: number; behind?: string[] }
+  | 'scenario' | 'setup_check' | 'checker' | 'replay' | 'steps_check'; state: 'waiting' | 'running'; since: number; behind?: string[] }
 /** Bug 289: whom a run in line waits behind ("eng T-02", "eng T-02 and HQ's test of T-01", "eng T-02 and 2 more"), as heavy.ts behindWords says it. */
 export const behindWords = (who: unknown): string => {
   const b = Array.isArray(who) ? who.map(String).filter(Boolean) : []; return b.length > 2 ? `${b[0]} and ${b.length - 1} more` : b.join(' and ')
@@ -37,6 +38,8 @@ export function runWords(r: Pick<TestRun, 'what' | 'state' | 'behind'>, key: str
   if (r.what === 'scenario') return go ? { box: 'HQ is running a scenario on the app', bar: 'HQ is running a scenario on the app' } : { box: `HQ's scenario ${turn}`, bar: `HQ's scenario ${turn}` }
   if (r.what === 'setup_check') return go ? { box: 'HQ is checking its test setup', bar: 'HQ is trying its test setup for real: seed, start, reset' }
     : { box: `HQ's check of its test setup ${turn}`, bar: `HQ's check of its test setup ${turn}` }
+  if (r.what === 'steps_check') return go ? { box: 'HQ is checking its test steps', bar: 'HQ is running the test steps Claude worked out, for real, in its sandbox' } // Bug 411
+    : { box: `HQ's check of its test steps ${turn}`, bar: `HQ's check of its test steps ${turn}` }
   if (r.what === 'checker') return go ? { box: 'HQ\'s checker is reading what the tester did', bar: 'HQ\'s checker is reading what the tester did, against the criteria' }
     : { box: `HQ's checker ${turn}`, bar: `HQ's checker ${turn}` }
   if (r.what === 'replay') return go ? { box: 'HQ is replaying a fixed finding', bar: 'HQ is replaying the findings whose fixes merged' }

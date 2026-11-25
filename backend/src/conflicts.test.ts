@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-conflicts-'))
 const { migrate, run } = await import('./db.ts')
 migrate()
-const { backBy, backWords, changeText, fixButton, fixConflictsText, fixingFor, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, notedSince, stalledKind, testsFailed,
+const { allOutside, backBy, backWords, changeText, fixButton, fixConflictsText, fixingFor, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, notedSince, stalledKind, testsFailed,
   whoMergedFirst } = await import('./conflicts.ts')
 const { getRepo, getTicket, localOnly, syncBlocks, usesGithub } = await import('./records.ts')
 
@@ -234,4 +234,40 @@ test('Bug 373: what the engineer wrote in its handoff log since the ticket went 
   run("UPDATE docs SET text = ? WHERE scope = ? AND key = 'tests_failed'", JSON.stringify({ test: 'npm test', output: 'x', earlier: '' }), scope)
   assert.equal(notedSince(t.id), '')
   run("DELETE FROM docs WHERE scope = ? AND key IN ('tests_failed', 'handoff')", scope)
+})
+
+// Bug 411: sent back with "put it where that command runs it", an engineer wrapped its backend's pytest tests in the frontend's test runner. A named test in a
+// folder HQ's test command runs nothing in is the command's gap: the engineer is told to change nothing and say so (a real engineer on today's words wired
+// pytest into `npm test`; on these, Haiku and Sonnet both called report_blocked and changed nothing, 2026-11-25).
+test('Bug 411: tests where the command runs nothing aren\'t the engineer\'s to move: it reports the block, and the usual steps stay for the rest', () => {
+  const t = { ...getTicket('shop')!, criteria: JSON.stringify([{ id: 'A1', kind: 'backend', text: 'Downloads are listed.' }]) }, CMD = '(cd "frontend" && npm test)'
+  const list = "The tests that didn't run:\n- A1: \"test_download_is_listed\" in backend/tests/test_downloads.py never ran: HQ's test command runs nothing in backend/ (it runs frontend/)."
+  const gap = { kind: 'fail' as const, test: CMD, earlier: '', unproven: true, missing: 1, outside: 1, output: list }
+  const text = fixTestsText({ t, base: 'main', failed: gap })
+  assert.match(text, /^HQ: b\/INV merged with main passes `\(cd "frontend" && npm test\)`, but that run didn't run every test you named for the ticket's criteria, /)
+  assert.match(text, /criteria, so HQ didn't merge it\.\n\nThe tests/)
+  assert.match(text, /runs nothing in backend\/ \(it runs frontend\/\)\.\n\nThat is a gap in HQ's test command, not in your ticket\. Do this:\n1\. Leave your code and your tests as they are\. /)
+  assert.match(text, /as they are\. Don't move these tests, and don't wrap them in or call them from another test runner to get them seen\.\n2\. Call report_blocked and say /)
+  assert.match(text, /2\. Call report_blocked and say which folder HQ's test command doesn't run\. Then end your turn\./)
+  assert.match(text, /HQ tells you when its test command has changed: run it then, and call open_pr again with the same title and body \(leave `tests` out unless/)
+  assert.doesNotMatch(text, /Make each test listed above run and pass|git merge|put it where that command runs it|Fix it now/) // nothing that asks it to change the code
+  assert.match(fixTestsText({ t, base: 'main', failed: gap, launch: { worktree: '/w' } }), /^You are the engineer for ticket .*\n\nHQ: b\/INV merged/) // a fresh engineer too
+  assert.match(fixTestsText({ t, base: 'main', failed: { ...gap, asked: true } }), /so the user sent it back to you\.\n\nThe tests/)
+  // some where the command runs nothing, some it should have run: the usual steps, and the folder rule for the first kind
+  const mixed = fixTestsText({ t, base: 'main', failed: { ...gap, missing: 3 } })
+  assert.match(mixed, /2\. Make each test listed above run and pass under `\(cd "frontend" && npm test\)` .*Don't drop a criterion's test\. For a test in a folder HQ's test command runs nothing in /)
+  assert.match(mixed, /don't move it and don't wrap it in or call it from another test runner: call report_blocked and say which folder HQ's test command doesn't run\.\n3\. Commit\./)
+  // what it must not change: unseen tests with none of them outside read as before
+  const usual = fixTestsText({ t, base: 'main', failed: { ...gap, outside: undefined } })
+  assert.match(usual, /2\. Make each test listed above run and pass under `\(cd "frontend" && npm test\)` \(HQ reads that command's output\), or name a test that does\. /)
+  assert.match(usual, /or name a test that does\. Don't drop a criterion's test\.\n3\. Commit\./)
+  assert.doesNotMatch(usual, /gap in HQ's test command|report_blocked and say which folder/)
+  assert.equal(allOutside(gap), true); assert.equal(allOutside({ ...gap, missing: 3 }), false); assert.equal(allOutside({ ...gap, outside: undefined }), false)
+  assert.equal(allOutside({ ...gap, unproven: undefined }), false); assert.equal(allOutside({ ...gap, missing: undefined }), true) // a count HQ didn't keep: all it knows of are outside
+  // why it went back, for the TPM, and kept with the ticket for whoever takes over
+  assert.equal(backWords(gap, 'main'), "its tests passed with it merged into main and none failed, but 1 test named for its criteria wasn't seen running in a folder HQ's test command runs nothing in")
+  assert.equal(backWords({ ...gap, missing: 3 }, 'main'),
+    "its tests passed with it merged into main and none failed, but 3 tests named for its criteria weren't seen running, 1 of them in a folder HQ's test command runs nothing in")
+  keepTestsFailed(t, gap); assert.equal(testsFailed(t, null).outside, 1); assert.equal(allOutside(testsFailed(t, null)), true)
+  keepTestsFailed(t, { ...gap, outside: undefined }); assert.equal(testsFailed(t, null).outside, undefined)
 })

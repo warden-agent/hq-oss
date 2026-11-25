@@ -1,0 +1,17 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.10.21, pytest-9.2.0, pluggy-1.7.0 -- /tmp/shop/backend/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /tmp/shop/backend
+configfile: pyproject.toml
+testpaths: tests
+collecting ... collected 7 items
+
+tests/test_downloads.py::test_download_is_listed PASSED                  [ 14%]
+tests/test_downloads.py::test_downloading_twice_keeps_one PASSED         [ 28%]
+tests/test_downloads.py::test_removed_download_leaves_list PASSED        [ 42%]
+tests/test_downloads.py::test_removing_missing_succeeds PASSED           [ 57%]
+tests/test_downloads.py::test_downloads_survive_restart SKIPPED (not...) [ 71%]
+tests/test_downloads.py::test_lists_are_per_user[a] PASSED               [ 85%]
+tests/test_downloads.py::test_lists_are_per_user[b] PASSED               [100%]
+
+========================= 6 passed, 1 skipped in 0.01s =========================

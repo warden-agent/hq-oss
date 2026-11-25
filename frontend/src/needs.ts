@@ -100,6 +100,7 @@ export const ALERT_KINDS = new Set(['stuck', 'blocked', 'dialog', 'message_for_u
 /** Good news: green, not red, because nothing is wrong (Bug 61). */
 export const goodNews = (kind: string): boolean => kind === 'merged' || kind === 'conflicts_fixed' || kind.startsWith('auto_finished:') || kind.startsWith('project_removed') // Bug 66's notice
   || kind.startsWith('repo_cleared:') || kind.startsWith('repo_testsetup_ok:') // Bug 251: a clean Clear, a checked test setup (their problems have kinds of their own)
+  || kind.startsWith('repo_teststeps_ok:') // Bug 411: test steps Claude worked out and HQ checked
 /** Plain information: nothing is wrong and nothing is asked, so neither red nor green (Bug 97: a newer Claude Code is installed, and HQ's agents stay put). */
 export const plainNews = (kind: string): boolean => kind === 'claude_newer'
 /** Notices about a whole project that need the user: they name their project in the kind. Auto mode's own, a test command engineers can't run (Bug 107),

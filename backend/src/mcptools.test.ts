@@ -53,7 +53,8 @@ test('an engineer is offered the tools of its own ticket: read it, log its hando
 })
 
 test('the Launch helper is offered the tools that save how the app starts and is tested, and no ticket tools', async () => {
-  assert.deepEqual(await offered(agent('launcher')), [...COMMON, 'save_launch', 'launch_ok', 'report_cant_start', 'save_test_setup', 'report_cant_test'])
+  assert.deepEqual(await offered(agent('launcher')), [...COMMON, 'save_launch', 'launch_ok', 'report_cant_start', 'save_test_setup', 'report_cant_test', 'save_test_steps',
+    'report_cant_test_steps']) // Bug 411: the test steps job, the same role
 })
 
 test('an architect and a tester are offered the two tools every agent has, and nothing else', async () => {

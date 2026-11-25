@@ -13,6 +13,7 @@ import { archive, deleteRepoRows, deleteRows, inList, startingNow, startingWhy, 
 import { fallbackNote } from './freshstart.ts'
 import { stopFirstMap } from './firstmap.ts'
 import { finish, sweepStrays } from './launchhelper.ts'
+import { finishSteps } from './teststeps.ts'
 import { inMergeQueue } from './mergewatch.ts'
 import { agentNote, noteScope, saveNote } from './notes.ts'
 import { row, stopPreview } from './preview.ts'
@@ -59,6 +60,7 @@ export async function removeRepo(repoId: string, landing: string | null = null):
     await stopPreview(repoId).catch(() => {}) // also waits for a start or stop already under way
     stopFirstMap(repoId) // its checkout goes with the test worktrees below
     const p = row(repoId); if (p?.helper_agent_id || p?.helper_worktree) await finish(repoId, null, null).catch(() => {}) // only HQ's own scratch worktree goes
+    await finishSteps(repoId, null).catch(() => {}) // a test steps helper at work ends here, with its worktree and HQ's check of its save (Bug 411)
     await sweepStrays(repo).catch(() => {})
     await sweepTestWorktrees(repo.path).catch(() => {})
     await stopAll(repoId)

@@ -22,6 +22,8 @@ import { replanDue } from './replan.ts'
 import { handOver, keepFirstRequest, messageTpm, tpmStarting } from './tpm.ts'
 import { writeFeatureMd } from './projectmd.ts'
 import { gitFacts, readNote } from './notes.ts'
+import { suiteCmd } from './suiteran.ts'
+import { stepsOf } from './teststepsstore.ts'
 import { backBy, backWords, changeText, clearConflict, clearStalled, fixConflictsText, fixingFor, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, testsFailed,
   whoMergedFirst } from './conflicts.ts'
 import { conflictsWith } from './localmerge.ts'
@@ -162,7 +164,8 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolea
     : `Ticket ${t.key} (${t.size}): ${t.title}\nFeature: ${f.title}\nBranch: ${branch} (your worktree: ${wtPath})\nExpected files: ${t.expected_files}\nDepends on: ${t.deps}\n\n`
       + `## Spec\n${spec}\n${criteriaBlock(criteriaOf(cur))}\nStart by calling get_ticket, explore the code, write your plan, and call ExitPlanMode.`
   const slot = await nextWorkerSlot(`pending-${t.id}`) // a fix runs on the S model below: no plan, so no opusplan plan→exec switch
-  const tests = repo.test_cmd && !t.repairs_main ? `\n\n${testCmdNote(repo.test_cmd)}` : '' // a repair's spec has the command: it's the one that failed
+  const cmd = suiteCmd(repo, wtPath), told = repo.test_cmd || stepsOf(repo.id) ? cmd : null // Bug 411: saved steps are told like a saved command; what the rules find, as before, isn't
+  const tests = told && !t.repairs_main ? `\n\n${testCmdNote(told)}` : '' // a repair's spec has the command: it's the one that failed
   const ports = `\n\n${portsNote(slot.env)}` // Bug 259: its own, not another HQ's
   const a = await launchAgent({
     role: 'engineer', repoId: f.repo_id, featureId: f.id, ticketId: t.id, model: modelFor('engineer', opts.fix || opts.resume?.status === 'resolving' ? 'S' : t.size), cwd: repo.path, displayName: `eng ${t.key}`, launchPrompt: prompt + tests + ports,

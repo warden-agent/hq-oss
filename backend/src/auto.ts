@@ -12,7 +12,7 @@ import { id, j } from './util.ts'
 import { getAgent, stopAgent, type Agent } from './agents.ts'
 import { actionOf, openAsks } from './asks.ts'
 import { attention, openAttention, resolveAttention, resolveForTicket, resolveKind, stillOpen, type Attention } from './attention.ts'
-import { mergeBase, setConflict, whoMergedFirst } from './conflicts.ts'
+import { allOutside, mergeBase, setConflict, whoMergedFirst } from './conflicts.ts'
 import { createPr, mergePr, pushBranch } from './github.ts'
 import { restoreMain } from './localmerge.ts'
 import { writeFeatureMd } from './projectmd.ts'
@@ -29,6 +29,11 @@ import { readyTickets } from './readiness.ts'
 import { ensureFresh, ghOpts, git, syncRepo } from './repos.ts'
 import { canLaunch } from './scheduler.ts'
 import { autoGen, autoWork, detectTests, failedLine, failReport, lookAtBase, sandboxProblem, showing, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
+import { notRunWords } from './testcensus.ts'
+import { readSteps, savedCmd, stepsOf } from './teststepsstore.ts'
+import { stepsGap, stepsHelperOf, stepsReady } from './teststeps.ts'
+import { suiteCmd } from './suiteran.ts'
+import { combinedCommit } from './localmerge.ts'
 export { failedLine } // it lives with the runs now (testrun.ts): conflicts.ts words a send-back with it too (Bug 373)
 import { countWords, took } from './testcounts.ts'
 import { addFeature, cancelTicket, createTicket, fillSlots, finishedAndStopped, fixConflicts, fixTests, resumeEngineer, testCmdNote } from './tickets.ts'
@@ -36,7 +41,7 @@ import { restartTpm, tpmStarting } from './tpm.ts'
 import { dialogGone } from './presence.ts'
 import { idleTooLong } from './bgruns.ts'
 import { saveTestCmds } from './heavy.ts'
-import { confirm, lookLines, proofOf, unproven, watchFor } from './criteria.ts'
+import { confirm, lookLines, outsideParts, proofOf, unproven, watchFor } from './criteria.ts'
 import { row as previewRow, runnableRecipe } from './preview.ts'
 import { lookHow, type LookPlan } from './smoke.ts'
 import { keepProposed, LEFT_OUT_ASK, leftOutLines, saysNothing } from './leftout.ts'
@@ -58,6 +63,8 @@ export const MAX_TRIES = 2
 export const MAX_REPAIRS = 2
 const TICK_MS = Number(process.env.HQ_AUTO_TICK_MS ?? 60_000)
 const SOON_MS = Number(process.env.HQ_AUTO_SOON_MS ?? 3_000), TPM_GONE_MS = 90_000
+/** Bug 411: a helper is working out the project's test steps (teststeps.ts). Tickets are still built; a test waits for the steps. */
+const STEPS_WAIT = 'Claude is working out how to test this project (once, a few minutes). Tickets are still built; nothing is tested or merged until the test steps are there.'
 const NO_TESTS = "No tests HQ can run, so finished tickets aren't merged. Add a test command, or ask the TPM for a ticket that adds tests."
 const RESUMABLE = ['planning', 'implementing', 'awaiting_answer', 'resolving']
 const FINISHED_NOT_MERGED = ['pr_ready', 'pr_open']
@@ -336,7 +343,10 @@ async function checkMain(repo0: Repo, r: AutoRun): Promise<void> {
     // A finished ticket already waiting goes first: its own test checks main, and tests main alone if it fails (PR #59). A new test command that only that ticket satisfies
     // would otherwise look like a broken main and open a repair that holds it up.
     if (!tip || repo.empty || openRepair(repo.id) || nextToMerge(repo, tip)) return checked()
-    const test = () => testBase(repo.path, base.ref, `run-${r.id}`, repo.test_cmd, gen, { repoId: repo.id, ticketId: null, what: 'main' })
+    // Bug 411: test files HQ's command runs nothing of: a helper works the test steps out first (once), and its end brings auto back here (listeners.ts)
+    if (await stepsReady(repo, tip) === 'working') return
+    if (!still()) return
+    const test = () => testBase(repo.path, base.ref, `run-${r.id}`, repo.test_cmd, gen, { repoId: repo.id, ticketId: null, what: 'main' }, { steps: stepsOf(repo.id) })
     let b = await test(); if (b.kind === 'fail' && !b.hung && still()) b = await test()
     if (b.kind === 'stopped') return // auto went off or stopped: no result, and a later run checks again (Bugs 89, 115)
     emit({ agentId: null, source: 'system', kind: 'auto.main_checked', payload: { repo: repo.id, run: r.id, result: b.kind, test: 'test' in b ? b.test : null } })
@@ -420,8 +430,13 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
     if (named.finished_sha && head !== named.finished_sha) return changedAfterOpenPr(t, head)
     const proof = proofOf(t) // the tests its open_pr named for its criteria: the run is watched for them by name
     const lp = lookPlan(repo) // and once they pass, HQ opens the app in the same checkout
+    // Bug 411: are the test steps settled for main with this ticket merged in (a ticket may add the first tests of a folder nothing runs yet)? If a helper is
+    // on them, this ticket is tested when it is done
+    const merged = await combinedCommit(repo.path, base.ref, head).catch(() => null)
+    if (merged && 'sha' in merged && await stepsReady(repo, merged.sha, { ticketId: t.id }) === 'working') return
+    if (!still()) return
     const r = await testCombined(repo.path, base.ref, head, t.key, repo.test_cmd, gen, { repoId: repo.id, ticketId: t.id, what: 'ticket' }, // on its box meanwhile (Bug 106)
-      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null })
+      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null, steps: stepsOf(repo.id) })
     if (r.kind === 'stopped' || r.kind === 'looked') return // auto went off or stopped: nothing follows, not even with it back on by now (Bugs 89, 115)
     emit({ agentId: null, source: 'system', kind: 'auto.tested', payload: { ticket: t.id, key: t.key, result: r.kind, test: 'test' in r ? r.test : null } })
     if (!still()) return // turned off or removed during the test: a run that was killed reads as a failure, and nothing should follow from it
@@ -435,16 +450,22 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
     if (r.kind === 'fail') {
       const fix = () => retry(t, `Its tests still fail on ${base.name} after ${MAX_TRIES} fixes. ${whyFailed(r)}`, () => fixTests(t.id, r))
       if (t.repairs_main) return fix() // main is broken: that's why this ticket exists, so testing main alone says nothing
-      const b = await testBase(repo.path, base.ref, t.key, repo.test_cmd, gen, { repoId: repo.id, ticketId: t.id, what: 'main' }); if (b.kind === 'stopped') return
+      const b = await testBase(repo.path, base.ref, t.key, repo.test_cmd, gen, { repoId: repo.id, ticketId: t.id, what: 'main' }, { steps: stepsOf(repo.id) })
+      if (b.kind === 'stopped') return
       if (b.kind === 'fail') { if (still()) await repairMain(getRepo(repo.id)!, tip, b); return } // turned off during the test: nothing to repair for
       return fix()
     }
     const cur = still(); if (!cur) return // turned off, stopped or moved on during the test: not merged
     if (proof?.tests.length) { // a passing run that skipped or never ran a criterion's test proves nothing about it: back to its engineer, like a failure
-      const tests = proof.tests.map((e) => ({ ...e, state: confirm(e, r.names) })), missing = unproven(tests, r.test)
+      const leftOut = repo.test_cmd?.trim() ? [] : stepsOf(repo.id)?.left_out ?? [] // what the saved steps leave out on purpose: a test there says why it can't be seen
+      const tests = proof.tests.map((e) => ({ ...e, state: confirm(e, r.names) })), missing = unproven(tests, r.test, r.names.parts, leftOut)
+      const outside = tests.filter((e) => e.state === 'not_run' && outsideParts(e, r.names.parts, leftOut)).length // Bug 411: in a folder the command runs nothing in
       setTicket(t.id, { proof: JSON.stringify({ ...proof, tests, confirmed_at: now() }) })
-      const failed: Failed = { kind: 'fail', test: r.test, unproven: true, missing: missing.length, earlier: '',
+      const failed: Failed = { kind: 'fail', test: r.test, unproven: true, missing: missing.length, ...(outside ? { outside } : {}), earlier: '',
         output: `The tests that didn't run:\n${missing.map((m) => `- ${m}`).join('\n')}` }
+      // Bug 411: all of them where the test command runs nothing: its engineer can't change the command, so nothing goes back to it. The user sets one that runs them
+      if (missing.length && allOutside(failed)) return park(t, `HQ didn't see the tests named for its criteria run: its test command (\`${r.test}\`) doesn't run the folder `
+        + `they are in. ${missing[0]} Set a test command that runs those tests too (Auto box), then press Try again.`)
       if (missing.length) return retry(t, `The tests named for its criteria still didn't all run after ${MAX_TRIES} fixes. ${missing[0]}`, () => fixTests(t.id, failed))
     }
     // HQ's look at the app with the ticket merged in (smokerules.ts). Only what the ticket changed counts: when something is wrong, HQ looks at main alone too.
@@ -559,7 +580,7 @@ const appLine = (t: Ticket): string[] => {
   const m = j<MergeTest | null>(t.merge_test, null), l = m?.ran === 'pass' ? m.look : undefined, w = lookWords(l)
   return !l || !w || w.tone === 'ok' || (l.ran === 'skipped' && l.quiet) ? [] : [w.short]
 }
-function summary(repo: Repo, r: AutoRun, all: Ticket[]): string {
+function summary(repo: Repo, r: AutoRun, all: Ticket[], notTested: string[] = []): string {
   const done = all.filter((t) => t.status === 'merged' && t.updated_at >= r.started_at), parked = all.filter((t) => t.auto_parked_why), behind = stuckBehindParked(all)
   const fs0 = [...new Set(done.map((t) => t.feature_id))].map((id0) => getFeature(id0)!).filter(Boolean)
   // The TPM records choices while it splits, before the first ticket opens the run: a feature's all count, the project's by time
@@ -590,10 +611,19 @@ function summary(repo: Repo, r: AutoRun, all: Ticket[]): string {
     waiting.length ? `## Finished, not merged (no tests HQ can run)\n${waiting.map((t) => `- ${t.key}: ${t.title}`).join('\n')}` : '',
     changed ? `## Test command changed\n- Was: \`${changed.was ?? 'the one HQ found'}\`\n- Now: \`${changed.now}\`\n- Left out: ${changed.left_out}` : '',
     leftOut.length ? `## Tests a repair left out\n${leftOut.join('\n')}` : '',
+    notTested.length ? `## Tests HQ didn't run\n${notTested.join('\n')}` : '', // Bug 411: never skipped without a word
   ].filter(Boolean).join('\n\n')
 }
+/** Bug 411: the test files HQ's command ran nothing of as the run ended, and what the project's test steps leave out on purpose, one line each: for the
+ *  summary, so tests that didn't run are never news the user has to find. */
+async function notTestedLines(repo: Repo, end: string): Promise<string[]> {
+  const gap = await stepsGap(repo, end || 'HEAD').catch(() => null), f = readSteps(repo.id)
+  const why = f.ended ? ` Claude couldn't work out test steps that run them: ${f.ended.note}` : ''
+  return [...(gap?.gaps ?? []).map((g) => `- ${notRunWords(g)}: HQ's test command runs nothing there.${why}`),
+    ...(repo.test_cmd?.trim() ? [] : f.steps?.left_out ?? []).map((l) => `- ${l.path}: left out of the test steps (${l.why})`)]
+}
 async function closeRun(repo: Repo, r: AutoRun, status: 'finished' | 'off'): Promise<void> {
-  const text = summary(repo, r, repoTickets(repo.id)), end = await ref(repo), t = now()
+  const end = await ref(repo), text = summary(repo, r, repoTickets(repo.id), await notTestedLines(repo, end)), t = now()
   run('UPDATE auto_runs SET status = ?, end_sha = ?, ended_at = ?, summary = ? WHERE id = ?', status, end || null, t, text, r.id)
   patch('auto_run', r.id, { ...r, status, end_sha: end || null, ended_at: t, summary: text })
   emit({ agentId: null, source: 'system', kind: 'auto.finished', payload: { repo: repo.id, run: r.id, status } })
@@ -658,7 +688,7 @@ async function tickRepo(repo0: Repo): Promise<void> {
     await keepTpm(repo, repoTickets(repo.id))
     const bad = refusedCmd(repo); if (bad && !bad.ticket && !openRepair(repo.id)) { await repairCommand(repo); repo = getRepo(repo.id)! } // Bug 107
     const cap = canLaunch(), repair = openRepair(repo.id)
-    const wait = !cap.ok && /usage/i.test(cap.why ?? '') ? `Waiting for usage: ${cap.why}` : repair ? repairNote(repo, repair) : null
+    const wait = !cap.ok && /usage/i.test(cap.why ?? '') ? `Waiting for usage: ${cap.why}` : repair ? repairNote(repo, repair) : stepsHelperOf(repo.id) ? STEPS_WAIT : null
     if (repo.auto_waiting !== NO_TESTS) setRepo(repo, { auto_waiting: wait })
     if (tpmSettled(repo.id)) await startReady(repo)
     const opened = openRun(repo.id)
@@ -761,6 +791,15 @@ export async function autoResume(repoId: string): Promise<{ ok: true }> {
   if (stopped) tellTpm(repoId, `HQ: the user resumed auto mode, so it's running again. ${going(repo.default_branch)} If what stopped it is still there, it stops again and HQ tells you.`)
   autoSoon(); return { ok: true }
 }
+/** Bug 411: engineers at work when a helper's test steps are saved. Each hears the project's test command as its own session can run it in its own
+ *  worktree (suiteran.ts suiteCmd): the parts with tests there, without one only HQ's sandbox can run. Not with the user's own command set: that one counts. */
+export function tellEngineersSteps(repoId: string): void {
+  const repo = getRepo(repoId); if (!repo || repo.test_cmd?.trim()) return
+  for (const t of repoTickets(repoId).filter((x) => x.assignee_agent_id && !DONE.includes(x.status) && !FINISHED_NOT_MERGED.includes(x.status))) {
+    const a = getAgent(t.assignee_agent_id!), cmd = suiteCmd(repo, t.worktree_path)
+    if (a && a.status !== 'exited' && cmd) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to: a.id, reason: 'test_cmd', body: `HQ: ${testCmdNote(cmd)}` })
+  }
+}
 /** Engineers at work when the test command changes: otherwise they keep running the old one, which may never finish. Bug 147:
  *  - Not the repair's engineer whose proposal it was (it ran the command, Bug 83): it knows the command, and HQ answers it on its own.
  *  - When that repair has commits, the command may need them, and they reach another branch only once the repair is in main: the note says
@@ -830,7 +869,7 @@ const alreadyRuns = (base: string, leftOut: string): string => "That's already t
 export function proposeTestCommand(agent: Agent, command: string, leftOut: string): string {
   const t = ticketForAgent(agent), repo = t ? getRepo(getFeature(t.feature_id)?.repo_id ?? '') : undefined
   if (!t?.repairs_main || !t.branch || !repo) throw new Error('Only a repair ticket can change the test command.')
-  if (sameCmd(command, repo.test_cmd ?? (t.worktree_path ? detectTests(t.worktree_path)?.test : null))) {
+  if (sameCmd(command, savedCmd(repo.test_cmd, stepsOf(repo.id)) ?? (t.worktree_path ? detectTests(t.worktree_path)?.test : null))) {
     keepProposed(t.id, command, leftOut) // Bug 142: what it said it leaves out goes in the summary once the repair merges; not a change of the command
     throw new Error(alreadyRuns(mergeBase(repo).name, leftOut))
   }
@@ -840,7 +879,8 @@ export function proposeTestCommand(agent: Agent, command: string, leftOut: strin
   const tell = (body: string) => sendMessage({ repoId: repo.id, featureId: t.feature_id, channel: 'dm', from: 'hq', to: agent.id, reason: 'fyi', body })
   void inMergeQueue(repo.id, async () => {
     const base = mergeBase(repo)
-    const r = await testCombined(repo.path, base.ref, `refs/heads/${t.branch}`, `${t.key}-cmd`, command, null, { repoId: repo.id, ticketId: t.id, what: 'command' })
+    const r = await testCombined(repo.path, base.ref, `refs/heads/${t.branch}`, `${t.key}-cmd`, command, null, { repoId: repo.id, ticketId: t.id, what: 'command' },
+      { steps: stepsOf(repo.id) }) // Bug 411: the saved steps' installs still run before a proposed command
     if (r.kind !== 'pass') {
       const why = r.kind === 'fail' ? `${whyFailed(r)}\n\n${failReport(r, 3000)}` : r.kind === 'error' ? r.why : r.kind
       return tell(`HQ: your test command didn't pass, so nothing changed. ${why}`)
@@ -890,9 +930,15 @@ export function autoRetry(ticketId: string): { ok: true } {
   setTicket(t.id, { auto_parked_why: null, auto_tries: 0 }); resolveForTicket(t.id); autoSoon(); return { ok: true }
 }
 /** What the Auto dialog shows: the user's test command, or the one HQ found in the checkout, and why this machine can't do it, if so. */
-export async function autoCheck(repoId: string): Promise<{ custom: string | null; found: string | null; sandbox: string | null }> {
+export async function autoCheck(repoId: string): Promise<{ custom: string | null; found: string | null; sandbox: string | null; not_run: string[]; asks: boolean }> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
-  return { custom: repo.test_cmd, found: detectTests(repo.path)?.test ?? null, sandbox: await sandboxProblem() }
+  // Bug 411: what HQ runs without a command of the user's own (the saved test steps, else what its rules find), and the tests that runs nothing of, for the
+  // user to see before HQ tests with it. `asks`: a helper will be asked to work the steps out at the next test (nobody has looked at this gap yet)
+  const base = await git(repo.path, 'rev-parse', '--verify', '--quiet', `${mergeBase(repo).ref}^{commit}`).catch(() => 'HEAD')
+  const gap = await stepsGap(repo, base || 'HEAD', { own: false }), f = readSteps(repo.id)
+  return { custom: repo.test_cmd, found: gap.runs, sandbox: await sandboxProblem(), not_run: [...gap.gaps.slice(0, 6).map(notRunWords),
+    ...gap.shaky.map((d) => `${d === '.' ? 'the top folder' : `${d}/`} (a Python project whose setup HQ's rules can only guess)`)],
+    asks: !!gap.key && !f.job && !f.looked.some((l) => l.gap === gap.key) }
 }
 export function setTestCmd(repoId: string, cmd: string): { cmd: string | null } {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
