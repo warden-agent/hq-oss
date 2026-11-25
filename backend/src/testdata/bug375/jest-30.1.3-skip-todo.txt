@@ -1,0 +1,14 @@
+
+> shop-jweb@0.1.0 test
+> jest
+
+(node:4516) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+[0m[7m[1m[32m PASS [39m[22m[27m[0m [2mtest/[22m[1msort.test.js[22m
+[0m[7m[1m[32m PASS [39m[22m[27m[0m [2mtest/[22m[1mapi.test.js[22m
+
+[1mTest Suites: [22m[1m[32m2 passed[39m[22m, 2 total
+[1mTests:       [22m[1m[33m1 skipped[39m[22m, [1m[35m1 todo[39m[22m, [1m[32m2 passed[39m[22m, 4 total
+[1mSnapshots:   [22m0 total
+[1mTime:[22m        0.083 s, estimated 1 s
+[2mRan all test suites[22m[2m.[22m

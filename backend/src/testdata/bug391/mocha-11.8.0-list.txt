@@ -1,0 +1,47 @@
+has due_on:   ✔ has due_on: 0ms
+    book list shows each due date:   ✔ book list shows each due date: 0ms
+    book list marks a book due soon:   1) book list marks a book due soon
+    book list sorting sorts books by due date:   2) book list sorting sorts books by due date
+
+  2 passing (4ms)
+  2 failing
+
+  1) book list
+       marks a book due soon:
+
+      AssertionError [ERR_ASSERTION]: 2 == 3
+      + expected - actual
+
+      -2
+      +3
+      
+      at Context.<anonymous> (test/books.test.js:4:46)
+      at process.processImmediate (node:internal/timers:504:21)
+
+  2) book list
+       sorting
+         sorts books by due date:
+
+      AssertionError [ERR_ASSERTION]: Expected values to be loosely deep-equal:
+
+[
+  2,
+  1
+]
+
+should loosely deep-equal
+
+[
+  1,
+  2
+]
+      + expected - actual
+
+       [
+      -  2
+         1
+      +  2
+       ]
+      
+      at Context.<anonymous> (test/books.test.js:6:50)
+      at process.processImmediate (node:internal/timers:504:21)

@@ -7,8 +7,10 @@ import { bus, emit, patch } from './events.ts'
 import { id, short } from './util.ts'
 import { update, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
-import { autoOn, closedWhy, getFeature, getTicket, setTicket } from './records.ts'
+import { autoOn, closedWhy, getFeature, getTicket, setTicket, type Ticket } from './records.ts'
 import { tellTpm } from './mergewatch.ts'
+import { beforeChange, changeReadBefore, replanDue } from './replan.ts'
+import { stepNotes } from './delivery.ts'
 
 export type PlanRevision = {
   id: string; ticket_id: string; agent_id: string; round: number; plan_text: string; plan_hash: string; plan_file_path: string | null
@@ -51,6 +53,9 @@ export function onExitPlanMode(agent: Agent, body: Record<string, unknown>, res:
   if (!plan.trim()) { jsonEnd(res, denyAnswer('HQ: the plan is empty (plan file not written). Write the plan, then call ExitPlanMode again.')); return }
   let rev = one<PlanRevision>('SELECT * FROM plan_revisions WHERE ticket_id = ? AND plan_hash = ? ORDER BY submitted_at DESC', ticketId, hash)
   if (rev?.verdict === 'superseded') rev = undefined // the same plan again after a newer one replaced it: a new round
+  // Bug 371: the ticket changed after this plan was written, and a new plan is owed: the old one again is a new round for the user, not taken back as approved
+  const tk0 = getTicket(ticketId)
+  if (rev && tk0 && beforeChange(tk0, rev.round) && replanDue(tk0, getFeature(tk0.feature_id)?.repo_id)) rev = undefined
   if (rev?.verdict === 'approve' || rev?.verdict === 'approve_with_edits' || rev?.verdict === 'user_engineer') {
     // Back to an approved plan: a newer round still open is moot, and left open it would read as a terminal-menu approval.
     if (supersedeOpen(ticketId, rev.round, agent.id)) setTicket(ticketId, { status: 'implementing' })
@@ -65,6 +70,10 @@ export function onExitPlanMode(agent: Agent, body: Record<string, unknown>, res:
     const t = one<{ plan_round: number }>('SELECT plan_round FROM tickets WHERE id = ?', ticketId)!
     const round = t.plan_round + 1
     const capped = revisesUsed(ticketId) >= revisionCap()
+    // Bug 371 follow-up: a new plan is owed, but this one was written before its engineer read the change (in the same model response as the step that
+    // brought the notice in, or with the notice still unread): it is no answer to the change, so the plan owed moves past it
+    const owed = tk0 && replanDue(tk0, getFeature(tk0.feature_id)?.repo_id)
+    const seen = owed ? changeReadBefore(agent.id, typeof body.transcript_path === 'string' ? body.transcript_path : agent.transcript_path) : null
     const r = tx(() => { // the new round, its review and the ticket's status together, or none of them
       supersedeOpen(ticketId, round, agent.id)
       const nr: PlanRevision = {
@@ -78,12 +87,13 @@ export function onExitPlanMode(agent: Agent, body: Record<string, unknown>, res:
         opened_at: now(), answered_at: null, closed_reason: null,
       }
       run('INSERT INTO review_requests(id, ticket_id, plan_revision_id, round, status, opened_at) VALUES (?,?,?,?,?,?)', rq.id, ticketId, nr.id, round, 'open', rq.opened_at)
-      setTicket(ticketId, { plan_round: round, status: capped ? 'escalated' : 'plan_review' })
+      setTicket(ticketId, { plan_round: round, status: capped ? 'escalated' : 'plan_review', ...seen && !seen.read ? { replan_after: round } : {} })
       return { rev: nr, review: rq }
     })
     rev = r.rev; review = r.review
     patch('review', review.id, { ...review, plan_text: plan, revises_used: revisesUsed(ticketId) } as unknown as Record<string, unknown>)
     emit({ agentId: agent.id, source: 'system', kind: 'gate.review_opened', payload: { review: review.id, round, hash, planLen: plan.length, capped } })
+    if (seen && !seen.read) emit({ agentId: agent.id, source: 'system', kind: 'gate.plan_before_change', payload: { review: review.id, round, why: seen.why } })
     if (capped) {
       const key = one<{ key: string }>('SELECT key FROM tickets WHERE id = ?', ticketId)?.key ?? ticketId
       attention('cap_reached', `${key}: plan sent back ${revisesUsed(ticketId)} times. Approve it or cancel the ticket.`, { agentId: agent.id, ticketId })
@@ -124,6 +134,9 @@ function supersedeOpen(ticketId: string, round: number, agentId: string): number
   return open.length
 }
 
+/** Bug 371: approving a plan of `round` settles the new plan `t` owes (one of a round after its spec changed). */
+const settles = (t: Pick<Ticket, 'replan_after'> | undefined, round: number): boolean => t?.replan_after != null && !beforeChange(t, round)
+
 /** Every verdict the gate knows how to act on; anything else would close a review and leave its ticket stuck. */
 export const VERDICTS = ['approve', 'approve_with_edits', 'revise', 'escalate', 'user_engineer', 'user_architect'] as const
 export type Verdict = (typeof VERDICTS)[number]
@@ -156,7 +169,8 @@ export function answerReview(reviewId: string, verdict: Verdict, opts: { plan?: 
     run('UPDATE plan_revisions SET verdict = ?, edited_plan_text = ?, verdict_by = ?, verdict_at = ?, verdict_message = ? WHERE id = ?',
       verdict, opts.plan ?? null, opts.by, t, opts.message ?? null, rev.id)
     run('UPDATE review_requests SET status = ?, answered_at = ?, closed_reason = ? WHERE id = ?', 'answered', t, verdict, reviewId)
-    setTicket(review.ticket_id, { status: ticketStatus })
+    // Bug 371: an approved plan written after the ticket's spec changed is the new plan that was owed
+    setTicket(review.ticket_id, { status: ticketStatus, ...approve && settles(tk0, review.round) ? { replan_after: null } : {} })
     // A stopped engineer stays stopped (Bug 231): its ticket shows Resume, and nothing waits for an agent that isn't there
     const gone = one<{ status: string }>('SELECT status FROM agents WHERE id = ?', rev.agent_id)?.status === 'exited'
     if (approve) update(rev.agent_id, { last_gate_allow_at: t, in_plan_mode: 0, ...gone ? {} : { status: 'working' } })
@@ -170,7 +184,10 @@ export function answerReview(reviewId: string, verdict: Verdict, opts: { plan?: 
     + 'If this changes what the ticket builds, keep its spec and title in step (update_ticket_spec, user_asked: true).')
   if (h) {
     const no = verdict === 'escalate' ? 'Plan escalated to the user; wait for a message from HQ.' : 'Plan not approved. Revise and call ExitPlanMode again.'
-    clearTimeout(h.timer); jsonEnd(h.res, approve ? allowAnswer(planText, rev.plan_file_path) : denyAnswer(opts.message ?? no))
+    // Bug 370: a plan sent back gets no tool step after it (no PostToolUse or PostToolUseFailure on 2.1.322), so a change to its ticket that waited
+    // for one goes in with the answer, before the plan is revised. An approved one's comes with its PostToolUse (hooks.ts)
+    const notes = approve ? null : stepNotes(rev.agent_id)
+    clearTimeout(h.timer); jsonEnd(h.res, approve ? allowAnswer(planText, rev.plan_file_path) : denyAnswer(`${opts.message ?? no}${notes ? `\n\n${notes}` : ''}`))
   }
   return { ok: true, held: !!h }
 }
@@ -188,7 +205,8 @@ export function onPostExitPlanMode(agent: Agent, body: Record<string, unknown>):
   tx(() => {
     run('UPDATE review_requests SET status = ?, answered_at = ?, closed_reason = ? WHERE id = ?', 'closed', t, 'user_override', open.id)
     run('UPDATE plan_revisions SET verdict = ?, verdict_by = ?, verdict_at = ? WHERE id = ?', 'user_override', 'user', t, open.plan_revision_id)
-    setTicket(ticketId, { status: 'implementing' })
+    const tk = getTicket(ticketId) // Bug 371: approved in the terminal, by a person: a plan written after the change settles the one owed
+    setTicket(ticketId, { status: 'implementing', ...settles(tk, open.round) ? { replan_after: null } : {} })
   })
   patch('review', open.id, { status: 'closed', closed_reason: 'user_override', answered_at: t })
   const responsePlanLen = String((body.tool_response as { plan?: string } | undefined)?.plan ?? '').length

@@ -301,6 +301,37 @@ test('Bug 141: an engineer set to haiku plans on Sonnet and builds on Haiku, wit
   assert.deepEqual(await alarms(), [`engineer ${e.id}: model switched ${HAIKU} → ${SONNET} (source auto); role paused`])
   assert.deepEqual((await hq.state()).settings.paused_roles, ['engineer'])
 })
+test('Bug 385: an approved engineer on haiku goes back into plan mode by itself, with no model alarm and the role not paused', async () => {
+  const p = await project('b385x'), SONNET = 'claude-sonnet-5-5', HAIKU = 'claude-haiku-5-5'
+  assert.equal((await hq.api('roles/engineer/resume', {})).status, 200) // Bug 141's case above leaves the role paused
+  const models = { tpm: 'opus', architect: 'opus', engineer_s: 'haiku', engineer_ml: 'opusplan', launcher: 'sonnet', tester: 'sonnet' }
+  assert.equal((await hq.api('settings', { key: 'models', value: models })).status, 200)
+  const t = await ticket(p, 'Tags'); await turnEnds(p); const e = await engineer(t); assert.equal(e.model_alias, 'haiku')
+  const step = (model: string, tools: string[]) => hq.modEvent(e.id, { kind: 'turn.step', model, agentId: null, usageModel: model, tools })
+  const tool = (ev: string, name: string, mode: string) => hq.hook(e.id, { hook_event_name: ev, tool_name: name, tool_input: {}, permission_mode: mode })
+  const alarms = async () => (await hq.state()).attention.filter((a: any) => a.agent_id === e.id && a.kind.startsWith('model_')).map((a: any) => a.detail)
+  await tool('PreToolUse', 'ExitPlanMode', 'plan'); await step(SONNET, ['ExitPlanMode'])
+  assert.equal((await hq.hook(e.id, exitPlanMode(`Plan for ${t.key}`))).hookSpecificOutput.decision.behavior, 'allow')
+  await hq.hook(e.id, { hook_event_name: 'PostModelSwitch', from_model: SONNET, to_model: HAIKU, source: 'auto', requested_model: null })
+  await tool('PostToolUse', 'ExitPlanMode', 'acceptEdits'); await tool('PreToolUse', 'Edit', 'acceptEdits'); await step(HAIKU, ['Edit'])
+  // What the real 2.1.322 sent when it called EnterPlanMode (bug385spike.mjs): PreToolUse in acceptEdits, PostToolUse in plan, the switch back to Sonnet
+  // of its own, and only then the request that made the call, on Haiku
+  await tool('PreToolUse', 'EnterPlanMode', 'acceptEdits'); await tool('PostToolUse', 'EnterPlanMode', 'plan')
+  await hq.hook(e.id, { hook_event_name: 'PostModelSwitch', from_model: HAIKU, to_model: SONNET, source: 'auto', requested_model: null })
+  await step(HAIKU, ['EnterPlanMode']); await tool('PreToolUse', 'Write', 'plan'); await step(SONNET, ['Write'])
+  const s = await hq.state(); assert.deepEqual(await alarms(), []); assert.deepEqual(s.settings.paused_roles ?? [], [])
+  const a = s.agents.find((x: any) => x.id === e.id); assert.equal(a.model_live, SONNET); assert.equal(a.in_plan_mode, 1)
+  // Building again, a switch back to Sonnet with no EnterPlanMode is still a fallback
+  await tool('PreToolUse', 'ExitPlanMode', 'plan'); await step(SONNET, ['ExitPlanMode'])
+  assert.equal((await hq.hook(e.id, exitPlanMode(`New plan for ${t.key}`))).hookSpecificOutput.decision.behavior, 'allow')
+  await hq.hook(e.id, { hook_event_name: 'PostModelSwitch', from_model: SONNET, to_model: HAIKU, source: 'auto', requested_model: null })
+  await tool('PostToolUse', 'ExitPlanMode', 'acceptEdits'); await tool('PreToolUse', 'Edit', 'acceptEdits')
+  assert.deepEqual(await alarms(), [])
+  await hq.hook(e.id, { hook_event_name: 'PostModelSwitch', from_model: HAIKU, to_model: SONNET, source: 'auto', requested_model: null })
+  assert.deepEqual(await alarms(), [`engineer ${e.id}: model switched ${HAIKU} → ${SONNET} (source auto); role paused`])
+  assert.deepEqual((await hq.state()).settings.paused_roles, ['engineer'])
+  assert.equal((await hq.api('roles/engineer/resume', {})).status, 200)
+})
 test('tickets that pass alone but fail together go back to their engineer, and the fix merges', async () => {
   const p = await project('mismatch')
   const t1 = await ticket(p, 'Server'), t2 = await ticket(p, 'Screen'); await turnEnds(p)
@@ -536,7 +567,8 @@ test('Bug 246: while auto mode is stopped, a finished ticket and a merge are tol
   const r = await hq.mcp(e1.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone\n\n## Tests left out\nNothing', feature_map_unchanged: true })
   const branch = (await tk(t1)).branch
   assert.equal(r.text, `Done. The user merges ${branch} into main from HQ. You're done: stop now.`)
-  assert.equal((await toTpm())[0], `HQ: T-01 is finished (${branch}). The user merges it into main from HQ; you'll be told when it merges.`)
+  assert.equal((await toTpm())[0], `HQ: T-01 is finished (${branch}). The user merges it into main from HQ; you'll be told when it merges.`
+    + ' Its plans: R-1 approved by HQ.') // Bug 387: HQ approved it, as plans are while auto mode is stopped
   assert.equal((await hq.api(`tickets/${t1.id}/merge`, {})).status, 200) // the board's Merge into main, while stopped
   await until(t1, 'merged')
   const merged = await waitFor('the TPM told of the merge', async () => (await toTpm()).find((b) => b.startsWith('HQ: T-01 merged.')))
@@ -1304,19 +1336,46 @@ test('a named test that HQ\'s run skipped, or never ran, sends the ticket back; 
   await build(p, t, e, { 'add.js': ADD, 'test/add.test.js': ADD_TEST.replace("('adds two numbers',", "('adds two numbers',{skip:true},"),
     'checks/bold.js': "require('node:test').test('total is bold',()=>{})\n" })
   assert.equal((await finish(e, tests)).isError, false) // git has nothing against it: both tests are on the branch
-  await until(t, 'resolving'); assert.equal((await tk(t)).fixing, 'tests')
+  await until(t, 'resolving'); assert.equal((await tk(t)).fixing, 'tests_unseen') // Bug 373: a reason of its own: no test failed
   const told = await waitFor('HQ to tell the engineer', async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === e.id &&
     /didn't run every test you named/.test(m.body)))
   assert.match(told.body, /passes `npm test`, but that run didn't run every test you named for the ticket's criteria, so HQ didn't merge it\./)
   assert.match(told.body, /- A1: "adds two numbers" in test\/add\.test\.js was skipped/)
   assert.match(told.body, /- A2: "total is bold" in checks\/bold\.js never ran\. `npm test` listed other tests and not this one/)
-  assert.deepEqual(await cameBack(e.id), [`${t.key} came back: the tests named for its criteria didn't all run`]) // Bug 206
+  assert.deepEqual(await cameBack(e.id), [`${t.key} came back: its tests passed, but 2 tests named for its criteria weren't seen running`]) // Bugs 206, 373
+  // Bug 373: the TPM hears what came back and why, in HQ's words (its engineer still runs, so it used to hear nothing until "fixed its tests")
+  const tpmTold = await waitFor('HQ to tell the TPM', async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === p.tpm.id && /went back/.test(m.body)))
+  assert.equal(tpmTold.body, `HQ: ${t.key} went back to its engineer (${e.id}, still running) because its tests passed with it merged into main and none failed, but 2 tests `
+    + "named for its criteria weren't seen running. HQ tested it before merging, and sent it back instead of merging it.")
   assert.deepEqual((await proofNow(t)).tests.map((x: any) => x.state), ['skipped', 'not_run']); assert.equal(fs.existsSync(path.join(p.dir, 'add.js')), false, 'not merged')
   const w = wt(p, t); fs.writeFileSync(path.join(w, 'test', 'add.test.js'), ADD_TEST); sh(w, 'mv', 'checks/bold.js', 'test/bold.test.js'); sh(w, 'add', '-A'); sh(w, 'commit', '-qm', 'they run now')
   const same = await finish(e); assert.equal(same.isError, true) // the tests it named last time are checked again, and one has moved
   assert.match(same.text, /A2: there's no checks\/bold\.js on your branch/); assert.equal((await tk(t)).status, 'resolving')
   assert.equal((await finish(e, [A1, { ...tests[1], file: 'test/bold.test.js' }])).isError, false)
   await until(t, 'merged'); assert.deepEqual((await proofNow(t)).tests.map((x: any) => x.state), ['passed', 'passed']); assert.equal((await tk(t)).auto_tries, 1)
+})
+
+// Bug 372: tests that ran and passed went back to the engineer as "never ran". The project's tests are in web/, run by a runner that prints a ✓ line per test
+// file (its path from web/) and no test names but the slow ones: here what vitest 4.1.11 really printed (src/testdata/bug372). hqcheck.test.ts has the button.
+// Bug 375: list.test.ts's line there says "1 skipped", so a test named in it is one HQ can't see by name; no reason to send the ticket back either.
+test('Bug 372: tests in a folder, run by a runner that prints a line per test file, are no reason to send a ticket back: it merges', async () => {
+  const p = await project('shop', { tests: false, auto: false }), web = path.join(p.dir, 'web'); fs.mkdirSync(path.join(web, 'src'), { recursive: true })
+  const out = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'testdata', 'bug372', 'vitest-4.1.11.txt'), 'utf8')
+  fs.writeFileSync(path.join(web, 'package.json'), JSON.stringify({ name: 'web', private: true, scripts: { test: 'node print.js' } }))
+  fs.writeFileSync(path.join(web, 'print.js'), `process.stdout.write(${JSON.stringify(out)})\n`); fs.writeFileSync(path.join(web, 'src', 'api.test.ts'), "test('has due_on', () => {})\n")
+  sh(p.dir, 'add', '.'); sh(p.dir, 'commit', '-qm', 'tests in web/'); assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
+  const t = await withCriteria(p, 'Due dates', [{ kind: 'backend', text: 'Each book in the list has its due date.' }, { kind: 'backend', text: 'The list says how many books it holds.' },
+    { kind: 'backend', text: 'The book due first is at the top of the list.' }])
+  await turnEnds(p)
+  const e = await engineer(t), tests = [{ criterion: 'A1', file: 'web/src/api.test.ts', name: 'has due_on' }, { criterion: 'A2', file: 'web/checks/count.test.ts', name: 'counts the books' },
+    { criterion: 'A3', file: 'web/src/list.test.ts', name: 'shows each due date' }]
+  await build(p, t, e, { 'web/src/list.test.ts': "test('shows each due date', () => {})\n", 'web/checks/count.test.ts': "test('counts the books', () => {})\n" })
+  assert.equal((await finish(e, tests)).isError, false)
+  await until(t, 'merged'); assert.equal((await tk(t)).auto_tries, 0); assert.deepEqual(await cameBack(e.id), [])
+  assert.deepEqual((await proofNow(t)).tests.map((x: any) => x.state), ['passed', 'unconfirmed', 'unconfirmed']) // A2's file is one the run never lists, A3's had one skipped
+  await turnEnds(p)
+  const r = await waitFor('the run to finish', async () => (await runs(p)).find((x: any) => x.status === 'finished'))
+  assert.match(r.summary, new RegExp(`- ${t.key}: tests passed, but HQ couldn't see A2, A3's by name: the test command doesn't print every test's name`))
 })
 
 test('the TPM gives criteria as a list: a ticket without them is refused, and criteria changed after a ticket finished send it back for the new one\'s test', async () => {

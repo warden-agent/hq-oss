@@ -1,4 +1,4 @@
-// Bugs 315, 341: a button whose job opened HQ's dialog first read busy ("Merging…", "Starting…", "Undoing…", a dimmed ✕) while the dialog was
+// Bugs 315, 341, 366: a button whose job opened HQ's dialog first read busy ("Merging…", "Starting…", "Undoing…", a dimmed ✕) while the dialog was
 // still up and nothing had happened yet. The dialog now goes in the `ask` step of useBusy / ActBtn (board.ts), which runs before the button
 // reads busy. This scans the page's code so a new button can't put a dialog back inside its job. The pages were checked in a headless browser
 // (Merge into main, Try it with another app on, with a one-off script).
@@ -102,4 +102,21 @@ test('Bugs 315, 341: what the scan must catch, and what it must not', () => {
     "const switchRepo = async (id) => { if (!(await stopOthers(all, id, { title: 'Switch', go: 'Switch' }))) return }",
   ]
   for (const code of fine) assert.ok(!jobs(code).some((j) => opensDialog(j, helpers)), `not caught: ${code.slice(0, 60)}`)
+})
+
+/** The `disabled={…}` of the `<button` that holds `marker` (its onClick), or null when it has none. */
+function disabledOf(code: string, marker: string): string | null {
+  const at = code.indexOf(marker); assert.ok(at >= 0, `found ${marker}`)
+  const tag = code.slice(code.lastIndexOf('<button', at), at), d = tag.indexOf('disabled={')
+  return d < 0 ? null : balanced(tag, d + 'disabled='.length).slice(1, -1)
+}
+test('Bug 366: Undo this run is not dimmed while its are-you-sure is up, like the other five; only busy (after yes) dims it', () => {
+  const auto = src('Auto.tsx'), nodes = src('Nodes.tsx')
+  assert.equal(disabledOf(auto, 'onClick={undo}'), 'busy')
+  // the other buttons Bug 341 changed: dimmed by busy (and their own reasons), never by their dialog being up
+  assert.equal(disabledOf(nodes, "onClick={() => run(() => api(path, {}), () => cancelConfirm("), 'busy')
+  assert.match(src('ui.tsx'), /export function ActBtn[^\n]*\n[^\n]*\n\s*const \[busy, go\] = useBusy\(\)\n[^\n]*disabled=\{disabled \|\| busy\}/)
+  // what it must catch: the old Undo, dimmed while asking
+  const old = '<button className="btn" disabled={busy || asking} title={`Put back`}\n          onClick={undo}>{busy ? \'Undoing…\' : \'Undo this run\'}</button>'
+  assert.equal(disabledOf(old, 'onClick={undo}'), 'busy || asking')
 })

@@ -6,7 +6,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
-import { claudeLockPid, claudeRunning, excludeLeftovers, listWorktrees, removeMerged, seedPackages, unlockStale } from './worktrees.ts'
+import { claudeLockPid, claudeRunning, copyPackages, copyTree, excludeLeftovers, listWorktrees, removeMerged, seedPackages, unlockStale } from './worktrees.ts'
 
 const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 const DEAD = 999_999 // above macOS's pid limit: never running
@@ -77,7 +77,10 @@ test('seedPackages (Bug 30): a new worktree gets main\'s node_modules at the roo
   fs.mkdirSync(path.join(dir, 'web')); fs.mkdirSync(path.join(dir, 'docs')); for (const d of ['.', 'web']) fs.writeFileSync(path.join(dir, d, 'package.json'), '{}')
   fs.writeFileSync(path.join(dir, 'docs', 'x.md'), 'no package.json here')
   sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'packages'); sh(dir, 'worktree', 'add', '-q', '-b', 'hq/f/T-1', wt('T-1'))
-  for (const d of ['.', 'web', 'docs']) { fs.mkdirSync(path.join(dir, d, 'node_modules', 'p'), { recursive: true }); fs.writeFileSync(path.join(dir, d, 'node_modules', 'p', 'i.js'), d) }
+  for (const d of ['.', 'web', 'docs']) {
+    fs.mkdirSync(path.join(dir, d, 'node_modules', 'p'), { recursive: true }); fs.writeFileSync(path.join(dir, d, 'node_modules', 'p', 'i.js'), d)
+    fs.writeFileSync(path.join(dir, d, 'node_modules', '.package-lock.json'), '{}') // a finished npm install (Bug 393)
+  }
   const t = new Date('2026-01-02T03:04:05Z'); fs.utimesSync(path.join(dir, 'node_modules', 'p', 'i.js'), t, t)
   assert.deepEqual(await seedPackages(dir, wt('T-1')), ['.', 'web'])
   assert.equal(fs.readFileSync(path.join(wt('T-1'), 'web', 'node_modules', 'p', 'i.js'), 'utf8'), 'web')
@@ -93,8 +96,49 @@ test('seedPackages: no copy when git doesn\'t ignore node_modules there, or main
   const { dir, wt } = repo(); fs.writeFileSync(path.join(dir, '.gitignore'), ''); fs.writeFileSync(path.join(dir, 'package.json'), '{}')
   sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'not ignored'); sh(dir, 'worktree', 'add', '-q', '-b', 'hq/f/T-1', wt('T-1'))
   assert.deepEqual(await seedPackages(dir, wt('T-1')), [], 'main has none')
-  fs.mkdirSync(path.join(dir, 'node_modules')); assert.deepEqual(await seedPackages(dir, wt('T-1')), [], 'would show up as new files')
+  fs.mkdirSync(path.join(dir, 'node_modules')); fs.writeFileSync(path.join(dir, 'node_modules', '.package-lock.json'), '{}')
+  assert.deepEqual(await seedPackages(dir, wt('T-1')), [], 'would show up as new files')
   assert.ok(!fs.existsSync(path.join(wt('T-1'), 'node_modules')))
+})
+
+/** Main's node_modules for Bug 393: a package with a program in .bin, and the tool's last file when `done` names it. */
+function installed(nm: string, done: string | null): void {
+  fs.mkdirSync(path.join(nm, 'vite'), { recursive: true }); fs.mkdirSync(path.join(nm, '.bin'), { recursive: true }); fs.writeFileSync(path.join(nm, 'vite', 'index.js'), 'v')
+  fs.writeFileSync(path.join(nm, '.bin', 'vite'), 'v'); const old = new Date(Date.now() - 60_000); fs.utimesSync(path.join(nm, '.bin'), old, old)
+  if (done) fs.writeFileSync(path.join(nm, done), '{}')
+}
+test('seedPackages (Bug 393): main\'s node_modules is copied only as a finished install left it, for npm, Yarn 1 and 2+, pnpm; Bun\'s as before', async () => {
+  const { dir, wt } = repo(); fs.writeFileSync(path.join(dir, 'package.json'), '{}'); sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'pkg')
+  let n = 0; const fresh = () => { const w = wt(`T-${++n}`); sh(dir, 'worktree', 'add', '-q', '-b', `hq/f/T-${n}`, w); return w }
+  const nm = path.join(dir, 'node_modules')
+  installed(nm, null); let w = fresh()
+  assert.deepEqual(await seedPackages(dir, w), [], 'no record: an install is filling it (npm ci deletes the record first and writes it last)')
+  assert.ok(!fs.existsSync(path.join(w, 'node_modules')), 'nothing copied: the look sees no node_modules and installs its own (smoke.ts installs)')
+  for (const done of ['.package-lock.json', '.yarn-integrity', '.yarn-state.yml', '.modules.yaml']) {
+    fs.rmSync(nm, { recursive: true }); installed(nm, done); w = fresh()
+    assert.deepEqual(await seedPackages(dir, w), ['.'], done); assert.ok(fs.existsSync(path.join(w, 'node_modules', 'vite', 'index.js')), done)
+  }
+  const later = new Date(Date.now() + 5_000); fs.utimesSync(path.join(nm, '.bin'), later, later); w = fresh()
+  assert.deepEqual(await seedPackages(dir, w), [], 'its programs changed after the last file: pnpm (or npm adding a package) is still at work')
+  fs.rmSync(nm, { recursive: true }); installed(nm, null); fs.writeFileSync(path.join(dir, 'bun.lock'), '{}'); w = fresh()
+  assert.deepEqual(await seedPackages(dir, w), ['.'], 'Bun writes no such file: copied as before')
+})
+test('copyPackages (Bug 393): an install that starts during the copy takes the copy away; a workspace member counts on the root\'s install', async () => {
+  const { dir, wt } = repo(); const nm = path.join(dir, 'node_modules'); installed(nm, '.package-lock.json')
+  const to = path.join(wt('X'), 'node_modules'); fs.mkdirSync(wt('X'), { recursive: true })
+  const npmCi = async (from: string, dest: string) => { await copyTree(from, dest); fs.rmSync(path.join(nm, '.package-lock.json')) } // npm ci began meanwhile
+  assert.equal(await copyPackages(dir, '.', to, npmCi), false); assert.ok(!fs.existsSync(to), 'the half copy is gone')
+  installed(nm, '.package-lock.json')
+  const doneAgain = async (from: string, dest: string) => { await copyTree(from, dest); fs.rmSync(path.join(nm, '.package-lock.json')); fs.writeFileSync(path.join(nm, '.package-lock.json'), '{}') }
+  assert.equal(await copyPackages(dir, '.', to, doneAgain), false, 'a whole install ran during the copy: its file is new'); assert.ok(!fs.existsSync(to))
+  assert.equal(await copyPackages(dir, '.', to), true); assert.ok(fs.existsSync(path.join(to, '.package-lock.json')))
+  fs.mkdirSync(path.join(dir, 'web', 'node_modules', 'x'), { recursive: true }); fs.writeFileSync(path.join(dir, 'web', 'package.json'), '{}')
+  const webTo = path.join(wt('X'), 'web', 'node_modules'); fs.mkdirSync(path.dirname(webTo), { recursive: true })
+  assert.equal(await copyPackages(dir, 'web', webTo), false, 'not a workspace: web has no install of its own that finished')
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ workspaces: ['web'] }))
+  assert.equal(await copyPackages(dir, 'web', webTo), true, 'a member: the root\'s finished install filled it')
+  fs.rmSync(webTo, { recursive: true }); fs.rmSync(path.join(nm, '.package-lock.json'))
+  assert.equal(await copyPackages(dir, 'web', webTo), false, 'and the root\'s install under way')
 })
 
 test('excludeLeftovers (Bug 263): an install\'s files never show in git status, in the checkout or its worktrees; ignored or tracked ones are left alone', async () => {

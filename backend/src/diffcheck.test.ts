@@ -45,16 +45,18 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-diffcheck-repo-'))
 const sh = (...a: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', ...a], { cwd: dir, encoding: 'utf8' })
 const write = (f: string, text: string) => { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), text) }
 sh('init', '-q', '-b', 'main'); write('add.js', 'exports.add = (a, b) => a - b\n'); write('package-lock.json', '{}\n'); write('web/package-lock.json', '{}\n')
+write('bun.lock', '{}\n') // Bug 358
 sh('add', '.'); sh('commit', '-qm', 'main')
 sh('checkout', '-qb', 'ticket'); write('add.js', 'exports.add = (a, b) => a + b\n'); write('test/add.test.js', "test('adds two numbers', () => {})\n")
-write('package-lock.json', `{${'"x": 1,\n'.repeat(500)}}\n`); write('web/package-lock.json', '{"y": 2}\n'); sh('add', '-A'); sh('commit', '-qm', 'ticket')
+write('package-lock.json', `{${'"x": 1,\n'.repeat(500)}}\n`); write('web/package-lock.json', '{"y": 2}\n'); write('bun.lock', '{"z": 3}\n'); sh('add', '-A'); sh('commit', '-qm', 'ticket')
 sh('checkout', '-q', 'main'); write('README.md', 'main moved on\n'); sh('add', '.'); sh('commit', '-qm', 'later on main')
 
 test('what the reader is shown: every changed file, then the branch\'s own diff without lockfiles, cut where it gets too long', async () => {
   const d = await diffFor(dir, 'refs/heads/main', 'refs/heads/ticket')
-  assert.match(d, /^Changed files:\n add\.js +\| +2 \+-\n package-lock\.json +\| +\d+ \+.*\n test\/add\.test\.js +\| +1 \+\n web\/package-lock\.json +\| +2 \+-\n 4 files changed/)
+  assert.match(d, new RegExp(String.raw`^Changed files:\n add\.js +\| +2 \+-\n bun\.lock +\| +2 \+-\n package-lock\.json +\| +\d+ \+.*\n`
+    + String.raw` test\/add\.test\.js +\| +1 \+\n web\/package-lock\.json +\| +2 \+-\n 5 files changed`))
   assert.match(d, /\n-exports\.add = \(a, b\) => a - b\n\+exports\.add = \(a, b\) => a \+ b\n/); assert.match(d, /\+test\('adds two numbers'/)
-  assert.doesNotMatch(d, /"x": 1|"y": 2|README|main moved on/) // lockfiles are named, not shown; what main did since isn't the ticket's change
+  assert.doesNotMatch(d, /"x": 1|"y": 2|"z": 3|README|main moved on/) // lockfiles are named, not shown; what main did since isn't the ticket's change
   sh('checkout', '-q', 'ticket'); write('big.txt', 'a line of a very long file\n'.repeat(4000)); sh('add', '.'); sh('commit', '-qm', 'big'); sh('checkout', '-q', 'main')
   const cut = await diffFor(dir, 'refs/heads/main', 'refs/heads/ticket')
   assert.ok(cut.length < 62_000, String(cut.length)); assert.match(cut.slice(-80), /\n\n\(The diff is cut here: \d+ more characters are not shown\.\)$/)

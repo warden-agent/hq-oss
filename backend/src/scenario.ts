@@ -11,7 +11,8 @@ import { getRepo } from './records.ts'
 import { git } from './reposync.ts'
 import { mergeBase } from './conflicts.ts'
 import { runnableRecipe, row } from './preview.ts'
-import { appSpec, browsersPrefix, prepareApp, type LookPlan, lookHow } from './smoke.ts'
+import { appSpec, blocked, browsersPrefix, prepareApp, startWhy, type LookPlan, lookHow } from './smoke.ts'
+import { moveLine } from './testports.ts'
 import { autoGen, detectTests, inCheckout, runSandboxed, type Shown } from './testrun.ts'
 import { buildTimeline, type Flag, type Row } from './timeline.ts'
 import { readSetup, type TestSetup } from './testsetupstore.ts'
@@ -37,11 +38,13 @@ const KEEP = 50
 export const scenariosDir = (repoId: string): string => path.join(PATHS.projects, repoId, 'scenarios')
 
 /** What the recorder is told (recorder.mjs's spec), for an app checked out at `wt`: the start steps' parts, each run as the test setup's production start
- *  says, the state paths and the seed. `out`: where it writes, in the checkout (the one folder the sandbox and HQ both reach). */
+ *  says, the state paths and the seed. `out`: where it writes, in the checkout (the one folder the sandbox and HQ both reach). `plan`: as prepareApp left it
+ *  for this checkout: a port it moved there (Bug 374) is moved in the setup's own commands too. */
 export function recordingSpec(wt: string, plan: LookPlan, setup: TestSetup, out: string) {
-  const base = appSpec(wt, plan)
-  return { ...base, root: wt, out, snapshot: setup.snapshot, seed: setup.seed,
-    parts: plan.recipe.parts.map((p) => { const s = setup.start.find((x) => x.part === p.name)!; return { name: p.name, cwd: path.join(wt, p.dir), run: s.run, build: s.build, port: p.port } }) }
+  const base = appSpec(wt, plan), here = (cmd: string): string => moveLine(cmd, plan.moved ?? [])
+  return { ...base, root: wt, out, snapshot: setup.snapshot, seed: setup.seed, // the seed writes data before the app starts: a number in it is no port
+    parts: plan.recipe.parts.map((p) => { const s = setup.start.find((x) => x.part === p.name)!
+      return { name: p.name, cwd: path.join(wt, p.dir), run: here(s.run), build: s.build ? here(s.build) : s.build, port: p.port } }) }
 }
 /** Why there's no test setup, in words that can't be read as "the project has no tests" (Bug 223: a project with `npm test` was told it had "no test setup
  *  yet"). The setup is HQ's way of starting and recording the app for scenarios, not the project's own tests; when it has those, the words say so. */
@@ -84,14 +87,16 @@ export async function runScenario(repoId: string, steps: Step[], o: { name?: str
   const sid = id('scn'), dest = path.join(scenariosDir(repoId), sid), name = o.name ?? `scenario ${sid}`
   const show: Shown | null = o.show ? { repoId, ticketId: null, what: o.show } : null
   const r = await inCheckout(repo.path, sha, `scenario-${sid}`, o.gen ?? autoGen(repo.path), show, async (wt, signal): Promise<ScenarioResult | { why: string } | 'stopped'> => {
-    const cant = await prepareApp(wt, plan, { signal, run: runSandboxed })
-    if (cant?.kind === 'stopped') return 'stopped'
-    if (cant) return { why: cant.kind === 'no_start' ? `the app couldn't be installed (${cant.why})` : cant.why }
+    const got = await prepareApp(wt, plan, { signal, run: runSandboxed })
+    if (got.kind === 'stopped') return 'stopped'
+    if (got.kind !== 'ready') return { why: got.kind === 'no_start' ? `the app couldn't be installed (${got.why})` : got.why }
+    const here = got.plan // as it runs in this checkout: on other ports, when its own were in use (Bug 374)
     const out = path.join(wt, '.hq-scenario'); fs.rmSync(out, { recursive: true, force: true })
-    const spec = { ...recordingSpec(wt, plan, setup, out), steps, stepMs: STEP_MS, ...(o.expect?.length ? { expect: o.expect } : {}) }
+    const spec = { ...recordingSpec(wt, here, setup, out), steps, stepMs: STEP_MS, ...(o.expect?.length ? { expect: o.expect } : {}) }
     // a reset starts the app again; a build may take a while
     const limit = spec.startMs * 2 + 10 * 60_000 + steps.length * (STEP_MS * 3 + SETTLE_MAX_MS) + (o.expect?.length ?? 0) * STEP_MS + 60_000
-    const run = await runSandboxed(wt, `${browsersPrefix()}${shq(process.execPath)} ${shq(STAND_IN() ?? RUNNER)} ${shq(JSON.stringify(spec))}`, { network: false, timeoutMs: limit, signal })
+    const run = await runSandboxed(wt, `${browsersPrefix()}${shq(process.execPath)} ${shq(STAND_IN() ?? RUNNER)} ${shq(JSON.stringify(spec))}`,
+      { network: false, timeoutMs: limit, signal, block: blocked(here) })
     if (signal.aborted) return 'stopped'
     fs.mkdirSync(path.dirname(dest), { recursive: true })
     if (fs.existsSync(out)) fs.cpSync(out, dest, { recursive: true }); else fs.mkdirSync(dest, { recursive: true })
@@ -101,6 +106,7 @@ export async function runScenario(repoId: string, steps: Step[], o: { name?: str
       const said = run.output.split('\n').map((l) => l.trim()).filter(Boolean).at(-1)?.slice(0, 200)
       res = { started: false, why: run.timedOut ? `the scenario took over ${Math.round(limit / 60_000)} minutes` : `the scenario ended with no result${said ? ` (${said})` : ''}`, steps: [] }
     }
+    if (!res.started && res.why) res.why = startWhy(res.why, here)
     if (res.output) fs.writeFileSync(path.join(dest, 'start-output.log'), res.output)
     const t = buildTimeline(dest, { endpoints: setup.endpoints, limits: setup.limits, name })
     return { id: sid, dir: dest, started: !!res.started, why: res.why, steps: res.steps, ...(res.expect ? { expect: res.expect } : {}), timeline: t.rows, flags: t.flags,

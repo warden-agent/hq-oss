@@ -1,0 +1,5 @@
+--- FAIL: TestList (0.00s)
+    a_test.go:3: want 2 got 1
+FAIL
+FAIL	b391	0.130s
+FAIL

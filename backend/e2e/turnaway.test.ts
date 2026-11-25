@@ -103,6 +103,62 @@ test('Bug 297, what it must not catch: a Stop HQ got, an Escape or No on a dialo
   assert.equal((await agentNow(dialog.tpm)).interrupted_at, null); assert.equal((await agentNow(error.tpm)).interrupted_at, null)
 })
 
+const openAlerts = async (a: any) => (await hq.state()).attention.filter((x: any) => x.kind === 'api_error' && x.agent_id === a.id && !x.resolved_at)
+
+test('Bug 367: a turn that ended on an API error (or a refusal) while HQ was down is shown failed once HQ is back, once', async () => {
+  // error: started with HQ up, failed while it was down. refused: the API refused its reply (also a StopFailure turn on 2.1.322). typed: started and failed
+  // while HQ was down (the mod marks its start `over`)
+  const error = await tpmWithMod(), refused = await tpmWithMod(), typed = await tpmWithMod()
+  for (const x of [error, refused]) await startTurn(x, 'T1')
+  await hq.down()
+  await error.mod.step({ turnId: 'T1' }, { toolUses: [{ name: 'Read' }] })
+  await error.mod.fire('turn.complete', { turnId: 'T1', isAborted: false, reason: 'error', answer: 'I will read the file.', durationMs: 900 })
+  await refused.mod.fire('turn.complete', { turnId: 'T1', isAborted: false, reason: 'refusal', answer: '', durationMs: 900 })
+  await typed.mod.fire('turn.start', { turnId: 'T1', text: 'typed b367' })
+  await typed.mod.fire('turn.complete', { turnId: 'T1', isAborted: false, reason: 'error', answer: '', durationMs: 900 })
+  await hq.up()
+  for (const x of [error, refused, typed]) { const asks = x.mod.asks(); x.mod.tick(); await waitFor('the mod\'s next ask', () => x.mod.asks() > asks) }
+  await turn()
+  for (const x of [error, refused, typed]) {
+    const a = await agentNow(x.tpm); assert.deepEqual([a.status, a.blocked_why, a.activity ?? null], ['blocked', 'api_error', null], x.tpm.id)
+    const fails = await events(x.tpm, 'hook.StopFailure'); assert.equal(fails.length, 1, x.tpm.id); assert.equal(JSON.parse(fails[0].payload).away, true)
+    assert.equal((await openAlerts(x.tpm)).length, 1, `${x.tpm.id}: its ⚠`)
+    assert.deepEqual(await replies(x.tpm), ['Hello.'], 'not a reply'); assert.equal((await events(x.tpm, 'agent.turn_over')).length, 0, 'no "Escape or No" line')
+  }
+  assert.match((await openAlerts(error.tpm))[0].detail, /turn ended with an API error while HQ was down$/)
+  assert.match((await openAlerts(refused.tpm))[0].detail, /turn ended with an API error while HQ was down \(the API refused its reply\)$/)
+  // the turn's own StopFailure, very late (after HQ said it): logged as old news, no second line or ⚠ (Bug 386's failureTold reads Bug 367's mark too)
+  const before = (await openAlerts(refused.tpm))[0].detail
+  await hq.hook(refused.tpm.id, { hook_event_name: 'StopFailure', error: 'overloaded_error' })
+  assert.deepEqual((await events(refused.tpm, 'hook.StopFailure')).map((e) => JSON.parse(e.payload).told ?? false), [true, false]) // newest first
+  assert.equal((await openAlerts(refused.tpm)).length, 1); assert.equal((await openAlerts(refused.tpm))[0].detail, before)
+  // the user's next message starts a turn: the error is over (Bug 178), as after a StopFailure HQ heard
+  await startTurn(error, 'T2'); assert.equal((await openAlerts(error.tpm)).length, 0)
+})
+
+test('Bug 367, what it must not catch: a StopFailure HQ heard, a Stop HQ heard, a turn that started since, a turn that ended normally', async () => {
+  const heard = await tpmWithMod(), stopped = await tpmWithMod(), since = await tpmWithMod(), normal = await tpmWithMod()
+  for (const x of [heard, stopped, since, normal]) await startTurn(x, 'T1')
+  await hq.hook(heard.tpm.id, { hook_event_name: 'StopFailure', error: 'overloaded_error' }) // HQ went down just after it: the mod's report comes late
+  await hq.hook(stopped.tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Retried b367.' }) // a refusal Claude Code retried to a normal answer
+  await hq.down()
+  await heard.mod.fire('turn.complete', { turnId: 'T1', isAborted: false, reason: 'error', answer: '', durationMs: 900 })
+  await stopped.mod.fire('turn.complete', { turnId: 'T1', isAborted: false, reason: 'refusal', answer: 'Retried b367.', durationMs: 900 })
+  await since.mod.fire('turn.complete', { turnId: 'T1', isAborted: false, reason: 'error', answer: '', durationMs: 900 })
+  await normal.mod.fire('turn.complete', { turnId: 'T1', isAborted: false, reason: 'answer', answer: 'Normal b367.', durationMs: 900 })
+  await hq.up()
+  await hq.hook(since.tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'try again b367' }) // the user's retry, heard before the mod's late report
+  for (const x of [heard, stopped, since, normal]) { const asks = x.mod.asks(); x.mod.tick(); await waitFor('the mod\'s next ask', () => x.mod.asks() > asks) }
+  await turn()
+  assert.deepEqual((await events(heard.tpm, 'hook.StopFailure')).map((e) => JSON.parse(e.payload).away ?? false), [false], 'only the one HQ heard')
+  assert.equal((await openAlerts(heard.tpm)).length, 1)
+  for (const x of [stopped, since, normal]) {
+    assert.equal((await events(x.tpm, 'hook.StopFailure')).length, 0, x.tpm.id); assert.equal((await openAlerts(x.tpm)).length, 0, x.tpm.id)
+  }
+  assert.equal((await agentNow(stopped.tpm)).status, 'idle'); assert.equal((await agentNow(since.tpm)).status, 'working')
+  assert.equal((await agentNow(normal.tpm)).status, 'idle'); assert.ok((await replies(normal.tpm)).includes('Normal b367.'))
+})
+
 test('Bug 298: an Escape while HQ was down is known once HQ is back, so the next message is typed at once, not handed to a mod that drops it', async () => {
   const t = await tpmWithMod(); await startTurn(t, 'T1')
   await hq.screen(t.tpm.id, INTERRUPTED); await waitFor('the screen', () => pane(t.tpm).includes('Interrupted')) // what Escape leaves (drawn while HQ is up)

@@ -234,9 +234,16 @@ test('the summary: a count, each finding with its steps, then one line per scena
     '- U1 (no feedback, s-02 Empty name, T-01 A2): Nothing happened. Expected: A message Steps: open / → click button "Add"',
     '- s-01 Add Dune: fine', '- s-03 Double add: no verdict (the map and criteria don\'t say what should happen)', '- s-04 Shop: not run (the session ended early)'])
   assert.deepEqual(uiTestLines({ at: 1, state: 'skipped', why: 'no start steps', quiet: true }), []); assert.deepEqual(uiTestLines(null), [])
+  // Bug 374: the project's own port was in use, so the tester's copy of the app ran on another: said once, under the count
+  assert.equal(uiTestLines({ ...u, moved: [{ part: 'api', from: 8000, to: 50123, by: "HQ's preview of shop" }] })[1],
+    "- HQ ran its own copy of the app on port 50123 instead of 8000 (in use by HQ's preview of shop)")
   const long = { ...u, findings: [{ ...u.findings[0]!, steps: [nav, ...Array.from({ length: 10 }, () => add)] }] } // a long chain: the last seven, and how many came before
   assert.match(uiTestLines(long)[1]!, /Steps: \(4 steps before\) → click button "Add"( → click button "Add"){6}$/)
   assert.deepEqual(uiTestLines({ at: 1, state: 'skipped', why: 'the app didn\'t start' }), ['- Not tried: the app didn\'t start'])
+  // Bug 380: a plan paid for before the app turned out not to start keeps its cost, and the line says it (none, or under a cent: nothing said)
+  assert.deepEqual(uiTestLines({ at: 1, state: 'skipped', why: 'the app didn\'t start', tokens: 3500, cost_usd: 0.04 }),
+    ['- Not tried: the app didn\'t start (its plan of scenarios had cost $0.04)'])
+  assert.deepEqual(uiTestLines({ at: 1, state: 'skipped', why: 'the app didn\'t start', tokens: 30, cost_usd: 0 }), ['- Not tried: the app didn\'t start'])
   // Bug 223: one it couldn't try from a browser is counted and said as such, with the criteria left without a verdict; not a finding
   const g = (id: string, criteria?: string[]) => ({ id, kind: 'basic' as const, title: `Greeting ${id}`, outcome: 'couldnt_test' as const, actions: 1,
     why: 'I couldn\'t change the clock', ...(criteria ? { criteria } : {}) })

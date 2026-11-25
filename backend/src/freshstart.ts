@@ -84,8 +84,9 @@ export async function freshStart(agentId: string, o: { how: 'now' | 'after_turn'
   update(a.id, { fresh_start_at: now(), fresh_start_then: o.then }) // first, so only this request is delivered to it from now on
   const m = sendMessage({ repoId: a.repo_id, featureId: a.feature_id, channel: 'dm', from: 'hq', to: a.id, reason: 'fresh_start', body: requestText(a, o.how === 'now', o.then) })
   update(a.id, { fresh_start_msg: m.id })
-  if (o.how === 'now') { update(a.id, { takeover_locked_until: 0 }); await interruptAndType(a, m) } // after_turn: the mod delivers it
+  // Bug 368: its Events line before the typing, which a restart can cut (the new backend types the rest, typeCutShort, and writes no line)
   emit({ agentId: a.id, source: 'system', kind: 'fresh_start.requested', payload: { how: o.how, then: o.then, role: a.role } }) // role: Bug 308's words
+  if (o.how === 'now') { update(a.id, { takeover_locked_until: 0 }); await interruptAndType(a, m) } // after_turn: the mod delivers it
 }
 
 /** Bug 338: an open fresh start now ends another way (the user clears the project while it writes its note): its `then` changes, and so
@@ -112,12 +113,11 @@ async function retell(agentId: string): Promise<void> {
     body: `${REPLACES}${requestText(a, true, then)}` })
   update(a.id, { fresh_start_msg: m.id }) // the sweep's time limit counts from this one; the old one is never handed out again (delivery.ts)
   const typed = !onDialog(a) // Enter on a dialog would pick its highlighted option (freshStartBlocker)
-  if (typed) {
-    update(a.id, { takeover_locked_until: 0 })
-    // its terminal gone: no throw into the Clear that asked; the agent ends, and the sweep writes HQ's note
-    await interruptAndType(a, m).catch((e) => emit({ agentId: a.id, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
-  }
-  emit({ agentId: a.id, source: 'system', kind: 'fresh_start.requested', payload: { how: typed ? 'now' : 'after_turn', ...told } })
+  emit({ agentId: a.id, source: 'system', kind: 'fresh_start.requested', payload: { how: typed ? 'now' : 'after_turn', ...told } }) // before the typing (Bug 368)
+  if (!typed) return
+  update(a.id, { takeover_locked_until: 0 })
+  // its terminal gone: no throw into the Clear that asked; the agent ends, and the sweep writes HQ's note
+  await interruptAndType(a, m).catch((e) => emit({ agentId: a.id, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
 }
 /** Whether the agent's note is in since its fresh start was asked for. */
 function noteIn(a: Agent): boolean {
@@ -213,27 +213,52 @@ export const inRepo = (repoId: string): Set<string> => new Set(features().filter
 /** The repo's live TPM and engineers (the project TPM has no feature: Bug 52). */
 const workers = (repoId: string): Agent[] => liveAgents().filter((x) => (x.role === 'tpm' || x.role === 'engineer') && repoOfAgent(x) === repoId)
 /** Switching away from a repo: every TPM and engineer in it leaves a note and stops, parked until the user comes back. Engineers
- *  whose plan waits for the user's review stay (they're idle and their context isn't growing). */
-export const parkRepo = (repoId: string): Promise<{ parked: string[]; left: string[]; stopped: string[] }> => inTurn(repoId, () => parkNow(repoId))
-async function parkNow(repoId: string): Promise<{ parked: string[]; left: string[]; stopped: string[] }> {
+ *  whose plan waits for the user's review stay (they're idle and their context isn't growing). `again`: a park the last backend began
+ *  (finishParks). */
+export const parkRepo = (repoId: string, o: { again?: boolean } = {}): Promise<{ parked: string[]; left: string[]; stopped: string[] }> =>
+  inTurn(repoId, () => parkNow(repoId, !!o.again))
+async function parkNow(repoId: string, again: boolean): Promise<{ parked: string[]; left: string[]; stopped: string[] }> {
   const parked: string[] = [], left: string[] = [], stopped: string[] = []
-  if (autoOn(repoId)) return { parked, left, stopped } // a project on auto keeps running while the user looks elsewhere
-  // Already writing a note: a fresh start whose new session would start at once waits for the user to come back instead (Bug 339). Marked
-  // for all of them first, with no wait in between: asking the others takes a few seconds each, and a note in meanwhile must find it
-  // (its words follow below, retell). A Clear's stays a Clear's, and one waiting for Resume is parked anyway.
-  const moved = new Set(workers(repoId).filter((a) => a.fresh_start_at && a.fresh_start_then === 'continue').map((a) => a.id))
-  for (const id of moved) update(id, { fresh_start_then: 'switch' })
-  move(repoId, true)
-  for (const { id } of workers(repoId)) {
-    const a = getAgent(id); if (!a) continue // read again: the one before can take a while (a note may be in, its session ended and parked)
-    if (moved.has(a.id)) { if (a.fresh_start_at && a.fresh_start_then === 'switch') await retell(a.id); parked.push(name(a)); continue }
-    if (a.status === 'exited') continue
-    if (a.fresh_start_at) { parked.push(name(a)); continue }
-    const why = freshStartBlocker(a); if (why) { left.push(`${name(a)}: ${why}`); continue }
-    await freshStart(a.id, { how: 'now', then: 'switch' }); parked.push(name(a))
-  }
-  emit({ agentId: null, source: 'ui', kind: 'repo.parked', payload: { repo: repoId, parked, left, stopped } })
+  if (autoOn(repoId)) { parking(repoId, null); return { parked, left, stopped } } // a project on auto keeps running while the user looks elsewhere
+  parking(repoId, now()) // Bug 369: until every agent is asked; a restart before then finishes the park (finishParks)
+  try {
+    // Already writing a note: a fresh start whose new session would start at once waits for the user to come back instead (Bug 339). Marked
+    // for all of them first, with no wait in between: asking the others takes a few seconds each, and a note in meanwhile must find it
+    // (its words follow below, retell). A Clear's stays a Clear's, and one waiting for Resume is parked anyway. Bug 369: one marked by
+    // the last backend, which went before it typed the switch's words, is told them now.
+    const moved = new Set(workers(repoId).filter((a) => a.fresh_start_at && (a.fresh_start_then === 'continue' || (a.fresh_start_then === 'switch' && !toldSwitch(a))))
+      .map((a) => a.id))
+    for (const id of moved) update(id, { fresh_start_then: 'switch' })
+    move(repoId, true)
+    for (const { id } of workers(repoId)) {
+      const a = getAgent(id); if (!a) continue // read again: the one before can take a while (a note may be in, its session ended and parked)
+      if (moved.has(a.id)) { if (a.fresh_start_at && a.fresh_start_then === 'switch') await retell(a.id); parked.push(name(a)); continue }
+      if (a.status === 'exited') continue
+      if (a.fresh_start_at) { parked.push(name(a)); continue }
+      const why = freshStartBlocker(a); if (why) { left.push(`${name(a)}: ${why}`); continue }
+      await freshStart(a.id, { how: 'now', then: 'switch' }); parked.push(name(a))
+    }
+  } finally { parking(repoId, null) }
+  emit({ agentId: null, source: 'ui', kind: 'repo.parked', payload: { repo: repoId, parked, left, stopped, ...(again ? { again } : {}) } })
   return { parked, left, stopped }
+}
+/** Bug 369: a switch away under way (since `at`), or none (null). Kept in the DB: the park asks one agent after the other, a few seconds each. */
+function parking(repoId: string, at: number | null): void {
+  run('UPDATE repos SET parking_at = ? WHERE id = ?', at, repoId); patch('repo', repoId, { parking_at: at })
+}
+/** Whether the request `a` has now is the switch's, in its words (whyEnding). */
+function toldSwitch(a: Agent): boolean {
+  const m = a.fresh_start_msg ? one<{ body: string }>('SELECT body FROM messages WHERE id = ?', a.fresh_start_msg) : undefined
+  return !!m?.body.includes(whyEnding(a, 'switch'))
+}
+/** Bug 369: at start-up, each switch away the last backend went down in the middle of: the agents it hadn't asked yet would keep working
+ *  in the project the user left. The park runs again: those already writing their note are left to it, the rest are asked now. Not for a
+ *  project being cleared: the Clear asks everyone itself. Called once the servers listen: what it types starts turns, whose hooks need HQ. */
+export function finishParks(): void {
+  for (const r of q<{ id: string; clearing_at: number | null }>('SELECT id, clearing_at FROM repos WHERE parking_at IS NOT NULL')) {
+    if (r.clearing_at) { parking(r.id, null); continue }
+    void parkRepo(r.id, { again: true }).catch((e) => emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { server: 'park', error: String(e) } }))
+  }
 }
 /** "Fresh start all": every TPM and engineer of the repo that can have one now. */
 export async function freshStartAll(repoId: string, then: Then): Promise<{ started: string[]; skipped: string[] }> {
@@ -273,19 +298,40 @@ export const resumeRepo = (repoId: string): Promise<{ resumed: string[]; waiting
 async function resumeNow(repoId: string): Promise<{ resumed: string[]; waiting: string[] }> {
   const resumed: string[] = [], waiting: string[] = []
   move(repoId, false)
-  if (getRepo(repoId)?.clearing_at) return { resumed, waiting } // its work is being archived, not picked up
-  for (const a of switchNotes(repoId)) { // read again: the one before can take a while, and a Clear's request stays a Clear's
-    if (getAgent(a.id)?.fresh_start_then !== 'switch') continue
-    await retarget(a.id, 'continue'); resumed.push(`${name(a)} (from its note)`)
-  }
-  if (getRepo(repoId)?.tpm_parked_at) {
-    try { await restartTpm(repoId, { why: 'resume' }); resumed.push('TPM') } catch (e) { waiting.push(`TPM: ${(e as Error).message}`) }
-  }
-  for (const f of features().filter((x) => x.repo_id === repoId && x.status !== 'cancelled')) {
-    for (const t of tickets(f.id).filter((x) => x.parked_at && RESUMABLE.includes(x.status))) {
-      try { await resumeEngineer(t.id); resumed.push(t.key) } catch (e) { waiting.push(`${t.key}: ${(e as Error).message}`) }
+  if (getRepo(repoId)?.parking_at) parking(repoId, null) // the user is back: a park the last backend began is over (it ran before this: inTurn)
+  if (getRepo(repoId)?.clearing_at) { resuming(repoId, null); return { resumed, waiting } } // its work is being archived, not picked up
+  resuming(repoId, now()) // Bug 389: until every parked agent is asked; a restart before then finishes the resume (finishResumes)
+  try {
+    for (const a of switchNotes(repoId)) { // read again: the one before can take a while, and a Clear's request stays a Clear's
+      if (getAgent(a.id)?.fresh_start_then !== 'switch') continue
+      await retarget(a.id, 'continue'); resumed.push(`${name(a)} (from its note)`)
     }
-  }
+    if (getRepo(repoId)?.tpm_parked_at) {
+      try { await restartTpm(repoId, { why: 'resume' }); resumed.push('TPM') } catch (e) { waiting.push(`TPM: ${(e as Error).message}`) }
+    }
+    for (const f of features().filter((x) => x.repo_id === repoId && x.status !== 'cancelled')) {
+      for (const t of tickets(f.id).filter((x) => x.parked_at && RESUMABLE.includes(x.status))) {
+        try { await resumeEngineer(t.id); resumed.push(t.key) } catch (e) { waiting.push(`${t.key}: ${(e as Error).message}`) }
+      }
+    }
+  } finally { resuming(repoId, null) }
   return { resumed, waiting }
+}
+/** Bug 389: coming back to a project is picking up its parked agents (since `at`), or nothing is (null). Kept in the DB like a park's mark
+ *  (parking): the resume starts one agent after the other, a few seconds each. */
+function resuming(repoId: string, at: number | null): void {
+  if ((getRepo(repoId)?.resuming_at ?? null) === at) return
+  run('UPDATE repos SET resuming_at = ? WHERE id = ?', at, repoId); patch('repo', repoId, { resuming_at: at })
+}
+/** Bug 389: at start-up, each coming-back the last backend went down in the middle of: the agents it hadn't started yet would stay parked in
+ *  the project the user is looking at. The resume runs again, and picks up only what is still parked or still writing the switch's note.
+ *  Not for a project being cleared (its work is archived), nor when the user has since chosen to press Resume themselves ("Wait until I press
+ *  Resume"; a project on auto picks up anyway, as turning auto on does). Called once the servers listen, like finishParks. */
+export function finishResumes(): void {
+  const wait = getSetting('after_fresh_start', DEFAULTS.after_fresh_start) === 'wait'
+  for (const r of q<{ id: string; clearing_at: number | null; auto_mode: number }>('SELECT id, clearing_at, auto_mode FROM repos WHERE resuming_at IS NOT NULL')) {
+    if (r.clearing_at || (wait && !r.auto_mode)) { resuming(r.id, null); continue }
+    void resumeRepo(r.id).catch((e) => emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { server: 'resume', error: String(e) } }))
+  }
 }
 export { readNote }

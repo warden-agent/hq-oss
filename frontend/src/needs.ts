@@ -134,6 +134,8 @@ export function needsYou(s: S, mergeAct: (t: any) => 'merge' | 'fix' | null): Ne
         : t.status === 'resolving' && t.fixing === 'changes' ? `${where(f.repo_id)}${t.key}'s change isn't built yet and its engineer stopped: press Build the change`
         : t.status === 'resolving' && t.fixing === 'review' ? `${where(f.repo_id)}what a reader found in ${t.key} isn't fixed yet and its engineer stopped: press Fix what it found`
         : t.status === 'resolving' && t.fixing === 'look' ? `${where(f.repo_id)}${t.key}'s app problems aren't fixed yet and its engineer stopped: press Fix the app`
+        : t.status === 'resolving' && t.fixing === 'tests_unseen' // Bug 373: its tests passed
+          ? `${where(f.repo_id)}the tests named for ${t.key}'s criteria still aren't seen running and its engineer stopped: press Fix tests`
         : t.status === 'resolving' && t.fixing ? `${where(f.repo_id)}${t.key}'s tests aren't fixed yet and its engineer stopped: press Fix tests`
         : `${where(f.repo_id)}${t.key} clashes with ${ticketBase(s, t.id)}: press Fix conflicts` })
   }

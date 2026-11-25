@@ -1,5 +1,7 @@
 // The UI tester: as an auto run ends (never in manual mode, never per ticket), a code-blind tester uses the whole app in a real browser the way a person would,
 // and reports where one would get stuck or confused. What it finds is a report in the run's summary; nothing is fixed or sent back by itself.
+// 0. A throwaway checkout of main is made ready for the app first (HQ's browser, its ports, its installs: smoke.ts prepareApp), so nothing is paid for
+//    on an app that can't be started here (Bug 380).
 // 1. One call (Sonnet, no tools) writes about 30 scenarios from the feature map and the run's screen criteria as a plain "what's new" list (uitesterrules.ts).
 // 2. HQ starts the app once, in a throwaway checkout of main, inside its test sandbox, under the tester's host (uitesthost.mjs), which resets it before each
 //    scenario and records each step on HQ's clock.
@@ -18,8 +20,8 @@ import { createRequire } from 'node:module'
 import { PATHS } from './config.ts'
 import { call, PLAIN } from './checker.ts'
 import { modelFor, testerFlags } from './roles.ts'
-import { appSpec, headlessShell, prepareApp, type LookPlan } from './smoke.ts'
-import { autoWork, browserProfile, inCheckout, runSandboxed, showing } from './testrun.ts'
+import { appSpec, blocked, headlessShell, prepareApp, startWhy, type LookPlan } from './smoke.ts'
+import { browserProfile, inCheckout, runSandboxed } from './testrun.ts'
 import { featureMap } from './uitestinputs.ts'
 import { recordingFor } from './scenario.ts'
 import { buildTimeline } from './timeline.ts'
@@ -72,45 +74,53 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
   if (process.platform !== 'darwin') return skipped('the UI tester runs on macOS only for now: its browser\'s sandbox is macOS\'s')
   const model = modelFor('tester'), began = Date.now(), map = featureMap(o.repoId), news = whatsNew(o.tickets)
   let tokens = 0, cost = 0
-  // 1. The scenarios
-  // Auto going off or stopping ends the planning call too, and the board says what HQ is doing meanwhile
-  const work = autoWork(o.repoPath, o.gen), page = showing({ repoId: o.repoId, ticketId: o.ticketId ?? null, what: 'tester' })
-  const planned = await call({ args: ['--model', model, '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', ...PLAIN, '--json-schema', PLAN_SCHEMA,
-    '--system-prompt', PLAN_SYSTEM], prompt: planPrompt(map, news.lines, SCENARIOS), signal: work.signal }).finally(() => { work.done(); page.over() })
-  if (planned.kind === 'error') return skipped(`the tester couldn't plan its scenarios (${planned.why})`)
-  if (planned.kind === 'stopped') return 'stopped'
-  tokens += planned.tokens; cost += planned.r.total_cost_usd ?? 0
-  // Findings a replay couldn't reproduce by script (Part 5): tried again by goal, first. The goal leads as given: Part 5 matches results back by it. Under it,
-  // what was seen then (the tester's own finding) or HQ's instruction (the checker's: its words never reach the tester), and the old steps in words, which
-  // no longer fit the app: the tester finds its own way. The title is what the summary calls it
-  const retry = (o.retry ?? []).map((f) => ({ title: `Again: ${(f.own ? f.what : f.expected || f.what).slice(0, 80)}`, goal: [f.goal, f.own ? `Seen before: ${f.what}` : f.what,
-    f.steps.length ? `The steps then, which may not fit the app any more (find your own way): ${f.steps.map(loopWords).join(' → ')}` : ''].filter(Boolean).join('\n') }))
-  const scenarios = keepPlan(planned.r.structured_output as unknown, SCENARIOS, news.ids, retry)
-  if (!scenarios.length) return skipped('the tester\'s plan had no scenarios HQ could use')
-  // Its folder starts empty: a run whose tester was stopped halfway and starts again keeps nothing of the first try
-  const dir = uiTestDir(o.repoId, o.runId); fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify(scenarios, null, 1))
+  // A step that ends untried once the plan was paid for keeps what it cost (Bug 380), for the check's results and the run's summary
+  const paid = (why: string): UiTest => ({ ...skipped(why), ...(tokens ? { tokens, cost_usd: Math.round(cost * 100) / 100 } : {}) })
 
-  // 2–4. The app, and the scenarios in batches
+  // Bug 380: the app is made ready first, in the checkout (HQ's browser, the ports, the installs), and only then are the scenarios asked for, a paid call.
+  // So a project HQ can't start here (a fixed port that is held and can't be moved, no browser, an install that fails) costs nothing. Only what can't be
+  // known without starting the app comes after the plan. The checkout's signal is auto mode's: auto going off or stopping ends the planning call too, and
+  // the board shows the tester meanwhile
   const r = await inCheckout(o.repoPath, o.sha, 'uitest', o.gen, { repoId: o.repoId, ticketId: o.ticketId ?? null, what: 'tester' }, async (wt, signal): Promise<UiTest | 'stopped'> => {
-    const cant = await prepareApp(wt, o.plan, { signal, run: runSandboxed })
-    if (cant?.kind === 'stopped') return 'stopped'
-    if (cant) return skipped(cant.kind === 'no_start' ? `the app couldn't be started (${cant.why})` : cant.why)
+    const got = await prepareApp(wt, o.plan, { signal, run: runSandboxed })
+    if (got.kind === 'stopped') return 'stopped'
+    if (got.kind !== 'ready') return skipped(got.kind === 'no_start' ? `the app couldn't be started (${got.why})` : got.why)
+    const plan = got.plan // as it runs in this checkout: on other ports, when its own were in use (Bug 374)
     // HQ_UITEST_BROWSER_EXE: for the e2e's stand-in Claude Code, which starts no browser
     const exe = process.env.HQ_UITEST_BROWSER_EXE || headlessShell(); if (!exe) return skipped('HQ\'s browser isn\'t on this machine')
+
+    // 1. The scenarios
+    const planned = await call({ args: ['--model', model, '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', ...PLAIN, '--json-schema', PLAN_SCHEMA,
+      '--system-prompt', PLAN_SYSTEM], prompt: planPrompt(map, news.lines, SCENARIOS), signal })
+    if (planned.kind === 'error') return skipped(`the tester couldn't plan its scenarios (${planned.why})`)
+    if (planned.kind === 'stopped' || signal.aborted) return 'stopped'
+    tokens += planned.tokens; cost += planned.r.total_cost_usd ?? 0
+    // Findings a replay couldn't reproduce by script (Part 5): tried again by goal, first. The goal leads as given: Part 5 matches results back by it. Under
+    // it, what was seen then (the tester's own finding) or HQ's instruction (the checker's: its words never reach the tester), and the old steps in words,
+    // which no longer fit the app: the tester finds its own way. The title is what the summary calls it
+    const retry = (o.retry ?? []).map((f) => ({ title: `Again: ${(f.own ? f.what : f.expected || f.what).slice(0, 80)}`, goal: [f.goal,
+      f.own ? `Seen before: ${f.what}` : f.what,
+      f.steps.length ? `The steps then, which may not fit the app any more (find your own way): ${f.steps.map(loopWords).join(' → ')}` : ''].filter(Boolean).join('\n') }))
+    const scenarios = keepPlan(planned.r.structured_output as unknown, SCENARIOS, news.ids, retry)
+    if (!scenarios.length) return paid('the tester\'s plan had no scenarios HQ could use')
+    // Its folder starts empty: a run whose tester was stopped halfway and starts again keeps nothing of the first try
+    const dir = uiTestDir(o.repoId, o.runId); fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify(scenarios, null, 1))
+
+    // 2–4. The app, and the scenarios in batches
     const out = path.join(wt, '.hq-uitest'), hostStop = new AbortController(), stop = () => hostStop.abort(); signal.addEventListener('abort', stop)
-    const rec = recordingFor(o.repoId, wt, o.plan) // the project's test setup: with one, the app runs under HQ's recorder
-    const spec = { ...appSpec(wt, o.plan), out, budget: BUDGET, looks: LOOK_TOOLS, shots: ['take_screenshot'], onElement: ON_ELEMENT, ...('record' in rec ? { record: rec.record } : {}) }
+    const rec = recordingFor(o.repoId, wt, plan) // the project's test setup: with one, the app runs under HQ's recorder
+    const spec = { ...appSpec(wt, plan), out, budget: BUDGET, looks: LOOK_TOOLS, shots: ['take_screenshot'], onElement: ON_ELEMENT, ...('record' in rec ? { record: rec.record } : {}) }
     const sessions = Math.ceil(scenarios.length / PER_SESSION) // the host's time limit: every session's, and the app's start
     // Under the recorder the start is the setup's: its seed command first, and a production build when it has one (the recorder's own limits for each)
     const startMs = HOST_START_MS + ('record' in rec ? SEED_MS + (rec.record.parts.some((x) => x.build) ? BUILD_MS : 0) : 0)
     const host = runSandboxed(wt, `exec ${shq(process.execPath)} ${shq(HOST)} ${shq(JSON.stringify(spec))}`,
-      { network: false, timeoutMs: SESSION_MS * sessions + startMs, signal: hostStop.signal })
+      { network: false, timeoutMs: SESSION_MS * sessions + startMs, signal: hostStop.signal, block: blocked(plan) })
     const tmp = fs.mkdtempSync(path.join(TMP_ROOT, `${TMP_PREFIX}${process.pid}-`))
     try {
       const up = await hostUp(out, signal, startMs)
       if (up === 'stopped') return 'stopped'
-      if (!up.started) return skipped(up.why ?? 'the app didn\'t start')
+      if (!up.started) return paid(startWhy(up.why ?? 'the app didn\'t start', plan))
       const origin = `http://localhost:${up.port}`, results: ScenarioResult[] = []
       const setup = 'setup' in rec && up.recorded ? rec.setup : null
       const unrecorded = setup ? null : 'why' in rec ? rec.why : `the app didn't start on its test setup (${up.unrecorded ?? 'no reason given'})`
@@ -140,6 +150,7 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
       pruneRecordings(o.repoId)
       const findings = numbered(results.flatMap((x) => x.findings))
       return { at: Date.now(), state: 'done', model, tokens, cost_usd: Math.round(cost * 100) / 100, ms: Date.now() - began, sessions, findings, ...(unrecorded ? { unrecorded } : {}),
+        ...(plan.moved?.length ? { moved: plan.moved } : {}),
         scenarios: results.map((x) => ({ id: x.scenario.id, kind: x.scenario.kind, title: x.scenario.title, outcome: x.outcome, actions: x.steps.length, ...(x.why ? { why: x.why } : {}),
           ...(x.scenario.criteria?.length ? { criteria: x.scenario.criteria } : {}) })) }
     } finally {

@@ -51,3 +51,24 @@ test('opening a feature that is not done changes nothing: its tickets show eithe
   assert.deepEqual(ids(open), ids(shut)); assert.deepEqual(ids(open), ['f:f1', 'f:f2', 't:a0', 't:a1', 't:b0', 'tpm'])
   assert.equal(feature(open).done, false); assert.equal(feature(open).lines[0].text, '1/2 merged')
 })
+
+test('Bug 365: the view\'s last tries are the boxes waiting on the user in the feature that needs them, then the first of them', () => {
+  const s = state(['implementing', 'plan_review', 'plan_review']); s.reviews = [{ id: 'R1', ticket_id: 'a1', status: 'open' }]
+  const b = buildBoard(s, 0)
+  assert.deepEqual(b.fits.slice(-2), [['f:f1', 't:a0', 't:a1', 't:a2'], ['t:a1']]) // T-03's status alone isn't a plan for you
+  s.reviews.push({ id: 'R2', ticket_id: 'a2', status: 'open' })
+  assert.deepEqual(buildBoard(s, 0).fits.slice(-3), [['f:f1', 't:a0', 't:a1', 't:a2'], ['t:a1', 't:a2'], ['t:a1']])
+  assert.deepEqual(buildBoard(state(['implementing']), 0).fits.at(-1), ['f:f2', 't:b0']) // nothing waits: the newest feature, as before
+})
+
+test('Bug 365 follow-up: a plan waiting on the user comes before finished work to merge, whatever the board order', () => {
+  const s = state(['pr_ready', 'pr_ready', 'pr_ready', 'plan_review']); s.reviews = [{ id: 'R1', ticket_id: 'a3', status: 'open' }]
+  for (const t of s.tickets) if (t.status === 'pr_ready') t.pr_state = 'local'
+  const b = buildBoard(s, 0)
+  // everything, the feature, its four waiting boxes (the plan first), the plan alone: not T-01, the first to merge
+  assert.deepEqual(b.fits.slice(-2), [['t:a3', 't:a0', 't:a1', 't:a2'], ['t:a3']])
+  assert.deepEqual(b.holds, ['t:a3']) // the edge pills mark the plan, not the work to merge
+  for (const t of s.tickets) if (t.status === 'plan_review') t.status = 'implementing'; s.reviews = []
+  assert.deepEqual(buildBoard(s, 0).fits.slice(-2), [['t:a0', 't:a1', 't:a2'], ['t:a0']]) // only work to merge: board order, as before
+  assert.deepEqual(buildBoard(s, 0).holds, [])
+})

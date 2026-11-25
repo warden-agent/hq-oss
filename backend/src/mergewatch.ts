@@ -1,6 +1,6 @@
 // Finished tickets: open_pr (push + PR, or wait for "Merge into main"), and noticing merges and conflicts with main by themselves.
 import fs from 'node:fs'
-import { checkOf, testedFor } from './hqcheckrules.ts'
+import { changedWords, checkOf, testedFor } from './hqcheckrules.ts'
 import path from 'node:path'
 import { attention, resolveForTicket, resolveKind, resolveKindForTicket } from './attention.ts'
 import { branchMerged, parseGithubRemote } from './reposync.ts'
@@ -11,16 +11,18 @@ import { bus, emit } from './events.ts'
 import { beat } from './beats.ts'
 import { j } from './util.ts'
 import { conflictsWith, mergeIntoMain, names } from './localmerge.ts'
-import { clearConflict, clearStalled, fixButton, fixWords, forTests, mergeBase, setConflict, stalledKind, whoMergedFirst } from './conflicts.ts'
+import { backWords, clearConflict, clearStalled, fixButton, fixWords, forTests, mergeBase, notedSince, setConflict, stalledKind, testsFailed, whoMergedFirst }
+  from './conflicts.ts'
 import { getAgent, stopAgent, type Agent } from './agents.ts'
 import { sendMessage } from './delivery.ts'
-import { autoGoing, getFeature, getRepo, getTicket, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type MergeTest, type Repo, type Ticket, liveTpm,
+import { autoGoing, getFeature, getRepo, getTicket, keepCheck, sweepNotices, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type MergeTest, type Repo, type Ticket, liveTpm,
   closedWhy, hqMoves } from './records.ts'
 import { countWords, took } from './testcounts.ts'
 import { ghOpts, git, syncRepo } from './repos.ts'
 import { releaseWorktree } from './slots.ts'
 import { criteriaOf, proofOf, type ProofEntry } from './criteria.ts'
 import { checkProof } from './proof.ts'
+import { planWords } from './planwords.ts'
 import { canLaunch } from './scheduler.ts'
 import { applyMapOnMerge, mapWanted, markUnchanged, pendingMapChange } from './mapstore.ts'
 
@@ -66,24 +68,34 @@ export async function finishTicket(agent: Agent, title: string, body: string, na
   const from = (await mergedPart(repo.path, base.ref, t))?.from ?? base.ref // its tests count from where it began, part of it in main or not
   const checked = await checkProof({ repoPath: repo.path, base: from, branch: t.branch, criteria: criteriaOf(cur), tests: given, expected: j<string[]>(cur.expected_files, []), at: now() })
   if ('problem' in checked) throw new Error(checked.problem)
+  const fixed = t.status === 'resolving' || (t.status === 'awaiting_answer' && t.prior_status === 'resolving')
+  const tests = fixed && forTests(t.fixing) // it went back for its tests, not conflicts (Bug 84)
+  // Bug 373: back from HQ's check of it: what its engineer changed since the commit HQ tested, read before anything is saved
+  const did = tests ? await changedSince(repo.path, t.finished_sha, sha, base.ref) : null
   if (mapWanted(cur) && !pendingMapChange(t.id)) { // the map is the tester's only picture of the app: a ticket that changes a screen says how (mapstore.ts)
     if (!mapUnchanged) throw new Error(`${t.key} has screen criteria, so HQ needs to know what changed on the feature map (get_ticket shows it). Call `
       + 'update_feature_map with the lines to add and remove on each screen you changed, or, if nothing a user sees changed, call open_pr again with feature_map_unchanged: true.')
     markUnchanged(cur, f.repo_id)
   }
   setTicket(t.id, { proof: JSON.stringify(checked.proof), finished_sha: sha || null })
-  const fixed = t.status === 'resolving' || (t.status === 'awaiting_answer' && t.prior_status === 'resolving')
-  const tests = fixed && forTests(t.fixing) // it went back for its tests, not conflicts (Bug 84)
-  const fixedWhat = t.fixing === 'look' ? 'what went wrong when HQ opened the app' : t.fixing === 'review' ? 'what a fresh reader of its changes found' : 'its tests'
   const changed = fixed && t.fixing === 'changes' // or for a spec the TPM changed after it was finished
-  const why = { tests, changed, fixed, fixedWhat }
+  // Bug 373: the TPM hears why it had gone back and what its engineer did about it (the files, and what it wrote in its handoff log meanwhile), not "fixed
+  // its tests": HQ can't know that, and here nothing had failed. The user's check that sent it keeps the same on the ticket (hqcheckrules.ts CheckBack),
+  // once the ticket is finished again (not when the push below fails).
+  const note = tests ? notedSince(t.id) : '', back = tests ? { back: backWords(testsFailed(t, repo.test_cmd), base.name), did: didWords(did, note) } : undefined
+  const keepBack = (): void => {
+    const sent = tests ? checkOf(getTicket(t.id) ?? t) : null; if (!sent?.sent_at || sent.back) return
+    keepCheck(t.id, { ...sent, back: { at: now(), sha: sha || null, files: did?.files ?? [], ...(did?.more ? { more: did.more } : {}), note: clip(note, 2000) } })
+  }
+  const files = tests && did ? { files: did.files, more: did.more } : {} // for the Events tab
+  const why = { tests, changed, fixed, again: back }
   clearConflict(t.id); clearStalled(t.id)
   run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
     `ticket:${t.id}`, 'pr', `# ${title}\n\n${body}`, now())
   if (!slug) {
-    setTicket(t.id, { status: 'pr_ready', pr_url: null, pr_state: 'local', prior_status: null, fixing: null })
-    emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: false, fixed } })
-    const w = finishWords(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t, { ...why, base: repo.default_branch, pushed: false })
+    setTicket(t.id, { status: 'pr_ready', pr_url: null, pr_state: 'local', prior_status: null, fixing: null }); keepBack()
+    emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: false, fixed, ...files } })
+    const w = finishWords(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t, { ...why, base: repo.default_branch, pushed: false, plans: planWords(getTicket(t.id) ?? t, repo.id) })
     if (w.notice) attention('conflicts_fixed', w.notice, { agentId: agent.id, ticketId: t.id })
     tellTpm(f, w.tpm)
     bus.emit('slot.freed') // its parallel slot is free now (listeners.ts)
@@ -100,31 +112,52 @@ export async function finishTicket(agent: Agent, title: string, body: string, na
   const closedPr = !hasPr && p.pr_state === 'closed'
   setTicket(t.id, hasPr || closedPr ? { status: hasPr ? 'pr_open' : 'pr_ready', prior_status: null, fixing: null }
     : { status: 'pr_ready', pr_url: null, pr_state: 'waiting', prior_status: null, fixing: null })
-  emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: true, waiting: !hasPr, fixed } })
+  keepBack()
+  emit({ agentId: agent.id, source: 'system', kind: 'ticket.pr_ready', payload: { ticket: t.id, key: t.key, branch: t.branch, pushed: true, waiting: !hasPr, fixed, ...files } })
   // read after the push: auto may have stopped, gone off or come back meanwhile
-  const w = finishWords(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t, { ...why, base: base.name, pushed: true })
+  const w = finishWords(getRepo(repo.id) ?? repo, getTicket(t.id) ?? t, { ...why, base: base.name, pushed: true, plans: planWords(getTicket(t.id) ?? t, repo.id) })
   if (w.notice) attention('conflicts_fixed', w.notice, { agentId: agent.id, ticketId: t.id })
   tellTpm(f, w.tpm)
   bus.emit('slot.freed') // its parallel slot is free now (listeners.ts)
   return w.reply
 }
+const clip = (s: string, max: number): string => s.length > max ? `${s.slice(0, max - 1).trimEnd()}…` : s
+/** Bug 373: the files a ticket's engineer changed after commit `from`, up to `sha`: its own commits, not what a merge of the base branch brought in (a merge
+ *  counts only for the files it settled by hand). A moved file counts under both its names. Up to `max` names and how many more there are. Null when HQ has
+ *  no `from` to count from (a ticket finished before HQ kept its commit) or git can't say. */
+export async function changedSince(repoPath: string, from: string | null, sha: string, baseRef: string, max = 8): Promise<{ files: string[]; more: number } | null> {
+  if (!from || !sha) return null
+  const out = await git(repoPath, 'log', '--cc', '--no-renames', '--format=', '--name-only', sha, `^${from}`, `^${baseRef}`, '--').catch(() => null); if (out === null) return null
+  const all = [...new Set(out.split('\n').map((l) => l.trim()).filter(Boolean))].sort()
+  return { files: all.slice(0, max), more: Math.max(0, all.length - max) }
+}
+/** What the engineer did about a send-back, for the TPM: the files, then its own notes, marked as its words (HQ didn't write them and hasn't checked them). */
+export function didWords(did: { files: string[]; more: number } | null, note: string): string {
+  return `${did ? `Since then its engineer ${changedWords(did.files, did.more)}. ` : ''}`
+    + (note ? `Its engineer's own notes on it: "${clip(note.replace(/\s*\n\s*/g, ' / '), 700)}"` : 'Its engineer wrote no note about it.')
+}
 /** What HQ says as a ticket is finished (open_pr): to the TPM, back to the engineer, and the user's notice when its conflicts are fixed. Bug 246: HQ tests and
  *  merges it only while auto mode is going (hqMoves); stopped, or with the ticket parked, the user does until Resume, as the board says. `repo` and `t` as read
- *  after the last wait. `pushed`: the branch went to GitHub, where the user can also make a PR. */
-export function finishWords(repo: Repo, t: Ticket, o: { base: string; pushed: boolean; tests: boolean; changed: boolean; fixed: boolean; fixedWhat: string }):
-  { tpm: string; reply: string; notice: string | null } {
+ *  after the last wait. `pushed`: the branch went to GitHub, where the user can also make a PR. `again` (Bug 373): it is back from HQ's check: why it had gone
+ *  back, and what its engineer did. */
+export function finishWords(repo: Repo, t: Ticket, o: { base: string; pushed: boolean; tests: boolean; changed: boolean; fixed: boolean; again?: { back: string; did: string };
+  plans?: string | null }): { tpm: string; reply: string; notice: string | null } {
   const hq = hqMoves(repo, t), { base, pushed } = o, at = `${t.branch}${pushed ? ', pushed' : ''}`, told = "you'll be told when it merges."
-  const tpm = hq ? `HQ: ${t.key} is finished (${at}). HQ tests it on ${base} and merges it; ${told}`
-    : o.tests ? `HQ: ${t.key}'s engineer fixed ${o.fixedWhat} on ${base}. The user merges it from HQ; ${told}`
+  const recap = o.again ? ` It had gone back because ${o.again.back}. ${o.again.did}` : ''
+  const tpm = o.tests ? `HQ: ${t.key}'s engineer finished it again (${at}).${recap} ${hq ? `HQ tests it on ${base} and merges it` : 'The user merges it from HQ'}; ${told}`
+    : hq ? `HQ: ${t.key} is finished (${at}). HQ tests it on ${base} and merges it; ${told}`
     : o.changed ? `HQ: ${t.key}'s engineer built the change to its spec (${at}). The user merges it from HQ; ${told}`
     : o.fixed ? `HQ: ${t.key}'s conflicts with ${base} are fixed. The user merges it from HQ; ${told}`
     : pushed ? `HQ: ${t.key} is finished (${at}). The user tries it, then merges it or makes a PR from HQ; ${told}`
     : `HQ: ${t.key} is finished (${at}). The user merges it into ${base} from HQ; ${told}`
+  // Bug 387: with auto off the user answers plans on the board and the TPM hears nothing of them; a ticket finished, or built again after a change, says them
+  const said = o.plans !== undefined && !o.tests && !hq && (o.changed || !o.fixed) // not for conflicts fixed, or a send-back from HQ's check
+  const plans = said ? ` Its plans: ${o.plans ?? 'none was handed in'}.` : ''
   const reply = pushed ? (hq ? `Pushed ${t.branch}. HQ tests it on ${base} and merges it. You're done: stop now.`
     : `Pushed ${t.branch}. The user tries it and merges it (or makes a PR) from HQ; HQ tells the TPM when it merges. You're done: stop now.`)
     : hq ? `Done. HQ tests ${t.branch} on ${base} and merges it. You're done: stop now.` : `Done. The user merges ${t.branch} into ${base} from HQ. You're done: stop now.`
   const notice = o.fixed && !o.tests && !o.changed && !hq ? `${t.key}: conflicts fixed (${base} merged in). Ready to merge again.` : null
-  return { tpm, reply, notice }
+  return { tpm: tpm + plans, reply, notice }
 }
 /** HQ's own notice to the project's TPM about a feature (from 'hq': the TPM can tell it from the user's words). Only to a running
  *  TPM: one that starts later is briefed with the board as it stands then (Bug 52). */

@@ -12,3 +12,7 @@ export const hqMoves = (repo: ModeRepo, t: ModeTicket): boolean => autoGoing(rep
 /** Who moves the ticket on next: HQ (hqMoves), the user, or nobody while its project is being cleared (Bug 311: HQ refuses starts and merges until the
  *  board is gone, records.ts notClearing, and auto mode is off for it meanwhile, clear.ts). */
 export const nextMover = (repo: ModeRepo, t: ModeTicket): 'hq' | 'user' | 'nobody' => repo.clearing_at ? 'nobody' : hqMoves(repo, t) ? 'hq' : 'user'
+/** Bug 364: Try again hands a ticket auto mode parked back to it, so only while auto mode is on (stopped too: it goes on once the user resumes it), and never
+ *  during a Clear (Bug 335). With auto mode off the park only says why auto mode left it: the user moves it on, as any ticket, and HQ refuses another go
+ *  (auto.ts autoRetry), which would drop the reason and start nothing. The box, the Ticket tab and the backend all ask this. */
+export const autoRetries = (repo: ModeRepo): boolean => !!repo.auto_mode && !repo.clearing_at

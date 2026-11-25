@@ -22,13 +22,14 @@ import { resumeRepo, switchNotes } from './freshstart.ts'
 import { AUTO_OFF_WORDS, autoOnWords } from './handover.ts'
 import { checkPlan, planChecks, planLine, stopPlanChecks } from './plancheck.ts'
 import { inMergeQueue, mergeNow } from './mergewatch.ts'
-import { features, getFeature, getRepo, getTicket, liveTpm, notClearing, repoOfAgent, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type Repo,
+import { autoRetries, features, getFeature, getRepo, getTicket, liveTpm, notClearing, repoOfAgent, setTicket, ticketForAgent, tickets, usesGithub, type Feature, type Repo,
   type MergeTest, type Ticket } from './records.ts'
 import { isRefusal, ranTestCmd, refusedTestCmd } from './refused.ts'
 import { readyTickets } from './readiness.ts'
 import { ensureFresh, ghOpts, git, syncRepo } from './repos.ts'
 import { canLaunch } from './scheduler.ts'
-import { autoGen, autoWork, detectTests, failReport, lookAtBase, sandboxProblem, showing, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
+import { autoGen, autoWork, detectTests, failedLine, failReport, lookAtBase, sandboxProblem, showing, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
+export { failedLine } // it lives with the runs now (testrun.ts): conflicts.ts words a send-back with it too (Bug 373)
 import { countWords, took } from './testcounts.ts'
 import { addFeature, cancelTicket, createTicket, fillSlots, finishedAndStopped, fixConflicts, fixTests, resumeEngineer, testCmdNote } from './tickets.ts'
 import { restartTpm, tpmStarting } from './tpm.ts'
@@ -212,13 +213,6 @@ const moving = (repo: Repo, all: Ticket[]): Ticket[] => {
   return all.filter((t) => !DONE.includes(t.status) && !t.auto_parked_why && !behind.has(t.id) && !(noTests && FINISHED_NOT_MERGED.includes(t.status)))
 }
 
-/** What failed, for the user: the first line that names it, never a stack trace. The engineer gets the whole output. */
-export function failedLine(output: string): string {
-  const lines = output.split('\n').map((l) => l.trim()).filter(Boolean)
-  const hit = lines.find((l) => /^(✖|×|---\s*FAIL\b|FAIL\b|FAILED\b|not ok\b|error\b|E\s)/i.test(l) && !/^✖ failing tests/i.test(l)) ?? lines.find((l) =>
-    /\berror\b|\bfailed?\b/i.test(l) && !/^(at |ℹ|#)/.test(l)) ?? lines.at(-1) ?? ''
-  return hit.replace(/\s*\(\d[\d.]*ms\)$/, '').slice(0, 140)
-}
 /** Why the tests failed, for the user and the TPM. A run that froze has no failed line worth naming: whatever came first is misleading. */
 const whyFailed = (r: Failed): string => r.hung
   ? `The tests froze and were stopped after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes.` : `Failed: ${failedLine(`${r.earlier}\n${r.output}`)}`
@@ -449,7 +443,8 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
     if (proof?.tests.length) { // a passing run that skipped or never ran a criterion's test proves nothing about it: back to its engineer, like a failure
       const tests = proof.tests.map((e) => ({ ...e, state: confirm(e, r.names) })), missing = unproven(tests, r.test)
       setTicket(t.id, { proof: JSON.stringify({ ...proof, tests, confirmed_at: now() }) })
-      const failed: Failed = { kind: 'fail', test: r.test, unproven: true, earlier: '', output: `The tests that didn't run:\n${missing.map((m) => `- ${m}`).join('\n')}` }
+      const failed: Failed = { kind: 'fail', test: r.test, unproven: true, missing: missing.length, earlier: '',
+        output: `The tests that didn't run:\n${missing.map((m) => `- ${m}`).join('\n')}` }
       if (missing.length) return retry(t, `The tests named for its criteria still didn't all run after ${MAX_TRIES} fixes. ${missing[0]}`, () => fixTests(t.id, failed))
     }
     // HQ's look at the app with the ticket merged in (smokerules.ts). Only what the ticket changed counts: when something is wrong, HQ looks at main alone too.
@@ -888,7 +883,10 @@ export async function answerTestCommand(repoId: string, use: boolean): Promise<{
 /** Another go for a parked ticket. */
 export function autoRetry(ticketId: string): { ok: true } {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
-  notClearing(getFeature(t.feature_id)?.repo_id ?? '') // Bug 335: the ticket goes with the board, and nothing starts meanwhile
+  const repoId = getFeature(t.feature_id)?.repo_id ?? ''
+  notClearing(repoId) // Bug 335: the ticket goes with the board, and nothing starts meanwhile
+  // Bug 364: with auto mode off nothing would take it: the park's reason went and nothing started. A page from before auto went off still shows the button
+  const repo = getRepo(repoId); if (!repo || !autoRetries(repo)) throw new Error('Auto mode is off for this project: turn it on, then Try again.')
   setTicket(t.id, { auto_parked_why: null, auto_tries: 0 }); resolveForTicket(t.id); autoSoon(); return { ok: true }
 }
 /** What the Auto dialog shows: the user's test command, or the one HQ found in the checkout, and why this machine can't do it, if so. */

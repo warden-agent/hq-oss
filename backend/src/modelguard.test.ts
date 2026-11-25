@@ -31,10 +31,10 @@ const step = (id: string, model: string, tools?: string[]) => onTurnStep(agent(i
 const alerts = (id: string) => q<any>("SELECT kind, detail FROM needs_attention WHERE agent_id = ? AND kind LIKE 'model_%'", id).map((a) => [a.kind, a.detail])
 const mismatch = (id: string, model: string, expected: string) => [['model_mismatch', `engineer ${id}: main-loop request on ${model}, expected ${expected}`]]
 /** The plan goes to HQ and auto mode approves it at once: the hook is answered before anything else from the agent is read. */
-async function approvedAtOnce(id: string): Promise<void> {
+async function approvedAtOnce(id: string, plan = `Plan of ${id}`): Promise<void> {
   let answer!: (v: any) => void; const answered = new Promise<any>((r) => { answer = r })
   const res = { writeHead: () => res, end: (s: string) => answer(JSON.parse(s)), on: () => res } as unknown as ServerResponse
-  onExitPlanMode(agent(id), { tool_input: { plan: `Plan of ${id}`, planFilePath: null } }, res)
+  onExitPlanMode(agent(id), { tool_input: { plan, planFilePath: null } }, res)
   const review = one<any>("SELECT id FROM review_requests WHERE ticket_id = ? AND status = 'open'", agent(id).ticket_id)!
   assert.deepEqual(answerReview(review.id, 'approve', { by: 'auto' }), { ok: true, held: true })
   assert.equal((await answered).hookSpecificOutput.decision.behavior, 'allow')
@@ -145,4 +145,68 @@ test('Bug 141: building on Sonnet is still a mismatch for haiku, and the full Ha
   step(full, SONNET, ['Read'])
   assert.deepEqual(alerts(full), [['model_mismatch', `engineer ${full}: main-loop request on ${SONNET}, expected haiku (plan mode)`]])
   assert.deepEqual(getSetting('paused_roles', []), [])
+})
+
+// Bug 385. Real 2.1.322 on haiku (a throwaway spike): an approved engineer that calls EnterPlanMode sends PreToolUse in acceptEdits,
+// PostToolUse in plan, then PostModelSwitch Haiku → Sonnet (source auto) 2 ms later, and the request that made the call is reported 1 ms after that, on Haiku.
+const { emit } = await import('./events.ts')
+/** A tool hook of the agent's own loop (or a helper's), as handleHook records it; `mode` is what the hook's permission_mode sets. */
+function hook(id: string, ev: 'PreToolUse' | 'PostToolUse', tool: string, mode: 'plan' | 'acceptEdits', sub = false): void {
+  emit({ agentId: id, source: 'hook', kind: `hook.${ev}:${tool}`, payload: { event: ev, tool, mode, ...sub ? { sub: true } : {} } })
+  if (!sub) run('UPDATE agents SET in_plan_mode = ? WHERE id = ?', mode === 'plan' ? 1 : 0, id)
+}
+const toSonnet = (id: string) => onPostModelSwitch(agent(id), { from_model: HAIKU, to_model: SONNET, source: 'auto', requested_model: null })
+
+test('Bug 385: an approved engineer on haiku goes back into plan mode by itself, switches back to Sonnet, and nothing is raised or paused', async () => {
+  unpause()
+  const e = engineer('haiku')
+  await approvedAtOnce(e); toHaiku(e); hook(e, 'PreToolUse', 'Edit', 'acceptEdits'); step(e, HAIKU, ['Edit'])
+  hook(e, 'PreToolUse', 'EnterPlanMode', 'acceptEdits'); hook(e, 'PostToolUse', 'EnterPlanMode', 'plan'); toSonnet(e)
+  step(e, HAIKU, ['EnterPlanMode']) // the request that made the call, reported after the switch
+  assert.deepEqual(alerts(e), []); assert.deepEqual(getSetting('paused_roles', []), [])
+  assert.equal(agent(e).model_live, SONNET); assert.equal(agent(e).in_plan_mode, 1)
+  hook(e, 'PreToolUse', 'Write', 'plan'); step(e, SONNET, ['Write']); step(e, SONNET, ['ExitPlanMode']) // the new plan, on the planning model
+  await approvedAtOnce(e, 'New plan'); toHaiku(e); step(e, HAIKU, ['Edit']) // approved again: back to Haiku, as the first time
+  assert.deepEqual(alerts(e), []); assert.deepEqual(getSetting('paused_roles', []), [])
+  assert.deepEqual(q<any>('SELECT expected FROM model_switches WHERE agent_id = ? ORDER BY id', e).map((r) => r.expected), [1, 1, 1])
+})
+
+test('Bug 385: the switch read before the PostToolUse that says plan mode still counts, by the EnterPlanMode call under way', async () => {
+  unpause()
+  const e = engineer('haiku')
+  await approvedAtOnce(e); toHaiku(e); hook(e, 'PreToolUse', 'EnterPlanMode', 'acceptEdits')
+  hook(e, 'PreToolUse', 'Read', 'acceptEdits', true) // a helper's call meanwhile doesn't hide it
+  toSonnet(e)
+  assert.deepEqual(alerts(e), []); assert.deepEqual(getSetting('paused_roles', []), []); assert.equal(agent(e).in_plan_mode, 1)
+})
+
+test('Bug 385: opusplan, the same way: the late EnterPlanMode request on Sonnet is no mismatch, and Opus planning after it is expected', async () => {
+  unpause()
+  const e = engineer('opusplan')
+  await approvedAtOnce(e); switched(e); step(e, SONNET, ['Edit'])
+  hook(e, 'PreToolUse', 'EnterPlanMode', 'acceptEdits'); hook(e, 'PostToolUse', 'EnterPlanMode', 'plan')
+  onPostModelSwitch(agent(e), { from_model: SONNET, to_model: OPUS, source: 'auto', requested_model: null })
+  step(e, SONNET, ['EnterPlanMode']); step(e, OPUS, ['Write'])
+  assert.deepEqual(alerts(e), []); assert.deepEqual(getSetting('paused_roles', []), []); assert.equal(agent(e).model_live, OPUS)
+})
+
+test('Bug 385: what the plan-mode excuse must not catch still alarms', async () => {
+  unpause()
+  const build = engineer('haiku') // back to Sonnet while building, with no EnterPlanMode: a fallback
+  await approvedAtOnce(build); toHaiku(build); hook(build, 'PreToolUse', 'EnterPlanMode', 'acceptEdits'); hook(build, 'PostToolUse', 'EnterPlanMode', 'plan')
+  toSonnet(build); hook(build, 'PreToolUse', 'ExitPlanMode', 'plan'); await approvedAtOnce(build, 'New plan'); toHaiku(build)
+  hook(build, 'PreToolUse', 'Edit', 'acceptEdits'); assert.deepEqual(alerts(build), []) // replanned once, fine; then building
+  toSonnet(build)
+  assert.deepEqual(alerts(build), fallback(build, HAIKU, SONNET)); assert.deepEqual(getSetting('paused_roles', []), ['engineer'])
+  unpause()
+  const other = engineer('haiku') // entering plan mode, but onto a model the alias never plans on
+  await approvedAtOnce(other); toHaiku(other); hook(other, 'PreToolUse', 'EnterPlanMode', 'acceptEdits'); hook(other, 'PostToolUse', 'EnterPlanMode', 'plan')
+  onPostModelSwitch(agent(other), { from_model: HAIKU, to_model: OPUS, source: 'auto', requested_model: null })
+  assert.deepEqual(alerts(other), fallback(other, HAIKU, OPUS)); assert.deepEqual(getSetting('paused_roles', []), ['engineer'])
+  unpause()
+  const late = engineer('opusplan') // an EnterPlanMode request on a model the alias never uses is still a mismatch
+  await approvedAtOnce(late); switched(late); hook(late, 'PostToolUse', 'EnterPlanMode', 'plan')
+  step(late, 'claude-fable-5-2', ['EnterPlanMode'])
+  assert.deepEqual(alerts(late), [['model_mismatch', `engineer ${late}: main-loop request on claude-fable-5-2, expected opus (plan mode)`]])
+  unpause()
 })

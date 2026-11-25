@@ -16,7 +16,7 @@ import { firstMapState, mapOf, saveMap, showMap, type FirstView } from './mapsto
 import { row as previewRow, runnableRecipe } from './preview.ts'
 import { getRepo, notClearing } from './records.ts'
 import { git } from './repos.ts'
-import { lookHow, prepareApp, type LookPlan } from './smoke.ts'
+import { lookHow, prepareApp, startWhy, type LookPlan } from './smoke.ts'
 import { serverCommand, testerModel } from './tester.ts'
 import { inCheckout, ownTmp, runSandboxed } from './testrun.ts'
 
@@ -98,19 +98,19 @@ async function writeFirst(repoId: string, p: LookPlan, stop: AbortSignal): Promi
   if (!sha) return { ok: false, why: `HQ couldn't find ${repo.default_branch} in the project` }
   const r = await inCheckout(repo.path, sha, 'map', null, { repoId, ticketId: null, what: 'map' }, async (wt, signal0): Promise<Wrote> => {
     const signal = AbortSignal.any([signal0, stop])
-    const cant = await prepareApp(wt, p, { signal, run: runSandboxed })
-    if (cant?.kind === 'stopped' || signal.aborted) return 'stopped'
-    if (cant) return { ok: false, why: cant.kind === 'no_start' ? `the app couldn't be started (${cant.why})` : cant.why }
+    const got = await prepareApp(wt, p, { signal, run: runSandboxed })
+    if (got.kind === 'stopped' || signal.aborted) return 'stopped'
+    if (got.kind !== 'ready') return { ok: false, why: got.kind === 'no_start' ? `the app couldn't be started (${got.why})` : got.why }
     const out = path.join(wt, '.hq-tester.json'), own = ownTmp()
     try {
       const more = { mode: 'map', rules: RULES, cap: MAP_ACTIONS, pageMax: PAGE_MAX }
-      const servers = { mcpServers: { browse: { type: 'stdio', ...serverCommand(wt, p, out, own.tmp, more) } } }
+      const servers = { mcpServers: { browse: { type: 'stdio', ...serverCommand(wt, got.plan, out, own.tmp, more) } } }
       const c = await call({ args: ['--model', testerModel(), '--tools', '', '--strict-mcp-config', '--mcp-config', JSON.stringify(servers), '--allowedTools', TOOLS, ...PLAIN,
         '--system-prompt', MAPPER_SYSTEM], prompt: mapperPrompt(MAP_ACTIONS, new Date().toISOString().slice(0, 10)), signal, timeoutMs: TIMEOUT_MS, env: { HQ_TESTER_OUT: out } })
       if (c.kind === 'stopped' || stop.aborted) return 'stopped'
       let seen: Out | null = null; try { seen = JSON.parse(fs.readFileSync(out, 'utf8')) as Out } catch { /* the server never wrote one */ }
       keep(repoId, seen, c)
-      if (seen?.started === false) return { ok: false, why: seen.why ?? 'the app couldn\'t be started' }
+      if (seen?.started === false) return { ok: false, why: startWhy(seen.why ?? 'the app couldn\'t be started', got.plan) }
       const text = seen?.report?.map
       const none = seen ? `the session ended without a map it could save${seen.refused ? ` (HQ refused ${seen.refused})` : ''}` : 'its browser tools never started'
       if (!text) return { ok: false, why: c.kind === 'error' ? `the session couldn't be asked (${c.why})` : none }

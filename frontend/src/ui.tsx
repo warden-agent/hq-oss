@@ -4,7 +4,7 @@ import { api, askUntilAnswered, errBody, errText, onError, withError, type ErrMs
 import { projectSlug } from '../../backend/src/projectname.ts'
 import { clock } from './testruns.ts'
 import { mdBlocks, mdInline } from './md.ts'
-import { backdropCloses } from './backdrop.ts'
+import { backdropCloses, confirmPressCounts } from './backdrop.ts'
 
 const statusColor: Record<string, string> = { working: 'bg-emerald-500/20 text-emerald-300', idle: 'bg-zinc-700/50 text-zinc-300', plan_review: 'bg-amber-500/20 text-amber-300', blocked: 'bg-rose-500/20 text-rose-300', paused: 'bg-rose-500/20 text-rose-300', launching: 'bg-sky-500/20 text-sky-300', exited: 'bg-zinc-800 text-zinc-500',
   planning: 'bg-sky-500/20 text-sky-300', implementing: 'bg-emerald-500/20 text-emerald-300', awaiting_answer: 'bg-amber-500/20 text-amber-300', pr_ready: 'bg-indigo-500/20 text-indigo-300', pr_open: 'bg-indigo-500/20 text-indigo-300', resolving: 'bg-amber-500/20 text-amber-300', merged: 'bg-emerald-500/30 text-emerald-200' }
@@ -91,11 +91,13 @@ export function Backdrop({ onClose, canClose = true, z = 'z-[90]', children }: {
 }
 /** HQ's dialog (stopOthers, freshConfirm and clearConfirm in board.ts): what a switch or start stops, which agents save a handoff
  *  note and stop (and which stay, and why), or a plain question. Enter confirms, Escape or a click outside cancels; on a `danger`
- *  question (Clear project) Cancel has the focus, so only a click on the red button goes ahead. */
+ *  question (Clear project) Cancel has the focus, so only a click on the red button goes ahead. Bug 390: its buttons ignore the rest of the
+ *  double click that opened it (backdrop.ts confirmPressCounts). */
 export function StopDialog() {
   const [q, setQ] = useState<(StopAsk & { resolve: (go: boolean) => void }) | null>(null)
   useEffect(() => { onAsk((x) => new Promise((resolve) => setQ({ ...x, resolve }))); return () => onAsk(null) }, [])
   const done = (go: boolean) => { q?.resolve(go); setQ(null) }
+  const press = (go: boolean) => (e: React.MouseEvent) => { if (confirmPressCounts(e.detail)) done(go) }
   useEffect(() => {
     if (!q) return
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape') done(false) }
@@ -113,8 +115,8 @@ export function StopDialog() {
         <div className="text-sky-200">{q.leaving ? `These save a handoff note and stop. They pick up from it when you come back to ${q.leaving}:` : q.danger ? 'These save a handoff note, then stop:' : 'These agents:'}</div>{list(q.parks)}</div>}
       {q.stays.length > 0 && <div className="flex flex-col gap-1.5 rounded-md border border-amber-500/30 bg-amber-950/30 p-2">
         <div className="text-amber-200">{q.staysHead ?? 'These keep running:'}</div>{list(q.stays)}</div>}
-      <div className="flex flex-wrap justify-end gap-1.5"><button className="btn" autoFocus={!!q.danger} onClick={() => done(false)}>Cancel</button>
-        <button className={`btn ${q.danger ? 'border-rose-500/60! bg-rose-950/40! text-rose-200!' : 'btn-primary'}`} autoFocus={!q.danger} onClick={() => done(true)}>{q.go}</button></div>
+      <div className="flex flex-wrap justify-end gap-1.5"><button className="btn" autoFocus={!!q.danger} onClick={press(false)}>Cancel</button>
+        <button className={`btn ${q.danger ? 'border-rose-500/60! bg-rose-950/40! text-rose-200!' : 'btn-primary'}`} autoFocus={!q.danger} onClick={press(true)}>{q.go}</button></div>
     </div>
   </Backdrop>
 }

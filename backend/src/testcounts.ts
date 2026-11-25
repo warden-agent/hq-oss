@@ -2,10 +2,16 @@
 // and "tests passed" says nothing about the tests that were skipped. Only the summary formats seen in real output (captured through runSandboxed, 2026-11-16):
 // node --test, pytest, unittest, cargo, jest, vitest, mocha. Anything else gives null and the page shows no counts: never a guessed "0 skipped".
 // go test prints no counts without -v, so it gives null too.
+// Bug 384: todo tests (vitest `| 1 todo`, jest `1 todo`, node `ℹ todo 1`) are a count of their own, as the runners print them: neither passed nor skipped,
+// and one makes its file's named tests read "couldn't confirm it" (Bug 375), so the tests line says why. `todo` is there only when some were.
 
-export type Counts = { passed: number; failed: number; skipped: number }
+export type Counts = { passed: number; failed: number; skipped: number; todo?: number }
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
-const NODE = /^[ℹ#] (pass|fail|skipped|cancelled) (\d+)$/
+/** What a terminal shows of one line of a run's output: what was written after the line's last carriage return, drawn over what came before it. A runner that
+ *  redraws its line prints `\r` and the new text (mocha's `list` reporter, with no terminal: `title: \r  ✔ title: 0ms`, Bug 383); a `\r` at the end (`\r\n`)
+ *  redraws nothing. HQ's readers of a run's output (the name watcher, the summary lines, failureLines, failedLine) all read a line this way, so they agree. */
+export const shownLine = (raw: string): string => { const s = raw.replace(/\r+$/, ''); return s.slice(s.lastIndexOf('\r') + 1) }
+const NODE = /^[ℹ#] (pass|fail|skipped|cancelled|todo) (\d+)$/
 const PYTEST = /^=*\s*(\d+ [a-z]+(?:, \d+ [a-z]+)*) in [\d.]+s\b/
 const JEST = /^Tests:\s+(\d+ [a-z]+(?:, \d+ [a-z]+)*)$/
 const VITEST = /^Tests\s+(\d+ [a-z]+(?: \| \d+ [a-z]+)*) \(\d+\)$/
@@ -20,7 +26,7 @@ const KEEP = 400 // a run with more summaries than this (a monorepo of hundreds 
 export function summaryLines(): { take: (chunk: string) => void; lines: () => string[] | null } {
   const kept: string[] = []; let rest = '', over = false
   const line = (raw: string) => {
-    const s = raw.replace(ANSI, '').trim()
+    const s = shownLine(raw).replace(ANSI, '').trim()
     if (s.length > 200 || !ANY.some((re) => re.test(s))) return
     if (kept.length < KEEP) kept.push(s); else over = true
   }
@@ -30,14 +36,15 @@ export function summaryLines(): { take: (chunk: string) => void; lines: () => st
   }
 }
 
-/** The passed, failed and skipped tests the summary lines add up to, over every summary (one per part of a chained command); null when none was recognised. */
+/** The passed, failed, skipped and todo tests the summary lines add up to, over every summary (one per part of a chained command); null when none was recognised. */
 export function testCounts(lines: string[] | null): Counts | null {
   if (!lines) return null
-  const c: Counts = { passed: 0, failed: 0, skipped: 0 }; let found = false, ran: number | null = null
+  const c: Counts = { passed: 0, failed: 0, skipped: 0 }; let found = false, ran: number | null = null, todo = 0
   const add = (word: string, n: number) => {
     if (/^(passed|passing|pass)$/.test(word)) c.passed += n
     else if (/^(failed|failing|fail|errors?|error|cancelled)$/.test(word)) c.failed += n
     else if (/^(skipped|pending|ignored)$/.test(word)) c.skipped += n
+    else if (word === 'todo') todo += n
     else return
     found = true
   }
@@ -56,11 +63,12 @@ export function testCounts(lines: string[] | null): Counts | null {
       c.failed += failed; c.skipped += skipped; c.passed += Math.max(0, ran - failed - skipped - (by['expected failures'] ?? 0)); found = true; ran = null
     }
   }
-  return found ? c : null
+  return !found ? null : todo ? { ...c, todo } : c
 }
 
-/** Counts in words, as the page says them: "412 passed, 6 skipped". Failed only when some did (a passing run with failures is a runner's own choice). */
+/** Counts in words, as the page says them: "412 passed, 6 skipped, 1 todo". Failed only when some did (a passing run with failures is a runner's own
+ *  choice); skipped and todo only when there are some. */
 export const countWords = (c: Counts): string =>
-  [`${c.passed} passed`, c.failed ? `${c.failed} failed` : '', c.skipped ? `${c.skipped} skipped` : ''].filter(Boolean).join(', ')
+  [`${c.passed} passed`, c.failed ? `${c.failed} failed` : '', c.skipped ? `${c.skipped} skipped` : '', c.todo ? `${c.todo} todo` : ''].filter(Boolean).join(', ')
 /** How long a run took: "under 1 s", "8 s", "2 min 5 s". */
 export const took = (ms: number): string => { const s = Math.round(ms / 1000), m = Math.floor(s / 60); return !s ? 'under 1 s' : m ? `${m} min${s % 60 ? ` ${s % 60} s` : ''}` : `${s} s` }

@@ -81,7 +81,7 @@ test('the user\'s own command installs with the project\'s own package manager, 
   // what it must not catch: npm's projects as before (npm-shrinkwrap.json is npm's lockfile too), an unknown packageManager, no packages at all
   assert.deepEqual(own({}), { install: NO_LOCK_INSTALL }); assert.deepEqual(own({ 'package-lock.json': '{}', 'yarn.lock': '' }), { install: 'npm ci' })
   assert.deepEqual(own({ 'npm-shrinkwrap.json': '{}' }), { install: 'npm ci' }); assert.deepEqual(own({ 'package.json': named('npm@10.9.0') }), { install: NO_LOCK_INSTALL })
-  assert.deepEqual(own({ 'package.json': named('bun@1.1.0'), 'yarn.lock': '' }), { install: 'yarn install --frozen-lockfile', install_when: 'yarn.lock' })
+  assert.deepEqual(own({ 'package.json': named('bun@1.1.0'), 'yarn.lock': '' }), { install: 'bun install --no-save', install_when: 'package.json' }) // Bug 358
   assert.deepEqual(ownInstall(repo({ 'package.json': pkg({ start: 'x' }), 'yarn.lock': '' }), all), {})
   // each install passes the same lockfile check as Claude's steps (it writes no lockfile, and follows the one there is)
   const cases: Record<string, string>[] = [{ 'yarn.lock': '' }, { 'yarn.lock': '__metadata:\n' }, { 'pnpm-lock.yaml': '' },
@@ -107,6 +107,42 @@ test('the user\'s own command installs with the project\'s own package manager, 
   assert.equal(needsInstall(part, dir, { [dir]: installMark(dir, 'pnpm-lock.yaml')! }), false)
   fs.writeFileSync(path.join(dir, 'pnpm-lock.yaml'), 'b'); assert.equal(needsInstall(part, dir, { [dir]: installMark(dir, 'pnpm-lock.yaml')! }), false)
   assert.equal(needsInstall(part, dir, { [dir]: 'an older mark' }), true)
+})
+
+test('a bun project installs with bun, following its bun.lock or bun.lockb, and never with npm (Bug 358)', () => {
+  const all = () => true, none = () => false, own = (files: Record<string, string>, has: (tool: string) => boolean = all) => ownInstall(repo({ 'package.json': deps, ...files }), has)
+  const named = (pm: string) => JSON.stringify({ name: 'x', dependencies: { ms: '2.1.3' }, packageManager: pm })
+  // the entry's case: a bun.lock and no node_modules (it was `npm install --no-package-lock`); bun 1.1's binary bun.lockb too
+  assert.deepEqual(own({ 'bun.lock': '{}' }), { install: 'bun install --frozen-lockfile', install_when: 'bun.lock' })
+  assert.deepEqual(own({ 'bun.lockb': '\0' }), { install: 'bun install --frozen-lockfile', install_when: 'bun.lockb' })
+  assert.equal(packageManager(repo({ 'package.json': deps, 'bun.lock': '' })).why, 'it has a bun.lock')
+  // packageManager names bun: its lockfile, or none written when there is none
+  assert.deepEqual(own({ 'package.json': named('bun@1.4.5') }), { install: 'bun install --no-save', install_when: 'package.json' })
+  assert.deepEqual(own({ 'package.json': named('bun@1.4.5'), 'bun.lock': '' }), { install: 'bun install --frozen-lockfile', install_when: 'bun.lock' })
+  // what it must not catch: npm's lockfile still comes first; yarn's and pnpm's before bun's; no packages at all
+  assert.deepEqual(own({ 'package-lock.json': '{}', 'bun.lock': '' }), { install: 'npm ci' })
+  assert.deepEqual(own({ 'pnpm-lock.yaml': '', 'bun.lock': '' }), { install: 'pnpm install --frozen-lockfile', install_when: 'pnpm-lock.yaml' })
+  assert.deepEqual(ownInstall(repo({ 'package.json': pkg({ start: 'x' }), 'bun.lock': '' }), all), {})
+  // each passes the same lockfile check as Claude's steps
+  for (const files of [{ 'bun.lock': '' }, { 'bun.lockb': '' }, { 'package.json': named('bun@1.2.0') }] as Record<string, string>[]) {
+    const dir = repo({ 'package.json': deps, ...files }), o = ownInstall(dir, all); assert.equal(lockfileProblem(o.install!, dir, dir, o.install_when), null, JSON.stringify(files))
+  }
+  // bun isn't installed: HQ says so, never npm in its place; packages installed already: it runs as it is
+  assert.match(own({ 'bun.lock': '' }, none).stop ?? '',
+    /^it uses Bun \(it has a bun\.lock\), and bun isn't installed on this computer .*npm ignores the bun\.lock .*Install Bun, then press Start again\.$/)
+  assert.match(own({ 'package.json': named('bun@1.4.5') }, none).stop ?? '', /it uses Bun \(its package\.json names bun@1\.4\.5 as its packageManager\).*the project asks for Bun/)
+  assert.deepEqual(own({ 'bun.lock': '', 'node_modules/ms/index.js': '' }, none), {})
+  // Claude's steps: a plain `bun install` rewrites the bun.lock (or writes one); `bun ci` follows it; the lockfile named is the one there is
+  const root = repo({ 'package.json': deps, 'bun.lockb': '', 'web/package.json': deps })
+  assert.match(lockfileProblem('bun install', root) ?? '', /^use `bun install --frozen-lockfile` \(there is a bun\.lockb\)$/)
+  assert.equal(lockfileProblem('bun ci', root), null); assert.equal(lockfileProblem('bun install --frozen-lockfile', root, root, 'bun.lockb'), null)
+  assert.match(lockfileProblem('cd web && bun i', root) ?? '', /^`bun i` runs in web: there is no bun\.lock, and `bun i` would write one .*use `bun install --no-save`/)
+  assert.equal(lockfileProblem('cd web && bun i --no-save', root, root, 'web/package.json'), null)
+  assert.deepEqual(installOutputs('bun install --frozen-lockfile', root), [path.join(root, 'node_modules')])
+  const r: Recipe = { parts: [{ name: 'app', dir: '.', install: 'bun ci', install_when: 'bun.lockb', run: 'bun run dev', port: 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  assert.deepEqual(installLeftovers(r, root), ['node_modules/'])
+  // the user's own `bun install` in their ⚙ command: a warning with the update advice (Bug 316)
+  assert.match(commandWarning('bun install && bun run dev', root) ?? '', /^`bun install` would write a bun\.lockb .*If it then says the bun\.lockb needs to be updated, run `bun install`/)
 })
 
 test('onPath: an executable file in a PATH folder', () => {
@@ -277,7 +313,9 @@ test('ports (Bug 354): a port another app of this HQ was given is never taken, t
   assert.equal((await assignPorts(r, 3094, busy([]), [], [3090]))!.ports.web, 3094) // what the others weren't given is kept as before
   assert.equal((await assignPorts(r, null, busy([3091]), [3092], [3090]))!.ports.web, 3093) // busy, given and a helper's ports all skipped
   assert.equal(await assignPorts(r, null, busy([]), [], Array.from({ length: 10 }, (_, i) => 3090 + i)), null) // never as a last resort
-  assert.deepEqual((await assignPorts(r, null, busy([]), [], [3189]))!.taken, []) // a fixed port is the recipe's own: as before
+  // Bug 362: a fixed port another app was given is taken too, though nothing listens on it yet; one only a helper was given is not
+  assert.deepEqual((await assignPorts(r, null, busy([]), [], [3189]))!, { ports: { api: 3189, web: 3090 }, taken: [{ part: 'api', port: 3189 }] })
+  assert.deepEqual((await assignPorts(r, null, busy([]), [3189], [3090]))!, { ports: { api: 3189, web: 3091 }, taken: [] })
   const two = { ...r, parts: r.parts.map((p) => ({ ...p, port: 'auto' as const })) }
   assert.deepEqual((await assignPorts(two, null, busy([]), [], [3090, 3092]))!.ports, { web: 3091, api: 3093 })
 })
@@ -290,6 +328,16 @@ test('test ports (Bug 226): up to three free ones from the top of the range, ano
   const others = [3091, 3092, 3093, 3094, 3095, 3096, 3097, 3098, 3099]
   assert.deepEqual(await testPorts(others, busy([3099])), [3090, 3097, 3098]) // the one nobody holds, then other helpers' free ones
   assert.deepEqual(await testPorts([], busy([...others, 3090])), [])
+})
+
+test('test ports (Bug 363): never a port given to an app that hasn\'t bound it yet, not even when it is the last free one', async () => {
+  const busy = (taken: number[]) => async (p: number) => taken.includes(p)
+  assert.deepEqual(await testPorts([], busy([]), 3, undefined, [3099, 3097]), [3095, 3096, 3098])
+  const full = [3090, 3091, 3092, 3093, 3094, 3095, 3096]
+  assert.deepEqual(await testPorts([], busy(full), 3, undefined, [3097]), [3098, 3099]) // the range nearly full: fewer ports, none of the app's
+  assert.deepEqual(await testPorts([3098, 3099], busy(full), 3, undefined, [3097]), [3098, 3099]) // another helper's before the app's
+  assert.deepEqual(await testPorts([], busy([...full, 3098, 3099]), 3, undefined, [3097]), [])
+  assert.deepEqual(await testPorts([], busy(full), 3, undefined, []), [3097, 3098, 3099]) // nothing given: as before
 })
 
 test('stray test ports (Bug 226): only a port the helper chose itself; its given ports, the recipe\'s fixed ones and the OS\'s own are fine', () => {
@@ -477,9 +525,10 @@ test('recipe (Bug 191): an npm install anywhere in the command is checked in the
 test('recipe (Bug 191): what is not an npm install is not caught', () => {
   const root = repo({ 'web/package.json': deps, 'npm/Makefile': '' }) // no lockfile: any npm install would be refused
   for (const c of ['pnpm install', 'yarn install']) assert.doesNotMatch(lockfileProblem(c, root, root) ?? '', /package-lock|`npm /, c) // their own check (Bug 239)
-  for (const c of ['bun install', 'echo npm install', 'cd npm && make', './npm-install.sh', 'npm run build', 'npm --prefix web run build',
+  for (const c of ['echo npm install', 'cd npm && make', './npm-install.sh', 'npm run build', 'npm --prefix web run build',
     'cd web && npm start', 'npx npm-check-updates', 'pip install -r requirements.txt'])
     assert.equal(lockfileProblem(c, root, root), null, c)
+  assert.doesNotMatch(lockfileProblem('bun install', root, root) ?? '', /package-lock|`npm /) // its own check (Bug 358)
 })
 
 test('recipe (Bug 211): a uv, yarn or pnpm install anywhere in the command is checked in the folder it runs in', () => {

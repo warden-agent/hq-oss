@@ -57,12 +57,14 @@ export const nextHoldEnd = (agents: Agent[], now = Date.now()): number | null =>
   const lock = a.status === 'exited' ? 0 : a.takeover_locked_until ?? 0
   return lock > now && lock <= now + LONG_HOLD_MS && (t === null || lock < t) ? lock : t
 }, null)
+/** Bug 370: kinds of message the agent reads at its next tool step while its turn is at work (backend delivery.ts MID_TURN_REASONS). */
+const MID_TURN_REASONS = ['spec_change']
 /** Messages HQ hasn't handed to this agent yet (same rule as the backend's pendingFor), and why they're waiting. Bug 228: the project's TPM hears every
  *  team message in its project, whatever the feature; counted only by feature, those held for it didn't show. */
 export function waitingFor(a: Agent, s: State, now = Date.now()): { count: number; held: boolean; why: string } | null {
   if (a.status === 'exited') return null
   const team = (m: any) => m.channel === 'team' && m.from_id !== a.id && m.repo_id === a.repo_id && (a.role === 'tpm' || !m.feature_id || m.feature_id === a.feature_id)
-  const count = s.messages.filter((m) => !m.delivered_at && (m.to_id === a.id || team(m))).length
+  const waiting = s.messages.filter((m) => !m.delivered_at && (m.to_id === a.id || team(m))), count = waiting.length
   if (!count) return null
   const hold = holdWhy(a, now); if (hold) return { count, held: true, why: hold }
   if (a.status === 'paused' || (s.settings.paused_roles ?? []).includes(a.role)) return { count, held: true, why: 'held · paused' }
@@ -71,6 +73,9 @@ export function waitingFor(a: Agent, s: State, now = Date.now()): { count: numbe
   if (a.interrupted_at && (a.type_waits === 'dialog' || a.type_waits === 'screen')) return { count, held: true, why: 'held · its terminal shows a menu or a question · answer or close it there' }
   // Bug 149: a line somebody typed into its prompt box and didn't send. HQ's text would go in after it, and Enter would send both as one message.
   if (a.interrupted_at && a.type_waits === 'draft') return { count, held: true, why: 'held · a half-written line is in its terminal · send or clear it there' }
+  // Bug 370: a change to its ticket's spec goes in with the next step of a turn at work, not after the turn
+  const step = a.status === 'working' || a.status === 'plan_review' ? waiting.filter((m) => MID_TURN_REASONS.includes(m.reason)).length : 0
+  if (step) return { count, held: false, why: step === count ? 'goes in with its next step' : `${step} with its next step, the rest when its turn ends` }
   return { count, held: false, why: a.status === 'working' ? 'waits for its current turn to end' : 'delivering…' }
 }
 /** Bug 228: the line a box and the Agents menu show about the agent's messages: those waiting, and why; or, with none waiting, a hold from its terminal
@@ -101,12 +106,16 @@ export function planAnswered(s: Pick<State, 'reviews'>, ticketId: string): { tex
   return SENT_BACK.includes(last?.closed_reason) ? { text: 'its plan was sent back · it is revising it', pill: 'revising plan' }
     : { text: 'its plan was answered · it carries on', pill: 'plan answered' }
 }
+/** Bug 371: with auto off, a new plan is owed for a change to the ticket's spec, and a plan of `round` came before its engineer read the change (backend
+ *  replan.ts): approving it still leaves the new plan to come. */
+export const beforeChange = (t: { replan_after?: number | null } | undefined, round: number): boolean => t?.replan_after != null && round <= t.replan_after
 /** Bug 216: whom a plan held at the gate waits on, in its ticket box's words. On auto HQ's plan check answers it (`hq`; `since`: the check is reading it now).
  *  `review`: the ticket's open review; none means it closed while the agent's status hasn't caught up (`closed`: it waits on nobody, Bug 234). */
 export function planWait(s: PlanState, ticketId: string, review: { round: number; plan_check?: unknown } | null)
   : { text: string; hq: boolean; since: number | null; closed?: boolean } {
   if (!review) return { text: planAnswered(s, ticketId).text, hq: false, since: null, closed: true }
-  if (!hqAnswersPlan(s, { ticket_id: ticketId })) return { text: `Plan R-${review.round} waiting for you`, hq: false, since: null }
+  if (!hqAnswersPlan(s, { ticket_id: ticketId })) return { text: `Plan R-${review.round} waiting for you${beforeChange(s.tickets.find((t) => t.id === ticketId), review.round)
+    ? ' · written before the spec changed' : ''}`, hq: false, since: null }
   const c = planCheckOf(review.plan_check)
   return c?.state === 'checking' ? { text: 'HQ is checking its plan against its criteria', hq: true, since: c.since } : { text: "its plan waits for HQ's check", hq: true, since: null }
 }

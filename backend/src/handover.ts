@@ -6,6 +6,7 @@ import { unmergedDeps } from './readiness.ts'
 import type { Message } from './delivery.ts'
 import { autoGoing, hqMoves, type Feature, type Repo, type Ticket } from './records.ts'
 import { criteriaBlock, criteriaOf } from './criteria.ts'
+import { replanDue } from './replan.ts'
 
 /** Bug 301: its PR was closed on GitHub without merging. The board offers Merge (a new PR, merged) and Make PR; auto mode merges it through a new PR. */
 const closedPr = (t: Ticket, hq: boolean): string => `finished and pushed; PR #${t.pr_number} was closed on GitHub without merging, so `
@@ -23,7 +24,8 @@ function standing(t: Ticket, all: Ticket[], repo: Repo): string {
         : hq ? 'ready; HQ starts it when your turn ends' : 'ready to start (the user starts it from HQ)'
       case 'planning': return 'an engineer is writing its plan'
       case 'plan_review': return on ? 'HQ checks its plan, then approves it or sends it back' : "its plan waits for the user's review"
-      case 'implementing': return 'an engineer is building it'
+      case 'implementing': return replanDue(t, repo.id) ? 'its spec changed after its plan was approved: its engineer shows the user a new plan first (Bug 371)'
+        : 'an engineer is building it'
       case 'awaiting_answer': return 'its engineer waits for an answer'
       case 'escalated': return 'escalated to the user'
       case 'pr_ready': if (clash) return `finished${t.pr_state === 'local' ? '' : ' and pushed'}, but it ${clash}`
@@ -112,8 +114,11 @@ export const lateWords = (l: LateCommits, base: string): string => {
 /** The launch prompt of an engineer taking over a ticket after a fresh start: the goal, the last engineer's note, what git
  *  shows, and the approved plan or HQ's instructions for what it went back for (conflicts or its tests, Bug 84). Not the update_handoff log: get_ticket has it if needed. */
 export function engineerResumePrompt(t: Ticket, o: { feature: string; worktree: string; base: string; note: string | null; git: GitFacts; plan: string | null; fix: string | null;
-  late?: LateCommits | null }): string {
+  late?: LateCommits | null; replan?: boolean }): string {
   const where = t.status === 'planning' ? 'Its plan was not written or not approved yet: finish exploring, write the plan and call ExitPlanMode.'
+    : o.replan ? 'Its spec or criteria changed after its plan was handed in, and with auto mode off the user approves a new plan before the change is built.'
+      + ` You start in plan mode: read what is done, write a new plan for ${t.key} as it is now (its "## In plain words" says what changed for the user) and`
+      + ' call ExitPlanMode. Build on only once it is approved: HQ refuses open_pr until then.'
     : o.fix ? `It was ${fixWords(t.fixing, o.base).ing}; HQ's instructions for that are below.`
     : o.late ? `Its plan is approved (below) and it was finished once. ${lateWords(o.late, o.base)}`
     : 'Its plan is approved (below) and the work is under way: carry on from where the last engineer stopped. Don\'t redo finished steps.'
@@ -139,5 +144,5 @@ ${o.git.log || '(none)'}
 
 Changed files since ${o.base}:
 ${o.git.diffStat || '(none)'}
-${o.plan ? `\n## Approved plan\n${o.plan}\n` : ''}${o.fix ? `\n## HQ's instructions\n${o.fix}\n` : ''}`
+${o.plan ? `\n## ${o.replan ? 'The plan approved before the change' : 'Approved plan'}\n${o.plan}\n` : ''}${o.fix ? `\n## HQ's instructions\n${o.fix}\n` : ''}`
 }

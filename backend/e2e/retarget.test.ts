@@ -57,7 +57,8 @@ test('Bug 338: a Clear during an open Fresh start types the Clear\'s request int
   assert.equal(asks.length, 2); assert.equal(a.fresh_start_msg, asks.find((m: any) => /^This replaces/.test(m.body)).id)
   await waitFor('the new request acked', async () => (await hq.state()).messages.find((m: any) => m.id === a.fresh_start_msg)?.ack_at)
   const lines = (await hq.api(`agents/${tpm.id}/events`)).json
-  assert.ok(JSON.stringify(lines).includes('Asked again for its handoff note: you are clearing the project. A new TPM takes over from it after the clear'))
+  assert.deepEqual(lines.events.map((l: any) => l.text).filter((t: string) => t.startsWith('Asked again')), // once: typed whole (Bug 368)
+    ['Asked again for its handoff note: you are clearing the project. A new TPM takes over from it after the clear'])
 
   assert.equal((await hq.mcp(tpm.id, 'write_handoff_note', { text: '## What the user wants from this project\n- b338 (B338-NOTE)' })).isError, false)
   await waitFor('the board gone', async () => !(await hq.state()).features.some((x: any) => x.repo_id === repo.id), 30_000)

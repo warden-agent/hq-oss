@@ -1,0 +1,15 @@
+> shop-web@0.1.0 test
+> jest
+
+(node:4516) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:4517) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS test/list.test.js
+PASS test/api.test.js
+
+Test Suites: 2 passed, 2 total
+Tests:       1 skipped, 2 passed, 3 total
+Snapshots:   0 total
+Time:        0.29 s
+Ran all test suites.

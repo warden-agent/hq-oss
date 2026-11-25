@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
-import { listenersUnder, listenPorts, lstartMs, pgidOf, pidsUnder, psEnv, whoAnswers, whose } from './procs.ts'
+import { boundTo, listenersUnder, listenPorts, lstartMs, pgidOf, pidsUnder, portHolder, portHolders, psEnv, whoAnswers, whose } from './procs.ts'
 
 test('lstartMs (Bug 319): ps\'s date for a process, in UTC; anything else is no date', () => {
   const f = (s: string) => lstartMs(s.trim().split(/\s+/))
@@ -72,4 +72,46 @@ test('listenersUnder (Bug 226): a server working in the folder is found with its
   assert.deepEqual(found.map((l) => [l.pid, l.port]), [[inside.k.pid, port]])
   assert.deepEqual(await listenersUnder(dir, [(await pgidOf(inside.k.pid!))!]), []) // the helper's own group is spared
   assert.deepEqual(await listenersUnder(path.join(dir, 'nope')), [])
+})
+
+test('boundTo (Bug 357): a listener, a socket bound without listening, the near end of a connection from the port; not a client of the port', () => {
+  const listing = ['p30', 'cnode-MainThread', 'f20', 'n*:7545', 'f21', 'n127.0.0.1:7545->127.0.0.1:50001', // a listener and a connection it took
+    'p31', 'cPython', 'f3', 'n127.0.0.1:7545', // bound, not listening (lsof says CLOSED)
+    'p32', 'cGoogle Chrome', 'f9', 'n127.0.0.1:50001->127.0.0.1:7545', // a browser on the app: it holds 50001, not 7545
+    'p33', 'cPython', 'f4', 'n[::1]:7545', 'p34', 'ccurl', 'f5', 'n[::1]:7545->[::1]:443', // IPv6: bound; a connection made from the port
+    'p35', 'cx', 'f6', 'n127.0.0.1:17545', 'f7', 'nprotocol: TCP', 'p36', 'cy', 'f8', 'n*:75450'].join('\n') // other ports; Linux's unplaced socket
+  assert.deepEqual(boundTo(listing, 7545), [{ pid: 30, cmd: 'node' }, { pid: 31, cmd: 'Python' }, { pid: 33, cmd: 'Python' }, { pid: 34, cmd: 'curl' }])
+  assert.deepEqual(boundTo(listing, 50001), [{ pid: 32, cmd: 'Google Chrome' }]) // the listener's end of that connection is on 7545
+  assert.deepEqual(boundTo('', 7545), [])
+})
+
+/** A python3 holding a free port of its own: `listen` or only bound (Bug 357). Resolves to its pid and the port once it holds it. */
+const python = (listen: boolean, t: { after: (f: () => void) => void }) => new Promise<{ pid: number; port: number }>((resolve, reject) => {
+  const code = `import socket, sys, time\ns = socket.socket(); s.bind(('127.0.0.1', 0))\n${listen ? 's.listen()\n' : ''}print(s.getsockname()[1], flush=True); time.sleep(60)`
+  const k = spawn('python3', ['-c', code], { stdio: ['ignore', 'pipe', 'ignore'] }); k.on('error', reject)
+  t.after(() => { try { k.kill('SIGKILL') } catch { /* gone */ } })
+  k.stdout!.once('data', (d) => resolve({ pid: k.pid!, port: Number(String(d).trim()) }))
+})
+const hasPython = (() => { try { execFileSync('python3', ['-c', '0'], { stdio: 'ignore' }); return true } catch { return false } })()
+
+test('portHolders (Bug 357): a program bound to the port without listening is named; Bug 44\'s listening look still skips it', {
+  skip: process.platform !== 'darwin' ? "Linux's lsof can't place a socket that is only bound" : !hasPython && 'no python3' }, async (t) => {
+  const b = await python(false, t)
+  const held = await portHolders(b.port)
+  assert.deepEqual(held.map((h) => [h.pid, h.cwd]), [[b.pid, fs.realpathSync(process.cwd())]])
+  assert.match(held[0]!.cmd, /^python/i)
+  assert.match((await portHolder(b.port))!, new RegExp(`^python.* \\(pid ${b.pid}\\)$`, 'i'))
+  assert.deepEqual(await portHolders(b.port, 'listening'), [])
+})
+
+test('portHolders: a listener is named both ways; a client connected to it is not a holder of its port', async (t) => {
+  const kid = (code: string) => {
+    const k = spawn(process.execPath, ['-e', code], { stdio: ['ignore', 'pipe', 'ignore'] }); t.after(() => { try { k.kill('SIGKILL') } catch { /* gone */ } })
+    return { k, said: new Promise<string>((resolve) => k.stdout!.once('data', (d) => resolve(String(d).trim()))) }
+  }
+  const l = kid("const s = require('net').createServer(); s.listen(0, '127.0.0.1', () => console.log(s.address().port))"), port = Number(await l.said)
+  await kid(`require('net').connect(${port}, '127.0.0.1', () => console.log('on')); setTimeout(() => {}, 60000)`).said
+  assert.deepEqual((await portHolders(port)).map((h) => h.pid), [l.k.pid]) // the listener's end of the connection it took is its own
+  assert.deepEqual((await portHolders(port, 'listening')).map((h) => h.pid), [l.k.pid])
+  assert.match((await portHolder(port))!, new RegExp(`\\(pid ${l.k.pid}\\)$`))
 })

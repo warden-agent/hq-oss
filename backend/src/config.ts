@@ -78,6 +78,9 @@ export const DEFAULTS = {
   plan_check: 'on', // auto mode has a fresh reader check each plan against the ticket's criteria (plancheck.ts); 'off': it approves every plan at once
   diff_check: 'on', // auto mode has a fresh reader check a risky ticket's changes before it merges (diffcheck.ts); 'off': it merges on the tests alone
   tester: 'on', // as an auto run ends, a code-blind tester uses the app in a browser (uitester.ts); 'off': the run ends without it. A project can turn it off too
+  // Bug 371, the owner's call: with auto mode off, a started ticket whose spec or criteria change after its plan was handed in goes back to a new plan the user
+  // approves before its engineer builds on (replan.ts); 'off': its engineer builds the change on the plan approved before (the change was the user's own request)
+  replan_on_change: 'on',
 }
 /** How long a build or test run waits for its turn before it goes ahead anyway (heavy.ts). An engineer's Bash hook may be held this long, so its time limit is a little more. */
 export const TURN_WAIT_S = Number(process.env.HQ_TURN_WAIT_S) || 1200
@@ -93,7 +96,7 @@ export function bashLimitMs(timeout: unknown): number {
 /** Settings the user picks from a short list (the UI offers only these, and the API takes nothing else). */
 export const CHOICES: Record<string, readonly (string | number)[]> = {
   context_limit: [100_000, 150_000, 200_000], context_action: ['warn', 'auto'], after_fresh_start: ['continue', 'wait'], app_look: ['on', 'off'],
-  plan_check: ['on', 'off'], diff_check: ['on', 'off'], tester: ['on', 'off'],
+  plan_check: ['on', 'off'], diff_check: ['on', 'off'], tester: ['on', 'off'], replan_on_change: ['on', 'off'],
 }
 /** An engineer's context warning for each TPM preset: about two-thirds, since an engineer's context fills with stale code and
  *  test output that a fresh session reads again from the files. */

@@ -9,6 +9,7 @@ import { presenceOf } from './presence.ts'
 import { paneShowsDialog } from './screen.ts'
 import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
 import { ackBatchFromPrompt, deliveredByStopHook, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway, modLook } from './delivery.ts'
+import { stepNotes } from './delivery.ts'
 import { turnEnded } from './delivery.ts'
 import { lateReportFits, submittedWhileAway } from './delivery.ts'
 import { listen, wake, type Waiter } from './wake.ts'
@@ -35,6 +36,9 @@ const DIALOGS = new Set(['permission_prompt', 'elicitation_dialog', 'elicitation
  *  helper's: the main loop's dialog stays open while one works. Not PermissionRequest: that comes before a dialog. Not proof either: a helper's dialog,
  *  or a second one, can still be open, and only the status file and the screen tell. */
 const DIALOG_MAY_BE_OVER = new Set(['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop', 'StopFailure'])
+/** Bugs 352, 359: the mod's turn.complete reasons for a turn that ended on an API error message, which fires StopFailure instead of Stop (2.1.322's query
+ *  loop): 'error', and 'refusal' (a reply the API refused with no fallback model to take it; the mod says 'refusal' before 'error'). */
+const API_ENDED = new Set(['error', 'refusal'])
 
 const json = (res: http.ServerResponse, code: number, obj: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)) }
 const deny = (message: string) => ({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message } } })
@@ -153,11 +157,29 @@ const endedWithoutStop = (agentId: string, turnId: unknown): boolean => {
  *  hook went to an HQ that was down. Not an interrupt, not an API error (a StopFailure, which isn't a Stop), and not a turn that ended at a tool call
  *  (Escape or No on a dialog: no Stop hook comes for it even with HQ up, and its `reason` is 'answer' too; checked on 2.1.322). From the events log, not
  *  `turns`: the start-up look (lookAtTurnsAtStart) may have ended the turn already. A mod from before this change sends no turn.complete late. */
-const stopLost = (agentId: string, body: Record<string, unknown>): boolean => {
-  if (body.isAborted === true || (body.reason ?? 'answer') !== 'answer' || body.atTool !== false) return false
+const stopLost = (agentId: string, body: Record<string, unknown>): boolean =>
+  body.isAborted !== true && (body.reason ?? 'answer') === 'answer' && body.atTool === false && noEndHeard(agentId, body.turnId)
+/** Bugs 297, 367: HQ heard the mod's start of this turn of the agent's own, and no Stop, StopFailure or prompt since. */
+const noEndHeard = (agentId: string, turnId: unknown): boolean => {
   const start = one<{ id: number | null }>(`SELECT MAX(id) AS id FROM events WHERE agent_id = ? AND kind = 'mod.turn.start' AND json_extract(payload, '$.turnId') = ?
-    AND COALESCE(json_extract(payload, '$.agentId'), '') = ''`, agentId, String(body.turnId ?? ''))?.id
+    AND COALESCE(json_extract(payload, '$.agentId'), '') = ''`, agentId, String(turnId ?? ''))?.id
   return !!start && !one(`SELECT 1 AS x FROM events WHERE agent_id = ? AND id > ? AND kind IN ('hook.Stop', 'hook.StopFailure', 'hook.UserPromptSubmit') LIMIT 1`, agentId, start)
+}
+/** Bug 367: the mod's late turn.complete of a turn that ended on an API error (API_ENDED), with no Stop or StopFailure since it started: its StopFailure
+ *  hook (fire-and-forget, never waits for HQ) went to an HQ that was down. 2.1.322 sends a StopFailure, never a Stop, for every turn whose last reply is an
+ *  API error message, a refusal too; a turn that ends on a model error sends neither (Bug 386), but it ended on an error all the same. */
+const failureLost = (agentId: string, body: Record<string, unknown>): boolean =>
+  body.isAborted !== true && API_ENDED.has(String(body.reason)) && noEndHeard(agentId, body.turnId)
+/** Bug 367: what the lost StopFailure hook would have done (handleHook 'StopFailure'): blocked on the API error, no activity line, its ⚠. Logged as a
+ *  `hook.StopFailure` marked `away` ("Turn failed while HQ was down"), so a restart and the start-up look read it as they read a real one. The error's own
+ *  words went with the hook; the mod only knows the reason. An agent that has ended since keeps its end. */
+function failedWhileAway(agent: Agent, reason: string): void {
+  const a = getAgent(agent.id); if (!a || a.status === 'exited') return
+  const what = reason === 'refusal' ? 'the API refused its reply' : 'an API error'
+  update(a.id, { status: 'blocked', blocked_why: 'api_error', last_event_at: now() }, { activity: null }) // one patch (Bug 98)
+  emit({ agentId: a.id, source: 'mod', kind: 'hook.StopFailure', payload: { event: 'StopFailure', tool: '', error: what, reason, away: true } })
+  attention('api_error', `${a.display_name ?? a.id}: turn ended with an API error while HQ was down${reason === 'refusal' ? ` (${what})` : ''}`,
+    { agentId: a.id, ticketId: a.ticket_id })
 }
 /** Bug 297: what the lost Stop hook would have done (handleHook 'Stop'): the turn is over, the TPM's answer is its reply (the 💬 line and Messages), and
  *  the agent is idle unless a helper or a run of its own still goes. The start-up look (lookAtTurnsAtStart) may have made it idle already. Logged as a
@@ -186,6 +208,51 @@ function startedWhileAway(agent: Agent): void {
   update(a.id, { status: 'working', last_event_at: now() }, { activity: 'Thinking' }) // one patch (Bug 98)
   if (a.status === 'blocked') resolveKind('api_error', a.id)
   emit({ agentId: a.id, source: 'system', kind: 'agent.turn_started_away', payload: { was: a.status } })
+}
+/** Bug 386: how long HQ waits for a StopFailure once the mod's turn.complete says a turn of the agent's own ended on an error (API_ENDED) with no Stop.
+ *  2.1.322 sends StopFailure without waiting for it, so it can reach HQ before or after turn.complete; a turn that ends on a model error (the query loop's
+ *  `reason: 'model_error'`: the model policy excludes the model, a usage-credits consent unanswered or declined, model_blocked, its catch-all for a thrown
+ *  error) sends none at all, and nothing would say it failed. In memory, and read back at start-up from the events log (waitForFailuresAtStart). */
+const FAILURE_WAIT_MS = Number(process.env.HQ_FAILURE_WAIT_S ?? 10) * 1000
+const failureWaits = new Map<string, NodeJS.Timeout>()
+/** Bug 386: the turn `turnId` is the agent's latest own turn (the mod's turn.start), and HQ heard no Stop, StopFailure or prompt since it started. */
+const failureUnheard = (agentId: string, turnId: string): boolean => {
+  const start = one<{ id: number; turn: unknown }>(`SELECT id, json_extract(payload, '$.turnId') AS turn FROM events WHERE agent_id = ? AND kind = 'mod.turn.start'
+    AND COALESCE(json_extract(payload, '$.agentId'), '') = '' ORDER BY id DESC LIMIT 1`, agentId)
+  return !!start && String(start.turn ?? '') === turnId
+    && !one(`SELECT 1 AS x FROM events WHERE agent_id = ? AND id > ? AND kind IN ('hook.Stop', 'hook.StopFailure', 'hook.UserPromptSubmit') LIMIT 1`, agentId, start.id)
+}
+/** Bug 386: HQ said the agent's current turn failed (failedUnheard, or Bug 367's failedWhileAway after a restart) and no new turn started since: a
+ *  StopFailure for it that comes now is old news. */
+const failureTold = (agentId: string): boolean => !!one(`SELECT 1 AS x FROM events WHERE agent_id = ? AND kind = 'hook.StopFailure'
+  AND (json_extract(payload, '$.unheard') = 1 OR json_extract(payload, '$.away') = 1) AND id > COALESCE((SELECT MAX(id) FROM events WHERE agent_id = ? AND (kind = 'hook.UserPromptSubmit'
+  OR (kind = 'mod.turn.start' AND COALESCE(json_extract(payload, '$.agentId'), '') = ''))), 0) LIMIT 1`, agentId, agentId)
+/** Bug 386: wait FAILURE_WAIT_MS from `from` (the turn.complete) for the turn's StopFailure; nothing heard by then, HQ says the turn failed. */
+function waitForFailure(agentId: string, turnId: string, reason: string, from = now()): void {
+  clearTimeout(failureWaits.get(agentId)); failureWaits.delete(agentId)
+  if (!failureUnheard(agentId, turnId)) return // its StopFailure came first
+  const t = setTimeout(() => { failureWaits.delete(agentId); failedUnheard(agentId, turnId, reason) }, Math.max(0, from + FAILURE_WAIT_MS - now()))
+  t.unref(); failureWaits.set(agentId, t)
+}
+/** Bug 386: what a StopFailure would have done (handleHook 'StopFailure'): blocked on the error, no activity line, its ⚠, and a "Turn failed" line. Logged
+ *  as a `hook.StopFailure` marked `unheard`, so a restart reads it as it reads a real one, and a real one that comes after it adds nothing (failureTold).
+ *  The error's own words are only on the agent's screen. Read again: a new turn, a Stop hook, the agent's end or Stop pressed in HQ may have come meanwhile. */
+function failedUnheard(agentId: string, turnId: string, reason: string): void {
+  const a = getAgent(agentId); if (!a || a.status === 'exited' || beingStopped(a.id) || !failureUnheard(a.id, turnId)) return
+  const what = reason === 'refusal' ? 'the API refused its reply' : 'its terminal says which'
+  update(a.id, { status: 'blocked', blocked_why: 'api_error', last_event_at: now() }, { activity: null }) // one patch (Bug 98)
+  emit({ agentId: a.id, source: 'system', kind: 'hook.StopFailure', payload: { event: 'StopFailure', tool: '', error: `an error (${what})`, reason, unheard: true } })
+  attention('api_error', `${a.display_name ?? a.id}: turn ended with an error (${what})`, { agentId: a.id, ticketId: a.ticket_id })
+}
+/** Bug 386: after a restart, an agent whose last own turn ended on an error HQ was still waiting to hear of waits out the rest of its time. */
+export function waitForFailuresAtStart(): void {
+  for (const a of liveAgents()) {
+    const since = one<{ id: number }>("SELECT MAX(id) AS id FROM events WHERE agent_id = ? AND kind = 'hook.SessionStart'", a.id)?.id ?? 0
+    const c = one<{ payload: string; at: number }>(`SELECT payload, created_at AS at FROM events WHERE agent_id = ? AND id > ? AND kind = 'mod.turn.complete'
+      AND COALESCE(json_extract(payload, '$.agentId'), '') = '' ORDER BY id DESC LIMIT 1`, a.id, since)
+    const b = c ? JSON.parse(c.payload) as Record<string, unknown> : null // a late one is Bug 367's (the mod sent it again once HQ was back)
+    if (b && b.isAborted !== true && b.late !== true && API_ENDED.has(String(b.reason))) waitForFailure(a.id, String(b.turnId ?? ''), String(b.reason), c!.at)
+  }
 }
 /** Bug 188: Escape or a denial on a dialog ends the turn with no Stop hook, and the mod's `turn.complete` says isAborted false (checked on 2.1.322). Once HQ
  *  has seen the dialog gone, the turn ends as above, unless a new one has started since (a prompt typed or sent meanwhile). `say`: it ended with no Stop and
@@ -244,7 +311,8 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
       Object.assign(live, { activity: on, last_message: trim(body.last_assistant_message, 2000) })
       if (agent.role === 'tpm') recordReply(agent, String(body.last_assistant_message ?? '')); break }
     // Bug 72: no dialog, the turn just ended with an error. It waits at its prompt for a message, isn't "waiting on a dialog", and isn't "Thinking"
-    case 'StopFailure': payload.error = trim(body.error ?? body, 400); Object.assign(fields, { status: 'blocked', blocked_why: 'api_error' }); live.activity = null; break
+    case 'StopFailure': payload.error = trim(body.error ?? body, 400); Object.assign(fields, { status: 'blocked', blocked_why: 'api_error' }); live.activity = null
+      if (failureTold(agent.id)) payload.told = true; break // Bug 386: HQ already said this turn failed: no second line or ⚠
     case 'Notification': Object.assign(payload, { ntype: body.notification_type, message: trim(body.message, 200) }); break
     case 'PostModelSwitch': case 'PreModelSwitch': Object.assign(payload, { from: body.from_model, to: body.to_model, source: body.source, requested: body.requested_model }); break
     case 'PreCompact': case 'PostCompact': payload.trigger = body.trigger; break
@@ -292,9 +360,10 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (ev === 'PostModelSwitch') { onPostModelSwitch(agent, body); return json(res, 200, {}) }
   if (ev === 'ConfigChange') return json(res, 200, agent.role === 'engineer' || agent.role === 'launcher' ? { decision: 'block', reason: 'HQ: configuration changes are not allowed' } : {})
   if (ev === 'PreCompact' && agent.role === 'tpm' && body.trigger === 'auto') { attention('tpm_rotate', `TPM ${agent.id}: Claude Code wanted to compact its memory; HQ blocked it. Fresh start the TPM`, { agentId: agent.id }); return json(res, 200, { decision: 'block', reason: 'HQ fresh-starts the TPM instead of compacting' }) }
-  if (ev === 'PostToolUse' && tool === 'ExitPlanMode') { onPostExitPlanMode(agent, body); return json(res, 200, {}) }
+  if (ev === 'PostToolUse' && tool === 'ExitPlanMode') { onPostExitPlanMode(agent, body); return json(res, 200, atStep(agent, ev, sub, body)) } // its plan's OK: it builds next
   if (ev === 'PostToolUse' && (tool === 'TaskCreate' || tool === 'TaskUpdate')) { recordTask(agent, tool, input, body.tool_response as Record<string, unknown> | undefined) }
   if (ev === 'UserPromptSubmit' || ev === 'Stop') {
+    if (ev === 'Stop' && !sub) wake(agent.id) // Bug 370: what waited for its next step goes to the mod now, though a helper may keep it 'working'
     const ctx: string[] = []
     // Only as a turn starts (Bug 139): on Stop the note made the agent answer it, again and again, and never go idle for the message to come in
     const unread = ev === 'UserPromptSubmit' ? unreadCount(agent) : 0
@@ -322,12 +391,17 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     }
     return json(res, 200, {})
   }
-  if (ev === 'StopFailure') { attention('api_error', `${agent.display_name ?? agent.id}: turn ended with an API error: ${trim(body.error ?? body, 200)}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
+  if (ev === 'StopFailure' && !payload.told) { attention('api_error', `${agent.display_name ?? agent.id}: turn ended with an API error: ${trim(body.error ?? body, 200)}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
   if (ev === 'SessionEnd' && !cleared) { revokeToken(agent.id); resolveKind('dialog', agent.id) } // the session is over: its token is no good to anyone now, and it has no dialog
   if (ev === 'SessionEnd' && !cleared && !agent.fresh_start_at && agent.role === 'engineer' && agent.ticket_id) { const tk = getTicket(agent.ticket_id); if (tk && !['pr_ready', 'pr_open', 'merged', 'cancelled'].includes(tk.status)) attention('engineer_exited', `${agent.display_name ?? agent.id} exited with ticket ${tk.key} in status ${tk.status}`, { agentId: agent.id, ticketId: agent.ticket_id }) }
+  if (ev === 'PostToolUse' || (ev === 'PostToolUseFailure' && body.is_interrupt !== true)) return json(res, 200, atStep(agent, ev, sub, body))
   return json(res, 200, {})
 }
 
+/** Bug 370: the answer to the agent's own tool step (not a helper's): what can't wait for its turn to end goes in with it (stepNotes). */
+function atStep(agent: Agent, ev: string, sub: boolean, body: Record<string, unknown>): Record<string, unknown> {
+  const notes = sub ? null : stepNotes(agent.id, now(), String(body.tool_use_id ?? '')); return notes ? { hookSpecificOutput: { hookEventName: ev, additionalContext: notes } } : {}
+}
 function recordTask(agent: Agent, tool: string, input: Record<string, unknown>, resp: Record<string, unknown> | undefined): void {
   const taskId = String(input.taskId ?? input.id ?? resp?.id ?? resp?.taskId ?? '')
   const subject = input.subject ?? input.content ?? resp?.subject; const status = input.status ?? (tool === 'TaskCreate' ? 'pending' : undefined)
@@ -383,6 +457,7 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
     }
     if (kind === 'turn.complete' && !body.agentId) turnEnded(agent, body.isAborted === true) // the agent's own turn, not a helper's
     if (kind === 'turn.complete' && !body.agentId && late && stopLost(agent.id, body)) stoppedWhileAway(agent, String(body.answer ?? ''))
+    else if (kind === 'turn.complete' && !body.agentId && late && failureLost(agent.id, body)) failedWhileAway(agent, String(body.reason))
     if (kind === 'batch_submit_failed' && fits) requeue(bid, 'submit_failed')
     if (kind === 'plugin.register' && body.name && body.name !== 'hq') attention('foreign_mod', `${agent.id}: another mod tried to load: ${body.name}`, { agentId: agent.id })
     if (kind === 'session.measure') {
@@ -397,11 +472,14 @@ function handleMod(agent: Agent, action: string, url: URL, body: Record<string, 
     // ~6 s, before Claude Code's permission_prompt notification, so no dialog notice is open for Bug 188's look either (real 2.1.322: isAborted false)
     // Bug 289: an interrupt has its line (agent.interrupted); a turn with no Stop gets one, here or once its dialog has gone
     const noStop = kind === 'turn.complete' && !body.agentId && body.isAborted !== true && endedWithoutStop(agent.id, body.turnId)
-    // Bug 352: an API error ends a turn with no Stop too, and on 2.1.322 its StopFailure comes after this: that hook's "Turn failed" line says so, not ours
-    const say = noStop && body.reason !== 'error'
+    // Bug 352: an API error ends a turn with no Stop too, and on 2.1.322 its StopFailure comes after this: that hook's "Turn failed" line says so, not ours.
+    // Bug 359: so does a reply the API refused ('refusal'): on 2.1.322 it is an API error message too (error invalid_request), so a StopFailure, no Stop
+    const say = noStop && !API_ENDED.has(String(body.reason))
     const told = kind === 'turn.complete' && !body.agentId && (body.isAborted === true || noStop) && turnOver(agent.id, false, say ? 'no_stop' : undefined)
     // Bug 188: its turn is over, so a dialog may be too (Escape or a denial on it ends the turn)
     if (kind === 'turn.complete' && !body.agentId) dialogMayBeOver(agent.id, body.isAborted === true ? 'interrupted' : 'turn_end', onDialogEnd(agent.id, say && !told))
+    // Bug 386: and if no StopFailure says so within FAILURE_WAIT_MS (a model error sends none), HQ does. A late report is Bug 367's: HQ was down for that hook
+    if (noStop && !late && API_ENDED.has(String(body.reason))) waitForFailure(agent.id, String(body.turnId ?? ''), String(body.reason))
     return json(res, 200, { ok: true })
   }
   json(res, 404, {})

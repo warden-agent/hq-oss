@@ -9,6 +9,7 @@ import { parseGithubRemote } from './reposync.ts'
 import type { Agent } from './agents.ts'
 import type { Counts } from './testcounts.ts'
 import type { Look } from './smokerules.ts'
+import type { HqCheck } from './hqcheckrules.ts'
 
 export type Repo = {
   id: string; name: string; path: string; remote: string | null; default_branch: string; context_doc_path: string | null
@@ -19,6 +20,10 @@ export type Repo = {
   empty: number | null
   /** The project's TPM (Bug 52): its latest session, and when it was parked (switched away from). */
   tpm_agent_id: string | null; tpm_parked_at: number | null; next_ticket: number; next_feature: number
+  /** Bug 369: a switch away from it is still asking its agents for their notes (since then); a restart finishes it. */
+  parking_at: number | null
+  /** Bug 389: coming back to it is still picking up its parked agents (since then); a restart finishes it. */
+  resuming_at: number | null
   /** Auto mode: on or off, why it stopped, why it's waiting, and the user's own test command. */
   auto_mode: number; auto_stopped_why: string | null; auto_waiting: string | null; test_cmd: string | null; test_cmd_proposed: string | null
   /** Bug 107: the saved test command Claude Code refused in an engineer's session, as JSON (auto.ts Refused). It goes when the command changes. */
@@ -34,8 +39,9 @@ export type Feature = {
 }
 /** Why a finished ticket went back to its engineer: null, its conflicts with main; 'tests', auto mode's test of it on main failed; 'tests_hung',
  *  that test never finished; 'look', the tests passed and the app had problems when HQ opened it with the ticket merged in (smoke.ts); 'review', the tests
- *  passed and a fresh reader of its changes found problems (diffcheck.ts); 'changes', the TPM changed its spec after it was finished. */
-export type Fixing = 'tests' | 'tests_hung' | 'look' | 'review' | 'changes' | null
+ *  passed and a fresh reader of its changes found problems (diffcheck.ts); 'changes', the TPM changed its spec after it was finished. 'tests_unseen' (Bug 373):
+ *  the tests passed and no test failed, but HQ didn't see every test named for its criteria run: a reason of its own, so nothing says "its tests failed". */
+export type Fixing = 'tests' | 'tests_hung' | 'tests_unseen' | 'look' | 'review' | 'changes' | null
 export type Ticket = {
   id: string; feature_id: string; key: string; slug: string; title: string; size: string; status: TicketStatus; prior_status: TicketStatus | null
   assignee_agent_id: string | null; expected_files: string; deps: string; edit_overrides: string; branch: string | null; worktree_path: string | null
@@ -49,10 +55,23 @@ export type Ticket = {
   proof: string | null // JSON criteria.ts Proof, set at open_pr: the test named for each criterion and what git flagged; null until it's finished once
   diff_check: string | null // JSON diffcheck.ts DiffCheck: how auto mode's reader of its changes answered before the merge; null when nothing read them
   hq_check: string | null // JSON hqcheckrules.ts HqCheck: the user's "Have HQ test this" (auto mode off), its latest; null: never tested that way
+  hq_checks: string | null // Bug 373: JSON HqCheck[], the checks before the latest, oldest first (hqcheckrules.ts pastWith); null: none before it
+  replan_after: number | null // Bug 371: a new plan is owed, of a round after this one (replan.ts); null: none
   finished_sha: string | null // Bug 143: the branch's commit at its last open_pr, the one auto mode tests and merges; null on tickets finished before HQ kept it
   parked_at: number | null; created_at: number; updated_at: number
 }
 
+/** The user's check of a ticket (hqcheckrules.ts HqCheck), kept on it without touching its updated_at (auto mode reads that) and sent to every open page. A
+ *  ticket that's gone (removed meanwhile) keeps nothing. */
+export function keepCheck(ticketId: string, c: HqCheck): void {
+  if (!getTicket(ticketId)) return
+  const json = JSON.stringify(c); run('UPDATE tickets SET hq_check = ? WHERE id = ?', json, ticketId); patch('ticket', ticketId, { hq_check: json })
+}
+/** Bug 373: the checks from before its latest one (hqcheckrules.ts pastWith), kept the same way. */
+export function keepPastChecks(ticketId: string, past: HqCheck[]): void {
+  if (!getTicket(ticketId)) return
+  const json = past.length ? JSON.stringify(past) : null; run('UPDATE tickets SET hq_checks = ? WHERE id = ?', json, ticketId); patch('ticket', ticketId, { hq_checks: json })
+}
 /** Bug 126: what HQ ran on a ticket before it merged. `pass`: auto mode's test of it on `on` (main with this ticket merged in) passed: the command, the counts
  *  its summary gave (null when HQ couldn't read them), how long the test step took. `none`: HQ did not test it as it merged
  *  (it may have tested an earlier version): the user pressed Merge (`user`), or it was merged
@@ -70,7 +89,7 @@ export const localOnly = (repo: Repo): boolean => repo.kind === 'github' && repo
 export const syncBlocks = (repo: Repo): boolean => repo.kind === 'github' && !localOnly(repo) && !repo.sync_ok
 /** Whether the project runs on auto mode. */
 export const autoOn = (repoId: string | null | undefined): boolean => !!repoId && !!one<{ x: number }>('SELECT 1 AS x FROM repos WHERE id = ? AND auto_mode = 1', repoId)
-export { autoGoing, hqMoves } from './mover.ts' // who moves a ticket on next: one rule, the board's too (Bug 292)
+export { autoGoing, autoRetries, hqMoves } from './mover.ts' // who moves a ticket on next: one rule, the board's too (Bug 292)
 export const repos = (): Repo[] => q<Repo>('SELECT * FROM repos ORDER BY created_at')
 export const getRepo = (repoId: string): Repo | undefined => one<Repo>('SELECT * FROM repos WHERE id = ?', repoId)
 /** Repos on their way out of HQ (remove.ts). In memory, not clearing_at: the fresh-start sweep finishes any clear it finds, and that changes the folder. */

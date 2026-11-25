@@ -245,19 +245,25 @@ function moveOn(boxes: Box[], b: Area, to: View, w: number, h: number, avoid: Re
 
 /** One feature's boxes on the board (its own and its tickets'), whether it's finished, and whether one of them waits on the user.
  *  `opened`: a finished feature the user opened to see its tickets (Bug 164); `done` is false for it, so it stays in the work in view.
- *  `working`: an engineer is on one of its tickets (Bug 306). */
-export type Group = { ids: string[]; done: boolean; needsYou: boolean; opened?: boolean; working?: boolean }
+ *  `working`: an engineer is on one of its tickets (Bug 306). `waiting`: which of its boxes wait on the user, those in `holding` first (their
+ *  agent can't go on until the user answers: a plan, a question), then the rest (work to merge), each in board order (Bug 365). */
+export type Group = { ids: string[]; done: boolean; needsYou: boolean; opened?: boolean; working?: boolean; waiting?: string[]; holding?: string[] }
 /** Which boxes the view tries to show, widest first (placeView shows the first that is readable):
  *  1. everything: the TPM sits centred over all the branches, so the view keeps it in the middle (Bug 52);
  *  2. the TPM and the work still going on (finished features left out);
- *  3. the TPM and the feature that needs the user; 4. that feature alone. With no feature waiting on the user: the newest finished
- *     feature the user opened, else the TPM if its Your turn has something (`tpmTurn`), else the newest unfinished feature an
- *     engineer is on (Bug 306: not a newer one nothing happens on yet), else the newest unfinished feature.
- *     The same set twice is tried once. */
+ *  3. the TPM and the feature that needs the user; 4. that feature alone; 5. its boxes that wait on the user; 6. those of them that hold
+ *     an agent up; 7. the first of them (a plan before work to merge)
+ *     (Bug 365: a feature too tall for a short board, the app pane open, was shown from its top, its plan for you cut at the bottom).
+ *     With no feature waiting on the user: the newest finished feature the user opened, else the TPM if its Your turn has something
+ *     (`tpmTurn`), else the newest unfinished feature an engineer is on (Bug 306: not a newer one nothing happens on yet), else the
+ *     newest unfinished feature. The same set twice is tried once. */
 export function fitSets(all: string[], groups: Group[], tpmTurn: boolean): string[][] {
   const going = groups.filter((g) => !g.done), want = going.find((g) => g.needsYou) ?? going.filter((g) => g.opened).at(-1)
   const focus = want ? want.ids : tpmTurn || !going.length ? ['tpm'] : (going.filter((g) => g.working).at(-1) ?? going.at(-1)!).ids
-  const sets = [all, ['tpm', ...going.flatMap((g) => g.ids)], [...new Set(['tpm', ...focus])], focus]
+  const mine = (ids?: string[]) => want?.needsYou ? (ids ?? []).filter((id) => want.ids.includes(id)) : []
+  const waiting = mine(want?.waiting), holding = mine(want?.holding), first = holding.length ? holding : waiting
+  const sets = [all, ['tpm', ...going.flatMap((g) => g.ids)], [...new Set(['tpm', ...focus])], focus,
+    ...waiting.length ? [waiting, ...holding.length ? [holding] : [], first.slice(0, 1)] : []]
   return sets.filter((set, i) => sets.findIndex((o) => o.join(' ') === set.join(' ')) === i)
 }
 
@@ -266,15 +272,23 @@ export function fitSets(all: string[], groups: Group[], tpmTurn: boolean): strin
 export const POP_EDGE = 8, POP_GAP = 10, POP_ROOM = 240, POP_FLOOR = 150
 /** A popover's place in the pane: its left edge and either its top (below the box) or its bottom (`above`), its width and its
  *  height limit (the panel inside scrolls its body past that). */
-export type PopPlace = { left: number; y: number; above: boolean; width: number; maxHeight: number }
+export type PopPlace = { left: number; y: number; above: boolean; width: number; maxHeight: number; spill?: boolean }
 /** Where a box's popover goes in a `w`×`h` pane (Bug 120: the visible board, which ends at the side panel). `box` is where the box is
  *  on screen, in pane pixels. The popover is as wide as it `want`s up to the pane less an edge each side, centred under the box and
  *  moved sideways to stay inside the pane. It opens below the box with the rest of the pane's height to grow in, or above when the
- *  room below is short and there's more above. */
-export function placePop(box: { x: number; y: number; w: number; h: number }, want: number, w: number, h: number): PopPlace {
+ *  room below is short and there's more above.
+ *  Bug 379: `spill` is the room in the window under the board (the app pane, when it shows below the board). A board short both
+ *  ways (a short window with the app pane open) cut the popover to a strip a line tall; then it opens below its box and grows down
+ *  over the app pane (`spill: true`: it must be drawn where the board doesn't clip it), when that is more room than above it. A box
+ *  that fills the board (its bottom at or past the board's) gets it from the board's bottom edge. */
+export function placePop(box: { x: number; y: number; w: number; h: number }, want: number, w: number, h: number, spill = 0): PopPlace {
   const width = Math.max(0, Math.min(want, w - 2 * POP_EDGE))
   const left = Math.max(POP_EDGE, Math.min(box.x + box.w / 2 - width / 2, w - POP_EDGE - width))
   const below = h - (box.y + box.h + POP_GAP) - POP_EDGE, over = box.y - POP_GAP - POP_EDGE
+  const top = box.y + box.h + POP_GAP, from = Math.min(top, h), room = h + spill - from - POP_EDGE // a box cut by the board's bottom: from there
+  if (spill > 0 && top >= 0 && box.y < h && below < POP_ROOM && over < POP_ROOM && room > Math.max(over, POP_FLOOR)) {
+    return { left, width, above: false, y: from, maxHeight: room, spill: true }
+  }
   const above = below < POP_ROOM && over > below
-  return { left, width, above, y: above ? box.y - POP_GAP : box.y + box.h + POP_GAP, maxHeight: Math.max(POP_FLOOR, above ? over : below) }
+  return { left, width, above, y: above ? box.y - POP_GAP : top, maxHeight: Math.max(POP_FLOOR, above ? over : below) }
 }

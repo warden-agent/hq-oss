@@ -84,7 +84,8 @@ test('a spec changed after the ticket is finished goes back to its engineer, and
   const done = await finish(e, wtOf(dir, t), 'v1\norders, newest first\n'); assert.match(done.text, /^Done\. The user merges/)
   now = await tk(t); assert.deepEqual([now.status, now.fixing, now.pr_state], ['pr_ready', null, 'local'])
   assert.equal((await notices(t, 'conflicts_fixed')).length + (await notices(t, 'change_stalled')).length, 0)
-  assert.ok((await sent('hq', tpm)).some((m: any) => m.body === "HQ: T-01's engineer built the change to its spec (hq/s1/T-01-orders). The user merges it from HQ; you'll be told when it merges."))
+  assert.ok((await sent('hq', tpm)).some((m: any) => m.body === "HQ: T-01's engineer built the change to its spec (hq/s1/T-01-orders). The user merges it from HQ; you'll be told when it merges."
+    + ' Its plans: none was handed in.')) // Bug 387: this fake engineer planned nothing
   assert.equal((await merge(t)).status, 200)
   assert.equal(fs.readFileSync(path.join(dir, 'version.txt'), 'utf8'), 'v1\norders, newest first\n')
 })

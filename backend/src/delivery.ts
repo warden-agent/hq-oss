@@ -98,11 +98,12 @@ export function nextBatchFor(agent: Agent, by: 'mod' | 'typed' = 'mod', t = now(
   const all = pendingFor(agent), ask = (m: Message): boolean => m.reason === 'fresh_start'
   const current = (m: Message): boolean => !!agent.fresh_start_at && (!agent.fresh_start_msg || m.id === agent.fresh_start_msg)
   for (const m of all.filter((x) => ask(x) && !current(x))) dropMessage(m.id, agent.fresh_start_at ? 'replaced' : 'fresh_start_over', t)
-  const msgs = agent.fresh_start_at ? all.filter(current) : all.filter((m) => !ask(m)); if (!msgs.length) return null
+  const held = by === 'mod' ? heldForStep(agent, all, t) : [] // Bug 370: these go in at its next tool step (stepNotes), not after its turn
+  const msgs = agent.fresh_start_at ? all.filter(current) : all.filter((m) => !ask(m) && !held.includes(m)); if (!msgs.length) return null
   // Bug 110: after an interrupted turn the mod's prompt would be dropped, so nothing is handed to it. HQ types the messages itself, when the screen allows it.
   if (by === 'mod' && interrupted) { typeNext(agent.id); return null }
   const user = msgs.map((m) => m.body).join('\n\n'), bid = id('B')
-  const labelled = msgs.map((m) => `[${m.reason}] from ${displayName(m.from_id)}${m.from_id === 'user' || m.from_id === 'hq' ? '' : ` (id ${m.from_id})`}${m.in_reply_to ? ' (reply)' : ''} [msg ${m.id}]: ${m.body}`).join('\n\n')
+  const labelled = labelledText(msgs)
   // What the user wrote goes in as their own words, but only when it can't be taken for a command; otherwise labelled, like everyone else's.
   // Bug 146: the mod's `$.prompt.submit` refuses a text that begins with "/" (2.1.322), so its words had never got through that way either
   const allUser = msgs.every((m) => m.from_id === 'user') && startsPlain(oneLine(user))
@@ -117,6 +118,44 @@ export function nextBatchFor(agent: Agent, by: 'mod' | 'typed' = 'mod', t = now(
   for (const m of msgs) patch('message', m.id, { batch_id: b.id, delivered_at: t, delivery_method: how })
   emit({ agentId: agent.id, source: 'system', kind: 'batch.handed', payload: { id: b.id, messages: msgs.map((m) => m.id), ...(by === 'typed' ? { typed: true } : {}) } })
   return { ...b, raw: allUser, asUser: allUser }
+}
+/** Each message on its own lines, saying what kind it is and who sent it, as a batch and a tool step's note (stepNotes) give them. */
+const labelledText = (msgs: Message[]): string => msgs.map((m) => `[${m.reason}] from ${displayName(m.from_id)}${m.from_id === 'user' || m.from_id === 'hq' ? ''
+  : ` (id ${m.from_id})`}${m.in_reply_to ? ' (reply)' : ''} [msg ${m.id}]: ${m.body}`).join('\n\n')
+/** Bug 370: messages that can't wait for the agent's turn to end. An engineer builds its ticket in one long turn, so HQ's notice that the ticket's spec
+ *  changed (mcp.ts update_ticket_spec) came after the old version was built. While its own turn is at work, these aren't handed to the mod (which
+ *  submits a prompt only once the agent is idle): the agent's next tool step carries them in, as the hook's added context (stepNotes, hooks.ts), and
+ *  Claude Code puts that in front of the model at once (checked on 2.1.322, after a step that worked and one that failed). Not Escape and typing, as
+ *  Urgent does: an Escape kills a build or a test run that is running, and no hook says so (2.1.322). Held MID_TURN_HOLD_MS at most, in case no step
+ *  comes (hooks are lossy); after that, or once its turn ends, the mod hands them out as before. */
+export const MID_TURN_REASONS: ReadonlySet<string> = new Set(['spec_change'])
+const MID_TURN_HOLD_MS = Number(process.env.HQ_MID_TURN_HOLD_S ?? 600) * 1000
+/** The messages among `pending` that wait for the agent's next tool step: of a MID_TURN_REASONS kind, held for less than MID_TURN_HOLD_MS, and only while
+ *  its own turn is at work (turnAtWork). Empty when none is of that kind, without a look at the events log. */
+function heldForStep(agent: Agent, pending: Message[], t: number): Message[] {
+  const some = pending.filter((m) => MID_TURN_REASONS.has(m.reason) && m.created_at > t - MID_TURN_HOLD_MS)
+  return some.length && turnAtWork(agent) ? some : []
+}
+/** Its own turn is at work: it is working, on a plan review or on a dialog, and the last of its turn events is a prompt that started a turn, not a
+ *  Stop, a failed turn, its mod's end of a turn (an Escape) or a new session. Read from the events log, so it holds across a backend restart. Working
+ *  only because a helper or a run in the background still goes, after its turn ended, isn't at work: the mod gives it its messages then. */
+export function turnAtWork(a: Agent): boolean {
+  if (!(a.status === 'working' || a.status === 'plan_review' || (a.status === 'blocked' && a.blocked_why === 'dialog'))) return false
+  const last = one<{ kind: string }>(`SELECT kind FROM events WHERE agent_id = ? AND (kind IN ('hook.UserPromptSubmit', 'hook.Stop', 'hook.StopFailure', 'hook.SessionStart')
+    OR (kind = 'mod.turn.complete' AND COALESCE(json_extract(payload, '$.agentId'), '') = '')) ORDER BY id DESC LIMIT 1`, a.id)
+  return last?.kind === 'hook.UserPromptSubmit'
+}
+/** Bug 370: what the agent's own tool step (a main-loop PostToolUse or PostToolUseFailure, hooks.ts) carries in: the MID_TURN_REASONS messages that wait
+ *  for it, held or not. The hook's answer is the delivery, so they count as read now (delivery_method 'hook'). Null: none, or it takes no messages now
+ *  (stopped, a fresh start's note, someone at its terminal, paused), and they go the usual way. */
+export function stepNotes(agentId: string, t = now(), use = ''): string | null { // use: the step's tool_use_id (Bug 371: which model response read them)
+  const a = getAgent(agentId); if (!a || a.status === 'exited' || a.fresh_start_at || (a.takeover_locked_until ?? 0) > t) return null
+  if (a.status === 'paused' || pausedRoles().includes(a.role)) return null
+  const msgs = pendingFor(a).filter((m) => MID_TURN_REASONS.has(m.reason)); if (!msgs.length) return null
+  tx(() => { for (const m of msgs) run("UPDATE messages SET delivered_at = ?, delivery_method = 'hook', ack_at = ? WHERE id = ?", t, t, m.id) })
+  for (const m of msgs) patch('message', m.id, { delivered_at: t, delivery_method: 'hook', ack_at: t })
+  emit({ agentId: a.id, source: 'system', kind: 'message.at_step', payload: { ids: msgs.map((m) => m.id), text: msgs.map((m) => m.body).join(' ').slice(0, 400), ...use ? { use } : {} } })
+  return `HQ: ${msgs.length > 1 ? 'these messages' : 'this message'} came in while you work. Read ${msgs.length > 1 ? 'them' : 'it'} now, before your next step:\n\n${labelledText(msgs)}`
 }
 /** The agent's own turn ended, as its mod tells it (not a helper's turn). Bug 110: an interrupted one (Escape in its terminal; no Stop hook comes) leaves
  *  Claude Code dropping every prompt a mod submits until a turn has ended normally (2.1.300, 2.1.322), so HQ types this agent's messages from here on. */
@@ -179,6 +218,7 @@ export function nextDeadline(agent: Agent, t = now()): number | null {
   for (const b of q<Batch>('SELECT * FROM batches WHERE agent_id = ? AND acked_at IS NULL AND dropped_at IS NULL AND handed_at IS NOT NULL', agent.id)) {
     times.push(b.handed_at! + 180_000); if (b.received_at === null) times.push(b.handed_at! + receive); if (b.submitted_at !== null) times.push(b.submitted_at + NOT_ACKED_MS)
   }
+  for (const m of heldForStep(agent, pendingFor(agent), t)) times.push(m.created_at + MID_TURN_HOLD_MS) // Bug 370: no step came, so the mod takes it
   const later = times.filter((x) => x >= t); return later.length ? Math.min(...later) + 1 : null // the checks compare with < and >
 }
 /** One look for the mod's waiting `next` (hooks.ts): the batch to hand out now, or else when to look again. Bug 330: both from ONE reading of the

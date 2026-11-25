@@ -107,7 +107,8 @@ export function AutoDialog({ all }: { all: State }) {
 
 function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; onClose: () => void; all: State }) {
   const [busy, go] = useBusy(), [err, setErr] = useState('') // shown in this box: the page's error strip is behind it
-  const [asking, setAsking] = useState(false) // Undo's are-you-sure is up: the button reads "Undoing…" only once the user says yes (Bug 341)
+  const [asking, setAsking] = useState(false) // Undo's are-you-sure is up (Bug 341): Escape and a click outside leave the summary alone.
+  // Undo itself reads "Undoing…" and dims only once the user says yes, like Merge and Try it (Bug 366); useBusy drops a second press meanwhile
   const base = all.repos.find((r) => r.id === run.repo_id)?.default_branch ?? 'main'
   const sure = async () => { setErr(''); setAsking(true); try { return await undoConfirm(name) } finally { setAsking(false) } }
   const undo = () => go(() => api(`auto-runs/${run.id}/undo`, {}).then(onClose, (e: Error) => setErr(errText(e))), sure)
@@ -123,7 +124,7 @@ function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; on
       <Findings all={all.findings ?? []} repoId={run.repo_id} />
       {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
       <div className="flex flex-wrap justify-end gap-1.5">{(run.status === 'finished' || run.status === 'off') && run.start_sha && run.end_sha !== run.start_sha
-        && <button className="btn" disabled={busy || asking} title={`Put ${base} back where this run started. The work stays on its branches.`}
+        && <button className="btn" disabled={busy} title={`Put ${base} back where this run started. The work stays on its branches.`}
           onClick={undo}>{busy ? 'Undoing…' : 'Undo this run'}</button>}
         <button className="btn btn-primary" autoFocus disabled={busy || asking} onClick={onClose}>Close</button></div>
     </div>

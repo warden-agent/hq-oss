@@ -10,7 +10,7 @@ import { PATHS } from './config.ts'
 import { one, q, run, now } from './db.ts'
 import { emit, patch, type HqEvent } from './events.ts'
 import { assignPorts, commandRecipe, commandWarning, detectCommand, frameBlocked, installLeftovers, PREVIEW_PORTS, portBusy, printedPorts, recipeProblem, refusedWords, runScript, supervisorSpec,
-  ownInstall, type Recipe, type Refusal } from './apprun.ts'
+  ownInstall, testPorts, type Recipe, type Refusal } from './apprun.ts'
 import { groupPids, pgidOf, portHolders, whoAnswers, whose, type Holder, type Whose } from './procs.ts'
 import { markFor, runOver, runStarting, sweepNow } from './leftovers.ts'
 import { git } from './reposync.ts'
@@ -142,7 +142,7 @@ function watch(repoId: string, since: number, done: string | null): void {
       const printed = printedPorts(tag ? out.split('\n').filter((l) => l.startsWith(`[${tag}] `)).join('\n') : out) // another part's URL isn't the page
       for (const p of [cur.port!, ...printed.filter((x) => x !== cur.port)]) {
         const r = await probe(p); if (!r) continue
-        const pane = await tmux.panePid(session), who = whoAnswers(await portHolders(p), pane ? await pgidOf(pane) : null, Date.now() - since)
+        const pane = await tmux.panePid(session), who = whoAnswers(await portHolders(p, 'listening'), pane ? await pgidOf(pane) : null, Date.now() - since)
         if (who.kind === 'wait') continue // something else answers there and this app isn't listening yet
         if (who.kind === 'clash') { unwatch(repoId); void clash(repoId, since, p, who.others); return }
         save(repoId, { status: 'running', url: `http://localhost:${p}/`, frameable: r.frameable ? 1 : 0, detail: done })
@@ -171,6 +171,8 @@ function clash(repoId: string, since: number, port: number, others: Holder[]): P
 
 /** How long the app's supervisor gets to end the app: its own grace (5 s for what was asked to stop, then it kills), with room to spare. */
 const STOP_MS = Number(process.env.HQ_PREVIEW_STOP_MS) || 8000
+/** How long ending a run waits for its app's port to come free (the OS lets go of it a moment after the app ends). */
+const PORT_FREE_MS = Number(process.env.HQ_PREVIEW_PORT_FREE_MS) || 3000
 /** What the supervisor wrote as this run ended (supervise.mjs): how much of the app ran outside its own process group, and what had to be killed;
  *  `no_ps` when it couldn't run `ps` and so only told its own process group to stop (Bug 182). */
 function stopReport(repoId: string, since: number): { outside?: number; killed?: number[]; no_ps?: true } {
@@ -187,7 +189,8 @@ function stopReport(repoId: string, since: number): { outside?: number; killed?:
  *  The caller's next save clears it. `sweep` false: no leftover look now (at start-up, before agents' commands are read back). */
 async function kill(repoId: string, why: Stopping, sweep = true): Promise<{ forced: boolean }> {
   const session = previewSession(repoId), cur = row(repoId), on = await tmux.hasSession(session)
-  if (on || (cur && cur.status !== 'stopped')) save(repoId, { stopping: why })
+  const ran = on || (!!cur && cur.status !== 'stopped') // a stopped app's saved port is nobody's of HQ's now: another program may hold it (Bug 356)
+  if (ran) save(repoId, { stopping: why })
   let forced = false // Bug 182: the supervisor didn't end within STOP_MS and HQ killed it, so it had no time to report what it stopped
   if (on) {
     const pid = (await tmux.paneDeadStatus(session)) === null ? await tmux.panePid(session) : null
@@ -198,7 +201,7 @@ async function kill(repoId: string, why: Stopping, sweep = true): Promise<{ forc
     await tmux.killSession(session)
   }
   if (cur?.started_at && cur.status !== 'stopped') { runOver(markFor(repoId, cur.started_at)); if (sweep) await sweepNow() }
-  const port = row(repoId)?.port; if (port) await waitFor(async () => !(await portBusy(port)), 3000)
+  const port = ran ? row(repoId)?.port : null; if (port) await waitFor(async () => !(await portBusy(port)), PORT_FREE_MS)
   return { forced }
 }
 
@@ -223,7 +226,7 @@ const handing = new Map<string, number[]>()
 /** Bug 354: every port this HQ gave another repo's app that is starting or running, or is giving one now. An app that hasn't bound its port yet (still
  *  installing, or slow to listen) leaves it looking free. Every part's port, from its run's spec.json (the row keeps the page's only); read from the
  *  rows, so it holds after a backend restart too. A stopped or crashed app's ports are free again. */
-function givenElsewhere(repoId: string): number[] {
+function givenElsewhere(repoId: string): Map<number, string> { // each port with the repo whose app it is (Bug 362: a refused start names that app)
   const live = q<Preview>(`SELECT * FROM previews WHERE status IN ('starting', 'running') AND id != ?`, repoId)
   const inSpec = (id: string): number[] => {
     try {
@@ -231,16 +234,21 @@ function givenElsewhere(repoId: string): number[] {
       return spec.parts.map((x) => Number(x.env.PORT)).filter((n) => Number.isInteger(n) && n > 0)
     } catch { return [] }
   }
-  return [...live.flatMap((p) => [...(p.port ? [p.port] : []), ...inSpec(p.id)]), ...[...handing].flatMap(([id, ps]) => id === repoId ? [] : ps)]
+  const to = new Map<number, string>()
+  for (const p of live) for (const n of [...(p.port ? [p.port] : []), ...inSpec(p.id)]) to.set(n, p.id)
+  for (const [id, ps] of handing) if (id !== repoId) for (const n of ps) to.set(n, id)
+  return to
 }
 /** Bug 354: one port choice at a time across this HQ (each repo's own queue lets two repos' starts overlap). Reading what the others were given, the busy
- *  checks and keeping this start's choice happen in one go, so two starts a moment apart can't both take the same free port. */
+ *  checks and keeping this start's choice happen in one go, so two starts a moment apart can't both take the same free port. Bug 362: that holds for
+ *  a fixed port too: one another app here was given is in `taken`, and `given` says whose app it is, as nothing may listen on it yet. */
 let choosing: Promise<unknown> = Promise.resolve()
-function choosePorts(repoId: string, recipe: Recipe, saved: number | null): ReturnType<typeof assignPorts> {
+type Choice = NonNullable<Awaited<ReturnType<typeof assignPorts>>> & { given: Map<number, string> }
+function choosePorts(repoId: string, recipe: Recipe, saved: number | null): Promise<Choice | null> {
   const job = async () => {
-    const got = await assignPorts(recipe, saved, portBusy, helperPortsHeld(repoId), givenElsewhere(repoId))
+    const given = givenElsewhere(repoId), got = await assignPorts(recipe, saved, portBusy, helperPortsHeld(repoId), [...given.keys()])
     if (got && !got.taken.length) handing.set(repoId, Object.values(got.ports)) // kept before the next choice can start
-    return got
+    return got && { ...got, given }
   }
   const p = choosing.then(job, job); choosing = p.catch(() => {}); return p
 }
@@ -256,6 +264,16 @@ export function startPreview(repoId: string, why: string | null = null, opts: { 
       throw e
     })
 }
+/** Bug 363: a Launch helper's test ports (`testPorts`), chosen in the same one-at-a-time queue as the apps' ports, so it can't take a port an app is
+ *  being given at that moment. Never a port given to an app that is starting or running: another project's (Bug 354's claims) or its own ('' is no
+ *  project's id; a test server there would meet that app too). `held`: the other helpers' ports, read when its turn comes; `keep` records the choice
+ *  before the next one can start. */
+export function chooseTestPorts(held: () => number[], keep: (ports: number[]) => void): Promise<number[]> {
+  const job = async () => { const got = await testPorts(held(), portBusy, 3, PREVIEW_PORTS, portsOnly(givenElsewhere(''))); keep(got); return got }
+  const p = choosing.then(job, job); choosing = p.catch(() => {}); return p
+}
+/** The ports of `givenElsewhere`, whichever shape it has (Bug 362 makes it a Map of port → whose app). */
+const portsOnly = (g: number[] | Map<number, string>): number[] => Array.isArray(g) ? g : [...g.keys()]
 /** Bug 236: a start that fails once it has begun ending the old run (a file HQ can't write, tmux can't make the session) left the row saying
  *  "running" with nothing running, and its `stopping` mark had the next backend start it again. Now the row says what is true: nothing runs, and why.
  *  The failures startJob names itself have saved their own words and cleared `stopping` already; before the old run is touched nothing changed. */
@@ -296,8 +314,12 @@ async function startJob(repoId: string, why: string | null, opts: { ticket?: str
   if (got.taken.length) { // something else answers there (the user's own dev server, say): this app would talk to it, not to its own part
     const all = repos(), held = await Promise.all(got.taken.map(async (x) =>
       (await portHolders(x.port)).map((h): PortHolder => ({ ...h, ...whose(h.cwd, all, repoId), port: x.port, part: x.part }))))
-    const known = held.flat(), msg = `Can't start ${repo.name}: ${got.taken.map((x, i) => heldText(x.port, x.part, held[i]!)).join('; ')}.`
-      + (known.length ? ' Stop it here, then Launch.' : ' Stop it, then Launch.')
+    // Bug 362: another app here was given the port and doesn't listen yet (installing, slow to start), so no program holds it: that app is named
+    const apps = got.taken.map((x, i) => held[i]!.length ? null : getRepo(got.given.get(x.port) ?? '')?.name ?? null)
+    const says = (x: { port: number; part: string }, i: number) => apps[i] ? `port ${x.port} (${x.part}) is being used by ${apps[i]}'s app` : heldText(x.port, x.part, held[i]!)
+    const known = held.flat(), mine = [...new Set(apps.filter((x) => x !== null))], msg = `Can't start ${repo.name}: ${got.taken.map(says).join('; ')}.`
+      + (known.length ? ' Stop it here, then Launch.' : mine.length ? ` Stop ${mine.map((x) => `${x}'s app`).join(' and ')}, then start ${repo.name} again.`
+        : ' Stop it, then Launch.')
     save(repoId, { status: 'stopped', detail: msg, url: null, port_holders: known.length ? JSON.stringify(known) : null, stopping: null })
     throw new PortTaken(msg, got.taken.map((x) => x.port))
   }
@@ -338,18 +360,22 @@ export function stopPreview(repoId: string, resumed = false): Promise<ReturnType
     unwatch(repoId); const { forced } = await kill(repoId, 'stop', !resumed)
     save(repoId, { status: 'stopped', detail: null, url: null, frameable: null, port_holders: null, stopping: null })
     // `forced`: HQ had to kill the supervisor (its whole process group), so the supervisor's own report is missing or cut short
-    emit({ agentId: null, source: 'system', kind: 'preview.stopped',
-      payload: { repo: repo.name, ...stopReport(repoId, since), ...(forced ? { forced: true } : {}), ...(resumed ? { after_restart: true } : {}) } })
+    // `run` (Bug 360): the run a Stop ended, kept past a backend restart (stoppedByStop); a resumed one is the last backend's Stop of that run
+    emit({ agentId: null, source: 'system', kind: 'preview.stopped', payload: { repo: repo.name, ...stopReport(repoId, since), ...(forced ? { forced: true } : {}),
+      ...(resumed ? { after_restart: true } : {}), ...(since && on ? { run: since } : {}) } })
     return previewView(repo)
   })
 }
 
 /** Bug 332: the runs (by `started_at`) a Stop ended, newest first, per repo: the user's Stop, the one-app dialog's, a Clear's or a Remove's (every
  *  stopPreview but the start-up one; the Launch helper's own, of a run that never answered, comes after it read the run), never the app ending by
- *  itself or HQ restarting it. Kept in memory, as the Launch helper's wait on its run is. */
+ *  itself or HQ restarting it. In memory, set before the Stop begins (a waiter reads it with the row); the events log keeps it past a restart. */
 const stopped = new Map<string, number[]>()
-/** Bug 332: did a Stop end this run of the repo's app? */
-export const stoppedByStop = (repoId: string, since: number): boolean => !!stopped.get(repoId)?.includes(since)
+/** Bug 332: did a Stop end this run of the repo's app? Bug 360: after a backend restart the memory is gone, so the events log answers: a Stop's
+ *  preview.stopped names the run it ended (`run`), and is logged after the run started (the index on agent_id, created_at finds it). */
+export const stoppedByStop = (repoId: string, since: number): boolean => !!stopped.get(repoId)?.includes(since) || !!one<{ x: number }>(
+  `SELECT 1 AS x FROM events WHERE agent_id IS NULL AND created_at >= ? AND kind = 'preview.stopped' AND json_extract(payload, '$.run') = ?
+     AND json_extract(payload, '$.repo') = ?`, since, since, getRepo(repoId)?.name ?? null)
 
 /** "Stop it and Launch" (Bug 42): stops the programs the user was shown on the recipe's fixed ports, then starts the app. Only
  *  those: if anything else holds a port now, nothing is stopped. Never HQ itself or a live agent's session. A program that

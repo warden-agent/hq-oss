@@ -3,6 +3,7 @@
 // step a script can replay, and the words for the run's summary. Pure: no DB, no processes.
 import type { Criterion } from './criteria.ts'
 import { cssWords, ordinal, within } from './findingrules.ts'
+import { movedWords, type MovedPort } from './smokerules.ts'
 
 export type ScenarioKind = 'basic' | 'weird' | 'complex' | 'retry'
 /** One thing to try, written by the tester's planning call from the feature map and what's new (or, for `retry`, by HQ from a finding a replay couldn't
@@ -32,7 +33,11 @@ export type ScenarioResult = { scenario: Scenario; outcome: Outcome; why?: strin
  *  `unrecorded`: why HQ's recorder wasn't on while it ran, so the backend checker has nothing of this run to read. */
 export type UiTest = { at: number } & ({ state: 'done'
   scenarios: { id: string; kind: ScenarioKind; title: string; outcome: Outcome; actions: number; why?: string; criteria?: string[] }[]
-  findings: UiFinding[]; ms: number; tokens: number; cost_usd: number; model: string; sessions: number; unrecorded?: string } | { state: 'skipped'; why: string; quiet?: boolean })
+  findings: UiFinding[]; ms: number; tokens: number; cost_usd: number; model: string; sessions: number; unrecorded?: string
+  /** Bug 374: ports the project hard-wires that were in use, so the tester's copy of the app ran on others. */
+  moved?: MovedPort[] }
+  /** `tokens`, `cost_usd`: what its plan of scenarios cost, when that was paid for before the step ended untried (Bug 380: the app didn't start). */
+  | { state: 'skipped'; why: string; quiet?: boolean; tokens?: number; cost_usd?: number })
 
 /** How many scenarios the tester writes, how many it gets per session, and what one scenario may take: browser actions (a click, typing, opening a page), looks
  *  at the page as text, and screenshots (for layout only). The tester's browser refuses a step past these (HQ's hook, uitesthost.mjs), not its prompt. */
@@ -379,7 +384,7 @@ const chain = (steps: Step[]): string => (steps.length > 8 ? [`(${steps.length -
  *  none ran, all for one reason, that reason once (Bug 170: thirty lines of the same words hid it). */
 export function uiTestLines(u: UiTest | null): string[] {
   if (!u) return []
-  if (u.state === 'skipped') return u.quiet ? [] : [`- Not tried: ${u.why}`]
+  if (u.state === 'skipped') return u.quiet ? [] : [`- Not tried: ${u.why}${u.cost_usd ? ` (its plan of scenarios had cost $${u.cost_usd.toFixed(2)})` : ''}`]
   const by = (o: Outcome) => u.scenarios.filter((s) => s.outcome === o)
   const whys = new Set(u.scenarios.map((s) => s.why))
   if (u.scenarios.length > 1 && by('not_run').length === u.scenarios.length && whys.size === 1) {
@@ -394,7 +399,7 @@ export function uiTestLines(u: UiTest | null): string[] {
     : s.outcome === 'couldnt_test' ? `couldn't test it from a browser, so ${s.criteria?.length ? `${s.criteria.join(', ')} ${s.criteria.length === 1 ? 'has' : 'have'}`
       : 'it has'} no verdict here (${s.why ?? 'no reason given'})`
     : `not run${s.why ? ` (${s.why})` : ''}`
-  return [head,
+  return [head, ...(u.moved?.length ? [`- HQ ran its own copy of the app on ${movedWords(u.moved)}`] : []),
     ...u.findings.map((f) => `- ${f.id} (${KIND_WORDS[f.kind]}, ${f.scenario} ${title(f.scenario)}${f.criterion ? `, ${f.criterion}` : ''}): ${f.what}`
       + `${f.expected ? ` Expected: ${f.expected}` : ''}${f.steps.length ? ` Steps: ${chain(f.steps)}` : ''}`),
     ...u.scenarios.filter((s) => s.outcome !== 'problem').map((s) => `- ${s.id} ${s.title}: ${verdict(s)}`)]

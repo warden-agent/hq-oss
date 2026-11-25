@@ -38,7 +38,9 @@ test('Bug 206: a ticket that came back says what sent it back: the tests, HQ\'s 
   const back = (p: Record<string, unknown>) => eventLine('ticket.fix_tests', { key: 'PAY-1', ...p })
   assert.equal(back({ why: 'tests', hung: false }), 'PAY-1 came back: its tests fail')
   assert.equal(back({ why: 'tests_hung', hung: true }), 'PAY-1 came back: its tests never finish')
-  assert.equal(back({ why: 'tests', unproven: true }), "PAY-1 came back: the tests named for its criteria didn't all run")
+  // Bug 373: nothing failed there, and HQ only knows it didn't see them: with how many once HQ kept that (rows from before have no count, and `why: 'tests'`)
+  assert.equal(back({ why: 'tests', unproven: true }), "PAY-1 came back: its tests passed, but some tests named for its criteria weren't seen running")
+  assert.equal(back({ why: 'tests_unseen', unproven: true, missing: 8 }), "PAY-1 came back: its tests passed, but 8 tests named for its criteria weren't seen running")
   assert.equal(back({ why: 'look', hung: false }), "PAY-1 came back: HQ's look at the app found something wrong")
   assert.equal(back({ why: 'review', hung: false, again: true }), 'PAY-1 came back: a fresh reader of its changes found something to fix')
   // rows from before Bug 206 have no `why`: a hung run said so; any other may have been the reader or the look, so the line doesn't say "tests fail"
@@ -171,6 +173,11 @@ test('"Have HQ test this": its start, its end each way, and a send to the engine
   assert.equal(eventLine('check.sent', { key: 'T-01' }), "You sent what HQ's test of T-01 found to its engineer")
 })
 
+test('Bug 374: a test that ran the app on another port says which, and who had the project\'s own', () => {
+  assert.equal(eventLine('testrun.port_moved', { repo: 'shop', part: 'api', from: 8000, to: 50123, by: "HQ's preview of shop", files: ['web/vite.config.ts'] }),
+    "HQ ran its own copy of shop for a test with its api part on port 50123 instead of 8000 (in use by HQ's preview of shop)")
+})
+
 test('Bug 201: what the stop of a frozen run and the other newly worded kinds say', () => {
   assert.equal(eventLine('bg.stopped', { by: 'user', tasks: ['b1'], minutes: 12, commands: ['npm run test-backend'] }),
     'You stopped its frozen background run: npm run test-backend (no CPU, no output for 12 min)')
@@ -193,6 +200,12 @@ test('Bug 201: what the stop of a frozen run and the other newly worded kinds sa
   assert.equal(eventLine('message.typed', { id: 'm', reason: 'urgent' }), 'HQ typed a message into its terminal')
   assert.equal(eventLine('message.typed', { id: 'm', reason: 'urgent', again: true, finished: true }), // Bug 331
     'HQ typed the rest of a message into its terminal after its restart (its first part was already in)')
+})
+
+test('Bug 370: a message that went in with a working agent\'s step says so, with its words', () => {
+  assert.equal(eventLine('message.at_step', { ids: ['m'], text: "HQ: the TPM updated T-01's spec. Call get_ticket to read it." }),
+    "Got a message while it worked, with its last step: HQ: the TPM updated T-01's spec. Call get_ticket to read it.")
+  assert.equal(eventLine('message.at_step', { ids: ['m', 'n'], text: 'HQ: one. HQ: two.' }), 'Got 2 messages while it worked, with its last step: HQ: one. HQ: two.')
 })
 
 test('Bug 210: the lines name the project\'s own default branch (master here), and main for a ticket that is gone', () => {
@@ -250,6 +263,8 @@ test('Bug 289: a background run that ended names its command, a turn with no Sto
 test('Bug 297: a Stop HQ learnt of late (its hook went to an HQ that was down) says so', () => {
   assert.equal(eventLine('hook.Stop', { last: 'Here is the list:\n1. Apple', away: true }), 'Turn ended while HQ was down: Here is the list: 1. Apple')
   assert.equal(eventLine('hook.Stop', { away: true }), 'Turn ended while HQ was down')
+  assert.equal(eventLine('hook.StopFailure', { error: 'an API error', away: true }), 'Turn failed while HQ was down: an API error') // Bug 367
+  assert.equal(eventLine('hook.StopFailure', { error: 'overloaded_error' }), 'Turn failed: overloaded_error')
   assert.equal(eventLine('hook.Stop', { last: 'Done.' }), 'Turn ended: Done.') // what it must not change: a Stop that came in time
 })
 
@@ -285,4 +300,13 @@ test('Bug 309: HQ\'s own wait for its turn reaches its ticket\'s engineer\'s Eve
 
 test('Bug 346: a turn HQ learnt of late (it started while HQ was down) says so', () => {
   assert.equal(eventLine('agent.turn_started_away', { was: 'idle' }), 'Its turn started while HQ was down: shown as working')
+})
+
+test('Bug 373: the Events tab says what the engineer changed when a sent-back ticket is finished again, and tells unseen names from a failed test', () => {
+  assert.equal(eventLine('ticket.pr_ready', { key: 'PAY-1', fixed: true, files: ['package.json'], more: 0 }), 'PAY-1 is finished again: its engineer changed 1 file: package.json')
+  assert.equal(eventLine('ticket.pr_ready', { key: 'PAY-1', fixed: true, files: [], more: 0 }), 'PAY-1 is finished again: its engineer changed no files')
+  assert.equal(eventLine('ticket.pr_ready', { key: 'PAY-1', fixed: false }), 'PAY-1 is ready to merge') // a first finish, and a fix of its conflicts, as before
+  assert.equal(eventLine('check.ended', { key: 'PAY-1', state: 'fail', unseen: 8 }),
+    "HQ's test of PAY-1: the tests passed, but 8 tests named for its criteria weren't seen running (View results on its box)")
+  assert.equal(eventLine('check.ended', { key: 'PAY-1', state: 'fail' }), "HQ's test of PAY-1 found a problem (View results on its box)")
 })

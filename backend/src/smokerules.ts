@@ -10,13 +10,29 @@ export type PageSeen = { path: string; title: string; text: number; things: numb
   bad: { status: number; method: string; url: string }[]; outside: string[]; load?: string }
 /** What one run of the app showed. `looked`: it started and HQ opened its pages. `no_start`: it never answered (`output`: what it printed). `skipped`: HQ
  *  couldn't look at all (a port the app always uses is taken, the browser didn't start): nothing about the code. */
-export type Seen = { kind: 'looked'; pages: PageSeen[]; ms: number } | { kind: 'no_start'; why: string; output: string } | { kind: 'skipped'; why: string }
+export type Seen = { kind: 'looked'; pages: PageSeen[]; ms: number; moved?: MovedPort[] } | { kind: 'no_start'; why: string; output: string; moved?: MovedPort[] }
+  | { kind: 'skipped'; why: string }
+/** Bug 374: a port the project hard-wires that was in use when HQ tested, so HQ ran its own copy of the app on another (testports.ts). `by`: who had it;
+ *  `fix`: what the user can do to free it. */
+export type MovedPort = { part: string; from: number; to: number; by: string; fix?: string }
+/** "port 50123 instead of 8000 (in use by HQ's preview of shop)", for each port HQ moved. */
+export const movedWords = (m: MovedPort[]): string => m.map((x) => `port ${x.to} instead of ${x.from} (in use by ${x.by})`).join(' and ')
+/** Why HQ couldn't open the app, when its own copy on another port didn't start (`why`: as the start says it). HQ can't tell whether the move is the reason:
+ *  a server that takes its port from somewhere HQ didn't see (a tool's own default) asks for the old one and is refused it. So nothing is said about the
+ *  code: the words name who has the port and what frees it, and with the port free the next test runs the app where it always runs. */
+export function movedNoStart(why: string, m: MovedPort[]): string {
+  const held = m.map((x) => `port ${x.from}, which its ${x.part} part always uses, is in use by ${x.by}`).join('; ')
+  const to = m.map((x) => x.to), on = to.length > 1 ? `ports ${to.slice(0, -1).join(', ')} and ${to.at(-1)}` : `port ${to[0]}`
+  const fix = [...new Set(m.map((x) => x.fix ?? 'Stop it, then test again'))].join('. ')
+  const said = why.replace(/^the app (?:didn't start|couldn't be started)(?::\s*|$)/, '') // a caller's own lead-in: these words say it already
+  return `${held}. HQ ran its own copy on ${on} instead, and the app didn't start there${said ? ` (${said})` : ''}. ${fix}`
+}
 export type Problem = { page: string; text: string }
 /** How the look ended, kept with the ticket's merge. `pass`: nothing wrong that main didn't already have (`known`: how many problems it shares with main;
  *  `offline`: sites its pages load from that HQ's browser couldn't reach, so what those pages logged wasn't judged). `fail`: the ticket goes back. `skipped`:
  *  HQ couldn't look, and says why; never the ticket's fault (`quiet`: it's how the project is set up, not something that went wrong this time; `dead`: the app
  *  doesn't start on main in HQ's sandbox, with or without the ticket, so there is nothing to compare a ticket with until that changes). */
-export type Look = { ran: 'pass'; pages: number; ms: number; known: number; offline: string[] } | { ran: 'fail'; why: string; problems: Problem[]; output?: string }
+export type Look = { ran: 'pass'; pages: number; ms: number; known: number; offline: string[]; moved?: MovedPort[] } | { ran: 'fail'; why: string; problems: Problem[]; output?: string }
   | { ran: 'skipped'; why: string; quiet?: boolean; dead?: boolean }
 
 const cut = (s: string, n = 240): string => { const one = s.replace(/\s+/g, ' ').trim(); return one.length > n ? `${one.slice(0, n - 1)}…` : one }
@@ -44,12 +60,17 @@ export function judge(ticket: Seen, main: Seen | null, base: string): Look {
   if (ticket.kind === 'skipped') return { ran: 'skipped', why: ticket.why }
   if (main?.kind === 'skipped') return { ran: 'skipped', why: main.why }
   if (ticket.kind === 'no_start') {
+    // Bug 374: HQ's copy on another port didn't start, and nothing shows the move works for this app (main alone didn't start on one either, or ran on its
+    // own port). That may be the move, not the code: nobody is blamed, and the app isn't written off for the run (`dead`), since a free port changes it.
+    const moved = ticket.moved?.length ? ticket : main?.kind === 'no_start' && main.moved?.length ? main : null
+    if (moved && !(main?.kind === 'looked' && main.moved?.length)) return { ran: 'skipped', why: movedNoStart(moved.why, moved.moved!) }
     if (main?.kind === 'no_start') return { ran: 'skipped', why: `the app doesn't start on ${base} either (${main.why})`, dead: true }
-    return { ran: 'fail', why: `The app doesn't start with it merged in: ${ticket.why}.`, problems: [], output: ticket.output }
+    const on = ticket.moved?.length ? `; HQ ran its own copy of the app on ${movedWords(ticket.moved)}` : ''
+    return { ran: 'fail', why: `The app doesn't start with it merged in: ${ticket.why}${on}.`, problems: [], output: ticket.output }
   }
   const all = allProblems(ticket), fresh = main?.kind === 'looked' ? newProblems(all, allProblems(main)) : all
   const offline = [...new Set(ticket.pages.flatMap((p) => p.outside))].sort()
-  if (!fresh.length) return { ran: 'pass', pages: ticket.pages.length, ms: ticket.ms, known: all.length, offline }
+  if (!fresh.length) return { ran: 'pass', pages: ticket.pages.length, ms: ticket.ms, known: all.length, offline, ...(ticket.moved?.length ? { moved: ticket.moved } : {}) }
   return { ran: 'fail', why: `The app has ${fresh.length === 1 ? 'a problem' : `${fresh.length} problems`} with it merged in that ${base} doesn't have.`, problems: fresh }
 }
 
@@ -67,5 +88,7 @@ export function lookWords(l: Look | null | undefined): { short: string; long: st
   if (l.ran === 'fail') return { short: 'app has problems', long: l.why, tone: 'look' }
   const known = l.known ? `; ${l.known} problem${l.known === 1 ? '' : 's'} it shares with what was there before` : ''
   const off = l.offline.length ? `; pages that load from ${l.offline.join(', ')} weren't judged by what they logged (HQ's browser has no internet)` : ''
-  return { short: `app opened, ${pagesWord(l.pages)}`, long: `HQ opened the app with it merged in: ${pagesWord(l.pages)}, nothing new wrong${known}${off}.`, tone: l.offline.length ? 'look' : 'ok' }
+  const moved = l.moved?.length ? ` HQ ran its own copy of the app on ${movedWords(l.moved)}.` : '' // Bug 374: checkable, and no surprise in the app's own output
+  return { short: `app opened, ${pagesWord(l.pages)}`, long: `HQ opened the app with it merged in: ${pagesWord(l.pages)}, nothing new wrong${known}${off}.${moved}`,
+    tone: l.offline.length ? 'look' : 'ok' }
 }

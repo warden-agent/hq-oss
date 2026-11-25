@@ -1,0 +1,21 @@
+> b377shop@1.0.0 test
+> mocha
+
+
+
+  ✔ has due_on
+  - a top-level skipped one
+  - a pending one with no body
+  nested
+    deeper
+      - deep skip
+      ✔ deep pass
+
+  book list
+    ✔ shows each due date
+    ✔ marks a book due soon
+    - sorts books by due date
+
+
+  4 passing (2ms)
+  4 pending

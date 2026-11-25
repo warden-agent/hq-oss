@@ -4,7 +4,7 @@ import { PATHS, PORTS, uiToken } from './config.ts'
 import { migrate } from './db.ts'
 import { recoverAgents, liveAgents } from './agents.ts'
 import { tellIfHqWasAway, typeCutShort } from './delivery.ts'
-import { lookAtTurnsAtStart, rebuildHelpers, rebuildTurns, startHooksServer } from './hooks.ts'
+import { lookAtTurnsAtStart, rebuildHelpers, rebuildTurns, startHooksServer, waitForFailuresAtStart } from './hooks.ts'
 import { startMcpServer } from './mcp.ts'
 import { startUiServer } from './ui.ts'
 import { startStuckLoop } from './stuck.ts'
@@ -20,7 +20,7 @@ import { repos } from './records.ts'
 import { emit } from './events.ts'
 import { attention } from './attention.ts'
 import { startRetention } from './retention.ts'
-import { startFreshStartLoop } from './freshstart.ts'
+import { finishParks, finishResumes, startFreshStartLoop } from './freshstart.ts'
 import { ensureTrusted } from './trust.ts'
 import { startAutoLoop } from './auto.ts'
 import { killTestRuns, sweepRunTmp, sweepTestWorktrees } from './testrun.ts'
@@ -81,6 +81,7 @@ async function main(): Promise<void> {
   startBgRuns() // before the first sweep and any hook: it reads back what agents wait on in the background (Bug 96)
   rebuildHelpers() // and the helpers they started in the background, after it: a helper's line comes first (Bug 232)
   rebuildTurns() // Bug 281: each agent's last turn start, prompt and Stop, so a quick Escape on a turn from before the restart still ends it
+  waitForFailuresAtStart() // Bug 386: a turn that ended on an error HQ was still waiting to hear of
   // Bug 268: a turn that ended while HQ was down; after the helpers and runs, which keep an agent working
   lookAtTurnsAtStart().catch((e) => emit({ agentId: null, source: 'system', kind: 'turn.look_error', payload: { error: String(e) } }))
   readBackCommands() // what agents' commands are still running, so the sweep spares what they started (Bug 145)
@@ -93,6 +94,8 @@ async function main(): Promise<void> {
   // Bug 296: an urgent message or a fresh start's request the last backend was typing when it went down. Once the servers listen: the prompt it
   // types starts a turn, whose hooks must reach HQ (typed before, they failed with ECONNREFUSED on the screen). In the background: an Escape waits 1.5 s
   void typeCutShort().catch((e) => emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
+  finishParks() // Bug 369: a switch away the last backend was in the middle of asks the rest of the project's agents (after typeCutShort's look)
+  finishResumes() // Bug 389: and a coming back it was in the middle of picks up the rest of the project's parked agents
   startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
   startLeftoverSweeps()
   startClaudeCheck()

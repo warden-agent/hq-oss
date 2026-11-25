@@ -6,7 +6,8 @@ import { edgeHints, HINT_H, HINT_W, LOWEST, placeBoard, wholeIn, type Box, type 
 const nodeTypes = { tpm: TpmNode, feature: FeatureNode, ticket: TicketNode }
 /** A request to bring a box into view (Show in the ⚠ menu, Read plan); `n` makes a repeat request for the same box count. */
 export type Focus = { node: string; n: number } | null
-type Props = { nodes: Node[]; edges: Edge[]; fits: string[][]; focus: Focus; onSelect: (id: string) => void; onPane: () => void }
+/** `holds`: boxes whose agent waits on the user's answer (a plan, a question): a pill toward one is amber and says so (Bug 365). */
+type Props = { nodes: Node[]; edges: Edge[]; fits: string[][]; holds?: string[]; focus: Focus; onSelect: (id: string) => void; onPane: () => void }
 /** A click on a box's own controls (buttons, links, inputs, its popover) is theirs; only a click on the box itself selects it.
  *  Needed because React bubbles clicks from a popover's portal (BoardPop in Nodes.tsx) up to the box. */
 const ownClick = (t: EventTarget | null) => t instanceof Element && !!t.closest('.react-flow__node-toolbar, button, a, input, textarea, select')
@@ -32,7 +33,7 @@ export const Graph = (p: Props) => <ReactFlowProvider><Flow {...p} /></ReactFlow
  *  pane changes size (panel opened, closed or dragged; window resized), until the view has been placed by hand (or boxes go away and
  *  leave a hand-placed view with none whole, Bug 306); ⛶ places it the same way and hands it back. Size changes wait 150ms so a
  *  panel drag re-fits once, at the end. A focus request pans its box near the top so its popover fits below. */
-function Flow({ nodes, edges, fits, focus, onSelect, onPane }: Props) {
+function Flow({ nodes, edges, fits, holds = [], focus, onSelect, onPane }: Props) {
   const rf = useReactFlow(), store = useStoreApi()
   const moved = useRef(false) // The user (or Show / Read plan) placed the view: stop auto-fitting until Fit is pressed
   const size = useStore((s) => `${s.width}x${s.height}`)
@@ -81,11 +82,14 @@ function Flow({ nodes, edges, fits, focus, onSelect, onPane }: Props) {
     <Background color="#27272a" />
     <Controls position={corner} showInteractive={false} showFitView={false} onZoomIn={() => { moved.current = true }} onZoomOut={() => { moved.current = true }}>{fitBtn}</Controls>
   </ReactFlow>
-  {hints.map((h) => { const n = h.ids.length, [a, b] = ARROW[h.side]
-    return <button key={h.side} type="button" data-edge-hint={h.side} style={{ left: h.x, top: h.y, width: HINT_W, height: HINT_H }}
-      title={`${n} more ${n === 1 ? 'box' : 'boxes'} past the ${h.side} edge of the board. Click to see ${n === 1 ? 'it' : 'the nearest'}.`}
+  {hints.map((h) => { const n = h.ids.length, [a, b] = ARROW[h.side], held = h.ids.some((id) => holds.includes(id))
+    return <button key={h.side} type="button" data-edge-hint={h.side} data-holds={held || undefined}
+      style={{ left: h.x, top: h.y, width: HINT_W, height: HINT_H }}
+      title={`${n} more ${n === 1 ? 'box' : 'boxes'} past the ${h.side} edge of the board${held ? `, ${n === 1 ? '' : 'one of them '}waiting on your answer (a plan or a question)`
+        : ''}. Click to see ${n === 1 ? 'it' : 'the nearest'}.`}
       onClick={() => { moved.current = true; void rf.setViewport(h.to, { duration: 300 }) }}
-      className="absolute z-10 whitespace-nowrap rounded-full border border-zinc-600 bg-zinc-800/95 text-[11px] text-zinc-200 hover:bg-zinc-700"
+      className={`absolute z-10 whitespace-nowrap rounded-full border bg-zinc-800/95 text-[11px] hover:bg-zinc-700 ${held
+        ? 'border-amber-500 text-amber-200' : 'border-zinc-600 text-zinc-200'}`}
     >{a}{n} more{b}</button>
   })}</div>
 }

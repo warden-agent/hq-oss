@@ -46,6 +46,8 @@ test('Bug 126: a merged ticket says what HQ ran on it first and how it ended, an
   assert.deepEqual(words(JSON.stringify(pass)), { box: 'tests passed', passed: true,
     long: "HQ's tests passed on main with it merged in, before it merged · 412 passed, 6 skipped · 8 s" })
   assert.equal(words(JSON.stringify({ ...pass, counts: null, ms: 125_000 }))!.long, "HQ's tests passed on main with it merged in, before it merged · 2 min 5 s", 'no counts: none made up')
+  assert.equal(words(JSON.stringify({ ...pass, counts: { passed: 2, failed: 0, skipped: 1, todo: 1 } }))!.long,
+    "HQ's tests passed on main with it merged in, before it merged · 2 passed, 1 skipped, 1 todo · 8 s", 'Bug 384: todo tests are counted, as the runner says them')
   assert.deepEqual(words(JSON.stringify({ ran: 'none', by: 'user', at: 1 })), { box: 'no HQ test', passed: false,
     long: 'You merged it with Merge, which runs no tests: HQ did not test this version as it merged (Have HQ test this, or auto mode, tests before a merge).' })
   assert.equal(words(JSON.stringify({ ran: 'none', by: 'outside', at: 1 }))!.long, 'It was merged outside HQ, so HQ did not test it as it merged.')

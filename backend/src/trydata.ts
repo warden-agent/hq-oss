@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { git } from './reposync.ts'
+import { copyPackages } from './worktrees.ts'
 import type { Ticket } from './records.ts'
 
 /** A ticket whose work is finished and waiting for the merge, with its worktree still on disk and nothing to fix first. */
@@ -32,6 +33,8 @@ export async function copyMainData(repoPath: string, wtPath: string, files: stri
     const from = path.join(repoPath, name), to = path.join(wtPath, name)
     if (!fs.existsSync(from) || (path.basename(name) === 'node_modules' && fs.existsSync(to))) continue
     fs.rmSync(to, { recursive: true, force: true }); fs.mkdirSync(path.dirname(to), { recursive: true })
+    if (path.basename(name) === 'node_modules') { if (await copyPackages(repoPath, path.dirname(name), to)) done.push(name); continue } // Bug 393: never half an install
+
     try { await cp(['-cRp', from, to]) } catch { fs.rmSync(to, { recursive: true, force: true }); await cp(['-Rp', from, to]) }
     done.push(name)
   }

@@ -9,21 +9,39 @@ const out = (cmd: string, args: string[]): Promise<string> =>
 
 /** lsof's program name for people: on Linux it gives node's thread name. */
 const program = (c: string): string => c.replace(/-MainThread$/, '')
-/** The program listening on this TCP port, e.g. "python3.1 (pid 55557)", or null. */
+/** Bug 357: the processes with a TCP socket whose own end is on `port`, from lsof's `-iTCP:<port> -Fpcn` listing, each once: a listener, one bound
+ *  there but not listening (lsof says CLOSED, not LISTEN: HQ's busy check finds the port taken, and a LISTEN-only lookup named nobody), or the near end
+ *  of a connection made from that port. Not a program connected *to* the port (a browser on the app): its `n` line is `<its own end>-><the port>`.
+ *  On Linux lsof can't place a bound socket that doesn't listen (it isn't in /proc/net/tcp), so that one stays unnamed there, as before. */
+export function boundTo(listing: string, port: number): { pid: number; cmd: string }[] {
+  const found = new Map<number, { pid: number; cmd: string }>(); let cur: { pid: number; cmd: string } | null = null
+  for (const l of listing.split('\n')) {
+    if (l.startsWith('p')) cur = { pid: Number(l.slice(1)), cmd: 'a program' }
+    else if (l.startsWith('c') && cur) cur.cmd = program(l.slice(1))
+    else if (l.startsWith('n') && cur && cur.pid > 0 && Number(/:(\d+)$/.exec(l.slice(1).split('->')[0]!)?.[1]) === port) found.set(cur.pid, cur)
+  }
+  return [...found.values()]
+}
+const bound = async (port: number) => boundTo(await out('lsof', ['-nP', `-iTCP:${port}`, '-Fpcn']), port)
+/** The program holding this TCP port, e.g. "python3.1 (pid 55557)", or null: listening there, or bound there without listening (Bug 357). */
 export async function portHolder(port: number): Promise<string | null> {
-  const lines = (await out('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpc'])).split('\n')
-  const pid = lines.find((l) => l.startsWith('p'))?.slice(1), cmd = lines.find((l) => l.startsWith('c'))?.slice(1)
-  return pid ? `${cmd ? program(cmd) : 'a program'} (pid ${pid})` : null
+  const h = (await bound(port))[0]
+  return h ? `${h.cmd} (pid ${h.pid})` : null
 }
 
-/** A process listening on a port: its id, process group, program name and working folder (null when lsof can't see it). */
+/** A process holding a port: its id, process group, program name and working folder (null when lsof can't see it). */
 export type Holder = { pid: number; pgid: number | null; cmd: string; cwd: string | null }
-/** Every process listening on this TCP port (a `--reload` server has two: the watcher and its worker). */
-export async function portHolders(port: number): Promise<Holder[]> {
+/** Every process holding this TCP port (a `--reload` server has two: the watcher and its worker). `only`: 'bound' (who to name when the port is taken,
+ *  and to stop for the user) counts a socket bound there that doesn't listen too (Bug 357); 'listening' only what answers there (Bug 44's check of
+ *  whose page the preview shows: a bound socket answers nothing, and on macOS an app can listen beside it). */
+export async function portHolders(port: number, only: 'bound' | 'listening' = 'bound'): Promise<Holder[]> {
   const found: { pid: number; cmd: string }[] = []
-  for (const l of (await out('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpc'])).split('\n')) {
-    if (l.startsWith('p')) found.push({ pid: Number(l.slice(1)), cmd: 'a program' })
-    else if (l.startsWith('c') && found.length) found.at(-1)!.cmd = program(l.slice(1))
+  if (only === 'bound') found.push(...await bound(port))
+  else {
+    for (const l of (await out('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpc'])).split('\n')) {
+      if (l.startsWith('p')) found.push({ pid: Number(l.slice(1)), cmd: 'a program' })
+      else if (l.startsWith('c') && found.length) found.at(-1)!.cmd = program(l.slice(1))
+    }
   }
   const ps = [...new Map(found.filter((x) => x.pid > 0).map((x) => [x.pid, x])).values()]; if (!ps.length) return []
   const cwds = new Map<number, string>(); let pid = 0

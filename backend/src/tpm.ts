@@ -50,17 +50,27 @@ async function launch(repoId: string, o: { message?: string | null; cleared?: bo
     const r0 = getRepo(repoId); if (!r0) throw new Error('unknown repo')
     const prev = r0.tpm_agent_id ? getAgent(r0.tpm_agent_id) : undefined
     if (prev && prev.status !== 'exited') throw new Error(`${r0.name}'s TPM is already running (${prev.id}).`)
+    // Bug 389: a TPM session the last backend started from the note but went down before recording here: it takes over, so a resume run again
+    // starts no second one. Not for a start that carries the user's words or a Clear's briefing: those are in the new session's prompt only.
+    const cut = o.message || o.cleared ? undefined : one<Agent>(`SELECT * FROM agents WHERE role = 'tpm' AND repo_id = ? AND feature_id IS NULL
+      AND status != 'exited' AND id IS NOT ? ORDER BY started_at DESC`, repoId, r0.tpm_agent_id)
+    if (cut) return took(repoId, cut, prev, { why: o.why, adopted: true })
     const repo = await ensureFresh(repoId)
     const ws = writeRepoMd(repoId), note = readNote(`resume:repo:${repoId}`)
     const prompt = tpmPrompt(repo, { ws, previous: prev?.id ?? null, note, board: board(repoId), messages: prev ? lastTalk(repoId) : [], message: o.message,
       cleared: o.cleared, context: fs.existsSync(path.join(ws, 'CONTEXT.md')), localOnly: localOnly(repo) })
     const a = await launchAgent({ role: 'tpm', repoId, model: modelFor('tpm'), cwd: ws, displayName: `TPM ${repo.name}`, launchPrompt: prompt, extraFlags: ['--add-dir', repo.path] })
-    run('UPDATE repos SET tpm_agent_id = ?, tpm_parked_at = NULL WHERE id = ?', a.id, repoId); patch('repo', repoId, { tpm_agent_id: a.id, tpm_parked_at: null })
-    if (prev) { handOver(prev.id, a.id); resolveKind('agent_exited', prev.id) }
-    resolveKind(`repo_clear_tpm:${repoId}`, null) // Bug 285: "its TPM didn't start again" alerts, so it goes once one has started
-    emit({ agentId: a.id, source: 'system', kind: 'tpm.started', payload: { repo: repoId, previous: prev?.id ?? null, why: o.why } })
-    return a
+    return took(repoId, a, prev, { why: o.why })
   } finally { starting.delete(repoId) }
+}
+
+/** `a` is the repo's TPM now: recorded, with what was left for the session before it. */
+function took(repoId: string, a: Agent, prev: Agent | undefined, o: { why: string; adopted?: boolean }): Agent {
+  run('UPDATE repos SET tpm_agent_id = ?, tpm_parked_at = NULL WHERE id = ?', a.id, repoId); patch('repo', repoId, { tpm_agent_id: a.id, tpm_parked_at: null })
+  if (prev) { handOver(prev.id, a.id); resolveKind('agent_exited', prev.id) }
+  resolveKind(`repo_clear_tpm:${repoId}`, null) // Bug 285: "its TPM didn't start again" alerts, so it goes once one has started
+  emit({ agentId: a.id, source: 'system', kind: 'tpm.started', payload: { repo: repoId, previous: prev?.id ?? null, why: o.why, ...(o.adopted ? { adopted: true } : {}) } })
+  return a
 }
 
 /** The user wrote in the TPM box. A running TPM gets it as a message; otherwise it starts (or comes back from its note) with the

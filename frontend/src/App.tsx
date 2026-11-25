@@ -3,16 +3,17 @@ import { agentPill, agentPlanWait, answerAsk, api, clearErrors, connectWs, ended
   type Agent, type State, type WsMsg } from './api'
 import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
-import { AttentionList, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
+import { AttentionList, CheckLine, CheckResults, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
 import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel,
   noteTakers, parkWords, removeConfirm, openAuto, openSummary, boardKeeper, turnOn, useBoard, type Board, type Pop, type PopKind } from './board'
 import { ActBtn, Elapsed, ErrorBar, LiveDot, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
 import { mergeTestOf, mergeTestWords, runWords } from './testruns.ts'
 import { byKind, criteriaOf, flagLines, KIND_HEADING, proofOf, proofWords } from '../../backend/src/criteria.ts'
+import { checksOf, outOfDate } from '../../backend/src/hqcheckrules.ts'
 import { lookWords } from '../../backend/src/smokerules.ts'
 import { diffCheckOf, diffCheckWords, planCheckOf, planCheckWords } from '../../backend/src/checks.ts'
 import { messageRoute } from '../../backend/src/msgroute.ts'
-import { nextMover } from '../../backend/src/mover.ts'
+import { autoRetries, nextMover } from '../../backend/src/mover.ts'
 import { agentHeader, pauseAt, usageParts } from './usage.ts'
 import { LaunchBtn, PreviewPane } from './Preview'
 import { clampH, forgetPrefs, rightWidth, usePreviewPrefs } from './previewPrefs'
@@ -211,7 +212,8 @@ export default function App() {
       </div>
       <div className="grid min-h-0" style={{ gridTemplateColumns: panel.open ? `minmax(0,1fr) 6px ${panelPx}px` : 'minmax(0,1fr)' }}>
         <main className="grid min-h-0 min-w-0" style={!pvOpen ? { gridTemplateRows: 'minmax(0,1fr)' } : pvBelow ? { gridTemplateRows: `minmax(0,1fr) 6px ${clampH(prefs.h)}px` } : { gridTemplateColumns: `minmax(0,1fr) 6px ${pvW}px` }}>
-          <div className="min-h-0 min-w-0"><Graph nodes={board.nodes} edges={board.edges} fits={board.fits} focus={focusReq} onSelect={selectNode} onPane={() => setPop(null)} /></div>
+          <div className="min-h-0 min-w-0"><Graph nodes={board.nodes} edges={board.edges} fits={board.fits}
+            holds={board.holds} focus={focusReq} onSelect={selectNode} onPane={() => setPop(null)} /></div>
           {pvOpen && <><Splitter dir={pvBelow ? 'row' : 'col'} label="Resize preview" size={pvBelow ? clampH(prefs.h) : pvW} def={pvBelow ? Math.round(window.innerHeight * 0.45) : rightWidth(prefs.device)}
             set={(n) => { const c = pvBelow ? clampH(n) : rightWidthIn(n, room); setPrefs(pvBelow ? { h: c } : { w: c }, false); return c }} save={(n) => setPrefs(pvBelow ? { h: n } : { w: n })} />
             <PreviewPane all={all!} p={pv} repo={repo} prefs={prefs} setPrefs={setPrefs} ws={ws} feed={feed} onRepo={switchRepo} roomRight={roomRight} onEvents={helperEvents} /></>}
@@ -439,20 +441,22 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
 }
 function TicketInfo({ t, state }: { t: any | null; state: State }) {
   if (!t) return <div className="p-4 text-sm text-zinc-500">Click a ticket box to see its details here.</div>
-  const f = state.features.find((x) => x.id === t.feature_id), deps = jsonList(t.deps), files = jsonList(t.expected_files), ask = ticketQuestion(state, t), park = parkWords(t)
-  const clearing = !!state.repos.find((r) => r.id === f?.repo_id)?.clearing_at // HQ refuses Try again during a Clear, so the tab doesn't offer it (as the box, Bug 335)
+  const f = state.features.find((x) => x.id === t.feature_id), deps = jsonList(t.deps), files = jsonList(t.expected_files), ask = ticketQuestion(state, t)
+  const repo = state.repos.find((r) => r.id === f?.repo_id), park = parkWords(t, repo), clearing = !!repo?.clearing_at
+  // HQ refuses Try again during a Clear (Bug 335) and with auto mode off (Bug 364), so the tab doesn't offer it then, as the box doesn't
+  const retry = !!repo && autoRetries(repo)
   // break-words: a long run with no spaces (a path in a stack trace) wraps instead of making the tab scroll sideways (Bug 144)
   return <div className="h-full overflow-y-auto break-words pr-1 text-xs">
     <div className="flex items-center gap-2"><span className="font-semibold">{t.key}</span><span className="text-zinc-500">{t.size}</span>
       <Pill s={t.status} label={ticketLabel(t, state.reviews.some((r) => r.ticket_id === t.id && r.status === 'open' && hqAnswersPlan(state, r)), clearingPlan(state, { ticket_id: t.id }))} /></div>
     <div className="mt-1 text-sm text-zinc-200">{t.title}</div>
-    {/* Bug 349: why auto mode parked it and what Try again does, as its box says; Try again here too, as on its box */}
+    {/* Bug 349: why auto mode parked it and what comes next, as its box says; Try again here too while auto mode can take it (Bug 364), as on its box */}
     {park && <div className="mt-2 rounded-md border border-rose-900 p-2">
       <div className="font-semibold text-rose-300">Parked by auto mode</div><div className="mt-0.5 text-rose-200">{park.why}</div>
       {clearing ? <div className="mt-1 text-zinc-400">The project is being cleared: nothing starts until that's done.</div> : <>
         <div className="mt-1 text-zinc-400">{park.next}</div>
-        <div className="mt-1.5"><ActBtn primary label="Try again" busyLabel="Trying…" title="Auto mode gives this ticket another go"
-          run={() => api(`tickets/${t.id}/auto-retry`, {})} /></div></>}</div>}
+        {retry && <div className="mt-1.5"><ActBtn primary label="Try again" busyLabel="Trying…" title="Auto mode gives this ticket another go"
+          run={() => api(`tickets/${t.id}/auto-retry`, {})} /></div>}</>}</div>}
     <dl className="mt-2 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1 text-zinc-400">
       {ask && <><dt>Question</dt><dd className="break-words text-amber-200">asked {askedWho(ask, state.agents)}: {ask.body}</dd></>}
       <dt>Feature</dt><dd className="text-zinc-300">{f?.title ?? '—'}</dd>
@@ -462,6 +466,7 @@ function TicketInfo({ t, state }: { t: any | null; state: State }) {
       {t.pr_url && <><dt>PR</dt><dd><a className="text-indigo-300 underline" href={t.pr_url} target="_blank" rel="noreferrer">{t.pr_number ? `#${t.pr_number}` : 'open'} ↗</a></dd></>}
     </dl>
     {t.status === 'merged' && <MergeTests key={`${t.id}:${t.merge_test}`} t={t} />}
+    <HqTests t={t} />
     <Criteria t={t} />
     <Readers t={t} state={state} />
     <div className="mt-3 font-semibold text-zinc-400">Spec</div>
@@ -470,6 +475,16 @@ function TicketInfo({ t, state }: { t: any | null; state: State }) {
   </div>
 }
 const TONE = { ok: 'text-emerald-300', look: 'text-amber-300', none: 'text-zinc-500' } as const
+/** Bug 373: every "Have HQ test this" of the ticket that HQ still has, newest first, each a line that opens its results: what it found, whether it went to the
+ *  engineer, and what the engineer did about it. Here whatever the ticket's status is: its box has the button only while it's finished and unmerged, so a
+ *  ticket sent back to its engineer, or merged, had nowhere to read why. Nothing for a ticket HQ never tested this way. */
+function HqTests({ t }: { t: any }) {
+  const all = checksOf(t); if (!all.length) return null
+  return <><div className="mt-3 font-semibold text-zinc-400">HQ's tests of it</div>
+    <div className="mt-1 space-y-1">{all.map((c, i) => <details key={c.id} className="rounded-md border border-zinc-800 px-2 py-1">
+      <summary className="cursor-pointer break-words"><CheckLine c={c} /></summary>
+      <div className="mt-1 flex flex-col gap-2 pb-1"><CheckResults t={t} c={c} old={i === 0 && outOfDate(t, c)} head={false} /></div></details>)}</div></>
+}
 /** A ticket's acceptance criteria, each with the test its engineer named for it at open_pr and how that test did in HQ's own run, then what git flagged about
  *  the finished work (deleted tests, files outside the plan). Nothing for a ticket with neither. */
 function Criteria({ t }: { t: any }) {

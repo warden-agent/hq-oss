@@ -1,0 +1,25 @@
+(node:50410) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+FAIL ./j.jest.js
+  book list
+    ✕ marks a book due soon (1 ms)
+    ✓ ok one
+
+  ● book list › marks a book due soon
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 2
+    Received: 1
+
+    [0m[31m[1m>[22m[39m[90m 1 |[39m describe([32m'book list'[39m[33m,[39m () [33m=>[39m { test([32m'marks a book due soon'[39m[33m,[39m () [33m=>[39m { expect([35m1[39m)[33m.[39mtoBe([35m2[39m) })[33m;[39m test([32m'ok one'[39m[33m,[39m () [33m=>[39m {}) })
+     [90m   |[39m                                                                               [31m[1m^[22m[39m
+     [90m 2 |[39m[0m
+
+      at Object.toBe (j.jest.js:1:79)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 1 passed, 2 total
+Snapshots:   0 total
+Time:        0.15 s
+Ran all test suites.

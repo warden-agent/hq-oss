@@ -56,7 +56,7 @@ export function runWords(r: Pick<TestRun, 'what' | 'state' | 'behind'>, key: str
 import type { Look } from '../../backend/src/smokerules.ts'
 // Bug 126: what HQ ran on a ticket before it merged, once it has. Nothing on the board showed it, and a TPM told the user "HQ ran the tests before each merge"
 // after six merges HQ never tested. The backend saves it on the ticket as it merges (records.ts MergeTest, the same type).
-export type Counts = { passed: number; failed: number; skipped: number }
+export type Counts = { passed: number; failed: number; skipped: number; todo?: number } // todo: Bug 384, only when some were (older records have none)
 export type MergeTest = { ran: 'pass'; test: string; counts: Counts | null; ms: number; on: string; at: number; look?: Look } | { ran: 'none'; by: 'user' | 'outside'; at: number }
 /** The ticket's `merge_test`, or null: merged before HQ kept a record, or not merged. Bad JSON is no record. */
 export function mergeTestOf(t: { merge_test?: string | null }): MergeTest | null {
@@ -64,9 +64,9 @@ export function mergeTestOf(t: { merge_test?: string | null }): MergeTest | null
 }
 /** "under 1 s", "8 s", "2 min 5 s" */
 export const took = (ms: number): string => { const s = Math.round(ms / 1000), m = Math.floor(s / 60); return !s ? 'under 1 s' : m ? `${m} min${s % 60 ? ` ${s % 60} s` : ''}` : `${s} s` }
-/** "412 passed, 6 skipped": skipped and failed only when there are some. */
+/** "412 passed, 6 skipped, 1 todo": failed, skipped and todo only when there are some (testcounts.ts, the same words). */
 export const countWords = (c: Counts): string =>
-  [`${c.passed} passed`, c.failed ? `${c.failed} failed` : '', c.skipped ? `${c.skipped} skipped` : ''].filter(Boolean).join(', ')
+  [`${c.passed} passed`, c.failed ? `${c.failed} failed` : '', c.skipped ? `${c.skipped} skipped` : '', c.todo ? `${c.todo} todo` : ''].filter(Boolean).join(', ')
 /** A merge's tests in words. `box`: a few words for the merged box's one row. `long`: the whole of it, for its tooltip and the Ticket tab. `passed`: tested and passed.
  *  `none`: null, the ticket merged before HQ kept a record (its box says nothing rather than "no tests", which may be untrue). */
 export function mergeTestWords(m: MergeTest | null): { box: string; long: string; passed: boolean } | null {

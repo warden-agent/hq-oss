@@ -204,3 +204,26 @@ test('Bug 352: a turn that ends on an API error reads "Turn failed", never "Esca
   await hq.modEvent(plain.id, { kind: 'turn.complete', turnId: 'T1', agentId: null, isAborted: false, reason: 'answer', durationMs: 900, answer: '' })
   assert.deepEqual(await turnOvers(plain), [{ why: 'no_stop', still: null }])
 })
+
+// Bug 359: a reply the API refuses ends the turn the same way on 2.1.322: Claude Code makes the refusal an API error message (error 'invalid_request'), so
+// StopFailure comes, never Stop; the mod's turn.complete says reason 'refusal' (it ranks a refusal above 'error') and comes first. No "Escape or No" line.
+const refused = (a: any, turnId: string) => hq.modEvent(a.id, { kind: 'turn.complete', turnId, agentId: null, isAborted: false, reason: 'refusal',
+  refusal: { category: 'cyber', explanation: null }, durationMs: 900, answer: '' })
+test('Bug 359: a turn the API refused reads "Turn failed", never "Escape or No", in either order; a refusal retried to a Stop keeps its Stop line', async () => {
+  const late = await tpm(), early = await tpm(), retried = await tpm()
+  for (const x of [late, early, retried]) { await ask(x, 'go on'); await start(x, 'T1'); await run(x, 'touch one.txt') }
+  await refused(late, 'T1') // 2.1.322's order: before its StopFailure, the turn is over (idle) with no line of ours
+  assert.deepEqual(await turnOvers(late), []); assert.equal((await now(late)).status, 'idle')
+  await hq.hook(late.id, { hook_event_name: 'StopFailure', error: 'invalid_request' })
+  await hq.hook(early.id, { hook_event_name: 'StopFailure', error: 'invalid_request' }); await refused(early, 'T1')
+  for (const x of [late, early]) {
+    assert.deepEqual(await turnOvers(x), [], x.id)
+    const l = await lines(x); assert.ok(l.slice(0, 2).includes('Turn failed: invalid_request'), `${x.id}: ${l.slice(0, 3).join(' | ')}`)
+    assert.ok(!l.some((t) => /Escape or No/.test(t)), x.id)
+    const a = await now(x); assert.deepEqual([a.status, a.blocked_why], ['blocked', 'api_error'], x.id)
+  }
+  // what it must not catch: Claude Code tried once more after the refusal and that reply ended normally: its Stop, then reason 'refusal' (any refusal in the turn)
+  await hq.hook(retried.id, { hook_event_name: 'Stop', last_assistant_message: 'done after all' }); await refused(retried, 'T1')
+  assert.deepEqual(await turnOvers(retried), []); assert.equal((await lines(retried))[0], 'Turn ended: done after all')
+  assert.equal((await now(retried)).status, 'idle')
+})

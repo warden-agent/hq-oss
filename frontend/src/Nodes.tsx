@@ -5,10 +5,10 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Handle, Position, useStore, type Node, type NodeProps } from '@xyflow/react'
-import { alertFrom, answerAsk, api, type State } from './api'
+import { alertFrom, answerAsk, api, beforeChange, type State } from './api'
 import { askLabels, askText, cancelConfirm, featureCancelText, mergeConfirm, removeText, startLabel, startText, turnOn, waitingOn } from './board'
-import { actLabel, answerReview, kindLabel, freshBlocker, freshConfirm, freshOffered, localOnly, OPEN_PREVIEW, stopOthers, ticketLabel, useBoard, useBusy, useRevisionCap,
-  type Act, type FeatureView, type Line, type TicketView, type TpmView, type Tone } from './board'
+import { actLabel, answerReview, fixWhy, kindLabel, freshBlocker, freshConfirm, freshOffered, localOnly, OPEN_PREVIEW, stopOthers, ticketLabel, useBoard, useBusy, useRevisionCap,
+  type Act, type FeatureView, type FixWhy, type Line, type TicketView, type TpmView, type Tone } from './board'
 import { goodNews, plainNews, ticketBase, turnQuestionText, type Question, type Turn } from './needs.ts'
 import { MORE } from './reply.ts'
 import { mergeTestOf, mergeTestWords } from './testruns.ts'
@@ -19,25 +19,31 @@ import { sendHere, sentHere, useAtEnd } from './atend.ts'
 import { placePop } from './fit'
 import { openDone } from './donefold'
 import { byKind, criteriaOf, KIND_HEADING } from '../../backend/src/criteria.ts'
-import { allSteps, canSend, checkButton, checkFacts, checkHeadline, checkOf, outOfDate, STEP_NAME, type Tone as CheckTone } from '../../backend/src/hqcheckrules.ts'
+import { allSteps, canSend, changedWords, checkButton, checkFacts, checkHeadline, checkOf, checksOf, checkTone, outOfDate, STEP_NAME, unseenOnly, type HqCheck,
+  type Tone as CheckTone } from '../../backend/src/hqcheckrules.ts'
 
 const tone: Record<Tone, string> = { plain: 'text-zinc-200', muted: 'text-zinc-400', amber: 'text-amber-300', rose: 'text-rose-300', sky: 'text-sky-300', emerald: 'text-emerald-300', indigo: 'text-indigo-300' }
 const POP = 'nodrag nopan nowheel' // popovers: the wheel scrolls them and a drag in them doesn't pan the graph
 /** A popover pinned to box `id` (Bug 120): inside the visible board (left of the side panel, inside the window) wherever the box is,
  *  as the view moves and the pane changes size: up to `want` px wide, under the box or over it (fit.ts placePop). Its height limit is
  *  the CSS variable --pop-h, which the panel inside takes as its max-height so its body scrolls and its buttons stay in view.
- *  Drawn in the board's own element, over ReactFlow's layers: the zoom buttons (z-index 5) sit over everything in the boxes' layer
- *  (4), NodeToolbar included, and covered the corner of Approve. Keeps NodeToolbar's class, which ownClick (Graph.tsx) looks for.
- *  Rendered only while open: it follows every pan. */
+ *  Drawn over the board in its wrapper (Graph.tsx), above everything in it: the zoom buttons (z-index 5) sat over everything in the
+ *  boxes' layer (4), NodeToolbar included, and covered the corner of Approve (Bug 120); the edge pills ("↓ 1 more") sat over the
+ *  popover (Bug 379). The layer it sits in clips it to the board, like the board itself. Keeps NodeToolbar's class, which ownClick
+ *  (Graph.tsx) looks for. Rendered only while open: it follows every pan.
+ *  Bug 379: on a board too short for it (a short window with the app pane open under the board) it was cut to a strip one line tall;
+ *  there it grows down over the app pane (placePop `spill`), and its layer stops clipping. The same layer either way, so nothing in
+ *  the popover (a half-written note) is lost when that changes. */
 function BoardPop({ id, want, children }: { id: string; want: number; children: React.ReactNode }) {
   const n = useStore((s) => s.nodeLookup.get(id)), [tx, ty, zoom] = useStore((s) => s.transform), root = useStore((s) => s.domNode)
   const w = useStore((s) => s.width), h = useStore((s) => s.height)
   if (!n || !root) return null
-  const { x, y } = n.internals.positionAbsolute
-  const p = placePop({ x: x * zoom + tx, y: y * zoom + ty, w: (n.measured.width ?? 0) * zoom, h: (n.measured.height ?? 0) * zoom }, want, w, h)
-  const style = { position: 'absolute', left: 0, top: 0, zIndex: 6, width: p.width, '--pop-h': `${p.maxHeight}px`,
+  const { x, y } = n.internals.positionAbsolute, under = Math.max(0, window.innerHeight - root.getBoundingClientRect().bottom)
+  const p = placePop({ x: x * zoom + tx, y: y * zoom + ty, w: (n.measured.width ?? 0) * zoom, h: (n.measured.height ?? 0) * zoom }, want, w, h, under)
+  const style = { position: 'absolute', left: 0, top: 0, width: p.width, pointerEvents: 'auto', '--pop-h': `${p.maxHeight}px`,
     transform: `translate(${p.left}px, ${p.y}px)${p.above ? ' translateY(-100%)' : ''}` }
-  return createPortal(<div className={`react-flow__node-toolbar ${POP}`} style={style as React.CSSProperties}>{children}</div>, root)
+  return createPortal(<div className="pointer-events-none absolute inset-0 z-20" style={{ overflow: p.spill ? 'visible' : 'hidden' }}>
+    <div className={`react-flow__node-toolbar ${POP}`} style={style as React.CSSProperties}>{children}</div></div>, root.parentElement ?? root)
 }
 /** Edge anchors. Every box has top in/out and bottom out/in (messages run both ways); tickets add left in / right out for
  *  dependencies. Always rendered (React Flow measures them once) and invisible; nothing can be connected by hand. */
@@ -112,7 +118,11 @@ function AttChip({ id, items }: { id: string; items: any[] }) {
 /** Fix conflicts: HQ checks again, then the ticket's engineer (or a fresh one on the same branch) merges main in. `why` tests: Fix tests,
  *  for one auto mode sent back for its tests whose fix stalled: the same instructions again, with what the tests printed (Bug 84).
  *  `why` change: Build the change, for one whose spec the TPM changed after it was finished and whose engineer stopped before building it. */
-export function FixAct({ t, why, base }: { t: any; why?: 'tests' | 'change' | 'look' | 'review'; base: string }) {
+export function FixAct({ t, why, base }: { t: any; why?: FixWhy; base: string }) {
+  // Bug 373: nothing failed there, so the button doesn't say its tests did
+  if (why === 'unseen') return <ActBtn primary label="Fix tests" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
+    title={"Its tests passed, but HQ didn't see every test named for its criteria run, and its engineer stopped before sorting that out. HQ sends it the list again;"
+      + ' if that engineer has stopped, a new one starts on the same branch.'} />
   if (why === 'review') return <ActBtn primary label="Fix what it found" busyLabel="Starting…" run={() => api(`tickets/${t.id}/fix-conflicts`, {})}
     title={'Its tests passed, but a fresh reader of its changes found problems, and its engineer stopped before fixing them. HQ sends it the findings again; if that'
       + ' engineer has stopped, a new one starts on the same branch.'} />
@@ -140,7 +150,7 @@ const FIX_KINDS = new Set(['merge_conflict', 'fix_stalled', 'look_stalled', 'rev
 export function AttentionList({ items, show, s }: { items: any[]; show?: (a: any) => (() => void) | null; s: Pick<State, 'agents' | 'repos' | 'features' | 'tickets'> }) {
   return <div className="flex flex-col gap-1">{items.map((a) => { const go = show?.(a); return <div key={a.id} className="rounded-md border border-zinc-800 bg-zinc-950/60 p-2 text-xs">
     <div className="flex items-start justify-between gap-2"><span className={`min-w-0 break-words font-medium ${goodNews(a.kind) ? 'text-emerald-300' : plainNews(a.kind) ? 'text-sky-300' : 'text-rose-300'}`}>{kindLabel(a.kind)}</span><span className="flex shrink-0 gap-1">
-      {FIX_KINDS.has(a.kind) && a.ticket_id && <FixAct t={{ id: a.ticket_id }} base={ticketBase(s, a.ticket_id)} why={a.kind === 'fix_stalled' ? 'tests' : a.kind === 'look_stalled' ? 'look' : a.kind === 'review_stalled' ? 'review' : a.kind === 'change_stalled' ? 'change' : undefined} />}{a.kind === 'bg_stalled' && a.agent_id && <StopRunAct agentId={a.agent_id} />}{go && <button className="btn-sm" onClick={go}>Show</button>}{!answerOnly(a.kind) && <ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} />}</span></div>
+      {FIX_KINDS.has(a.kind) && a.ticket_id && <FixAct t={{ id: a.ticket_id }} base={ticketBase(s, a.ticket_id)} why={a.kind === 'fix_stalled' ? fixWhy(s.tickets.find((x) => x.id === a.ticket_id)) ?? 'tests' : a.kind === 'look_stalled' ? 'look' : a.kind === 'review_stalled' ? 'review' : a.kind === 'change_stalled' ? 'change' : undefined} />}{a.kind === 'bg_stalled' && a.agent_id && <StopRunAct agentId={a.agent_id} />}{go && <button className="btn-sm" onClick={go}>Show</button>}{!answerOnly(a.kind) && <ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} />}</span></div>
     <div className="mt-1 break-words text-zinc-400"><Linked text={a.detail} /></div>
     {(() => { const from = alertFrom(a, s); return from && <div className="mt-1 break-words text-zinc-500">{from.line}</div> })()}</div> })}</div>
 }
@@ -170,6 +180,8 @@ export function ReviewPanel({ r, label, onDone }: { r: any; label: string; onDon
     : msg.trim() ? 'Send the blocking issues back to the engineer' : 'Write the blocking issues first'
   return <div className="hq-pop flex max-h-[var(--pop-h,70vh)] w-full flex-col border-amber-500/40!">
     <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium text-amber-300" title={label}>{label}</span>{onDone && <button className="btn" title="Close (Esc)" onClick={onDone}>×</button>}</div>
+    {!autoIsOn && beforeChange(b.state.tickets.find((t) => t.id === r.ticket_id), r.round) && <div className="mt-1 shrink-0 break-words text-xs text-amber-300">
+      Written before its engineer read the change to the spec: approving it still leaves a new plan for the change to come. Revise asks for that now.</div>}
     <div className="min-h-0 overflow-y-auto">
       {plain && <div className="mt-2"><div className="text-zinc-400">In plain words</div>{/* Bug 130: says it sums up the plan */}
         <div className="mt-1 rounded-md bg-zinc-800/60 p-2 text-[13px] leading-5 text-zinc-100"><Md text={plain} /></div></div>}
@@ -349,38 +361,73 @@ function CheckAct({ v, id }: { v: TicketView; id: string }) {
 const STEP_MARK = { pass: ['✓', 'text-emerald-400'], fail: ['✗', 'text-rose-400'], skipped: ['–', 'text-zinc-500'], running: ['●', 'text-emerald-300 animate-pulse'],
   waiting: ['·', 'text-zinc-600'], not_run: ['·', 'text-zinc-600'] } as const
 const LINE_TONE = { ok: 'text-emerald-300/90', bad: 'text-rose-300', plain: 'text-zinc-300' } as const
+const HEAD_TONE: Record<CheckTone, string> = { plain: 'text-zinc-200', green: 'text-emerald-300', red: 'text-rose-300', amber: 'text-amber-300', grey: 'text-zinc-400' }
+const hm = (ms: number): string => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+/** When a check began: the time, with the day when that isn't today. */
+const checkWhen = (c: HqCheck): string => new Date(c.started_at).toDateString() === new Date().toDateString() ? hm(c.started_at)
+  : `${new Date(c.started_at).toLocaleDateString([], { month: 'short', day: 'numeric' })} ${hm(c.started_at)}`
+/** One check in a line, for a list of them: when, how it ended in its colour, and whether it went to the engineer. */
+export function CheckLine({ c }: { c: HqCheck }) {
+  return <><span className="text-zinc-400">{checkWhen(c)} · </span><span className={HEAD_TONE[checkTone(c)]}>{checkHeadline(c)}</span>
+    {c.sent_at ? <span className="text-sky-300"> · sent to its engineer</span> : null}</>
+}
+/** One check's results: how it went, what it tested, what became of it once it was sent to the engineer (Bug 373: when that engineer finished again, the
+ *  files it changed and what it wrote, which used to stay in its terminal), then each check in order with what it saw. `old`: the ticket was finished again
+ *  since this, its latest check. `head`: its heading line too (not under a line that says it already). Tests that passed with named ones unseen are amber
+ *  with a "?", never the red ✗ of a failed test. */
+export function CheckResults({ t, c, old = false, head = true }: { t: any; c: HqCheck; old?: boolean; head?: boolean }) {
+  const going = c.state === 'running', soft = unseenOnly(c)
+  return <><div>{head && <div className={`break-words font-medium ${old ? 'text-amber-300' : HEAD_TONE[checkTone(c)]}`}>{checkHeadline(c)}</div>}
+    <div className="break-words text-xs text-zinc-400">{checkFacts(c)}{going && <> · going for <Elapsed since={c.started_at} /></>}</div>
+    {old && <div className="mt-1 break-words text-xs text-amber-300">
+      {t.key}'s engineer finished it again after this test, so these results are about older code. Test again to check what it has now.</div>}
+    {c.sent_at && <div className="mt-1 text-xs text-sky-300">Sent to its engineer at {hm(c.sent_at)}.</div>}
+    {c.back && <div className="mt-1 break-words text-xs text-zinc-300"><span className="text-sky-300">Its engineer finished it again at {hm(c.back.at)}</span> and{' '}
+      {changedWords(c.back.files, c.back.more)}.{c.back.note ? ' What it wrote about it:' : ' It wrote no note about it.'}
+      {c.back.note && <div className="mt-0.5 max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950/70 p-1.5 text-zinc-300">{c.back.note}</div>}</div>}</div>
+    <ol className="space-y-1.5 text-xs leading-5">{allSteps(c).map((s) => {
+      const amber = soft && s.state === 'fail', [mark, tone] = amber ? ['?', 'text-amber-300'] : STEP_MARK[s.state]
+      return <li key={s.kind} className="break-words"><span className={`inline-block w-4 font-semibold ${tone}`}>{mark}</span><span className="font-semibold text-zinc-200">{STEP_NAME[s.kind]}</span>
+        <span className="text-zinc-400"> · </span><span className={amber ? 'text-amber-200' : s.state === 'fail' ? 'text-rose-200' : 'text-zinc-300'}>{s.words}</span>
+        {'lines' in s && s.lines?.length ? <ul className="ml-4 mt-0.5 space-y-0.5">{s.lines.map((l, i) =>
+          <li key={i} className={amber && l.tone === 'bad' ? 'text-amber-300' : LINE_TONE[l.tone]}>{l.text}</li>)}</ul> : null}
+        {'output' in s && s.output ? <details className="ml-4 mt-0.5"><summary className="cursor-pointer text-indigo-300">What it printed ›</summary>
+          <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-zinc-950/70 p-1.5 text-[11px] leading-4 text-zinc-300">{s.output}</pre></details> : null}
+      </li>
+    })}</ol></>
+}
 /** HQ's check of a ticket: how it went (or how far it has got), each check in order with what it saw, and what the user can do next: stop it, test again, send
- *  what failed to the engineer, merge. Closes with × or Esc. */
+ *  what failed to the engineer, merge. Bug 373: HQ keeps the earlier tests too, listed under the results; a click shows one, with no buttons (they act on the
+ *  latest). Closes with × or Esc. */
 function CheckPanel({ v, onDone }: { v: TicketView; onDone: () => void }) {
-  const t = v.t, c = checkOf(t)!, old = outOfDate(t, c), going = c.state === 'running'
-  const head = going ? 'text-zinc-200' : c.state === 'pass' && !old ? 'text-emerald-300' : c.state === 'fail' && !old ? 'text-rose-300' : 'text-amber-300'
+  const t = v.t, all = checksOf(t), [pick, setPick] = useState<string | null>(null)
+  const c = all.find((x) => x.id === pick) ?? all[0]!, latest = c === all[0], going = latest && c.state === 'running'
   const finished = t.status === 'pr_ready' || t.status === 'pr_open', merge = v.acts.find((a) => a.kind === 'merge')
   return <div className="hq-pop flex max-h-[var(--pop-h,70vh)] w-full flex-col gap-2">
     <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium text-zinc-200" title={`${t.key}: ${t.title}`}>{t.key}: HQ's test</span>
       <button className="btn" title="Close (Esc)" onClick={onDone}>×</button></div>
-    <div><div className={`break-words font-medium ${head}`}>{checkHeadline(c)}</div>
-      <div className="break-words text-xs text-zinc-400">{checkFacts(c)}{going && <> · going for <Elapsed since={c.started_at} /></>}</div>
-      {old && <div className="mt-1 break-words text-xs text-amber-300">
-        {t.key}'s engineer finished it again after this test, so these results are about older code. Test again to check what it has now.</div>}
-      {c.sent_at && <div className="mt-1 text-xs text-sky-300">Sent to its engineer at {new Date(c.sent_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.</div>}</div>
-    <ol className="min-h-0 space-y-1.5 overflow-y-auto text-xs leading-5">{allSteps(c).map((s) => {
-      const [mark, tone] = STEP_MARK[s.state]
-      return <li key={s.kind} className="break-words"><span className={`inline-block w-4 font-semibold ${tone}`}>{mark}</span><span className="font-semibold text-zinc-200">{STEP_NAME[s.kind]}</span>
-        <span className="text-zinc-400"> · </span><span className={s.state === 'fail' ? 'text-rose-200' : 'text-zinc-300'}>{s.words}</span>
-        {'lines' in s && s.lines?.length ? <ul className="ml-4 mt-0.5 space-y-0.5">{s.lines.map((l, i) => <li key={i} className={LINE_TONE[l.tone]}>{l.text}</li>)}</ul> : null}
-        {'output' in s && s.output ? <details className="ml-4 mt-0.5"><summary className="cursor-pointer text-indigo-300">What it printed ›</summary>
-          <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-zinc-950/70 p-1.5 text-[11px] leading-4 text-zinc-300">{s.output}</pre></details> : null}
-      </li>
-    })}</ol>
-    <div className="flex flex-wrap gap-1">
+    <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
+      {!latest && <div className="break-words text-xs text-sky-300">An earlier test, from {checkWhen(c)}.{' '}
+        <button className="nopan text-indigo-300 hover:underline" onClick={() => setPick(null)}>Back to the latest ›</button></div>}
+      <CheckResults t={t} c={c} old={latest && outOfDate(t, c)} />
+      {all.length > 1 && <div className="text-xs"><div className="font-semibold text-zinc-400">Every test of {t.key}, newest first</div>
+        <ul className="mt-0.5 space-y-0.5">{all.map((x, i) => <li key={x.id} className="break-words">
+          <button className={`nopan text-left hover:underline ${x.id === c.id ? 'font-semibold' : ''}`} aria-current={x.id === c.id}
+            title={x.id === c.id ? 'Shown above' : 'Show this test’s results'} onClick={() => setPick(i === 0 ? null : x.id)}>
+            <span className="text-zinc-500">{x.id === c.id ? '▸ ' : ''}</span><CheckLine c={x} /></button></li>)}</ul></div>}
+    </div>
+    {latest && <div className="flex flex-wrap gap-1">
       {going ? <ActBtn label="Stop" busyLabel="Stopping…" title="Stop HQ's test now. Nothing is kept from it but what it has already said." run={() => api(`tickets/${t.id}/check-stop`, {})} />
         : <>
           {canSend(t, c) && <ActBtn primary label="Send to engineer" busyLabel="Sending…" run={() => api(`tickets/${t.id}/check-send`, {})}
             title={c.send?.kind === 'conflicts' ? `Its engineer merges ${c.base} in and fixes the conflicts (as Fix conflicts does)`
+              : unseenOnly(c) ? "The list of tests HQ didn't see goes to its engineer (a fresh one starts if it has stopped): it makes them show up in HQ's run, or says why they"
+                + ' already do. It calls open_pr again when done; then test it again.'
               : 'What failed goes to its engineer to fix (a fresh one starts if it has stopped). It calls open_pr again when done; then test it again.'} />}
-          {finished && <ActBtn label="Test again" busyLabel="Starting…" title="HQ tests the ticket as it is now, from the start" run={() => api(`tickets/${t.id}/check`, {})} />}
+          {finished && <ActBtn label="Test again" busyLabel="Starting…" title="HQ tests the ticket as it is now, from the start. These results are kept: they stay in the list here."
+            run={() => api(`tickets/${t.id}/check`, {}).then(() => setPick(null))} />}
           {merge && <MergeAct a={merge} t={t} />}</>}
-    </div>
+    </div>}
   </div>
 }
 /** The question a ticket's engineer asked (Bug 129): whom, when, and all of it. One for the user has a box to answer it: the answer goes to the

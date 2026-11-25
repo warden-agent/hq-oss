@@ -11,7 +11,7 @@ import { createRequire } from 'node:module'
 import { DEFAULTS, PATHS } from './config.ts'
 import { getSetting } from './db.ts'
 import { call, PLAIN } from './checker.ts'
-import { appSpec, browsersPrefix, prepareApp, type LookPlan } from './smoke.ts'
+import { appSpec, blocked, browsersPrefix, prepareApp, startWhy, type LookPlan } from './smoke.ts'
 import { cleanEnv, inCheckout, ownTmp, runSandboxed, sandboxCommand } from './testrun.ts'
 import { keepReport, testerPrompt, TESTER_SYSTEM, type ToTry, type Tried } from './testerrules.ts'
 import { shq } from './util.ts'
@@ -30,10 +30,11 @@ export const testerModel = (): string => { const m = getSetting('models', DEFAUL
 
 type Out = { started: boolean | null; why: string | null; actions: { tool: string; ok: boolean }[]; report: unknown }
 /** The command Claude Code starts the browser tools with: HQ's test sandbox around the MCP server, in `wt`, with the clean environment a test run gets
- *  (Claude Code starts its MCP servers bare). `out`: where the server writes what the agent did, in the checkout, the one folder HQ and it both reach. */
+ *  (Claude Code starts its MCP servers bare). `out`: where the server writes what the agent did, in the checkout, the one folder HQ and it both reach.
+ *  `plan`: as prepareApp left it for this checkout (a port it moved is refused to the sandbox, Bug 374). */
 export function serverCommand(wt: string, plan: LookPlan, out: string, tmp: string | null, more: Record<string, unknown> = {}): { command: string; args: string[] } {
   const spec = { ...appSpec(wt, plan), sdk: sdk(), zod: zod(), cap: TESTER_ACTIONS, out, ...more } // more: the first-map session's mode, cap and rules (firstmap.ts)
-  const inner = `cd ${shq(wt)} && ${browsersPrefix()}exec ${shq(process.execPath)} ${shq(MCP)} ${shq(JSON.stringify(spec))}`, box = sandboxCommand(wt, inner, { network: false })
+  const inner = `cd ${shq(wt)} && ${browsersPrefix()}exec ${shq(process.execPath)} ${shq(MCP)} ${shq(JSON.stringify(spec))}`, box = sandboxCommand(wt, inner, { network: false, block: blocked(plan) })
   return { command: '/usr/bin/env', args: ['-i', ...Object.entries(cleanEnv(tmp)).map(([k, v]) => `${k}=${v}`), box.bin, ...box.args] }
 }
 /** Tries one feature on `sha` (main as the run leaves it). `stopped`: auto mode went off or stopped meanwhile; nothing is kept. Everything it starts (the
@@ -42,12 +43,13 @@ export function tryFeature(o: { repoPath: string; repoId: string; sha: string; p
   const f = o.feature, base = { feature: f.handle, title: f.title, tickets: f.tickets }
   const skipped = (why: string): Tried => ({ ...base, state: 'skipped', why })
   return inCheckout(o.repoPath, o.sha, 'tester', o.gen, { repoId: o.repoId, ticketId: null, what: 'tester' }, async (wt, signal): Promise<Tried | 'stopped'> => {
-    const cant = await prepareApp(wt, o.plan, { signal, run: runSandboxed })
-    if (cant?.kind === 'stopped') return 'stopped'
-    if (cant) return skipped(cant.kind === 'no_start' ? `the app couldn't be started (${cant.why})` : cant.why)
+    const got = await prepareApp(wt, o.plan, { signal, run: runSandboxed })
+    if (got.kind === 'stopped') return 'stopped'
+    if (got.kind !== 'ready') return skipped(got.kind === 'no_start' ? `the app couldn't be started (${got.why})` : got.why)
+    const plan = got.plan
     const out = path.join(wt, '.hq-tester.json'), own = ownTmp()
     try {
-      const servers = { mcpServers: { browse: { type: 'stdio', ...serverCommand(wt, o.plan, out, own.tmp) } } }
+      const servers = { mcpServers: { browse: { type: 'stdio', ...serverCommand(wt, plan, out, own.tmp) } } }
       const m = testerModel(), today = new Date().toISOString().slice(0, 10)
       const c = await call({ args: ['--model', m, '--tools', '', '--strict-mcp-config', '--mcp-config', JSON.stringify(servers), '--allowedTools', TOOLS, ...PLAIN, '--system-prompt', TESTER_SYSTEM],
         prompt: testerPrompt(f, TESTER_ACTIONS, today), signal, timeoutMs: TIMEOUT_MS, env: { HQ_TESTER_OUT: out } }) // HQ_TESTER_OUT: for the e2e's stand-in, which has no MCP
@@ -55,7 +57,7 @@ export function tryFeature(o: { repoPath: string; repoId: string; sha: string; p
       let seen: Out | null = null; try { seen = JSON.parse(fs.readFileSync(out, 'utf8')) as Out } catch { /* the server never wrote one */ }
       keep(o.repoId, o.runId, f.handle, seen)
       if (c.kind === 'error') return skipped(`the tester couldn't be asked (${c.why})`)
-      if (seen?.started === false) return skipped(seen.why ?? 'the app couldn\'t be started')
+      if (seen?.started === false) return skipped(startWhy(seen.why ?? 'the app couldn\'t be started', plan))
       if (!seen?.report) return skipped(seen ? 'the tester ended without saying what it found' : 'the tester\'s browser tools never started')
       return { ...base, state: 'tried', ...keepReport(seen.report, f.criteria.map((x) => x.id)), actions: seen.actions.length, ms: c.ms, tokens: c.tokens, model: m }
     } finally { await own.done() }

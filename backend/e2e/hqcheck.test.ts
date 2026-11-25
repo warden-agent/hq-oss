@@ -5,9 +5,10 @@
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import net from 'node:net'
 import path from 'node:path'
 import { startHq, waitFor, sh, type Hq } from './harness.ts'
-import { checkButton, checkOf } from '../src/hqcheckrules.ts'
+import { checkButton, checkHeadline, checkOf, checksOf } from '../src/hqcheckrules.ts'
 
 let hq: Hq
 // HQ_LOOK_RUNNER: no browser here; HQ's look at the app runs fake-look.mjs in its place. The UI tester's browser is never started (fake-claude.mjs drives its host)
@@ -18,11 +19,12 @@ afterEach(async () => { await hq?.stop() })
 const PASS = "require('node:test').test('ok',()=>{})\n", FAIL = "require('node:test').test('adds two',()=>{ require('node:assert').equal(1+1,3) })\n"
 // HELD waits until the test lets it go, with a file in the run's own checkout (as auto.test.ts): it orders a check's run without timing
 const HELD = 'until [ -f go ]; do sleep 0.1; done'
-/** A project with `npm test` and one passing test, its TPM running, auto mode off. */
-async function project(name: string) {
+/** A project with `npm test` and one passing test, its TPM running, auto mode off. `files`: its tests instead, wherever they are. */
+async function project(name: string, files?: Record<string, string>) {
   const dir = hq.repo(name)
-  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, private: true, scripts: { start: 'node server.js', test: 'node --test' } }))
-  fs.mkdirSync(path.join(dir, 'test')); fs.writeFileSync(path.join(dir, 'test', 'ok.test.js'), PASS); sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'tests')
+  const all = files ?? { 'package.json': JSON.stringify({ name, private: true, scripts: { start: 'node server.js', test: 'node --test' } }), 'test/ok.test.js': PASS }
+  for (const [f, text] of Object.entries(all)) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), text) }
+  sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'tests')
   const repo = (await hq.api('repos', { path: dir })).json
   const f = (await hq.api('features', { repoId: repo.id, title: name, request: `Build ${name}` })).json
   await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
@@ -31,26 +33,30 @@ async function project(name: string) {
 type P = Awaited<ReturnType<typeof project>>
 const tk = async (t: any) => (await hq.state()).tickets.find((x: any) => x.id === t.id)
 const wt = (p: P, t: any) => path.join(p.dir, '.claude', 'worktrees', t.key)
-/** A ticket, its engineer, and `files` committed and handed over with open_pr (after running the tests, as Bug 162 asks with auto off). */
-async function finished(p: P, title: string, files: Record<string, string>, cmd = 'npm test'): Promise<{ t: any; eng: any }> {
-  const t = (await hq.api('tickets', { featureId: p.f.id, title, size: 'S', spec: `${title}.` })).json
+/** A ticket, its engineer, and `files` committed and handed over with open_pr (after running the tests, as Bug 162 asks with auto off). `proof`: its
+ *  criteria, and the test open_pr names for each. */
+async function finished(p: P, title: string, files: Record<string, string>, cmd = 'npm test', proof?: { criteria: unknown[]; tests: unknown[] }): Promise<{ t: any; eng: any }> {
+  const t = (await hq.api('tickets', { featureId: p.f.id, title, size: 'S', spec: `${title}.`, ...(proof ? { criteria: proof.criteria } : {}) })).json
   const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
   await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
-  await commitAndOpen(p, t, eng, files, cmd)
+  await commitAndOpen(p, t, eng, files, cmd, proof?.tests)
   return { t, eng }
 }
-async function commitAndOpen(p: P, t: any, eng: any, files: Record<string, string>, cmd = 'npm test'): Promise<void> {
+async function commitAndOpen(p: P, t: any, eng: any, files: Record<string, string>, cmd = 'npm test', tests?: unknown[]): Promise<void> {
   for (const [f, text] of Object.entries(files)) { // '' removes the file
     const at = path.join(wt(p, t), f); if (text === '') fs.rmSync(at); else { fs.mkdirSync(path.dirname(at), { recursive: true }); fs.writeFileSync(at, text) }
   }
   sh(wt(p, t), 'add', '-A'); sh(wt(p, t), 'commit', '-qm', t.title)
   await hq.hook(eng.id, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: cmd }, tool_use_id: `toolu_${eng.id}_${Date.now()}` })
   await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
-  const r = await hq.mcp(eng.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true })
+  const r = await hq.mcp(eng.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true, ...(tests ? { tests } : {}) })
   assert.equal(r.isError, false, r.text)
   await waitFor(`${t.key} finished`, async () => (await tk(t))?.status === 'pr_ready')
 }
 const check = (t: any) => hq.api(`tickets/${t.id}/check`, {})
+/** HQ's own notice to the project's TPM that matches `re` (Bug 373: what it hears when a ticket goes back, and when it is finished again). */
+const toTpm = (p: P, re: RegExp) => waitFor(`HQ to tell the TPM ${re}`, async () =>
+  (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === p.f.tpm_agent_id && re.test(m.body)))
 /** Waits for the ticket's check to end, and gives it. */
 const ended = (t: any, ms = 30_000) => waitFor(`${t.key}'s check to end`, async () => { const c = checkOf((await tk(t)) ?? {}); return c && c.state !== 'running' ? c : null }, ms)
 const button = async (t: any) => { const b = checkButton((await tk(t))!, true); return b && [b.label, b.tone] }
@@ -77,6 +83,58 @@ test('a passing check is green with each check said, and merging that very versi
   assert.equal(rec.ran, 'pass'); assert.equal(rec.test, 'npm test'); assert.equal(rec.counts.passed, 2); assert.equal(rec.on, 'main')
 })
 
+// Bug 372: the eight tests named for a ticket's criteria ran and passed, and the check said all eight "never ran". The project's tests were in a folder and
+// run by vitest, which prints a ✓ line per test file (its path from that folder) and names only its slow tests. Here web/'s test script prints what vitest
+// 4.1.11 really printed for these files (src/testdata/bug372, captured through HQ's sandbox), and HQ's own command for the project is (cd "web" && npm test).
+// Bug 375: list.test.ts's line there says "1 skipped", so a test named in it (here the skipped one) is one HQ can't see, not "passed".
+test('Bug 372: tests in a folder, run by a runner that prints a line per test file: the check is green, and a test HQ can\'t see by name is no failure', async () => {
+  const out = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'testdata', 'bug372', 'vitest-4.1.11.txt'), 'utf8')
+  const p = await project('shop', { 'web/package.json': JSON.stringify({ name: 'web', private: true, scripts: { test: 'node print.js' } }),
+    'web/print.js': `process.stdout.write(${JSON.stringify(out)})\n`, 'web/src/api.test.ts': "test('has due_on', () => {})\n" })
+  const criteria = [{ kind: 'backend', text: 'Each book in the list has its due date.' }, { kind: 'backend', text: 'A book due within 3 days is marked due soon.' },
+    { kind: 'backend', text: 'The list says how many books it holds.' }]
+  const tests = [{ criterion: 'A1', file: 'web/src/api.test.ts', name: 'has due_on' }, { criterion: 'A2', file: 'web/src/list.test.ts', name: 'marks a book due soon' },
+    { criterion: 'A3', file: 'web/checks/count.test.ts', name: 'counts the books' }] // a file the run never lists: HQ can't tell, and says so
+  const { t } = await finished(p, 'Due dates', { 'web/src/list.test.ts': "test('shows each due date', () => {})\ntest.skip('marks a book due soon', () => {})\n",
+    'web/checks/count.test.ts': "test('counts the books', () => {})\n" }, '(cd "web" && npm test)', { criteria, tests })
+  const r = await check(t); assert.equal(r.status, 200, JSON.stringify(r.json))
+  const c = await ended(t)
+  assert.equal(c.state, 'pass', JSON.stringify(c)); assert.deepEqual(await button(t), ['View results ✓', 'green'])
+  assert.deepEqual(c.steps.slice(0, 2).map((s) => [s.kind, s.state]), [['tests', 'pass'], ['criteria', 'pass']])
+  assert.equal(c.steps[1]!.words, "The tests passed, but HQ couldn't see 2 of the 3 tests named for its criteria by name.") // not "Every test … ran"
+  assert.match(c.steps[0]!.words, /^`\(cd "web" && npm test\)` passed/)
+  assert.deepEqual(c.steps[1]!.lines, [
+    { text: 'A1: web/src/api.test.ts · "has due_on" · passed in HQ\'s test run', tone: 'ok' }, // its file's line has nothing skipped
+    { text: 'A2: web/src/list.test.ts · "marks a book due soon" · in a passing run; the test command doesn\'t print every test\'s name, so HQ couldn\'t confirm it',
+      tone: 'plain' }, // Bug 375: was "passed in HQ's test run"
+    { text: 'A3: web/checks/count.test.ts · "counts the books" · in a passing run; the test command doesn\'t print every test\'s name, so HQ couldn\'t confirm it', tone: 'plain' }])
+  assert.deepEqual(JSON.parse((await tk(t)).proof).tests.map((e: any) => e.state), ['passed', 'unconfirmed', 'unconfirmed']) // the Ticket tab reads these
+  assert.equal((await tk(t)).status, 'pr_ready'); assert.equal((await hq.state()).agents.filter((a: any) => a.role === 'engineer' && a.status === 'working').length, 1) // nobody new started
+})
+
+// Bug 376: two folders with a test file at the same path in each. HQ's command runs web/'s tests only (admin/ has none of its own to run), and vitest started
+// in web/ prints `src/api.test.ts`: that line counted for admin/src/api.test.ts too, so a test named there read "passed". Here as in Bug 372's test above.
+test('Bug 376: a file line from web/\'s run doesn\'t count for admin/\'s file at the same path; with the user\'s own command HQ can\'t tell, as before', async () => {
+  const out = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'testdata', 'bug372', 'vitest-4.1.11.txt'), 'utf8')
+  const p = await project('b376x', { 'web/package.json': JSON.stringify({ name: 'web', private: true, scripts: { test: 'node print.js' } }),
+    'web/print.js': `process.stdout.write(${JSON.stringify(out)})\n`, 'admin/package.json': JSON.stringify({ name: 'admin', private: true }) })
+  const criteria = [{ kind: 'backend', text: 'Each book has its due date.' }, { kind: 'backend', text: 'The admin page lists the users.' }]
+  const tests = [{ criterion: 'A1', file: 'web/src/api.test.ts', name: 'has due_on' }, { criterion: 'A2', file: 'admin/src/api.test.ts', name: 'lists the users' }]
+  const { t } = await finished(p, 'Due dates', { 'web/src/api.test.ts': "test('has due_on', () => {})\n", 'admin/src/api.test.ts': "test('lists the users', () => {})\n" },
+    '(cd "web" && npm test)', { criteria, tests })
+  const states = async () => JSON.parse((await tk(t)).proof).tests.map((e: any) => e.state)
+  assert.equal((await check(t)).status, 200); const c = await ended(t)
+  assert.equal(c.state, 'pass', JSON.stringify(c)); assert.match(c.steps[0]!.words, /^`\(cd "web" && npm test\)` passed/)
+  assert.deepEqual(c.steps[1]!.lines![1], { text: 'A2: admin/src/api.test.ts · "lists the users" · in a passing run; the test command doesn\'t print every test\'s name, so HQ '
+    + 'couldn\'t confirm it', tone: 'plain' }) // before the fix: "passed in HQ's test run"
+  assert.deepEqual(await states(), ['passed', 'unconfirmed'])
+  // the user's own command, which HQ doesn't build: where its runner starts is the user's to know, so the line counts for both files, as before Bug 376
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'cd web && npm test' })).status, 200)
+  assert.equal((await check(t)).status, 200)
+  const again = await waitFor('the second check to end', async () => { const x = checkOf(await tk(t)); return x && x.id !== c.id && x.state !== 'running' ? x : null })
+  assert.equal(again.state, 'pass', JSON.stringify(again)); assert.deepEqual(await states(), ['passed', 'passed'])
+})
+
 test('a failing check is red; main alone decides whose it is; Send goes to the engineer once; a new open_pr makes it out of date; Test again', async () => {
   const p = await project('red')
   const { t, eng } = await finished(p, 'Add maths', { 'test/maths.test.js': FAIL })
@@ -89,14 +147,24 @@ test('a failing check is red; main alone decides whose it is; Send goes to the e
   assert.equal(s.json.engineer, eng.id) // still running: it gets a message
   const told = await waitFor('the engineer told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /so the user sent it back to you/.test(m.body)))
   assert.match(told.body, /adds two/); assert.doesNotMatch(told.body, /HQ didn't merge/)
-  const now = await tk(t); assert.equal(now.status, 'resolving'); assert.ok(checkOf(now)!.sent_at)
+  // Bug 373: the TPM hears what came back and why, in HQ's words: here a test did fail, and it is named
+  assert.match((await toTpm(p, /went back/)).body, new RegExp(`^HQ: T-01 went back to its engineer \\(${eng.id}, still running\\) because its tests failed with it merged into main: `
+    + '.*adds two.*\\. The user had HQ test it and sent it back\\.$'))
+  const now = await tk(t); assert.equal(now.status, 'resolving'); assert.equal(now.fixing, 'tests'); assert.ok(checkOf(now)!.sent_at)
   assert.equal(await button(t), null, 'its engineer has it: no button until it is finished again')
   assert.match((await hq.api(`tickets/${t.id}/check-send`, {})).json.error, /sent to its engineer already/)
   // the engineer fixes it and finishes again: the old results are about older code
   await commitAndOpen(p, t, eng, { 'test/maths.test.js': PASS })
   assert.deepEqual(await button(t), ['Results out of date', 'grey'])
+  // Bug 373: and the TPM hears what its engineer did, not "fixed its tests"; the check that was sent keeps it on the ticket
+  const done = (await toTpm(p, /finished it again/)).body
+  assert.match(done, /^HQ: T-01's engineer finished it again \(hq\/red\/T-01-add-maths\)\. It had gone back because its tests failed with it merged into main: .*adds two/)
+  assert.match(done, /\. Since then its engineer changed 1 file: test\/maths\.test\.js\. Its engineer's own notes on it: "done" The user merges it from HQ; you'll be told when it merges\.$/)
+  const back = checkOf((await tk(t))!)!.back!; assert.deepEqual([back.files, back.note], [['test/maths.test.js'], 'done'])
   assert.equal((await check(t)).status, 200); assert.equal((await ended(t)).state, 'pass')
   assert.deepEqual(await button(t), ['View results ✓', 'green'])
+  // Test again didn't wipe the first results: they are still on the ticket, with what was sent and what came of it
+  assert.deepEqual(checksOf((await tk(t))!).map((x) => [x.id, x.state, !!x.sent_at, !!x.back]), [[checkOf((await tk(t))!)!.id, 'pass', false, false], [c.id, 'fail', true, true]])
 })
 
 test('main\'s own tests failing too: amber, not the ticket\'s fault, and nothing to send', async () => {
@@ -111,24 +179,30 @@ test('main\'s own tests failing too: amber, not the ticket\'s fault, and nothing
   assert.match((await hq.api(`tickets/${t.id}/check-send`, {})).json.error, /found nothing to send/)
 })
 
+/** The UI tester's planning calls so far (fake-claude.mjs logs each call to its home). */
+const planCalls = (): any[] => { try { return fs.readFileSync(path.join(hq.home, 'fake-checks.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+  .filter((c) => /^You plan how to test/.test(c.system)) } catch { return [] } }
+/** A finished ticket with screen criteria (`crit`), each with no test of its own, so the UI tester has something to try. */
+async function screenTicket(p: P, title: string, crit: { kind: string; text: string }[]): Promise<any> {
+  const t = (await hq.api('tickets', { featureId: p.f.id, title, size: 'S', spec: `${title}.`, criteria: crit })).json, eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  for (const [f, text] of Object.entries({ [`${t.key}.txt`]: 'x\n' })) fs.writeFileSync(path.join(wt(p, t), f), text)
+  sh(wt(p, t), 'add', '-A'); sh(wt(p, t), 'commit', '-qm', title)
+  await hq.hook(eng.id, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_use_id: `toolu_${eng.id}_1` })
+  await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
+  const cant = 'It is about what the screen shows, and nothing here can render a page.'
+  const r = await hq.mcp(eng.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true,
+    tests: crit.map((_, i) => ({ criterion: `A${i + 1}`, cant_test: cant })) })
+  assert.equal(r.isError, false, r.text); await waitFor(`${t.key} finished`, async () => (await tk(t))?.status === 'pr_ready')
+  return t
+}
+
 test('a project with start steps: the app is opened and the UI tester tries it; a finding is red, and a tester that can\'t run is amber, never green', async () => {
   const p = await project('app')
   assert.equal((await hq.api(`previews/${p.repo.id}/command`, { command: 'node server.js' })).status, 200)
   const plan = `FAKE-PLAN: ${JSON.stringify({ scenarios: [{ kind: 'basic', title: 'Tick Dune off', goal: 'Tick Dune off.', criteria: ['A1'] }] })}`
   const found = `FAKE-UITEST: ${JSON.stringify({ 's-01': { outcome: 'problem', notes: [], findings: [{ kind: 'no_feedback', what: 'Ticking showed nothing.', expected: 'Crossed out' }] } })}`
-  const made = async (title: string, crit: { kind: string; text: string }[]) => {
-    const t = (await hq.api('tickets', { featureId: p.f.id, title, size: 'S', spec: `${title}.`, criteria: crit })).json, eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
-    await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
-    for (const [f, text] of Object.entries({ [`${t.key}.txt`]: 'x\n' })) fs.writeFileSync(path.join(wt(p, t), f), text)
-    sh(wt(p, t), 'add', '-A'); sh(wt(p, t), 'commit', '-qm', title)
-    await hq.hook(eng.id, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_use_id: `toolu_${eng.id}_1` })
-    await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
-    const cant = 'It is about what the screen shows, and nothing here can render a page.'
-    const r = await hq.mcp(eng.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true,
-      tests: crit.map((_, i) => ({ criterion: `A${i + 1}`, cant_test: cant })) })
-    assert.equal(r.isError, false, r.text); await waitFor(`${t.key} finished`, async () => (await tk(t))?.status === 'pr_ready')
-    return t
-  }
+  const made = (title: string, crit: { kind: string; text: string }[]) => screenTicket(p, title, crit)
   const red = await made('Tick things off', [{ kind: 'ui', text: `Ticking crosses it out. ${plan}` }, { kind: 'ui', text: `It stays on the list. ${found}` }])
   assert.equal((await check(red)).status, 200)
   const c = await ended(red)
@@ -146,6 +220,65 @@ test('a project with start steps: the app is opened and the UI tester tries it; 
   assert.equal(a.state, 'error', JSON.stringify(a)); assert.equal(a.why, "the UI tester couldn't run; nothing that ran failed")
   assert.match(a.steps.at(-1)!.words, /couldn't plan its scenarios/); assert.equal(a.steps.at(-1)!.trouble, true)
   assert.deepEqual(await button(amber), ["Couldn't finish", 'amber'])
+})
+
+// Bug 374: the project's start steps give a part a fixed port (one the project hard-wires), and HQ's own preview of the app is running on it, as it
+// normally is. HQ's test used to skip the app ("port … is taken") and end amber. Now its copy runs on another port, in its own checkout: the look and the
+// UI tester both run, the results say so, and the preview is never stopped. Linux: a run has a network of its own, so the port was always free there.
+test('Bug 374: with HQ\'s preview on the app\'s fixed port, the check still opens the app and tries it, on another port, and the preview stays up', async () => {
+  const p = await project('fixed'), free = net.createServer(); await new Promise<void>((r) => free.listen(0, '127.0.0.1', r))
+  const port = (free.address() as net.AddressInfo).port; await new Promise((r) => free.close(r))
+  const recipe = { parts: [{ name: 'app', dir: '.', run: 'node server.js', port }], show: 'app', worktree_files: [], notes: `Port ${port} is hard-wired.` }
+  const db = hq.db() // the start steps as the Launch helper saves them once the user has OK'd them
+  try { db.prepare("INSERT OR REPLACE INTO previews(id, recipe, status, updated_at) VALUES (?, ?, 'stopped', 1)").run(p.repo.id, JSON.stringify(recipe)) } finally { db.close() }
+  assert.equal((await hq.api(`previews/${p.repo.id}/start`, {})).status, 200)
+  const pv = async () => (await hq.state()).previews.find((x: any) => x.id === p.repo.id)
+  const up = await waitFor('the preview on its fixed port', async () => { const v = await pv(); return v?.status === 'running' && v.port === port ? v : null }, 20_000)
+  const plan = `FAKE-PLAN: ${JSON.stringify({ scenarios: [{ kind: 'basic', title: 'Open the list', goal: 'Open the list.', criteria: ['A1'] }] })}`
+  const t = await screenTicket(p, 'Show the list', [{ kind: 'ui', text: `The list shows. ${plan}` }])
+  assert.equal((await check(t)).status, 200)
+  const c = await ended(t, 60_000), look = c.steps.find((s) => s.kind === 'look')!, ui = c.steps.find((s) => s.kind === 'ui')!
+  const mac = process.platform === 'darwin', moved = new RegExp(`HQ ran its own copy of the app on port (\\d+) instead of ${port} \\(in use by HQ's preview of fixed\\)\\.$`)
+  assert.equal(c.state, 'pass', JSON.stringify(c)); assert.equal(look.state, 'pass', JSON.stringify(look))
+  if (mac) {
+    assert.match(look.words, moved); assert.notEqual(Number(moved.exec(look.words)![1]), port)
+    assert.equal(ui.state, 'pass', JSON.stringify(ui)); assert.match(ui.lines![0]!.text, moved) // the tester's own app, started for real in HQ's sandbox
+    const kept = c.tested?.look; assert.ok(kept?.ran === 'pass' && kept.moved?.[0]?.from === port, JSON.stringify(kept)) // kept with the result, for a merge's record
+  } else assert.doesNotMatch(look.words, /instead of/)
+  // the preview was never touched: the same run, still answering on the project's own port
+  const still = await pv(); assert.deepEqual([still.status, still.port, still.started_at], ['running', port, up.started_at])
+  assert.equal(await (await fetch(`http://localhost:${port}/`)).text(), 'v1\n')
+  assert.equal(sh(p.dir, 'status', '--porcelain'), ''); await waitFor('no checkout left', () => testCheckouts(p).length === 0) // and nothing in the user's folder
+  // A port HQ can't be sure it has found every mention of is left where it is: amber, with who has it and what to press
+  if (!mac) return
+  fs.writeFileSync(path.join(p.dir, 'ports.js'), `exports.API_PORT = ${port}\n`); sh(p.dir, 'add', '.'); sh(p.dir, 'commit', '-qm', 'a port in the code') // the user's own commit on main
+  const asked = planCalls().length; assert.equal(asked, 1, 'the first check above planned once')
+  assert.equal((await check(t)).status, 200)
+  const a = await ended(t, 60_000), cant = a.steps.find((s) => s.kind === 'look')!
+  assert.equal(a.state, 'error', JSON.stringify(a)); assert.equal(a.why, "HQ couldn't open the app; nothing that ran failed")
+  assert.equal(cant.words, `Couldn't open it: port ${port}, which its app part always uses, is in use by HQ's preview of fixed. HQ couldn't run its own copy on another port: `
+    + `ports.js line 1 names ${port} in a way HQ can't safely change. Stop the app in the preview, then test again.`)
+  assert.equal((await pv()).status, 'running')
+  // Bug 380: the UI tester found that out before asking for its plan, a paid call: none was made, and its step says why, with nothing paid
+  const noPlan = a.steps.find((s) => s.kind === 'ui')!; assert.equal(planCalls().length, asked, 'no plan for an app that can\'t be started here')
+  assert.equal(noPlan.words, `Not tried: port ${port}, which its app part always uses, is in use by HQ's preview of fixed. HQ couldn't run its own copy on another `
+    + `port: ports.js line 1 names ${port} in a way HQ can't safely change. Stop the app in the preview, then test again.`); assert.equal(a.cost_usd, undefined)
+  // A copy HQ moved that doesn't start there (its server takes the port from somewhere HQ can't see, and is refused the old one): amber too, about the port
+  // and what to press, never about the code. The look's stand-in says what a real start says; the UI tester's own app is started for real.
+  const noStart = 'its app part stopped (1) while the app was starting'
+  fs.writeFileSync(path.join(p.dir, 'server.js'), `require('http').createServer((q, s) => s.end('v2')).listen(${port - 1} + 1)\n`)
+  fs.writeFileSync(path.join(p.dir, 'look.json'), JSON.stringify({ kind: 'no_start', why: noStart, output: 'listen EPERM' }))
+  sh(p.dir, 'rm', '-q', 'ports.js'); sh(p.dir, 'add', '.'); sh(p.dir, 'commit', '-qm', 'the port from somewhere HQ can\'t see')
+  assert.equal((await check(t)).status, 200)
+  const b = await ended(t, 90_000), words = new RegExp(`port ${port}, which its app part always uses, is in use by HQ's preview of fixed\\. HQ ran its own copy on port (\\d+) instead, `
+    + `and the app didn't start there \\(${noStart.replace(/[()]/g, '\\$&')}\\)\\. Stop the app in the preview, then test again`)
+  assert.equal(b.state, 'error', JSON.stringify(b)); assert.equal(b.why, "HQ couldn't open the app; nothing that ran failed")
+  assert.match(b.steps.find((s) => s.kind === 'look')!.words, new RegExp(`^Couldn't open it: ${words.source}\\.$`))
+  const tried = b.steps.find((s) => s.kind === 'ui')!; assert.match(JSON.stringify(tried), words, JSON.stringify(tried)); assert.notEqual(tried.state, 'fail')
+  // only a start shows this, so the plan came first here: paid for, and its cost is shown (Bug 380)
+  assert.equal(planCalls().length, asked + 1); assert.match(tried.words, /\. Its plan of scenarios had cost \$0\.01\.$/); assert.equal(b.cost_usd, 0.01)
+  const after = await pv(); assert.deepEqual([after.status, after.port, after.started_at], ['running', port, up.started_at]) // the preview: still the same run
+  assert.equal(await (await fetch(`http://localhost:${port}/`)).text(), 'v1\n')
 })
 
 test('a check under way ends, and says why, on Stop, auto mode coming on, a restart, a merge and a Clear; a second click is refused; nothing is left', async () => {
@@ -195,9 +328,82 @@ test('a ticket auto mode parked is the user\'s to test; handed back to auto mode
   const { t } = await finished(p, 'One', { 'one.txt': '1\n' }, HELD)
   // auto mode on, and this ticket parked by it, as two failed fixes leave it (written as auto.ts park does, without its run)
   const db = hq.db(); try { db.prepare('UPDATE tickets SET auto_parked_why = ? WHERE id = ?').run('Its tests still fail after 2 fixes.', t.id) } finally { db.close() }
+  // Bug 364: with auto mode off (turned off after it parked this) nothing would take it: HQ refuses another go, and the park keeps its reason
+  const off = await hq.api(`tickets/${t.id}/auto-retry`, {}); assert.equal(off.status, 409); assert.match(off.json.error, /Auto mode is off/)
+  assert.equal((await tk(t)).auto_parked_why, 'Its tests still fail after 2 fixes.')
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
   assert.equal((await check(t)).status, 200, 'parked: the user moves it on, so HQ tests it on request'); await onBox(t)
   assert.equal((await hq.api(`tickets/${t.id}/auto-retry`, {})).status, 200)
   const c = await ended(t); assert.equal(c.state, 'stopped'); assert.match(c.why!, /auto mode took over/)
   assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200)
+})
+
+// Bug 373: on the live run all eight tests named for a ticket's criteria "never ran" (they had run and passed: Bug 372). The box showed a failed test's red ✗,
+// the TPM heard only "to fix its tests" and told the user the tests hadn't passed, what the engineer found stayed in its terminal, and Test again wiped the
+// first results. Here a named test really isn't run by `npm test` (it sits in a folder `node --test` never looks in): nothing fails, and HQ says so.
+const ADD = 'exports.add=(a,b)=>a+b\n'
+const ADD_TEST = "const t=require('node:test'),a=require('node:assert');t.test('adds two numbers',()=>{a.equal(require('../add').add(2,3),5)})\n"
+test('Bug 373: tests that pass with a named one unseen are amber, not a failed test; the TPM hears why the ticket went back and what its engineer did; the results stay', async () => {
+  const p = await project('unseen'), events = async (id: string): Promise<string[]> => ((await hq.api(`agents/${id}/events`)).json.events as any[]).map((x) => x.text)
+  const t = (await hq.api('tickets', { featureId: p.f.id, title: 'Adding', size: 'S', spec: 'Adding.', criteria: [{ kind: 'backend', text: 'Adding 2 and 3 gives 5.' }] })).json
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json, w = wt(p, t)
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  const put = (f: string, text: string) => { fs.mkdirSync(path.dirname(path.join(w, f)), { recursive: true }); fs.writeFileSync(path.join(w, f), text) }
+  const handOver = async (e: string, notes: string[], tests: unknown[]) => {
+    sh(w, 'add', '-A'); sh(w, 'commit', '-qm', 'work')
+    await hq.hook(e, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_use_id: `toolu_${e}_${notes.length}` })
+    for (const text of notes) await hq.mcp(e, 'update_handoff', { kind: 'before_pr', text })
+    const r = await hq.mcp(e, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone', feature_map_unchanged: true, tests })
+    assert.equal(r.isError, false, r.text); await waitFor(`${t.key} finished`, async () => (await tk(t))?.status === 'pr_ready')
+  }
+  put('add.js', ADD); put('checks/add.js', ADD_TEST)
+  await handOver(eng.id, ['Built add. npm test: 1 passed.'], [{ criterion: 'A1', file: 'checks/add.js', name: 'adds two numbers' }])
+  const branch = (await tk(t)).branch
+
+  // amber, in its own words: the tests passed and none failed
+  assert.equal((await check(t)).status, 200)
+  const c = await ended(t)
+  assert.equal(c.state, 'fail'); assert.deepEqual(c.steps.map((s) => [s.kind, s.state]), [['tests', 'pass'], ['criteria', 'fail']])
+  assert.equal(c.steps[1]!.words, "1 test named for its criteria wasn't seen running. The tests themselves passed: none failed.")
+  assert.equal(checkHeadline(c), "The tests passed, but 1 test named for its criteria wasn't seen running")
+  assert.deepEqual(await button(t), ['View results ⚠', 'amber'])
+  assert.equal(c.send?.kind === 'fix' && c.send.missing, 1)
+
+  // its engineer has stopped, as a finished one does: Send starts a fresh one, and the TPM hears what came back and why
+  await hq.api(`agents/${eng.id}/stop`, {})
+  const s = await hq.api(`tickets/${t.id}/check-send`, {}); assert.equal(s.status, 200, JSON.stringify(s.json))
+  const e2: string = s.json.engineer; assert.notEqual(e2, eng.id)
+  assert.equal((await toTpm(p, /went back/)).body, "HQ: T-01 went back to an engineer because its tests passed with it merged into main and none failed, but 1 test named for its "
+    + `criteria wasn't seen running. The user had HQ test it and sent it back. Engineer ${e2} started on it (branch ${branch}). Address messages for this ticket to id ${e2}.`)
+  const tpmHeard = async () => (await hq.state()).messages.filter((m: any) => m.from_id === 'hq' && m.to_id === p.f.tpm_agent_id).map((m: any) => m.body).join('\n')
+  assert.doesNotMatch(await tpmHeard(), /fix its tests|tests failed|tests fail/) // the words it guessed "its tests didn't pass" from
+  let now = await tk(t); assert.deepEqual([now.status, now.fixing], ['resolving', 'tests_unseen'])
+  assert.deepEqual((await events(e2)).filter((x) => /came back/.test(x)), ["T-01 came back: its tests passed, but 1 test named for its criteria wasn't seen running"])
+
+  // the fresh engineer puts the test where the command runs it, says so in its handoff log, and finishes again
+  await waitFor('the fresh engineer', async () => (await hq.state()).agents.find((a: any) => a.id === e2 && a.status === 'working'))
+  fs.rmSync(path.join(w, 'checks'), { recursive: true }); put('test/add.test.js', ADD_TEST)
+  const notes = ['The test sat in checks/, which npm test never runs: moved it to test/.', 'Ran npm test after the move: 2 passed.']
+  await handOver(e2, notes, [{ criterion: 'A1', file: 'test/add.test.js', name: 'adds two numbers' }])
+  assert.equal((await toTpm(p, /finished it again/)).body, `HQ: T-01's engineer finished it again (${branch}). It had gone back because its tests passed with it merged into main `
+    + "and none failed, but 1 test named for its criteria wasn't seen running. Since then its engineer changed 2 files: checks/add.js, test/add.test.js. Its engineer's own "
+    + `notes on it: "${notes.join(' / ')}" The user merges it from HQ; you'll be told when it merges.`)
+  assert.doesNotMatch(await tpmHeard(), /fixed its tests/)
+  assert.ok((await events(e2)).includes('T-01 is finished again: its engineer changed 2 files: checks/add.js, test/add.test.js'))
+  // on the ticket: the check that was sent says what its engineer did with it (it used to stay in the engineer's terminal)
+  now = await tk(t); const sent = checkOf(now)!
+  assert.equal(sent.id, c.id); assert.ok(sent.sent_at); assert.deepEqual(sent.back!.files, ['checks/add.js', 'test/add.test.js']); assert.equal(sent.back!.note, notes.join('\n'))
+  assert.equal(sent.back!.sha, now.finished_sha); assert.deepEqual(await button(t), ['Results out of date', 'grey'])
+
+  // Test again: it passes now, and the first results are still on the ticket, after a restart too
+  assert.equal((await check(t)).status, 200); const c2 = await ended(t); assert.equal(c2.state, 'pass', JSON.stringify(c2))
+  assert.match(c2.steps[1]!.words, /Every test named for its criteria ran/); assert.deepEqual(await button(t), ['View results ✓', 'green'])
+  const kept = () => tk(t).then((x) => checksOf(x).map((k) => [k.id, k.state, !!k.sent_at, k.back?.files.length ?? 0]))
+  assert.deepEqual(await kept(), [[c2.id, 'pass', false, 0], [c.id, 'fail', true, 2]])
+  await hq.restart(); assert.deepEqual(await kept(), [[c2.id, 'pass', false, 0], [c.id, 'fail', true, 2]])
+  // a third test keeps both of the others, and a merge keeps them all on the merged ticket
+  assert.equal((await check(t)).status, 200); const c3 = await ended(t)
+  assert.deepEqual((await kept()).map((k) => k[0]), [c3.id, c2.id, c.id])
+  const m = await hq.api(`tickets/${t.id}/merge`, {}); assert.equal(m.status, 200, JSON.stringify(m.json))
+  assert.deepEqual((await kept()).map((k) => k[0]), [c3.id, c2.id, c.id])
 })

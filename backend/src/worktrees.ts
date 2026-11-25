@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { branchMerged, git } from './reposync.ts'
+import { packageManager } from './apprun.ts'
 
 export type Worktree = { path: string; branch: string | null; locked: string | null }
 /** The repo's linked worktrees (`git worktree list --porcelain`, main checkout left out). `locked` is the lock's reason. */
@@ -70,9 +71,41 @@ export async function seedPackages(repoPath: string, wtPath: string): Promise<st
     const from = path.join(repoPath, rel, 'node_modules'), to = path.join(wtPath, rel, 'node_modules')
     if (!fs.existsSync(path.join(wtPath, rel, 'package.json')) || !fs.existsSync(from) || fs.existsSync(to)) continue
     if (!(await git(wtPath, ['check-ignore', '-q', path.join(rel, 'node_modules') + '/']).then(() => true, () => false))) continue
-    await copyTree(from, to); done.push(rel)
+    if (await copyPackages(repoPath, rel, to)) done.push(rel)
   }
   return done
+}
+/** Bug 393: the file each package manager writes into node_modules last, once its install is done: npm's own record and Yarn 1's .yarn-integrity
+ *  (`npm ci` and Yarn 1 delete theirs first), Yarn 2+'s .yarn-state.yml and pnpm's .modules.yaml (rewritten at the end). Watched on npm 11.7.0, Yarn
+ *  1.22.22 and 4, pnpm 9.15.9: each is written after node_modules/.bin. Bun 1.4.5 writes none. */
+const INSTALLED = ['.package-lock.json', '.yarn-integrity', '.yarn-state.yml', '.modules.yaml']
+/** How the finished install in the node_modules `nm` looks now (its last file's inode, size and time), or null when none has finished there or one is
+ *  under way: no such file, or node_modules/.bin changed after it (pnpm and an npm install that adds packages keep the old file until they end). */
+function installedMark(nm: string): string | null {
+  const stat = (f: string) => { try { return fs.statSync(path.join(nm, f)) } catch { return null } }
+  const m = INSTALLED.map(stat).find((s) => s?.isFile()); if (!m) return null
+  const bin = stat('.bin'); return bin && bin.mtimeMs > m.mtimeMs ? null : `${m.ino}:${m.size}:${m.mtimeMs}`
+}
+const workspaceRoot = (d: string): boolean => {
+  if (fs.existsSync(path.join(d, 'pnpm-workspace.yaml'))) return true
+  try { return !!JSON.parse(fs.readFileSync(path.join(d, 'package.json'), 'utf8'))?.workspaces } catch { return false }
+}
+/** The finished install that main's `<rel>/node_modules` comes from: its own, else (a workspace member) the workspace root's. 'bun': Bun's, which leaves
+ *  no file to tell, so it is copied as before (its installs take well under a second). */
+function installedFrom(repoPath: string, rel: string): string | null {
+  const dir = path.join(repoPath, rel), member = rel !== '.' && workspaceRoot(repoPath)
+  if (packageManager(dir).tool === 'bun' || (member && packageManager(repoPath).tool === 'bun')) return 'bun'
+  return installedMark(path.join(dir, 'node_modules')) ?? (member ? installedMark(path.join(repoPath, 'node_modules')) : null)
+}
+/** Bug 393: copies main's `<rel>/node_modules` to `to` only as a finished install left it. The preview's first start (`npm ci`) empties and refills it,
+ *  and a copy taken then lacked packages: HQ's look skipped the install (there was a node_modules) and blamed the ticket for "vite: command not found".
+ *  Not copied while an install is under way or when none finished; one that starts during the copy is caught after it (its file is gone or new) and the
+ *  copy removed. Either way the checkout installs its own. Returns whether it copied. */
+export async function copyPackages(repoPath: string, rel: string, to: string, copy = copyTree): Promise<boolean> {
+  const before = installedFrom(repoPath, rel); if (before === null) return false
+  await copy(path.join(repoPath, rel, 'node_modules'), to)
+  if (installedFrom(repoPath, rel) === before) return true
+  fs.rmSync(to, { recursive: true, force: true }); return false
 }
 const cp = (args: string[]): Promise<void> => new Promise((resolve, reject) => execFile('cp', args, (err) => err ? reject(err) : resolve()))
 /** Copy a folder: an APFS clone if the system can, else a plain copy (Linux's cp has no -c). */

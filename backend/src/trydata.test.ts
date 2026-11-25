@@ -25,7 +25,9 @@ test('copyMainData: main\'s data/ and .env replace the worktree\'s; the worktree
   assert.ok(!fs.existsSync(path.join(wt, 'data', 'old.json')), "the worktree's own data is replaced, not merged")
   assert.equal(fs.readFileSync(path.join(wt, '.env'), 'utf8'), 'X=1')
   assert.equal(fs.readFileSync(path.join(wt, 'node_modules', 'p.js'), 'utf8'), 'wt pkg', 'its own packages are kept')
-  fs.rmSync(path.join(wt, 'node_modules'), { recursive: true }); assert.deepEqual((await copyMainData(dir, wt)).sort(), ['.env', 'data', 'logs', 'node_modules'])
+  fs.rmSync(path.join(wt, 'node_modules'), { recursive: true }); assert.deepEqual((await copyMainData(dir, wt)).sort(), ['.env', 'data', 'logs'],
+    'Bug 393: no finished install in main (npm\'s record is missing: npm ci is filling it): not copied, the preview installs its own')
+  put(path.join(dir, 'node_modules', '.package-lock.json'), '{}'); assert.deepEqual((await copyMainData(dir, wt)).sort(), ['.env', 'data', 'logs', 'node_modules'])
   assert.equal(fs.readFileSync(path.join(wt, 'node_modules', 'p.js'), 'utf8'), 'main pkg', 'none: main\'s are copied, so the preview needs no install')
   assert.ok(!fs.existsSync(path.join(wt, 'dist')), 'build output belongs to the code it was built from')
   assert.equal(fs.readFileSync(path.join(wt, 'app.js'), 'utf8'), 'ticket')

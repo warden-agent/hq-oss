@@ -1,7 +1,7 @@
 // Where the board's view goes (Bug 119, frontend/src/fit.ts): everything while it's readable, else less, and never cut on both sides.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { CORNERS, CROWDED_GIVE, edgeHints, fitSets, floorAt, HINT_H, HINT_W, LOWEST, NARROW, placeBoard, placePop, placeView, POP_EDGE,
+import { CORNERS, CROWDED_GIVE, edgeHints, fitSets, floorAt, HINT_H, HINT_W, LOWEST, NARROW, placeBoard, placePop, placeView, POP_EDGE, POP_GAP,
   POP_FLOOR, READABLE, wholeIn, type Box, type Corner } from '../../frontend/src/fit.ts'
 
 /** Which boxes a view shows whole in a w×h pane. */
@@ -206,6 +206,28 @@ test('what it must not change: a narrow popover in a wide board keeps its width;
 test('a box panned off the board still gets a popover tall enough to use, and a pane too narrow for any gives width 0', () => {
   assert.equal(placePop({ x: 100, y: 900, w: 200, h: 100 }, 520, 900, 860).maxHeight >= POP_FLOOR, true)
   assert.equal(placePop({ x: 0, y: 0, w: 10, h: 10 }, 520, 10, 860).width, 0)
+})
+// Bug 379: 820×700, side panel and app pane open: the board is 414×166 with 465 px of app pane under it. HQ's test results opened under T-01 in a
+// popover the board cut to its title row.
+test('a board short both ways with the app pane under it: the popover opens below its box and grows down over the app pane', () => {
+  const box = { x: 87, y: 26, w: 240, h: 100 }, p = placePop(box, 480, 414, 166, 465) // 22 px below it, 8 above
+  assert.equal(p.spill, true); assert.equal(p.above, false); assert.equal(p.y, 26 + 100 + POP_GAP)
+  assert.equal(p.y + p.maxHeight, 166 + 465 - POP_EDGE) // down to the window's bottom edge, less the edge: its buttons stay on screen
+  assert.equal(placePop(box, 480, 414, 166).spill, undefined) // with nothing under the board: as before
+  // the default app pane (board 313 px): 169 px below the box, 8 above, both short of POP_ROOM
+  const q = placePop(box, 480, 414, 313, 318); assert.equal(q.spill, true); assert.equal(q.maxHeight, 169 + 318)
+  // a box with more lines fills the board (seen in the UI check): the popover starts at the board's bottom edge, where the box is cut
+  const r = placePop({ x: 87, y: 26, w: 240, h: 135 }, 480, 414, 166, 465); assert.deepEqual({ spill: r.spill, y: r.y }, { spill: true, y: 166 })
+  assert.equal(r.y + r.maxHeight, 166 + 465 - POP_EDGE)
+})
+test('what the app pane must not change: room enough on the board, a box low with room above, a box panned off the top, a hair of room under it', () => {
+  const tall = placePop({ x: 96, y: 129, w: 222, h: 107 }, 520, 414, 860, 300) // 606 px below the box
+  assert.equal(tall.spill, undefined); assert.equal(tall.y + tall.maxHeight, 860 - POP_EDGE)
+  const low = placePop({ x: 300, y: 300, w: 295, h: 120 }, 520, 914, 440, 300) // 2 px below, 282 above
+  assert.deepEqual({ spill: low.spill, above: low.above }, { spill: undefined, above: true })
+  assert.equal(placePop({ x: 100, y: -200, w: 200, h: 100 }, 520, 900, 166, 400).spill, undefined) // panned off the top: no popover over the header
+  assert.equal(placePop({ x: 100, y: 170, w: 200, h: 100 }, 520, 900, 166, 400).spill, undefined) // panned off the bottom: none over the app pane
+  assert.equal(placePop({ x: 100, y: 200, w: 200, h: 20 }, 520, 900, 300, 2).above, true) // 2 px under the board: more room above (182 to 64)
 })
 
 // Bug 284: boxes the view leaves wholly past an edge get a hint there ("‹ 1 more") that pans to the nearest of them.
@@ -463,4 +485,82 @@ test('Bug 344: wherever the buttons end up they cover fewer boxes than before, a
     assert.ok(cut(bs, p.view, w, h).length <= cut(bs, v, w, h).length, at); assert.equal(p.view.zoom >= floorAt(w) - 1e-9, true, at)
   }
   assert.ok(moved > 0, 'some short boards move the buttons')
+})
+
+// Bug 365: that board at 820×700 px with the side panel and the app pane open (a 414×280 px board), as the page laid it out on main
+// 46c6fb0 (bug344demo): T-05 is taller, its plan's buttons on it. F-1 doesn't fit at the floor, so the view showed it from its top and
+// T-05 (the plan for you, with Approve) was cut at the bottom, with no pill saying so.
+const plan = (): Box[] => [
+  { id: 'tpm', x: 149, y: 0, w: 340, h: 158 }, { id: 'f1', x: 141.5, y: 214, w: 355, h: 50 },
+  { id: 't1', x: 0, y: 320, w: 295, h: 82 }, { id: 't3', x: 0, y: 418, w: 295, h: 82 }, { id: 't4', x: 0, y: 516, w: 295, h: 82 },
+  { id: 't5', x: 0, y: 614, w: 295, h: 126 }, { id: 't2', x: 343, y: 320, w: 295, h: 82 },
+]
+const waitSets = (waiting: string[], holding?: string[]) => fitSets(plan().map((b) => b.id),
+  [{ ids: ['f1', 't1', 't3', 't4', 't5', 't2'], done: false, needsYou: true, waiting, holding }], false)
+test('fitSets (Bug 365): after the feature that needs you, its boxes that wait on you, then the first of them', () => {
+  const F1 = ['f1', 't1', 't3', 't4', 't5', 't2'], ids = plan().map((b) => b.id)
+  assert.deepEqual(waitSets(['t5']), [ids, F1, ['t5']]) // everything (the TPM and the work going on is the same), F-1, T-05
+  assert.deepEqual(waitSets(['t3', 't5']), [ids, F1, ['t3', 't5'], ['t3']])
+  assert.deepEqual(waitSets([]), [ids, F1]) // nothing named: as before
+  assert.deepEqual(waitSets(['f1']).at(-1), ['f1']) // the feature's own box (an alert on it)
+  assert.deepEqual(waitSets(['tpm', 'zz']), [ids, F1]) // only the feature's own boxes count
+  // A feature the user opened (Bug 164) waits on no one: no more sets
+  assert.deepEqual(fitSets(ids, [{ ids: F1, done: false, needsYou: false, opened: true, waiting: ['t5'] }], false), [ids, F1])
+})
+test('Bug 365: the bug: in a 414×280 px board F-1 from its top cut T-05 at the bottom; now T-05 is whole, readable, nothing cut', () => {
+  const b = buttonsIn('bottom-left', 414, 280)
+  const old = placeBoard(plan(), waitSets([]), 414, 280, (c) => buttonsIn(c, 414, 280))!
+  assert.deepEqual(cut(plan(), old.view, 414, 280), ['t5']); assert.equal(old.view.zoom, READABLE)
+  const p = placeBoard(plan(), waitSets(['t5']), 414, 280, (c) => buttonsIn(c, 414, 280))!
+  assert.ok(whole(plan(), p.view, 414, 280).includes('t5')); assert.deepEqual(cut(plan(), p.view, 414, 280), [])
+  assert.ok(p.view.zoom >= READABLE, `zoom ${p.view.zoom}`); assert.deepEqual(underButtons(plan(), p.view, buttonsIn(p.corner, 414, 280)), [])
+  // What's left out has a pill: every box not whole is past an edge that has one
+  const hs = edgeHints(plan(), p.view, 414, 280, [b]), told = hs.flatMap((h) => h.ids)
+  for (const o of plan()) if (!whole(plan(), p.view, 414, 280).includes(o.id)) assert.ok(told.includes(o.id), o.id)
+})
+test('Bug 365: short boards from 414 px wide up (the app pane open): the box waiting on you whole and not under the buttons, nothing cut', () => {
+  for (const w of [414, 574, 820, 914]) for (let h = 120; h <= 420; h += 20) {
+    const p = placeBoard(plan(), waitSets(['t5']), w, h, (c) => buttonsIn(c, w, h))!, at = `${w}x${h}`
+    assert.ok(whole(plan(), p.view, w, h).includes('t5'), at); assert.deepEqual(cut(plan(), p.view, w, h), [], at)
+    assert.ok(p.view.zoom >= floorAt(w) - 1e-9, `${at}: zoom ${p.view.zoom}`)
+    assert.ok(!underButtons(plan(), p.view, buttonsIn(p.corner, w, h)).includes('t5'), at)
+  }
+})
+test('Bug 365, what it must not change: where the feature fits above the floor the view is as before; else the box waiting on you shows', () => {
+  let same = 0
+  for (const [bs, sets, more, wait] of [[plan(), waitSets([]), waitSets(['t5']), 't5'],
+    [board(), fitSets(all(), groups(true), false), fitSets(all(), groups(true).map((g) => g.needsYou ? { ...g, waiting: ['t2'] } : g), false), 't2']] as const)
+    for (let w = 300; w <= 1500; w += 37) for (const h of [200, 280, 390, 600, 831, 900]) {
+      const before = placeView(bs, sets, w, h)!, after = placeView(bs, more, w, h)!, at = `${bs.length} boxes, ${w}x${h}`
+      if (before.zoom > floorAt(w) + 1e-9) { assert.deepEqual(after, before, at); same++; continue }
+      assert.ok(whole(bs, after, w, h).includes(wait), at); assert.ok(cut(bs, after, w, h).length <= cut(bs, before, w, h).length, at)
+    }
+  assert.ok(same > 50, `${same} views compared`)
+})
+
+// Bug 365 follow-up (the combined branch's UI tester): T-01, T-03 and T-04 finished and waiting to be merged, T-05's plan waiting. All four don't
+// fit a short board, and the first of them in board order was T-01: the view showed work to merge and the plan, which holds an engineer up, sat
+// below with only "↓ 3 more" to say so.
+test('fitSets (Bug 365 follow-up): the boxes that hold an agent up are tried before the first box', () => {
+  const F1 = ['f1', 't1', 't3', 't4', 't5', 't2'], ids = plan().map((b) => b.id)
+  assert.deepEqual(waitSets(['t5', 't1', 't3', 't4'], ['t5']), [ids, F1, ['t5', 't1', 't3', 't4'], ['t5']])
+  assert.deepEqual(waitSets(['t3', 't5', 't1'], ['t3', 't5']), [ids, F1, ['t3', 't5', 't1'], ['t3', 't5'], ['t3']])
+  assert.deepEqual(waitSets(['t1', 't5'], ['t5']).at(-1), ['t5']) // a waiting list in board order still puts the plan first
+  assert.deepEqual(waitSets(['t1', 't3'], []), [ids, F1, ['t1', 't3'], ['t1']]) // nothing holds anyone up: board order, as before
+})
+// The tester's board as the page laid it out (bug365pdemo): one column, four finished tickets with their buttons, the plan under them.
+const shop = (): Box[] => [{ id: 'tpm', x: -10, y: 0, w: 340, h: 142 }, { id: 'f1', x: 40, y: 198, w: 240, h: 50 },
+  ...[1, 2, 3, 4].map((n) => ({ id: `t${n}`, x: 0, y: 304 + (n - 1) * 136, w: 320, h: 120 })), { id: 't5', x: 0, y: 848, w: 320, h: 94 }]
+const shopSets = (waiting: string[], holding?: string[]) => fitSets(shop().map((b) => b.id),
+  [{ ids: ['f1', 't1', 't2', 't3', 't4', 't5'], done: false, needsYou: true, waiting, holding }], false)
+test('Bug 365 follow-up: in a short board with work to merge above it, the plan waiting on you is the box shown whole', () => {
+  for (const [w, h] of [[414, 280], [414, 390], [574, 310], [914, 310], [1440, 310], [820, 280]]) {
+    const at = `${w}x${h}`, buttons = (c: Corner) => buttonsIn(c, w, h)
+    const old = placeBoard(shop(), shopSets(['t1', 't2', 't3', 't4', 't5']), w, h, buttons)!
+    assert.ok(!whole(shop(), old.view, w, h).includes('t5'), `${at}: the bug, T-01 first`)
+    const p = placeBoard(shop(), shopSets(['t5', 't1', 't2', 't3', 't4'], ['t5']), w, h, buttons)!
+    assert.ok(whole(shop(), p.view, w, h).includes('t5'), at); assert.deepEqual(cut(shop(), p.view, w, h), [], at)
+    assert.ok(p.view.zoom >= floorAt(w) - 1e-9, `${at}: zoom ${p.view.zoom}`)
+    assert.deepEqual(underButtons(shop(), p.view, buttonsIn(p.corner, w, h)), [], at)
+  }
 })

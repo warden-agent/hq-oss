@@ -18,11 +18,12 @@ import { nextWorkerSlot, releaseSlot } from './slots.ts'
 import { portsNote } from './slotports.ts'
 import { mergedPart, tellTpm } from './mergewatch.ts'
 import { engineerResumePrompt, type LateCommits } from './handover.ts'
+import { replanDue } from './replan.ts'
 import { handOver, keepFirstRequest, messageTpm, tpmStarting } from './tpm.ts'
 import { writeFeatureMd } from './projectmd.ts'
 import { gitFacts, readNote } from './notes.ts'
-import { changeText, clearConflict, clearStalled, fixConflictsText, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, testsFailed, whoMergedFirst }
-  from './conflicts.ts'
+import { backBy, backWords, changeText, clearConflict, clearStalled, fixConflictsText, fixingFor, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, testsFailed,
+  whoMergedFirst } from './conflicts.ts'
 import { conflictsWith } from './localmerge.ts'
 import * as tmux from './tmux.ts'
 import { excludeHqFolders, seedPackages } from './worktrees.ts'
@@ -87,9 +88,10 @@ export function createTicket(featureId: string, t: { key?: string; title: string
     id: id('tkt'), feature_id: featureId, key, slug: slugify(t.title), title: t.title, size: (t.size || 'M').toUpperCase(), status: 'queued',
     prior_status: null, assignee_agent_id: null, expected_files: JSON.stringify(t.expected_files ?? []), deps: JSON.stringify(t.depends_on ?? []),
     edit_overrides: '[]', branch: null, worktree_path: null, pr_number: null, pr_url: null, pr_state: null, plan_round: 0, handoff_updated_at: null,
-    last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, hq_check: null, repairs_main: t.repairs_main ?? null,
+    last_handoff_hash: null, spec: t.spec, go_ahead: 0, conflict_files: null, conflict_with: null, auto_tries: 0, auto_parked_why: null, hq_check: null, hq_checks: null,
+    repairs_main: t.repairs_main ?? null,
     repairs_cmd: t.repairs_cmd ?? null, fixing: null, merge_test: null, criteria: JSON.stringify(t.criteria ?? []), proof: null, diff_check: null,
-    finished_sha: null, parked_at: null, created_at: ts, updated_at: ts,
+    replan_after: null, finished_sha: null, parked_at: null, created_at: ts, updated_at: ts,
   }
   run(`INSERT INTO tickets(id, feature_id, key, slug, title, size, status, expected_files, deps, edit_overrides, plan_round, spec, repairs_main, repairs_cmd, criteria, created_at,
        updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, row.id, featureId, key, row.slug, row.title, row.size, 'queued', row.expected_files, row.deps, '[]', 0, t.spec,
@@ -130,8 +132,9 @@ export async function launchEngineer(ticketId: string, opts: { synced?: boolean;
 /** `fix`: an engineer that finished work goes back to (Fix conflicts, auto mode's failed test on main, or a spec the TPM changed, as
  *  `fixing` says): it starts in acceptEdits with HQ's instructions as its prompt (no plan to review), and the ticket goes to `resolving`. */
 type Resume = { prompt: (worktree: string) => Promise<string>; mode: 'plan' | 'acceptEdits'; status: TicketStatus; noted: boolean } // noted: a handoff note was left
-/** `quiet`: the caller tells the TPM itself (fillSlots, Bug 127: one notice for all the engineers one click started). */
-async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolean; fix?: (worktree: string) => string; fixing?: Fixing; resume?: Resume }): Promise<Agent> {
+/** `quiet`: the caller tells the TPM itself (fillSlots, Bug 127: one notice for all the engineers one click started). `back` (Bug 373): why HQ's check sent
+ *  the ticket back and who sent it, in HQ's words (conflicts.ts backWords, backBy): the TPM is told that, not only "to fix its tests". */
+async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolean; fix?: (worktree: string) => string; fixing?: Fixing; back?: string; resume?: Resume }): Promise<Agent> {
   const f = getFeature(t.feature_id)!; notClearing(f.repo_id); const repo = opts.synced ? getRepo(f.repo_id)! : await ensureFresh(f.repo_id)
   const branch = t.branch ?? `hq/${f.slug}/${t.key}-${t.slug}`
   const wtName = t.key; const wtPath = path.join(repo.path, '.claude', 'worktrees', wtName)
@@ -175,7 +178,8 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolea
   emit({ agentId: a.id, source: 'system', kind: 'ticket.launched', payload: { ticket: t.id, branch, worktree: wtPath, slot: slot.idx, fix: !!opts.fix } })
   const why = opts.fix ? ` to ${fixWords(opts.fixing ?? null, mergeBase(repo).name).to}`
     : opts.resume ? ` to take over after a fresh start${opts.resume.noted ? ' (the last engineer left a handoff note)' : ''}` : ''
-  if (!opts.quiet) tellTpm(f, `HQ: engineer ${a.id} started on ${t.key}${why} (branch ${branch}). Address messages for this ticket to id ${a.id}.`)
+  if (!opts.quiet) tellTpm(f, opts.back ? `HQ: ${t.key} went back to an engineer because ${opts.back} Engineer ${a.id} started on it (branch ${branch}). `
+    + `Address messages for this ticket to id ${a.id}.` : `HQ: engineer ${a.id} started on ${t.key}${why} (branch ${branch}). Address messages for this ticket to id ${a.id}.`)
   return a
 }
 
@@ -198,6 +202,7 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
   if (old && old.status !== 'exited') throw new Error(`${t.key} still has an engineer running (${old.id}).`)
   if (starting.has(t.id)) throw new Error(`${t.key} is already starting.`)
   notClearing(getFeature(t.feature_id)?.repo_id ?? '')
+  const cut = !fixing.has(t.id) ? halfStarted(t) : undefined; if (cut) return adoptEngineer(t, cut, old)
   const cap = canLaunch({ ignoreCap: !!o.replace }); if (!cap.ok) throw new Error(cap.why)
   starting.add(t.id)
   try {
@@ -206,7 +211,9 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
     const rev = one<{ edited_plan_text: string | null; plan_text: string }>(`SELECT edited_plan_text, plan_text FROM plan_revisions
       WHERE ticket_id = ? AND verdict IN ('approve', 'approve_with_edits') ORDER BY round DESC, submitted_at DESC`, t.id)
     const plan = t.status === 'planning' || t.status === 'resolving' ? null : rev ? rev.edited_plan_text ?? rev.plan_text : null
-    const a = await startEngineer(t, { synced: true, resume: { mode: t.status === 'planning' ? 'plan' : 'acceptEdits', status: t.status, noted: !!note, prompt: async (wt) => {
+    const replan = t.status !== 'resolving' && replanDue(t, f.repo_id) // Bug 371: its spec changed after that plan: it plans again, for the user
+    const mode = t.status === 'planning' || replan ? 'plan' : 'acceptEdits'
+    const a = await startEngineer(t, { synced: true, resume: { mode, status: t.status, noted: !!note, prompt: async (wt) => {
       let fix: string | null = null
       if (t.status === 'resolving' && t.fixing === 'changes') fix = changeText({ t })
       else if (t.status === 'resolving' && forTests(t.fixing)) fix = fixTestsText({ t, base: base.name, failed: testsFailed(t, repo.test_cmd) }) // Bug 84
@@ -214,7 +221,7 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
         const mh = await git(wt, 'rev-parse', '--git-path', 'MERGE_HEAD').catch(() => '')
         fix = fixConflictsText({ t, base: base.name, files: j<string[]>(t.conflict_files, []), merged: j<string[]>(t.conflict_with, []), inProgress: !!mh && fs.existsSync(path.resolve(wt, mh)) })
       }
-      return engineerResumePrompt(t, { feature: f.title, worktree: wt, base: base.name, note, git: await gitFacts(wt, base.ref), plan, fix,
+      return engineerResumePrompt(t, { feature: f.title, worktree: wt, base: base.name, note, git: await gitFacts(wt, base.ref), plan, fix, replan,
         late: fix || t.status !== 'implementing' ? null : await lateCommits(repo.path, base.ref, t) })
     } } })
     if (old) { for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
@@ -224,6 +231,19 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
   } finally { starting.delete(t.id) }
 }
 
+/** Bug 389: an engineer the last backend started on `t` for a resume but went down before recording it on the ticket (startEngineer records it once
+ *  launchAgent returns): its session runs, from the note, while the ticket still says parked. Nothing of this backend is starting one (the callers check). */
+const halfStarted = (t: Ticket): Agent | undefined => q<Agent>(`SELECT * FROM agents WHERE role = 'engineer' AND ticket_id = ? AND status != 'exited'
+  AND id IS NOT ? ORDER BY started_at DESC`, t.id, t.assignee_agent_id).find((a) => a.started_at >= (t.parked_at ?? 0))
+/** It takes the ticket over, as startEngineer and resumeEngineer would have recorded it, so a resume run again starts no second engineer. */
+function adoptEngineer(t: Ticket, a: Agent, old: Agent | undefined): Agent {
+  run('UPDATE worker_slots SET agent_id = ? WHERE agent_id = ?', a.id, `pending-${t.id}`) // its ports, still under the launch's name
+  setTicket(t.id, { assignee_agent_id: a.id, parked_at: null })
+  if (old) { handOver(old.id, a.id); for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
+  clearStalled(t.id)
+  emit({ agentId: a.id, source: 'system', kind: 'ticket.resumed', payload: { ticket: t.id, key: t.key, previous: old?.id ?? null, note: !!readNote(`resume:ticket:${t.id}`), adopted: true } })
+  return getAgent(a.id) ?? a
+}
 const fixing = new Set<string>() // tickets whose Fix conflicts (or fix of their tests, or change of spec) is under way
 const leaving = new Map<string, Promise<void>>() // by ticket: its engineer is being stopped because the ticket is finished (stopFinished)
 /** A finished ticket's engineer is left this long after its last sign of life (the hook that ended its turn), so its last answer reaches the session. */
@@ -260,7 +280,8 @@ export function finishedAndStopped(agentId: string): Ticket | undefined {
 }
 /** A finished ticket goes back to its engineer with HQ's instructions: as a message when it still runs, else a fresh engineer on
  *  the same worktree and branch starts with them. `why`: what it's fixing, kept on the ticket while it's `resolving` (Bug 84). */
-async function sendBack(t: Ticket, featureId: string, live: Agent | undefined, text: (launch?: { worktree: string }) => string, why: Fixing): Promise<{ via: 'message' | 'launch'; engineer: string }> {
+async function sendBack(t: Ticket, featureId: string, live: Agent | undefined, text: (launch?: { worktree: string }) => string, why: Fixing,
+  back?: string): Promise<{ via: 'message' | 'launch'; engineer: string }> {
   if (live) {
     setTicket(t.id, { status: 'resolving', prior_status: null, fixing: why })
     sendMessage({ featureId, channel: 'dm', from: 'hq', to: live.id, reason: 'fyi', body: text() }); return { via: 'message', engineer: live.id }
@@ -268,13 +289,15 @@ async function sendBack(t: Ticket, featureId: string, live: Agent | undefined, t
   starting.add(t.id)
   try {
     setTicket(t.id, { fixing: why })
-    const engineer = (await startEngineer(t, { synced: true, fix: (worktree) => text({ worktree }), fixing: why })).id
+    const engineer = (await startEngineer(t, { synced: true, fix: (worktree) => text({ worktree }), fixing: why, back })).id
     if (t.assignee_agent_id) for (const k of ['engineer_exited', 'agent_exited', 'stuck']) resolveKind(k, t.assignee_agent_id) // the old engineer's notices
     return { via: 'launch', engineer }
   } finally { starting.delete(t.id) }
 }
-/** Bug 206: what a ticket.fix_tests event says it came back for (the Events tab reads it): what it went back to fix, not just whether the tests hung. */
-const backWhy = (why: Fixing, failed: Failed) => ({ why, hung: !!failed.hung, ...(failed.unproven && why === 'tests' ? { unproven: true } : {}) })
+/** Bug 206: what a ticket.fix_tests event says it came back for (the Events tab reads it): what it went back to fix, not just whether the tests hung. Bug 373:
+ *  and, for tests that passed with named ones unseen, how many those were. */
+const backWhy = (why: Fixing, failed: Failed) => ({ why, hung: !!failed.hung,
+  ...(failed.unproven && (why === 'tests' || why === 'tests_unseen') ? { unproven: true, ...(failed.missing ? { missing: failed.missing } : {}) } : {}) })
 /** Auto mode: the tests failed on main plus this ticket, so it goes back to its engineer, even over the parallel limit (like Fix conflicts). */
 export async function fixTests(ticketId: string, failed: Failed): Promise<{ via: 'message' | 'launch'; engineer: string }> {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
@@ -289,9 +312,11 @@ export async function fixTests(ticketId: string, failed: Failed): Promise<{ via:
     if (live && !(await tmux.hasSession(live.tmux_session))) throw new Error(`${t.key}'s engineer (${live.id}) can't be reached right now`)
     if (!live) { const cap = canLaunch({ ignoreCap: true }); if (!cap.ok) throw new Error(cap.why) }
     keepTestsFailed(t, failed); clearStalled(t.id)
-    const why: Fixing = failed.review ? 'review' : failed.look ? 'look' : failed.hung ? 'tests_hung' : 'tests'
-    const r = await sendBack(t, f.id, live, (launch) => fixTestsText({ t, base, failed, launch }), why)
+    const why = fixingFor(failed), back = `${backWords(failed, base)}. ${backBy(failed)}` // Bug 373: what came back and why, in HQ's words
+    const r = await sendBack(t, f.id, live, (launch) => fixTestsText({ t, base, failed, launch }), why, back)
     emit({ agentId: r.engineer, source: 'system', kind: 'ticket.fix_tests', payload: { ticket: t.id, key: t.key, via: r.via, test: failed.test, ...backWhy(why, failed) } })
+    // a fresh engineer's start tells the TPM (startEngineer); one that still runs got a message, and the TPM used to hear nothing until "fixed its tests"
+    if (r.via === 'message') tellTpm(f, `HQ: ${t.key} went back to its engineer (${r.engineer}, still running) because ${back}`)
     return r
   } finally { fixing.delete(t.id) }
 }
@@ -353,7 +378,8 @@ export async function fixConflicts(ticketId: string): Promise<{ key: string; cle
     }
     if (tests) { // its tests' instructions again, with what they printed: nothing to check against main first
       const repo = getRepo(f.repo_id)!, base = mergeBase(repo).name, failed = testsFailed(t0, repo.test_cmd)
-      const { via, engineer } = await sendBack(t0, f.id, live, (launch) => fixTestsText({ t: t0, base, failed, launch }), again)
+      const back = `${backWords(failed, base)}. Its last engineer stopped before finishing, so another takes it up.`
+      const { via, engineer } = await sendBack(t0, f.id, live, (launch) => fixTestsText({ t: t0, base, failed, launch }), again, back)
       clearStalled(t0.id)
       emit({ agentId: engineer, source: 'ui', kind: 'ticket.fix_tests', payload: { ticket: t0.id, key: t0.key, via, test: failed.test, ...backWhy(again, failed), again: true } })
       return { key: t0.key, clean: false, via, engineer }

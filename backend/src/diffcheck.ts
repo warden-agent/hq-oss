@@ -44,7 +44,7 @@ Rules:
 - verdict is "send_back" only with at least one finding. Otherwise "ok", with no findings.`
 const MAX_DIFF = 60_000, MAX_OUTPUT = 2000
 /** Files whose diff tells a reader nothing and can be thousands of lines: lockfiles. They are named in the list of changed files, not shown. */
-const NOT_SHOWN = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'uv.lock', 'poetry.lock', 'Cargo.lock', 'go.sum']
+const NOT_SHOWN = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb', 'uv.lock', 'poetry.lock', 'Cargo.lock', 'go.sum']
 /** git with room for a big diff (HQ's usual helper stops at 1 MB of output). */
 const git = (cwd: string, args: string[]): Promise<string> => new Promise((resolve, reject) =>
   execFile('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd, maxBuffer: 64 * 1024 * 1024, timeout: 60_000 },

@@ -9,7 +9,8 @@ import { execFileSync } from 'node:child_process'
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-conflicts-'))
 const { migrate, run } = await import('./db.ts')
 migrate()
-const { changeText, fixButton, fixConflictsText, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, stalledKind, testsFailed, whoMergedFirst } = await import('./conflicts.ts')
+const { backBy, backWords, changeText, fixButton, fixConflictsText, fixingFor, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, notedSince, stalledKind, testsFailed,
+  whoMergedFirst } = await import('./conflicts.ts')
 const { getRepo, getTicket, localOnly, syncBlocks, usesGithub } = await import('./records.ts')
 
 const sh = (cwd: string, ...args: string[]): string =>
@@ -189,4 +190,48 @@ test('a ticket sent back for what a fresh reader of its changes found: its own w
   assert.doesNotMatch(text, /fails its tests|never finished|opens it|Lines that named a failure/)
   keepTestsFailed(t, failed); assert.equal(testsFailed(t, 'npm test').review, true); assert.equal(testsFailed(t, 'npm test').look, undefined)
   assert.equal(testsFailed({ ...t, id: 'nothing-kept-2', fixing: 'review' }, 'npm test').review, true)
+})
+
+// Bug 373: on the live run the TPM heard "started on SHOP-2 to fix its tests on origin/main" for tests that had all passed, and told the user they hadn't.
+test('Bug 373: tests that passed with named ones unseen are a reason of their own, and why a ticket went back is said in HQ\'s words', () => {
+  const failed = { kind: 'fail' as const, test: 'npm test', output: '▶ maths\n✖ adds two (1.2ms)\nℹ fail 1', earlier: '' }
+  const unseen = { ...failed, unproven: true, missing: 8, output: "The tests that didn't run:\n- A1: …" }
+  assert.deepEqual([failed, { ...failed, hung: true }, unseen, { ...failed, look: true }, { ...failed, look: true, tester: true }, { ...failed, review: true }].map(fixingFor),
+    ['tests', 'tests_hung', 'tests_unseen', 'look', 'look', 'review'])
+  assert.deepEqual(fixWords('tests_unseen', 'origin/main'), { to: 'get the tests named for its criteria seen running on origin/main (no test failed)',
+    ing: 'getting the tests named for its criteria seen running on origin/main (no test failed)' })
+  assert.doesNotMatch(fixWords('tests_unseen', 'main').to, /fix its tests/) // the words the TPM read as "its tests didn't pass"
+  assert.equal(forTests('tests_unseen'), true); assert.equal(stalledKind('tests_unseen'), 'fix_stalled'); assert.equal(fixButton('tests_unseen'), 'Fix tests')
+  assert.equal(fixWords('tests', 'main').to, 'fix its tests on main') // a failed test keeps its words
+  // why it went back, as one clause after "because", and who sent it
+  assert.equal(backWords(unseen, 'origin/main'), "its tests passed with it merged into origin/main and none failed, but 8 tests named for its criteria weren't seen running")
+  assert.equal(backWords({ ...unseen, missing: undefined }, 'main'), "its tests passed with it merged into main and none failed, but some tests named for its criteria weren't seen running")
+  assert.equal(backWords(failed, 'main'), 'its tests failed with it merged into main: ✖ adds two')
+  assert.match(backWords({ ...failed, hung: true }, 'main'), /^its tests never finished with it merged into main: HQ stopped `npm test` after \d+ minutes$/)
+  assert.equal(backWords({ ...failed, look: true }, 'main'), 'the app had problems when HQ opened it with it merged into main')
+  assert.equal(backWords({ ...failed, look: true, tester: true }, 'main'), "HQ's UI tester found problems when it used the app in a browser with it merged into main")
+  assert.equal(backWords({ ...failed, review: true }, 'main'), 'a fresh reader of its changes found problems')
+  assert.equal(backBy({ ...failed, asked: true }), 'The user had HQ test it and sent it back.'); assert.match(backBy(failed), /^HQ tested it before merging, and sent it back/)
+  // kept with the ticket for whoever takes over, the count too; with nothing kept, the ticket's own reason still says "passed, unseen" and names no failed line
+  const t = getTicket('shop')!
+  keepTestsFailed(t, unseen); assert.deepEqual(testsFailed(t, null), { ...unseen, hung: false })
+  run("DELETE FROM docs WHERE scope = ? AND key = 'tests_failed'", `ticket:${t.id}`)
+  assert.equal(testsFailed({ ...t, fixing: 'tests_unseen' }, 'npm test').unproven, true); assert.equal(testsFailed({ ...t, fixing: 'tests' }, 'npm test').unproven, undefined)
+  assert.equal(backWords(testsFailed({ ...t, fixing: 'tests' }, 'npm test'), 'main'), 'its tests failed with it merged into main')
+})
+
+test('Bug 373: what the engineer wrote in its handoff log since the ticket went back is read back, and nothing from before', () => {
+  const t = getTicket('shop')!, scope = `ticket:${t.id}`, failed = { kind: 'fail' as const, test: 'npm test', output: 'x', earlier: '' }
+  const log = (text: string) => run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,1) ON CONFLICT(scope, key) DO UPDATE SET text = text || char(10) || char(10) || excluded.text',
+    scope, 'handoff', text) // as update_handoff appends (mcp.ts)
+  assert.equal(notedSince(t.id), '', 'never sent back: nothing')
+  log('### 2026-11-23 20:30 — before_pr\nBuilt the list. 155 tests passed.')
+  keepTestsFailed(t, failed); assert.equal(notedSince(t.id), '', 'sent back, and nothing written yet')
+  log('### 2026-11-23 20:31 — before_pr\nThe tests did run and pass: the runner prints no names.\nChanged the test script to list them.')
+  log('### 2026-11-23 20:31 — before_pr\nRan npm test after the last edit: 155 passed.')
+  assert.equal(notedSince(t.id), 'The tests did run and pass: the runner prints no names. Changed the test script to list them.\nRan npm test after the last edit: 155 passed.')
+  // a failure kept before HQ noted where the log stood can't tell old entries from new: nothing, never the whole log
+  run("UPDATE docs SET text = ? WHERE scope = ? AND key = 'tests_failed'", JSON.stringify({ test: 'npm test', output: 'x', earlier: '' }), scope)
+  assert.equal(notedSince(t.id), '')
+  run("DELETE FROM docs WHERE scope = ? AND key IN ('tests_failed', 'handoff')", scope)
 })

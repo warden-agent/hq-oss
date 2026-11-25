@@ -8,8 +8,17 @@ import path from 'node:path'
 import { startHq, waitFor, exitPlanMode, type Hq } from './harness.ts'
 
 let hq: Hq
-before(async () => { hq = await startHq({ env: { HQ_FRESH_START_TIMEOUT_S: '2' } }); await hq.api('settings', { key: 'concurrency_cap', value: 20 }) })
-after(async () => { await hq?.stop() })
+// The file's HQ waits HQ's usual time for a handoff note. It waited 2 s, and on Linux the notes the tests write raced HQ's own one: moves that
+// type to agents (park, resume, a restart's) take a few seconds there, and HQ ended an agent a test still counted on (Bug 389's Linux run).
+before(async () => { hq = await startHq(); await hq.api('settings', { key: 'concurrency_cap', value: 20 }) })
+let quick: Hq | undefined
+after(async () => { await hq?.stop(); await quick?.stop() })
+/** Runs `fn` on a second test HQ that writes the note itself 2 s after its request is in: for the tests of HQ's note when none comes. */
+async function quickNotes(fn: () => Promise<void>): Promise<void> {
+  const main = hq
+  if (!quick) { quick = await startHq({ env: { HQ_FRESH_START_TIMEOUT_S: '2' } }); await quick.api('settings', { key: 'concurrency_cap', value: 20 }) }
+  hq = quick; try { await fn() } finally { hq = main }
+}
 
 async function setup(name: string): Promise<{ dir: string; repo: any; f: any; tpm: any }> {
   const dir = hq.repo(name)
@@ -115,7 +124,7 @@ test('Bug 72: an API error is no dialog: its reason is kept, Urgent is typed, an
   const r2 = await hq.api(`agents/${eng2.id}/fresh-start`, {}); assert.equal(r2.status, 409); assert.match(r2.json.error, /dialog/)
 })
 
-test('no note in time: HQ writes one, and a parked ticket waits for Resume', async () => {
+test('no note in time: HQ writes one, and a parked ticket waits for Resume', () => quickNotes(async () => {
   const { f } = await setup('fresh-fallback')
   const t = await ticket(f, 'Quiet'); const eng = await building(t)
   const pre = (tool: string, tool_input: object, extra: object = {}) => hq.hook(eng.id, { hook_event_name: 'PreToolUse', tool_name: tool, tool_input, ...extra })
@@ -130,11 +139,11 @@ test('no note in time: HQ writes one, and a parked ticket waits for Resume', asy
   assert.doesNotMatch(note, /none recorded|helper-search/)
   const r = await hq.api(`tickets/${t.id}/resume`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.match(await prompt(r.json.id), /Written by HQ/); assert.equal((await tk(t)).parked_at, null)
-})
+}))
 
 // Bug 196: HQ's note from the first clear stayed as if the TPM had written it, so the second clear archived it again and the third
 // TPM was told the TPM before it waits on a dialog.
-test("Bug 196: a second clear with no note from the TPM gets HQ's new note, not the first clear's", async () => {
+test("Bug 196: a second clear with no note from the TPM gets HQ's new note, not the first clear's", () => quickNotes(async () => {
   const { repo, tpm } = await setup('fresh-clear-twice')
   const tpmBack = (old: string) => waitFor('the TPM back', async () => {
     const id = (await repoRow(repo.id)).tpm_agent_id; return id && id !== old && (await agent(id))?.status === 'working' ? id as string : null }, 40_000)
@@ -151,7 +160,7 @@ test("Bug 196: a second clear with no note from the TPM gets HQ's new note, not 
   assert.match(first!, /waited on a dialog/); assert.match(then!, /^\(Written by HQ: the TPM didn't leave a note: none came within/)
   assert.doesNotMatch(then!, /dialog/)
   assert.match(await prompt(third), /didn't leave a note: none came within/); assert.doesNotMatch(await prompt(third), /dialog/)
-})
+}))
 
 test('context limit: one warning past the limit; with auto, a fresh start once the step ends', async () => {
   const { f } = await setup('fresh-context')
@@ -300,10 +309,7 @@ test('Bug 350, what it must not catch: a switch away again parks once more; a fr
   assert.equal((await agent(tpm.id)).fresh_start_then, 'switch')
   const now = (await agent(tpm.id)).fresh_start_msg // the request it has now, in its terminal too
   assert.match((await asksTo(tpm.id)).find((m: any) => m.id === now).body, /^This replaces HQ's earlier request[^]*The user switched to another project/)
-  // The engineer's note may be HQ's by now: this file's HQ waits only 2 s for a note once the request is in, and the three moves above type
-  // to the TPM (a few seconds on a slow machine). Either way its work is parked, which is what this checks.
-  if ((await agent(eng.id)).status !== 'exited') await hq.mcp(eng.id, 'write_handoff_note', { text: 'B350-WAIT' }).catch(async (e) => {
-    if ((await agent(eng.id)).status !== 'exited') throw e })
+  await hq.mcp(eng.id, 'write_handoff_note', { text: 'B350-WAIT' })
   await hq.mcp(tpm.id, 'write_handoff_note', { text: 'B350-AWAY' })
   await waitFor('both parked', async () => (await tk(t)).parked_at && (await repoRow(repo.id)).tpm_parked_at)
   assert.equal(await live(t), undefined)
@@ -317,6 +323,170 @@ test('Bug 350: auto turned on while the switch\'s notes are still being written:
   assert.equal((await hq.api(`repos/${repo.id}/auto`, { on: true })).status, 200)
   assert.equal((await agent(tpm.id)).fresh_start_then, 'continue')
   await hq.api(`repos/${repo.id}/auto`, { on: false }); await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+})
+
+/** Bug 369: the switch away from `repo` is asked for, and the backend goes down while the park is still asking (one agent after the other,
+ *  typing into each terminal: a few seconds each): once one of `ids` has its request, and before all of them have. Then it comes back.
+ *  The ones not asked yet, as the database said while it was down. */
+async function downMidPark(repo: any, ids: string[]): Promise<string[]> {
+  const away = hq.api(`repos/${repo.id}/park`, {}).catch(() => null) // goes with the backend
+  await waitFor('the first request', async () => { const s = await hq.state(); return ids.some((id) => s.agents.find((a: any) => a.id === id)?.fresh_start_at) })
+  await hq.down(); await away
+  const db = hq.db({ readOnly: true }); let unasked: string[]
+  try { unasked = ids.filter((id) => !(db.prepare('SELECT fresh_start_at FROM agents WHERE id = ?').get(id) as any).fresh_start_at) } finally { db.close() }
+  assert.ok(unasked.length, 'the park was over before the backend went down: this test checked nothing')
+  await hq.up(); return unasked
+}
+/** The note of each of `ids` still writing one (a note that came in already ended its session). */
+async function notes(ids: string[], text: string): Promise<void> {
+  for (const id of ids) {
+    if ((await agent(id)).fresh_start_at) await hq.mcp(id, 'write_handoff_note', { text }).catch(async (e) => { if ((await agent(id)).status !== 'exited') throw e })
+  }
+}
+const switchAsked = async (id: string) => (await asksTo(id)).some((m: any) => /The user switched to another project in HQ/.test(m.body))
+/** Whether the agent's Events say HQ asked it for the switch's note ("Asked for its handoff note: you switched projects"). */
+const switchLine = async (id: string) => (await hq.api(`events?agent=${id}`)).json
+  .some((e: any) => e.kind === 'fresh_start.requested' && JSON.parse(e.payload).then === 'switch')
+test('Bug 369: a restart in the middle of a switch away finishes the park: the agents it hadn\'t asked yet are asked, none keeps working', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, f, tpm } = await setup('b369x')
+  const t1 = await ticket(f, 'One'); const e1 = await building(t1)
+  const t2 = await ticket(f, 'Two'); const e2 = await building(t2)
+  const ids = [tpm.id, e1.id, e2.id], unasked = await downMidPark(repo, ids)
+  for (const id of ids) await waitFor(`${id} asked for the switch's note`, () => switchAsked(id)) // in its terminal too, and its Events say so
+  for (const id of unasked) await waitFor(`${id}'s Events line`, () => switchLine(id)) // written once the request is typed
+  await notes(ids, 'B369X')
+  await waitFor('all parked', async () => (await tk(t1)).parked_at && (await tk(t2)).parked_at && (await repoRow(repo.id)).tpm_parked_at, 20_000)
+  assert.equal(await live(t1), undefined); assert.equal(await live(t2), undefined); assert.equal((await repoRow(repo.id)).parking_at, null)
+  const back = await hq.api(`repos/${repo.id}/resume`, {}); assert.equal(back.json.resumed.length, 3, JSON.stringify(back.json))
+  await waitFor('the engineers back', async () => (await live(t1)) && (await live(t2)))
+})
+
+test('Bug 369 with Bug 350: switching straight back after the restart: every agent picks up from its note, nothing stays parked', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, f, tpm } = await setup('b369y')
+  const t1 = await ticket(f, 'One'); const e1 = await building(t1)
+  const t2 = await ticket(f, 'Two'); const e2 = await building(t2)
+  const ids = [tpm.id, e1.id, e2.id], unasked = await downMidPark(repo, ids)
+  const back = await hq.api(`repos/${repo.id}/resume`, {}) // waits for the park the restart finishes, then tells each
+  assert.equal(back.status, 200); assert.equal(back.json.resumed.length, 3, JSON.stringify(back.json))
+  for (const id of unasked) assert.ok(await switchLine(id)) // the park reached them first (the words of a request not typed yet are the resume's now)
+  await notes(ids, 'B369Y')
+  const fresh = async (t: any, old: string) => { const a = await live(t); return a && a.id !== old && (await tk(t)).assignee_agent_id === a.id }
+  await waitFor('everyone back', async () => (await fresh(t1, e1.id)) && (await fresh(t2, e2.id)) && (await repoRow(repo.id)).tpm_agent_id !== tpm.id, 20_000)
+  assert.equal((await tk(t1)).parked_at, null); assert.equal((await tk(t2)).parked_at, null); assert.equal((await repoRow(repo.id)).tpm_parked_at, null)
+})
+
+test('Bug 369, what it must not catch: after a switch away and back, a restart parks nothing', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, tpm } = await setup('b369z')
+  assert.equal((await hq.api(`repos/${repo.id}/park`, {})).json.parked.length, 1); assert.equal((await repoRow(repo.id)).parking_at, null)
+  await hq.api(`repos/${repo.id}/resume`, {}); await notes([tpm.id], 'B369Z')
+  const next = await waitFor('the TPM back', async () => { const id = (await repoRow(repo.id)).tpm_agent_id; return id !== tpm.id && (await agent(id))?.status === 'working' && id })
+  await hq.restart() // a park would have asked it before the backend answers anything: parkNow's first request is recorded before its first wait
+  assert.deepEqual(await asksTo(next), []); assert.equal((await agent(next)).status, 'working'); assert.equal((await repoRow(repo.id)).tpm_parked_at, null)
+})
+
+/** Bug 389: a project switched away from, all of its work parked from the notes: the TPM and `n` engineers building. */
+async function parkedAll(name: string, n: number): Promise<{ repo: any; tpm: any; ts: any[]; engs: any[] }> {
+  const { repo, f, tpm } = await setup(name), ts: any[] = [], engs: any[] = []
+  for (let i = 1; i <= n; i++) { const t = await ticket(f, `Part ${i}`); ts.push(t); engs.push(await building(t)) }
+  assert.equal((await hq.api(`repos/${repo.id}/park`, {})).json.parked.length, n + 1)
+  await notes([tpm.id, ...engs.map((e) => e.id)], name.toUpperCase())
+  await waitFor('all parked', async () => (await repoRow(repo.id)).tpm_parked_at && (await Promise.all(ts.map(tk))).every((t) => t.parked_at), 20_000)
+  return { repo, tpm, ts, engs }
+}
+/** The project's live TPMs and each ticket's live engineers: one each once it is all back, never two. */
+async function running(repoId: string, ts: any[]): Promise<{ tpms: number; engineers: number[] }> {
+  const s = await hq.state(), on = (a: any) => a.status !== 'exited'
+  return { tpms: s.agents.filter((a: any) => a.role === 'tpm' && a.repo_id === repoId && on(a)).length,
+    engineers: ts.map((t) => s.agents.filter((a: any) => a.role === 'engineer' && a.ticket_id === t.id && on(a)).length) }
+}
+/** Everything parked is back: the TPM and an engineer on each ticket, one each, from the notes; nothing marked parked or being resumed. */
+async function allBack(repo: any, tpm: any, ts: any[]): Promise<void> {
+  await waitFor('everyone back', async () => { const r = await repoRow(repo.id), all = await Promise.all(ts.map(tk))
+    return !r.tpm_parked_at && r.tpm_agent_id !== tpm.id && r.resuming_at === null && all.every((t) => !t.parked_at && t.assignee_agent_id) }, 20_000)
+  for (const t of ts) await waitFor(`${t.key ?? t.id}'s engineer`, () => live(t))
+  assert.deepEqual(await running(repo.id, ts), { tpms: 1, engineers: ts.map(() => 1) })
+  assert.match(await prompt((await repoRow(repo.id)).tpm_agent_id), new RegExp(repo.name.toUpperCase()))
+}
+/** The end of a Bug 389 test: its project's sessions stop, so the tests after it still find free engineer slots (20 at most: the parallel limit and
+ *  the test HQ's 200 engineer ports) once these tests have started several engineers each. */
+async function stopAll(repoId: string): Promise<void> {
+  for (const a of (await hq.state()).agents.filter((x: any) => x.repo_id === repoId && x.status !== 'exited')) await hq.api(`agents/${a.id}/stop`, {})
+  await waitFor('its sessions ended', async () => !(await hq.state()).agents.some((x: any) => x.repo_id === repoId && x.status !== 'exited'))
+}
+test('Bug 389: a restart in the middle of coming back to a project finishes the resume: the agents it hadn\'t started yet start, none twice', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, tpm, ts } = await parkedAll('b389x', 4)
+  const back = hq.api(`repos/${repo.id}/resume`, {}).catch(() => null) // goes with the backend
+  // the resume starts the TPM first, then one engineer after the other: down once the TPM is back, while engineers are still parked
+  await waitFor('the TPM back', async () => !(await repoRow(repo.id)).tpm_parked_at, 20_000)
+  await hq.down(); await back
+  const db = hq.db({ readOnly: true }); let still: number, mark: unknown
+  try {
+    still = ts.filter((t) => (db.prepare('SELECT parked_at FROM tickets WHERE id = ?').get(t.id) as any).parked_at).length
+    mark = (db.prepare('SELECT resuming_at FROM repos WHERE id = ?').get(repo.id) as any).resuming_at
+  } finally { db.close() }
+  assert.ok(still, 'the resume was over before the backend went down: this test checked nothing')
+  assert.ok(mark, 'the resume under way is recorded')
+  await hq.up()
+  await allBack(repo, tpm, ts)
+  await stopAll(repo.id)
+})
+
+/** Bug 389: the last backend went down right after it marked a coming back to `repo` under way (repos.resuming_at), before it started anyone. */
+async function downAfterMark(repo: any): Promise<void> {
+  await hq.down()
+  const db = hq.db(); try { db.prepare('UPDATE repos SET resuming_at = ? WHERE id = ?').run(Date.now(), repo.id) } finally { db.close() }
+  await hq.up()
+}
+test('Bug 389: a coming back recorded but not begun when HQ went down is done at start-up', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, tpm, ts } = await parkedAll('b389y', 1)
+  await downAfterMark(repo)
+  await allBack(repo, tpm, ts)
+  await stopAll(repo.id)
+})
+
+// Seen on Linux only: the backend went down in the middle of starting an engineer for the resume, after its session began and before the ticket
+// recorded it, and the resume run again at start-up started a second engineer on that ticket. The same can happen to the TPM.
+test('Bug 389: a session the last backend started for the resume but never recorded takes over: no second TPM or engineer starts', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, tpm, ts, engs } = await parkedAll('b389w', 1)
+  assert.equal((await hq.api(`repos/${repo.id}/resume`, {})).json.resumed.length, 2)
+  await allBack(repo, tpm, ts)
+  const t = await tk(ts[0]), eng = await agent(t.assignee_agent_id), next = await agent((await repoRow(repo.id)).tpm_agent_id)
+  await hq.down() // as the last backend left it had it gone down just after starting those two: ticket and repo still say parked, the slot is the launch's
+  const db = hq.db()
+  try {
+    db.prepare('UPDATE tickets SET assignee_agent_id = ?, parked_at = ? WHERE id = ?').run(engs[0].id, eng.started_at - 1000, t.id)
+    db.prepare('UPDATE worker_slots SET agent_id = ? WHERE agent_id = ?').run(`pending-${t.id}`, eng.id)
+    db.prepare('UPDATE repos SET tpm_agent_id = ?, tpm_parked_at = ?, resuming_at = ? WHERE id = ?').run(tpm.id, next.started_at - 1000, Date.now(), repo.id)
+  } finally { db.close() }
+  await hq.up()
+  await waitFor('the resume over', async () => { const r = await repoRow(repo.id); return r.resuming_at === null && !r.tpm_parked_at && !(await tk(t)).parked_at })
+  assert.equal((await tk(t)).assignee_agent_id, eng.id); assert.equal((await repoRow(repo.id)).tpm_agent_id, next.id)
+  assert.deepEqual(await running(repo.id, ts), { tpms: 1, engineers: [1] })
+  const ro = hq.db({ readOnly: true })
+  try { assert.equal((ro.prepare('SELECT agent_id FROM worker_slots WHERE agent_id IN (?, ?)').all(eng.id, `pending-${t.id}`) as any[]).map((r) => r.agent_id).join(), eng.id) }
+  finally { ro.close() }
+  await stopAll(repo.id)
+})
+
+test('Bug 389, what it must not catch: with "Wait until I press Resume" the parked work stays parked after the restart; a finished resume starts nobody again', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'wait' }) // the user chose it during the resume, before HQ went down
+  const { repo, tpm, ts } = await parkedAll('b389z', 1)
+  await downAfterMark(repo)
+  // cleared at start-up without a resume: one would mark it again (resumeNow) until it ended, with the engineer and the TPM started
+  await waitFor('the mark gone', async () => (await repoRow(repo.id)).resuming_at === null)
+  assert.ok((await tk(ts[0])).parked_at); assert.ok((await repoRow(repo.id)).tpm_parked_at); assert.deepEqual(await running(repo.id, ts), { tpms: 0, engineers: [0] })
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  assert.equal((await hq.api(`repos/${repo.id}/resume`, {})).json.resumed.length, 2) // the switch back the page asks for with the setting off
+  await allBack(repo, tpm, ts)
+  await hq.restart() // nothing under way: nobody starts again
+  assert.equal((await repoRow(repo.id)).resuming_at, null); assert.deepEqual(await running(repo.id, ts), { tpms: 1, engineers: [1] })
+  await stopAll(repo.id)
 })
 
 test("the project's TPM is parked and comes back even when every feature is done (Bug 52: no done-TPM stop)", async () => {

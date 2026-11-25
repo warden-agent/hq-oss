@@ -5,36 +5,34 @@
 // The check is owned by its ticket, with a stop of its own (not auto mode's count): the user's Stop, the ticket leaving "finished", auto mode taking the
 // ticket over, a Clear or Remove, and a backend restart each end it, and it says why.
 import { DEFAULTS } from './config.ts'
-import { getSetting, now, q, run } from './db.ts'
-import { bus, emit, patch, type Patch } from './events.ts'
+import { getSetting, now, q } from './db.ts'
+import { bus, emit, type Patch } from './events.ts'
 import { id } from './util.ts'
-import { autoGoing, getFeature, getRepo, getTicket, hqMoves, notClearing, setTicket, type Repo, type Ticket } from './records.ts'
+import { autoGoing, getFeature, getRepo, getTicket, hqMoves, keepCheck, keepPastChecks, notClearing, setTicket, type Repo, type Ticket } from './records.ts'
 import { mergeBase, setConflict, whoMergedFirst } from './conflicts.ts'
 import { ensureFresh, git } from './repos.ts'
-import { failReport, lookAtBase, showing, testBase, testCombined, type Failed, type Shown, type TestResult } from './testrun.ts'
+import { failedLine, failReport, lookAtBase, showing, testBase, testCombined, type Failed, type Shown, type TestResult } from './testrun.ts'
 import { combinedCommit } from './localmerge.ts'
-import { confirm, criteriaOf, proofOf, proofWords, unproven, watchFor } from './criteria.ts'
-import { judge, lookReport, lookWords, needsBase, type Look, type Seen } from './smokerules.ts'
+import { confirm, criteriaOf, proofOf, proofWords, ranWords, unproven, watchFor } from './criteria.ts'
+import { judge, lookReport, lookWords, movedWords, needsBase, type Look, type Seen } from './smokerules.ts'
 import { lookHow, type LookPlan } from './smoke.ts'
 import { row as previewRow, runnableRecipe } from './preview.ts'
 import { readAgain, readDiff, readReport, whyRead } from './diffcheck.ts'
 import { diffCheckOf } from './checks.ts'
 import { planChecks } from './plancheck.ts'
 import { runUiTest } from './uitester.ts'
-import { failedLine, uiTestOn } from './auto.ts'
+import { uiTestOn } from './auto.ts'
 import { fixConflicts, fixTests } from './tickets.ts'
 import { countWords, took } from './testcounts.ts'
-import { checkOf, FINISHED, outOfDate, STEP_NAME, type CheckStep, type HqCheck, type SendBack, type StepKind, type StepLine } from './hqcheckrules.ts'
+import { checkOf, FINISHED, outOfDate, pastChecks, pastWith, STEP_NAME, unseenCount, unseenWords, type CheckStep, type HqCheck, type SendBack, type StepKind,
+  type StepLine } from './hqcheckrules.ts'
 
 /** The checks under way, by ticket: what stops each one, and why it was stopped (the results say it). */
 const going = new Map<string, { stop: AbortController; why?: string }>()
 export const checking = (ticketId: string): boolean => going.has(ticketId)
 
 /** Kept on the ticket without touching its updated_at (auto mode reads that), and sent to every open page. A ticket that's gone (removed meanwhile) keeps nothing. */
-function save(ticketId: string, c: HqCheck): void {
-  if (!getTicket(ticketId)) return
-  const json = JSON.stringify(c); run('UPDATE tickets SET hq_check = ? WHERE id = ?', json, ticketId); patch('ticket', ticketId, { hq_check: json })
-}
+const save = keepCheck
 const repoOf = (t: Ticket): Repo | undefined => { const f = getFeature(t.feature_id); return f ? getRepo(f.repo_id) : undefined }
 const tipOf = (repo: Repo, ref: string): Promise<string> => git(repo.path, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`).catch(() => '')
 
@@ -62,6 +60,8 @@ export async function startCheck(ticketId: string): Promise<{ id: string }> {
     if (!base_sha) throw new Error(`HQ couldn't find ${base.name} in ${repo.name}.`)
     if (own.stop.signal.aborted) throw new Error(own.why ? `It stopped before it began: ${own.why}.` : 'It stopped before it began.')
     const c: HqCheck = { id: id('check'), state: 'running', sha, base: base.name, base_sha, finished_sha: t.finished_sha, started_at: now(), now: 'tests', steps: [] }
+    // Bug 373: the check before this one stays with the ticket (the last few do): Test again used to wipe the results the user had sent to its engineer
+    const prev = checkOf(t); if (prev) keepPastChecks(t.id, pastWith(pastChecks(t), prev))
     save(t.id, c)
     emit({ agentId: null, source: 'ui', kind: 'check.started', payload: { ticket: t.id, key: t.key, check: c.id, sha } })
     void runCheck(t, getRepo(repo.id) ?? repo, c, own).catch(() => {})
@@ -128,7 +128,8 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
   const at = (k: StepKind): void => { c.now = k; save(t0.id, c) }
   const end = (state: HqCheck['state'], why?: string, send?: SendBack): void => {
     Object.assign(c, { state, ended_at: now(), now: undefined }, why ? { why } : {}, send ? { send } : {}); save(t0.id, c)
-    emit({ agentId: null, source: 'system', kind: 'check.ended', payload: { ticket: t0.id, key: t0.key, check: c.id, state, why: why ?? null } })
+    const unseen = unseenCount(c) // Bug 373: nothing failed, HQ just didn't see named tests run: the Events tab says that, not "found a problem"
+    emit({ agentId: null, source: 'system', kind: 'check.ended', payload: { ticket: t0.id, key: t0.key, check: c.id, state, why: why ?? null, ...(unseen ? { unseen } : {}) } })
   }
   const stopped = (): void => end('stopped', own.why ?? 'stopped')
   const fix = (f: Omit<Extract<SendBack, { kind: 'fix' }>, 'kind'>): SendBack => ({ kind: 'fix', ...f })
@@ -177,11 +178,13 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
           const w = proofWords(e); return { text: `${e.criterion}: ${w.text}`, tone: e.state === 'skipped' || e.state === 'not_run' ? 'bad' : w.tone === 'ok' ? 'ok' : 'plain' }
         })
         if (missing.length) {
-          step({ kind: 'criteria', state: 'fail', words: `${missing.length === 1 ? 'A test' : `${missing.length} tests`} named for its criteria didn't run.`, lines })
-          return end('fail', undefined, fix({ test: r.test, unproven: true, earlier: '', output: `The tests that didn't run:\n${missing.map((m) => `- ${m}`).join('\n')}` }))
+          // Bug 373: what HQ knows, no more: the run passed and it didn't see these by name ("didn't run" was untrue when the runner printed no names, Bug 372)
+          const n = missing.length, words = unseenWords(n)
+          step({ kind: 'criteria', state: 'fail', words: `${words[0]!.toUpperCase()}${words.slice(1)}. The tests themselves passed: none failed.`, lines })
+          return end('fail', undefined, fix({ test: r.test, unproven: true, missing: n, earlier: '', output: `The tests that didn't run:\n${missing.map((m) => `- ${m}`).join('\n')}` }))
         }
-        const named = tests.filter((e) => !e.cant_test).length, none = tests.length - named
-        step(named ? { kind: 'criteria', state: 'pass', words: `Every test named for its criteria ran${none ? ` (${none} of them ${none === 1 ? 'has' : 'have'} no test)` : ''}.`, lines }
+        const named = tests.some((e) => !e.cant_test)
+        step(named ? { kind: 'criteria', state: 'pass', words: ranWords(tests), lines }
           : { kind: 'criteria', state: 'skipped', words: 'Its engineer named no test for any of its criteria: each one says why.', lines })
       } else step({ kind: 'criteria', state: 'skipped', words: criteriaOf(t).length ? 'Its engineer named no tests for its criteria.' : 'It has no acceptance criteria.' })
     }
@@ -242,14 +245,19 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
           tickets: [{ key: cur.key, title: cur.title, criteria: criteriaOf(cur) }] })
           .catch((e) => ({ at: now(), state: 'skipped' as const, why: `HQ hit an error (${(e as Error).message.split('\n')[0]})` }))
         if (u === 'stopped' || signal.aborted) return stopped()
-        if (u.state === 'skipped') step({ kind: 'ui', state: 'skipped', words: `Not tried: ${u.why}.`, ...('quiet' in u && u.quiet ? {} : { trouble: true }) }) // quiet: how the project is set up
-        else {
+        if (u.state === 'skipped') {
+          // Bug 380: a plan paid for before the app turned out not to start here: its cost is the check's too, and the step says what it was for
+          const paid = 'cost_usd' in u && u.cost_usd ? u.cost_usd : 0; if (paid) c.cost_usd = paid
+          step({ kind: 'ui', state: 'skipped', words: `Not tried: ${u.why}.${paid ? ` Its plan of scenarios had cost $${paid.toFixed(2)}.` : ''}`,
+            ...('quiet' in u && u.quiet ? {} : { trouble: true }) }) // quiet: how the project is set up
+        } else {
           c.cost_usd = u.cost_usd
           const title = (sid: string) => u.scenarios.find((s) => s.id === sid)?.title ?? sid
           const lines: StepLine[] = u.scenarios.map((s) => ({ tone: s.outcome === 'ok' ? 'ok' as const : s.outcome === 'problem' ? 'bad' as const : 'plain' as const,
             text: `${s.title}: ${s.outcome === 'ok' ? 'fine' : s.outcome === 'problem' ? u.findings.filter((f) => f.scenario === s.id).map((f) => f.what).join(' · ') || 'a problem'
               : s.outcome === 'unspecified' ? 'no verdict (nothing says what should happen)' : s.outcome === 'couldnt_test' ? `couldn't test from a browser${s.why ? ` (${s.why})` : ''}`
               : `not run${s.why ? ` (${s.why})` : ''}`}` }))
+          if (u.moved?.length) lines.unshift({ text: `HQ ran its own copy of the app on ${movedWords(u.moved)}.`, tone: 'plain' }) // Bug 374
           const ok = u.scenarios.filter((s) => s.outcome === 'ok').length, n = u.scenarios.length
           if (u.findings.length) {
             step({ kind: 'ui', state: 'fail', words: `${u.findings.length === 1 ? 'A problem' : `${u.findings.length} problems`} in ${n} scenario${n === 1 ? '' : 's'}.`, lines })
@@ -284,7 +292,8 @@ export async function sendCheck(ticketId: string): Promise<{ engineer: string | 
   if (outOfDate(t, c)) throw new Error(`${t.key} changed after HQ tested it: press Test again first.`)
   const s = c.send
   const r = s.kind === 'conflicts' ? await fixConflicts(ticketId) : await fixTests(ticketId, { kind: 'fail', asked: true, test: s.test, output: s.output, earlier: s.earlier,
-    ...(s.hung ? { hung: true } : {}), ...(s.unproven ? { unproven: true } : {}), ...(s.look ? { look: true } : {}), ...(s.review ? { review: true } : {}),
+    ...(s.hung ? { hung: true } : {}), ...(s.unproven ? { unproven: true } : {}), ...(s.missing ? { missing: s.missing } : {}), ...(s.look ? { look: true } : {}),
+    ...(s.review ? { review: true } : {}),
     ...(s.tester ? { tester: true } : {}) } satisfies Failed)
   const now0 = getTicket(ticketId), c2 = now0 && checkOf(now0)
   if (c2?.id === c.id) save(ticketId, { ...c2, sent_at: now() })

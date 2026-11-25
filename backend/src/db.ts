@@ -222,6 +222,18 @@ UPDATE repos SET clear_tpm_was_on = 1 WHERE clearing_at IS NOT NULL AND EXISTS (
 // Migration 43: "Have HQ test this" (hqcheck.ts): with auto mode off, the user's check of one finished ticket, kept with it (JSON, hqcheckrules.ts HqCheck) so the
 // button and the results survive a backend restart. NULL: never tested this way.
 `ALTER TABLE tickets ADD COLUMN hq_check TEXT;`,
+// Migration 44 (Bug 373): the checks of a ticket from before its latest one (JSON list, hqcheckrules.ts pastWith), so Test again doesn't wipe the results the
+// user sent to its engineer. Its own column: hq_check is saved and sent to every page at each step of a check under way. NULL: none before the latest.
+`ALTER TABLE tickets ADD COLUMN hq_checks TEXT;`,
+// Migration 45 (Bug 371): with auto mode off, the TPM changed a started ticket's spec or criteria after a plan was handed in: the ticket's plan_round then, so
+// only a plan of a later round, approved, lets its engineer build on and finish (replan.ts). A counter, not a time. NULL: no new plan owed.
+`ALTER TABLE tickets ADD COLUMN replan_after INTEGER;`,
+// Migration 46 (Bug 369): when a switch away from the project began asking its agents for their notes, until all are
+// asked (freshstart.ts parkNow), so a restart in the middle finishes the park (finishParks). NULL: no park under way.
+`ALTER TABLE repos ADD COLUMN parking_at INTEGER;`,
+// Migration 47 (Bug 389): when HQ began picking up the work of a project the user switched back to (freshstart.ts resumeNow), until every
+// parked agent is asked, so a restart in the middle finishes the resume (finishResumes). NULL: no resume under way.
+`ALTER TABLE repos ADD COLUMN resuming_at INTEGER;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

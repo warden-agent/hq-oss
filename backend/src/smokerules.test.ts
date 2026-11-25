@@ -2,7 +2,7 @@
 // says it couldn't look instead of blaming the ticket, and the words for each.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { allProblems, judge, lookReport, lookWords, needsBase, newProblems, problemsOf, type PageSeen, type Seen } from './smokerules.ts'
+import { allProblems, judge, lookReport, lookWords, movedNoStart, movedWords, needsBase, newProblems, problemsOf, type PageSeen, type Seen } from './smokerules.ts'
 
 const page = (o: Partial<PageSeen> = {}): PageSeen => ({ path: '/', title: 'Library', text: 40, things: 2, console: [], errors: [], failed: [], bad: [], outside: [], ...o })
 const looked = (...pages: PageSeen[]): Seen => ({ kind: 'looked', pages, ms: 1200 })
@@ -76,4 +76,43 @@ test('the report for the engineer, and the words for the page and the summary', 
       + "logged (HQ's browser has no internet)." })
   assert.deepEqual(lookWords({ ran: 'skipped', why: 'HQ couldn\'t download its browser (offline)' }),
     { short: "app not opened: HQ couldn't download its browser (offline)", long: "HQ didn't open the app before it merged: HQ couldn't download its browser (offline).", tone: 'look' })
+})
+
+test('Bug 374: a look that ran on another port, because the project\'s own was in use, says so where the user reads it, and is kept with the result', () => {
+  const moved = [{ part: 'api', from: 8000, to: 50123, by: "HQ's preview of shop" }]
+  const pass = judge({ kind: 'looked', pages: [page()], ms: 1200, moved }, null, 'main')
+  assert.deepEqual(pass, { ran: 'pass', pages: 1, ms: 1200, known: 0, offline: [], moved })
+  assert.deepEqual(lookWords(pass), { short: 'app opened, 1 page', tone: 'ok',
+    long: "HQ opened the app with it merged in: 1 page, nothing new wrong. HQ ran its own copy of the app on port 50123 instead of 8000 (in use by HQ's preview of shop)." })
+  assert.equal(movedWords([...moved, { part: 'jobs', from: 3001, to: 50124, by: 'node in ~/x (pid 7)' }]),
+    "port 50123 instead of 8000 (in use by HQ's preview of shop) and port 50124 instead of 3001 (in use by node in ~/x (pid 7))")
+  // a look on the project's own port says nothing of ports, and keeps none
+  const plain = judge(looked(page()), null, 'main'); assert.equal('moved' in plain, false); assert.doesNotMatch(lookWords(plain)!.long, /port/)
+})
+
+test('Bug 374: a moved copy that didn\'t start is about the port, not the code: who has it and what to do, unless main alone started on a moved port', () => {
+  const moved = [{ part: 'api', from: 8000, to: 50123, by: "HQ's preview of shop", fix: 'Stop the app in the preview, then test again' }]
+  const dead = (m?: typeof moved): Seen => ({ kind: 'no_start', why: 'its api part stopped (1) while the app was starting', output: 'EPERM', ...(m ? { moved: m } : {}) })
+  const words = "port 8000, which its api part always uses, is in use by HQ's preview of shop. HQ ran its own copy on port 50123 instead, and the app didn't start there "
+    + '(its api part stopped (1) while the app was starting). Stop the app in the preview, then test again'
+  assert.equal(movedNoStart('its api part stopped (1) while the app was starting', moved), words)
+  assert.equal(movedNoStart("the app didn't start: its api part stopped (1) while the app was starting", moved), words) // a caller's own lead-in isn't said twice
+  assert.equal(movedNoStart("the app couldn't be started", moved), words.replace(/ \(its api.*starting\)/, ''))
+  // neither started on another port: the move may be why, so nobody is blamed and the app isn't written off for the run
+  assert.deepEqual(judge(dead(moved), dead(moved), 'main'), { ran: 'skipped', why: words })
+  assert.deepEqual(judge(dead(moved), null, 'main'), { ran: 'skipped', why: words })
+  assert.deepEqual(judge(dead(moved), looked(page()), 'main'), { ran: 'skipped', why: words }) // main ran on its own port: no proof the move works
+  assert.deepEqual(judge(dead(), dead(moved), 'main'), { ran: 'skipped', why: words }) // main alone was the moved one
+  assert.equal(lookWords(judge(dead(moved), dead(moved), 'main'))!.long, `HQ didn't open the app before it merged: ${words}.`)
+  // main alone started on a moved port: the move works for this app, so the ticket broke the start, and the words still say where it ran
+  const blamed = judge(dead(moved), { kind: 'looked', pages: [page()], ms: 1200, moved }, 'main')
+  assert.deepEqual(blamed, { ran: 'fail', problems: [], output: 'EPERM', why: "The app doesn't start with it merged in: its api part stopped (1) while the app was starting; "
+    + "HQ ran its own copy of the app on port 50123 instead of 8000 (in use by HQ's preview of shop)." })
+  // no port was moved: as before
+  assert.deepEqual(judge(dead(), dead(), 'main'), { ran: 'skipped', why: "the app doesn't start on main either (its api part stopped (1) while the app was starting)", dead: true })
+  assert.equal(judge(dead(), looked(page()), 'main').ran, 'fail')
+  // two ports, two holders
+  assert.equal(movedNoStart('x', [...moved, { part: 'jobs', from: 3001, to: 50124, by: 'node in ~/x (pid 7)' }]), "port 8000, which its api part always uses, is in use by HQ's preview of shop; "
+    + "port 3001, which its jobs part always uses, is in use by node in ~/x (pid 7). HQ ran its own copy on ports 50123 and 50124 instead, and the app didn't start there (x). "
+    + 'Stop the app in the preview, then test again. Stop it, then test again')
 })

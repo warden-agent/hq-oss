@@ -764,3 +764,163 @@ test('Bug 351: a restart during HQ\'s first run of the OK\'d steps; the helper s
   assert.equal((await hq.mcp(h3, 'launch_ok')).isError, false); await gone(h3)
   await hq.api(`previews/${repo.id}/stop`, {})
 })
+
+test('Bug 360: the page answered, then a backend restart and a Stop (either order): launch_ok is still taken; a crash then a Stop still is not', async () => {
+  await stopOthers()
+  const dir = hq.repo('b360x'); fs.rmSync(path.join(dir, 'package.json'))
+  fs.writeFileSync(path.join(dir, 'up.js'),
+    "require('http').createServer((q, s) => { s.end('b360 up'); if (q.url === '/crash') setTimeout(() => process.exit(3), 50) }).listen(process.env.PORT)\n")
+  sh(dir, 'add', '-A'); sh(dir, 'commit', '-qm', 'an app that answers, and can crash')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const steps = (run: string) => ({ parts: [{ name: 'app', dir: '.', run, port: 'auto' }], show: 'app', worktree_files: [], notes: '' })
+  const status = (s: string) => waitFor(`the app ${s}`, async () => { const x = await preview(repo.id); return x.status === s ? x : null }, 20_000)
+  const gone = (h: string) => waitFor('the helper to go', async () => (await hq.state()).agents.find((a: any) => a.id === h)?.status === 'exited')
+  /** A helper whose OK'd steps HQ ran and whose page answered: it was told to call launch_ok. */
+  const answered = async (run: string) => {
+    const h = (await hq.api(`previews/${repo.id}/setup`, { why: 'fix' })).json.helper_agent_id as string
+    await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching')); await nextBatch(h)
+    assert.equal((await hq.mcp(h, 'save_launch', steps(run))).isError, false)
+    assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+    const p = await status('running'); assert.match(await nextBatch(h), /the page answered[^]*call launch_ok/)
+    return { h, p }
+  }
+  const taken = async (h: string, run: string) => {
+    const before = sentTo(h), ok = await hq.mcp(h, 'launch_ok')
+    assert.equal(ok.isError, false, ok.text); assert.match(ok.text, /^Done\. The user stopped the app after it answered; HQ keeps your steps\./)
+    await gone(h)
+    const p = await preview(repo.id)
+    assert.equal(p.status, 'stopped'); assert.equal(p.helper_state, null); assert.equal(p.helper_note, null); assert.equal(p.draft_recipe, null) // no OK card
+    assert.equal(p.recipe.parts[0].run, run); assert.equal(sentTo(h), before) // not sent back to save the same steps
+    assert.ok(!(await hq.state()).attention.some((a: any) => a.kind === `repo_launch:${repo.id}`))
+  }
+
+  // Restart, then Stop: launch_ok was refused ("HQ has no working run of your steps yet. Save them with save_launch"), as the answer was only in memory
+  const a = await answered('node up.js')
+  await hq.restart()
+  assert.equal((await preview(repo.id)).started_at, a.p.started_at) // the same run, picked up again
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  await taken(a.h, 'node up.js')
+  const lines = (await hq.api(`agents/${a.h}/events`)).json.events.map((e: any) => e.text) // its Events tab says HQ's run answered
+  assert.ok(lines.some((l: string) => /^HQ's run of its steps answered at http:\/\/localhost:\d+\/$/.test(l)), JSON.stringify(lines))
+
+  // Stop, then restart: both facts outlive the backend
+  const b = await answered('node up.js --b')
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  await hq.restart()
+  await taken(b.h, 'node up.js --b')
+
+  // What it must not take (as Bug 332): the app crashed by itself after it answered, then a restart, then a Stop on the crashed app
+  const c = await answered('node up.js --c')
+  await fetch(`${c.p.url}crash`).catch(() => null); await status('crashed')
+  await hq.restart()
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  assert.match((await hq.mcp(c.h, 'launch_ok')).text, /no working run of your steps yet/)
+  assert.equal((await hq.api(`previews/${repo.id}/dismiss`, {})).status, 200); await gone(c.h)
+
+  // Nor a run of other steps: the page answered and a Stop ended that run, then the helper saved new steps and the user OK'd them; HQ restarts
+  const d = await answered('node up.js --d')
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  assert.equal((await hq.mcp(d.h, 'save_launch', steps('sleep 4 && node up.js --d2'))).isError, false)
+  assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200); await status('starting')
+  await hq.restart()
+  assert.match((await hq.mcp(d.h, 'launch_ok')).text, /no working run of your steps yet/)
+  assert.match(await nextBatch(d.h), /the page answered/); await status('running')
+  assert.equal((await hq.mcp(d.h, 'launch_ok')).isError, false) // its own run answered: taken as before
+  await gone(d.h)
+  await hq.api(`previews/${repo.id}/stop`, {})
+})
+
+test('Bug 361: Restart, Launch or a new ⚙ command during HQ\'s first run of the OK\'d steps; the helper hears the run that counts (or goes)', async () => {
+  await stopOthers()
+  const dir = hq.repo('b361x'); fs.rmSync(path.join(dir, 'package.json'))
+  fs.writeFileSync(path.join(dir, 'up.js'), "console.log('B361 listening'); require('http').createServer((q, s) => s.end('b361 up')).listen(process.env.PORT)\n")
+  fs.writeFileSync(path.join(dir, 'crash.js'), "console.log('B361 boom: no such table'); process.exit(3)\n")
+  sh(dir, 'add', '-A'); sh(dir, 'commit', '-qm', 'an app that answers, and one that crashes')
+  const repo = (await hq.api('repos', { path: dir })).json
+  const steps = (run: string) => ({ parts: [{ name: 'app', dir: '.', run, port: 'auto' }], show: 'app', worktree_files: [], notes: '' })
+  const status = (s: string, not?: number) => waitFor(`the app ${s}`, async () => {
+    const x = await preview(repo.id); return x.status === s && x.started_at !== not ? x : null
+  }, 20_000)
+  const gone = (h: string) => waitFor('the helper to go', async () => (await hq.state()).agents.find((a: any) => a.id === h)?.status === 'exited')
+  const helper = async (why?: 'fix') => {
+    const h = (await hq.api(`previews/${repo.id}/${why ? 'setup' : 'start'}`, why ? { why } : {})).json.helper_agent_id
+    await waitFor('the helper', async () => (await hq.state()).agents.find((a: any) => a.id === h && a.status !== 'launching')); await nextBatch(h)
+    return h as string
+  }
+  const okd = async (h: string, run: string) => {
+    assert.equal((await hq.mcp(h, 'save_launch', steps(run))).isError, false)
+    assert.equal((await hq.api(`previews/${repo.id}/approve`, {})).status, 200)
+    const p = await status('starting'); assert.equal(p.helper_state, 'trying'); return p
+  }
+  const lines = async (h: string) => (await hq.api(`agents/${h}/events`)).json.events.map((e: any) => e.text)
+  const done = async (h: string) => (await hq.api('events?limit=400')).json.filter((e: any) => e.kind === 'launch.helper_done' && e.agent_id === h)
+    .map((e: any) => JSON.parse(e.payload))
+  const again = 'The app was started again during the first run of the steps you OK\'d: HQ tells it how the new run goes'
+
+  // Restart while HQ's run starts: the helper hears how the new run went (it was never told, and stayed "trying" until Stop Claude)
+  const h1 = await helper()
+  const run1 = await okd(h1, 'sleep 3 && node up.js')
+  assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200) // the pane's Restart (and the top bar's Launch) post this
+  const told = await nextBatch(h1)
+  assert.match(told, /: The app was started again during HQ's run of your steps \(the user's Restart or Launch, or a merge\), with the same steps\. /, told)
+  assert.match(told, /Real run on the user's checkout: the page answered at http:\/\/localhost:\d+\/\. Last output:[^]*B361 listening[^]*call launch_ok/, told)
+  let p = await preview(repo.id); assert.notEqual(p.started_at, run1.started_at); assert.equal(p.status, 'running'); assert.equal(p.helper_state, 'working')
+  assert.equal(await page(p.url), 'b361 up')
+  assert.ok((await lines(h1)).includes(again), JSON.stringify(await lines(h1)))
+  assert.equal((await hq.mcp(h1, 'launch_ok')).isError, false); await gone(h1)
+  await hq.api(`previews/${repo.id}/stop`, {})
+
+  // Restarted twice, then the new run crashes: the helper gets that crash once, with its output
+  const h2 = await helper('fix')
+  const run2 = await okd(h2, 'sleep 3 && node crash.js'), sent2 = sentTo(h2)
+  assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200)
+  const mid = await status('starting', run2.started_at)
+  assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200)
+  await status('starting', mid.started_at)
+  const told2 = await nextBatch(h2)
+  assert.match(told2, /: The app was started again[^]*Real run on the user's checkout: it stopped with code 3\. Last output:\n[^]*B361 boom[^]*Fix the steps/, told2)
+  assert.equal(sentTo(h2), sent2 + 1); assert.equal((await preview(repo.id)).helper_state, 'working')
+
+  // A Stop of the run that replaced it: the helper goes as after any Stop (Bug 332), and the steps stay
+  const run3 = await okd(h2, 'sleep 3 && node up.js'), sent3 = sentTo(h2)
+  assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200)
+  await status('starting', run3.started_at)
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+  await gone(h2)
+  p = await preview(repo.id); assert.equal(p.helper_state, null); assert.equal(p.draft_recipe, null); assert.equal(p.recipe.parts[0].run, 'sleep 3 && node up.js')
+  assert.equal(sentTo(h2), sent3)
+  assert.deepEqual(await waitFor('its end on record', async () => { const d = await done(h2); return d.length ? d : null }),
+    [{ repo: 'b361x', state: null, note: null, why: 'app_stopped' }])
+
+  // A merge restarts the app on main during the run (the entry's other case): the helper hears how that run went
+  const f = (await hq.api('features', { repoId: repo.id, title: 'b361 merge', request: 'Build it' })).json
+  await waitFor('the TPM', async () => (await hq.state()).agents.find((a: any) => a.id === f.tpm_agent_id && a.status === 'working'))
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Notes', size: 'S', spec: 'notes.' })).json
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  const wt = path.join(dir, '.claude', 'worktrees', t.key)
+  fs.writeFileSync(path.join(wt, 'notes.txt'), 'b361\n'); sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', 'notes')
+  assert.equal((await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'notes' })).isError, false)
+  assert.equal((await hq.mcp(eng.id, 'open_pr', { title: 'notes', body: 'notes\n\n## Deviations from approved plan\nNone' })).isError, false)
+  const h4 = await helper('fix'), run5 = await okd(h4, 'sleep 8 && node up.js'), sent5 = sentTo(h4)
+  const m = await hq.api(`tickets/${t.id}/merge`, {}); assert.equal(m.status, 200, JSON.stringify(m.json))
+  await waitFor('the restart after the merge', async () => (await preview(repo.id)).started_at !== run5.started_at, 20_000)
+  await waitFor('HQ to tell the helper', () => sentTo(h4) > sent5, 30_000) // the restarted run sleeps 8 s before it answers
+  const told4 = await nextBatch(h4)
+  assert.match(told4, /: The app was started again[^]*Real run on the user's checkout: the page answered at http:\/\/localhost:\d+\//, told4)
+  p = await preview(repo.id); assert.notEqual(p.started_at, run5.started_at); assert.ok(m.json.sha.startsWith(p.head), `${p.head} vs ${m.json.sha}`)
+  assert.equal((await hq.mcp(h4, 'launch_ok')).isError, false); await gone(h4)
+  await hq.api(`previews/${repo.id}/stop`, {})
+
+  // The user's own ⚙ command restarts the app with that: the helper's steps don't run, so it goes, and its steps stay
+  const h3 = await helper('fix')
+  const run4 = await okd(h3, 'sleep 3 && node up.js'), sent4 = sentTo(h3)
+  assert.equal((await hq.api(`previews/${repo.id}/command`, { command: 'node up.js' })).status, 200)
+  await gone(h3)
+  p = await status('running', run4.started_at); assert.equal(p.command, 'node up.js'); assert.equal(p.helper_state, null)
+  assert.equal(p.recipe.parts[0].run, 'sleep 3 && node up.js'); assert.equal(sentTo(h3), sent4)
+  assert.deepEqual(await waitFor('its end on record', async () => { const d = await done(h3); return d.length ? d : null }),
+    [{ repo: 'b361x', state: null, note: null, why: 'own_command' }])
+  assert.ok((await lines(h3)).includes('Done with the launch steps: you set your own start command, which runs now; the steps you OK\'d stay'))
+  await hq.api(`previews/${repo.id}/command`, { command: null }); await hq.api(`previews/${repo.id}/stop`, {})
+})

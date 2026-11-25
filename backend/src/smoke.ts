@@ -11,11 +11,14 @@ import { createRequire } from 'node:module'
 import type { Recipe } from './apprun.ts'
 import { copyMainData } from './trydata.ts'
 import { shq } from './util.ts'
-import type { Seen } from './smokerules.ts'
+import { movedNoStart, type MovedPort, type Seen } from './smokerules.ts'
+import { blocked, placePorts } from './testports.ts'
 
 /** What HQ starts to look at a project's app: its launch recipe (the user's own command, or the steps they OK'd for the preview), the checkout whose own
  *  settings and data a copy is taken of (as Try it does), and the recipe in a few words for a report. */
-export type LookPlan = { recipe: Recipe; repoPath: string; how: string }
+export type LookPlan = { recipe: Recipe; repoPath: string; how: string
+  /** Bug 374: ports the project hard-wires that HQ moved in the checkout this plan runs in (prepareApp): `recipe` already has the new ones. */
+  moved?: MovedPort[] }
 export const lookHow = (r: Recipe): string => r.parts.map((p) => r.parts.length > 1 ? `${p.name}: ${p.run}` : p.run).join(' + ')
 
 const RUNNER = path.join(import.meta.dirname, 'smokerun.mjs')
@@ -67,41 +70,60 @@ export function ensureBrowser(): Promise<string | null> {
   return fetching
 }
 
-type Run = (cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal }) => Promise<{ code: number | null; output: string; timedOut: boolean }>
+type Run = (cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; block?: number[] }) =>
+  Promise<{ code: number | null; output: string; timedOut: boolean }>
 /** A part's install is needed in a fresh checkout unless its packages came with it: HQ copies the main checkout's node_modules into a test checkout
  *  (worktrees.ts seedPackages), and an npm install on top of them would only rewrite files. Anything else (uv sync, go build) is quick when up to date. */
-const installs = (p: Recipe['parts'][number], dir: string): boolean => !!p.install && !(/^(npm|yarn|pnpm)\b/.test(p.install.trim()) && fs.existsSync(path.join(dir, 'node_modules')))
+const installs = (p: Recipe['parts'][number], dir: string): boolean => !!p.install && !(/^(npm|yarn|pnpm|bun)\b/.test(p.install.trim()) && fs.existsSync(path.join(dir, 'node_modules')))
 
-/** Gets a throwaway checkout ready for the app to run in: HQ's browser on the machine, a copy of the user's own settings and data (as Try it takes), and each
- *  part's install, with the network on, as for the tests. Null when it's ready; else why the app can't be started here. */
-export async function prepareApp(wt: string, plan: LookPlan, o: { signal: AbortSignal; run: Run }): Promise<null | Exclude<Seen, { kind: 'looked' }> | { kind: 'stopped' }> {
+export type Prepared = { kind: 'ready'; plan: LookPlan } | Exclude<Seen, { kind: 'looked' }> | { kind: 'stopped' }
+/** Gets a throwaway checkout ready for the app to run in: HQ's browser on the machine, a copy of the user's own settings and data (as Try it takes), a port
+ *  of its own for a part whose hard-wired one is in use (Bug 374, testports.ts), and each part's install, with the network on, as for the tests.
+ *  `ready`: the plan as it runs in this checkout (`moved`: the ports HQ changed there), for appSpec and, as `block`, for every sandboxed run of it. Else why
+ *  the app can't be started here. */
+export async function prepareApp(wt: string, plan0: LookPlan, o: { signal: AbortSignal; run: Run }): Promise<Prepared> {
   const stopped = { kind: 'stopped' } as const
   const none = await ensureBrowser(); if (none) return { kind: 'skipped', why: none }
   if (o.signal.aborted) return stopped
-  await copyMainData(plan.repoPath, wt, plan.recipe.worktree_files).catch(() => []) // an app that needs its .env or its data to start gets a copy, never the user's own
+  const copied = await copyMainData(plan0.repoPath, wt, plan0.recipe.worktree_files).catch(() => []) // an app that needs its .env or its data to start gets a copy, never the user's own
+  const placed = await placePorts(wt, plan0, copied).catch((e) => ({ skip: `HQ couldn't check the app's ports (${(e as Error).message.split('\n')[0]})` }))
+  if ('skip' in placed) return { kind: 'skipped', why: placed.skip }
+  if (o.signal.aborted) return stopped
+  const plan = placed.plan
   for (const p of plan.recipe.parts) {
     const dir = path.join(wt, p.dir); if (!installs(p, dir)) continue
     const i = await o.run(dir, p.install!, { network: true, timeoutMs: INSTALL_MS, signal: o.signal })
     if (o.signal.aborted) return stopped
     if (i.code !== 0) return { kind: 'no_start', why: `installing its ${p.name} part failed (\`${p.install}\`)`, output: i.output.slice(-3000) }
   }
-  return null
+  return { kind: 'ready', plan }
 }
-/** What the sandboxed scripts are told about the app and the browser: the recipe's parts in `wt`, which one has the page, and HQ's own playwright-core. */
+/** Why an app didn't start. When HQ moved a port for this run (Bug 374) that may be the reason (a part that listens on its old port whatever it is told is
+ *  refused it), so the words are about the port: who has it, what HQ tried, and what frees it (smokerules.ts movedNoStart). */
+export const startWhy = (why: string, plan: LookPlan): string => plan.moved?.length ? movedNoStart(why, plan.moved) : why
+export { blocked }
+/** What the sandboxed scripts are told about the app and the browser: the recipe's parts in `wt`, which one has the page, and HQ's own playwright-core.
+ *  The app counts as started once every part listens on its port, the moved ones (Bug 374) on their new one (appstart.mjs, Bug 388). */
 export const appSpec = (wt: string, plan: LookPlan) => ({ parts: plan.recipe.parts.map((p) => ({ name: p.name, cwd: path.join(wt, p.dir), run: p.run, port: p.port })),
   show: plan.recipe.show, pwCore: pwCore(), startMs: START_MS })
 /** `PLAYWRIGHT_BROWSERS_PATH=… ` in front of a sandboxed command, when HQ's browser isn't in Playwright's usual folder. */
 export const browsersPrefix = (): string => Object.entries(browsersEnv()).map(([k, v]) => `${k}=${shq(v)} `).join('')
 /** Starts the app in `wt` (a throwaway checkout of the commit to look at) and opens its pages. `run`: the sandboxed runner (testrun.ts runSandboxed): the app,
  *  and the browser with it, run with localhost only and none of the user's credentials. `stopped`: the signal ended it (auto mode went off): nothing follows. */
-export async function lookIn(wt: string, plan: LookPlan, o: { signal: AbortSignal; run: Run }): Promise<Seen | { kind: 'stopped' }> {
+export async function lookIn(wt: string, plan0: LookPlan, o: { signal: AbortSignal; run: Run }): Promise<Seen | { kind: 'stopped' }> {
   const stopped = { kind: 'stopped' } as const
-  const cant = await prepareApp(wt, plan, o); if (cant) return cant
+  const got = await prepareApp(wt, plan0, o); if (got.kind !== 'ready') return got
+  const plan = got.plan // as it runs here: on other ports, when its own were in use (Bug 374)
   const out = path.join(wt, '.hq-look.json'); fs.rmSync(out, { force: true }) // in the checkout: the one folder this and the sandboxed run both reach; it goes with it
   const spec = { ...appSpec(wt, plan), out, pageMs: PAGE_MS, maxPages: MAX_PAGES, depth: DEPTH }
-  const r = await o.run(wt, `${browsersPrefix()}${shq(process.execPath)} ${shq(STAND_IN ?? RUNNER)} ${shq(JSON.stringify(spec))}`, { network: false, timeoutMs: LOOK_MS, signal: o.signal })
+  const r = await o.run(wt, `${browsersPrefix()}${shq(process.execPath)} ${shq(STAND_IN ?? RUNNER)} ${shq(JSON.stringify(spec))}`,
+    { network: false, timeoutMs: LOOK_MS, signal: o.signal, block: blocked(plan) })
   if (o.signal.aborted) return stopped
-  try { return JSON.parse(fs.readFileSync(out, 'utf8')) as Seen } catch { /* it never wrote one */ }
+  try {
+    const seen = JSON.parse(fs.readFileSync(out, 'utf8')) as Seen
+    if (!plan.moved?.length) return seen
+    return seen.kind === 'skipped' ? seen : { ...seen, moved: plan.moved } // a start that failed too: the verdict's words are about the port then (judge)
+  } catch { /* it never wrote one */ }
   const said = r.output.split('\n').map((l) => l.trim()).filter(Boolean).at(-1)?.slice(0, 200)
   return { kind: 'skipped', why: r.timedOut ? `HQ's look at the app took over ${Math.round(LOOK_MS / 60_000)} minutes` : `HQ's look at the app ended with no result${said ? ` (${said})` : ''}` }
 }

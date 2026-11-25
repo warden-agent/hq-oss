@@ -4,6 +4,7 @@ import { q } from './db.ts'
 import { getAgent } from './agents.ts'
 import { getFeature, getRepo, getTicket } from './records.ts'
 import { behindWords } from './heavy.ts'
+import { changedWords, unseenWords } from './hqcheckrules.ts'
 
 export type EventLine = { id: number; at: number; agentId: string | null; text: string }
 
@@ -64,7 +65,9 @@ const nameOf = (id: unknown): string => { const a = getAgent(String(id ?? '')); 
  *  before Bug 206 have no `why`: a run that never finished said so, anything else may have been the tests, HQ's look at the app or the reader. */
 const BACK: Record<string, string> = { tests: 'its tests fail', tests_hung: 'its tests never finish', look: "HQ's look at the app found something wrong",
   review: 'a fresh reader of its changes found something to fix' }
-const cameBack = (p: Record<string, unknown>): string => `${keyOf(p.ticket, p.key)} came back: ${p.unproven ? "the tests named for its criteria didn't all run"
+/** Bug 373: tests that passed with named ones unseen say so: nothing failed, and HQ only knows it didn't see them (`missing`: how many; rows from before have none). */
+const cameBack = (p: Record<string, unknown>): string => `${keyOf(p.ticket, p.key)} came back: ${p.unproven || p.why === 'tests_unseen'
+  ? `its tests passed, but ${unseenWords(Number(p.missing) || 0)}`
   : BACK[String(p.why)] ?? (p.hung ? BACK.tests_hung : "HQ's check before merging found something to fix")}`
 
 /** One plain line for an event, or null when the Events tab leaves it out. */
@@ -75,13 +78,14 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
   if (hidden(kind)) return null
   const p = payload, [what, tool = ''] = kind.split(':') as [string, string?]
   const helper = p.sub ? 'Helper · ' : ''
+  if (kind === 'hook.StopFailure' && p.told) return null // Bug 386: HQ had already said that turn failed (hooks.ts failedUnheard)
   switch (what) {
     case 'hook.PreToolUse': return helper + toolLine(tool, p.input)
     case 'hook.PostToolUseFailure': return helper + (p.is_interrupt ? `${tool} stopped (interrupted)` : `${tool} failed: ${one(p.error, 300)}`)
     case 'hook.UserPromptSubmit': return prompt(String(p.prompt ?? ''))
     case 'hook.Stop': { const what = p.away ? 'Turn ended while HQ was down' : 'Turn ended' // Bug 297: its Stop hook was lost, the mod said so later
       return p.last ? `${what}: ${one(p.last, 300)}` : what }
-    case 'hook.StopFailure': return `Turn failed: ${one(p.error)}`
+    case 'hook.StopFailure': return `${p.away ? 'Turn failed while HQ was down' : 'Turn failed'}: ${one(p.error)}` // Bug 367: its hook was lost, the mod said so later
     case 'hook.SessionStart': return `Claude Code started${p.source ? ` (${p.source})` : ''}`
     case 'hook.SessionEnd': return `Claude Code ended${p.reason ? ` (${p.reason})` : ''}`
     case 'hook.SubagentStop': return 'A helper finished'
@@ -93,6 +97,8 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'message.sent': return `Sent a message to ${nameOf(p.to)}`
     case 'message.typed': return p.finished ? 'HQ typed the rest of a message into its terminal after its restart (its first part was already in)' // Bug 331
       : `HQ typed a message into its terminal${p.again ? ' after its restart' : ''}`
+    case 'message.at_step': { const n = Array.isArray(p.ids) ? p.ids.length : 1 // Bug 370
+      return `Got ${n > 1 ? `${n} messages` : 'a message'} while it worked, with its last step: ${one(p.text, 300)}` }
     case 'message.cut_short': return 'HQ restarted while it was typing a message into its terminal: it types it again' // Bug 296
     case 'message.dropped': return 'HQ dropped its unread note of the new test command: the ticket was finished' // Bug 147
     case 'ask.opened': return `Asked you: ${one(p.question)}`
@@ -121,7 +127,10 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'launch.test_port': return `HQ stopped its test server on port ${list(p.ports)}: not one HQ gave it for tests (${list(p.given)}), so it could clash with `
       + 'another app. Its save was refused'
     case 'launch.helper_done': return p.why === 'app_stopped' ? 'Done with the launch steps: the app was stopped before it answered; the steps you OK\'d stay' // Bug 332
-      : 'Done with the launch steps'
+      : p.why === 'own_command' ? 'Done with the launch steps: you set your own start command, which runs now; the steps you OK\'d stay' // Bug 361
+        : 'Done with the launch steps'
+    case 'launch.run_answered': return `HQ's run of its steps answered${p.url ? ` at ${one(p.url)}` : ''}` // Bug 360: what launch_ok may confirm, kept
+    case 'launch.run_restarted': return 'The app was started again during the first run of the steps you OK\'d: HQ tells it how the new run goes' // Bug 361
     case 'launch.run_resumed': return `HQ restarted during the first run of the steps you OK'd: ${p.again ? 'it runs them again' : 'it picks that run up again'}` // Bug 351
     case 'agent.launched': return `Started${p.model ? ` (${p.model})` : ''}`
     case 'agent.stopped': return `Stopped${p.reason ? `: ${one(p.reason, 100)}` : ''}`
@@ -157,6 +166,7 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'gate.pending_answered': return 'HQ told it its plan still waits for review'
     case 'gate.reattached': return `Asked about its plan again${Number(p.round) > 1 ? ` (round ${p.round})` : ''}: it still waits for review`
     case 'gate.review_superseded': return `Its plan${p.round ? ` (round ${p.round})` : ''} was replaced by a newer one${p.by ? ` (round ${p.by})` : ''}`
+    case 'gate.plan_before_change': return `Its plan${p.round ? ` (round ${p.round})` : ''} was written before it read the change to its spec: approving it still leaves a new plan to come` // Bug 371
     case 'gate.user_override': return 'Its plan was approved in its terminal\'s menu, not through HQ'
     case 'gate.plan_file_write_failed': return `HQ couldn't write the approved plan into its plan file: ${one(p.error)}`
     case 'testcmd.refused': return `Claude Code refused the project's test command for it${p.cmd ? `: ${one(p.cmd, 100)}` : ''}`
@@ -171,7 +181,8 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'ticket.resumed': return `Picked up ${keyOf(p.ticket, p.key)} again`
     case 'ticket.pr_open': return `Opened a pull request for ${keyOf(p.ticket, p.key)}`
     case 'ticket.pr_refused': return `HQ didn't take ${keyOf(p.ticket, p.key)} as finished (open pr): ${one(p.why, 600)}` // Bug 248
-    case 'ticket.pr_ready': return `${keyOf(p.ticket, p.key)} is ready to merge`
+    case 'ticket.pr_ready': return Array.isArray(p.files) // Bug 373: back from HQ's check: what its engineer changed since
+      ? `${keyOf(p.ticket, p.key)} is finished again: its engineer ${changedWords((p.files as unknown[]).map(String), Number(p.more) || 0)}` : `${keyOf(p.ticket, p.key)} is ready to merge`
     case 'ticket.merge_started': return `HQ began merging ${keyOf(p.ticket, p.key)}`
     case 'ticket.merged_by_hq': return `HQ merged ${keyOf(p.ticket, p.key)}`
     case 'ticket.merged': return `${keyOf(p.ticket, p.key)} is in ${baseOf(p.ticket)}`
@@ -180,6 +191,7 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     // "Have HQ test this" (hqcheck.ts): the user's check of a ticket, with auto mode off
     case 'check.started': return `You had HQ test ${keyOf(p.ticket, p.key)}`
     case 'check.ended': return p.state === 'pass' ? `HQ's test of ${keyOf(p.ticket, p.key)}: everything passed`
+      : p.state === 'fail' && p.unseen ? `HQ's test of ${keyOf(p.ticket, p.key)}: the tests passed, but ${unseenWords(Number(p.unseen))} (View results on its box)`
       : p.state === 'fail' ? `HQ's test of ${keyOf(p.ticket, p.key)} found a problem (View results on its box)`
       : p.state === 'stopped' ? `HQ's test of ${keyOf(p.ticket, p.key)} stopped${p.why ? `: ${one(p.why, 200)}` : ''}`
       : `HQ couldn't finish testing ${keyOf(p.ticket, p.key)}${p.why ? `: ${one(p.why, 200)}` : ''}`
@@ -191,6 +203,8 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'auto.looked': return p.ran === 'pass' ? `HQ opened the app with ${keyOf(p.ticket, p.key)} merged in: it looks fine` // Bug 201
       : p.ran === 'fail' ? `HQ opened the app with ${keyOf(p.ticket, p.key)} merged in and found a problem${p.why ? `: ${one(p.why, 200)}` : ''}`
       : `HQ didn't look at the app with ${keyOf(p.ticket, p.key)} merged in${p.why ? `: ${one(p.why, 200)}` : ''}`
+    // Bug 374: a port the project hard-wires was in use, so HQ's test ran its own copy of the app on another
+    case 'testrun.port_moved': return `HQ ran its own copy of ${p.repo ?? 'the app'} for a test with its ${p.part} part on port ${p.to} instead of ${p.from} (in use by ${one(p.by)})`
     case 'auto.parked': return `Auto mode left ${keyOf(p.ticket, p.key)} for you: ${one(p.why, 200)}`
     case 'auto.moved': return !p.merged ? `HQ didn't merge ${keyOf(p.ticket, p.key)}: its branch got commits after open_pr, so it goes back to its engineer to call open_pr again`
       : p.named ? `HQ merged the commit ${keyOf(p.ticket, p.key)}'s open_pr handed over; the ones its branch got meanwhile are tested and merged next` // Bug 184
@@ -205,6 +219,7 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     }
     case 'auto.repair_opened': return `HQ opened ${keyOf(p.ticket, p.key)} to fix ${baseOf(p.ticket)}`
     case 'ticket.change': return `Asked to change ${keyOf(p.ticket, p.key)}`
+    case 'ticket.replan_asked': return `HQ asked for a new plan for ${keyOf(p.ticket, p.key)}: its spec changed after its plan was handed in, so you approve it first` // Bug 371
     case 'ticket.cancelled': return `${keyOf(p.ticket, p.key)} was cancelled`
   }
   if (what.startsWith('attention.') && p.detail) return `Alert: ${one(p.detail, 200)}`

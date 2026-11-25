@@ -50,6 +50,9 @@ const pane = (a: any): string => hq.tmux('capture-pane', '-p', '-J', '-t', a.tmu
 const escapes = (a: any): number => { try { return fs.readFileSync(path.join(flags, `escapes.${a.tmux_session}`), 'utf8').trim().split('\n').length } catch { return 0 } }
 async function draw(a: any, text: string, shows: string): Promise<void> { await hq.screen(a, text); await waitFor(`the screen to show "${shows}"`, () => pane(a).includes(shows)) }
 const msgTo = async (a: any, reason: string) => (await hq.state()).messages.find((m: any) => m.to_id === a.id && m.reason === reason)
+/** Bug 368: its "Asked (again) for its handoff note" lines in its Events tab, oldest first. */
+const asked = async (a: any): Promise<string[]> => (await hq.api(`agents/${a.id}/events`)).json.events.map((l: any) => l.text)
+  .filter((t: string) => t.startsWith('Asked ')).reverse()
 const typedAgain = async (a: any) => (await hq.api(`events?agent=${a.id}`)).json.filter((e: any) => e.kind === 'message.typed').map((e: any) => JSON.parse(e.payload))
 
 async function tpmOf(name: string): Promise<{ repo: any; f: any; tpm: any }> {
@@ -81,6 +84,8 @@ test('Bug 296: a restart after the Clear\'s Escape and before its note request w
   await waitFor('the request acked', async () => (await msgTo(tpm, 'fresh_start')).ack_at)
   assert.deepEqual((await typedAgain(tpm)).map((p: any) => [p.reason, p.again ?? false]), [['fresh_start', true]])
   assert.equal(escapes(tpm), 1, 'no second Escape into a waiting prompt (twice opens the Rewind menu)')
+  assert.deepEqual(await asked(tpm), ['Asked for its handoff note: you are clearing the project. A new TPM takes over from it after the clear'],
+    'its Events line, once: written before the typing the restart cut (Bug 368)')
   // the TPM answers what it now sees, and the clear ends with its note
   assert.equal((await hq.mcp(tpm.id, 'write_handoff_note', { text: '## What the user wants\n- b296 (CUT-NOTE)' })).isError, false)
   await waitFor('the board gone', async () => !(await hq.state()).features.some((x: any) => x.repo_id === repo.id), 30_000)
@@ -128,4 +133,32 @@ test("Bug 331: a restart in the middle of typing an urgent message: HQ types the
   const events = (await hq.api(`events?agent=${tpm.id}`)).json.map((e: any) => e.kind)
   assert.ok(!events.includes('message.held'), 'not held as somebody\'s draft')
   assert.equal(escapes(tpm), 1, 'no second Escape')
+})
+
+test("Bug 368: a restart while HQ types a Clear's request that replaces a Fresh start's: \"Asked again\" is in the TPM's Events once", async () => {
+  const { repo, tpm } = await tpmOf('b368clear')
+  assert.equal((await hq.api(`agents/${tpm.id}/fresh-start`, { then: 'continue' })).status, 200) // typed whole, with no restart
+  const first = (await hq.state()).agents.find((a: any) => a.id === tpm.id).fresh_start_msg
+  await waitFor('the Fresh start request acked', async () => (await hq.state()).messages.find((m: any) => m.id === first)?.ack_at)
+  assert.deepEqual(await asked(tpm), ['Asked for its handoff note: a fresh start. A new session takes over from it'])
+  await draw(tpm, WORKING, 'esc to interrupt') // it works on its note
+  const flag = path.join(flags, `after.${tpm.tmux_session}`), held = path.join(flags, `held.${tpm.tmux_session}`)
+  fs.rmSync(held, { force: true }); fs.writeFileSync(flag, '')
+  try {
+    void hq.api(`repos/${repo.id}/clear`, {}).catch(() => null) // HQ types the Clear's request; the backend goes down in the middle
+    await waitFor('the Escape before the Clear\'s request', () => fs.existsSync(held), 15_000)
+    await draw(tpm, IDLE, 'Interrupted')
+    const m = (await hq.state()).messages.find((x: any) => x.to_id === tpm.id && /^This replaces/.test(x.body))
+    assert.ok(m.delivered_at); assert.equal(m.ack_at, null) // what the restart cuts: typing begun, not done
+    await hq.down()
+  } finally { fs.rmSync(flag, { force: true }) }
+  await hq.up()
+
+  await waitFor('the Clear\'s request in the TPM\'s terminal', () => pane(tpm).includes('This replaces HQ'), 15_000)
+  const again = (await hq.state()).agents.find((a: any) => a.id === tpm.id).fresh_start_msg
+  await waitFor('the Clear\'s request acked', async () => (await hq.state()).messages.find((m: any) => m.id === again)?.ack_at)
+  assert.deepEqual(await asked(tpm), ['Asked for its handoff note: a fresh start. A new session takes over from it',
+    'Asked again for its handoff note: you are clearing the project. A new TPM takes over from it after the clear'], 'each line once, in order')
+  assert.equal((await hq.mcp(tpm.id, 'write_handoff_note', { text: '## What the user wants from this project\n- b368 (B368-NOTE)' })).isError, false)
+  await waitFor('the board gone', async () => !(await hq.state()).features.some((x: any) => x.repo_id === repo.id), 30_000)
 })

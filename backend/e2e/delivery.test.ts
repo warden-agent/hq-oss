@@ -4,7 +4,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { startHq, waitFor, type Hq } from './harness.ts'
+import { startHq, waitFor, exitPlanMode, type Hq } from './harness.ts'
 import { slotWindow } from '../src/slotports.ts'
 
 let hq: Hq
@@ -543,6 +543,81 @@ test('Bug 168: the spec or title a ticket already has, given again, changes noth
   assert.equal((await spec(t, { spec: 'A pine shelf.', title: 'Pine shelf' })).text, 'Updated.')
   await waitFor('the spec notice', async () => (await told(eng.id)).some((m: any) => m.body === `HQ: the TPM updated ${t.key}'s spec. Call get_ticket to read it.`))
   assert.equal((await told(eng.id)).length, 2) // and nothing for the unchanged parts
+})
+
+test('Bug 370: a change of mind reaches a working engineer at its next step, also right after its plan is approved, not when its turn ends', async () => {
+  // Bug 371's re-plan after a spec change (PR #350) is its own test (e2e/replan.test.ts): here only how the notice gets in
+  assert.equal((await hq.api('settings', { key: 'replan_on_change', value: 'off' })).status, 200)
+  try {
+  const { f, tpm } = await setup('b370x')
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Search box', size: 'S', spec: 'A search box.' })).json
+  const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
+  await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
+  await takeLaunch(eng.id) // its one long turn: plan, then build
+  const change = async (spec: string) => { // Bug 371 adds its re-plan words with auto off
+    const r = await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, spec, user_asked: true }); assert.match(r.text, /^Updated\./)
+  }
+  const notices = async () => (await hq.state()).messages.filter((m: any) => m.to_id === eng.id && m.from_id === 'hq' && /^HQ: the TPM updated/.test(m.body))
+  const step = (ev: string, extra: Record<string, unknown> = {}) => hq.hook(eng.id, { hook_event_name: ev, tool_name: 'Read', tool_input: { file_path: 'a.ts' }, ...extra })
+  const carried = (r: any): string => r?.hookSpecificOutput?.additionalContext ?? ''
+  const notice = `HQ: the TPM updated ${t.key}'s spec. Call get_ticket to read it.`
+
+  // It is looking around before its plan: the change goes in with its next step, and the mod (which waits for the turn to end) is handed none of it
+  await change('A search box that also finds tags.')
+  assert.deepEqual(await hq.modNext(eng.id), {})
+  const sub = await step('PostToolUse', { agent_id: 'helper-1' }); assert.equal(carried(sub), '', "a helper's step is not its own")
+  const gone = await step('PostToolUseFailure', { error: 'Interrupted', is_interrupt: true }); assert.equal(carried(gone), '', 'an interrupted step carries nothing')
+  const first = await step('PostToolUse')
+  assert.match(carried(first), /^HQ: this message came in while you work\. Read it now, before your next step:\n\n\[spec_change\] from HQ \[msg [\w-]+\]: /)
+  assert.ok(carried(first).endsWith(notice), carried(first))
+  const [n1] = await notices(); assert.deepEqual([n1.reason, n1.delivery_method, !!n1.ack_at], ['spec_change', 'hook', true]) // ✓ read on the page
+  assert.equal(carried(await step('PostToolUse')), '', 'once')
+
+  // Its plan waits for review, the user changes their mind and sends the plan back: no step comes after a send-back, so the answer carries it
+  const open = (not = '') => waitFor('the open review', async () => (await hq.state()).reviews.find((r: any) => r.ticket_id === t.id && r.status === 'open' && r.id !== not))
+  const held1 = hq.hook(eng.id, exitPlanMode('Plan: a search box'))
+  const r1 = await open()
+  await change('A search box that finds tags, for real.')
+  assert.deepEqual(await hq.modNext(eng.id), {})
+  assert.equal((await hq.api(`reviews/${r1.id}/answer`, { verdict: 'revise', by: 'user', message: 'b370x: smaller, please.' })).json.ok, true)
+  const back = (await held1).hookSpecificOutput.decision
+  assert.equal(back.behavior, 'deny'); assert.match(back.message, /^b370x: smaller, please\.\n\nHQ: this message came in while you work\./); assert.ok(back.message.endsWith(notice))
+
+  // Its next plan waits for review and the user changes their mind: the approval's step (PostToolUse of ExitPlanMode) carries it, before it builds
+  const hold = hq.hook(eng.id, exitPlanMode('Plan: a search box that finds tags'))
+  const review = await open(r1.id)
+  await change('A search box that finds tags and titles.')
+  assert.deepEqual(await hq.modNext(eng.id), {})
+  assert.equal((await hq.api(`reviews/${review.id}/answer`, { verdict: 'approve', by: 'user' })).json.ok, true)
+  assert.equal((await hold).hookSpecificOutput.decision.behavior, 'allow')
+  assert.deepEqual(await hq.modNext(eng.id), {}, 'building now: still not the mod')
+  const approved = await hq.hook(eng.id, { hook_event_name: 'PostToolUse', tool_name: 'ExitPlanMode', tool_input: {}, tool_response: { plan: 'x' } })
+  assert.ok(carried(approved).endsWith(notice), JSON.stringify(approved))
+  assert.equal((await hq.state()).attention.filter((a: any) => a.kind === 'user_override' && a.agent_id === eng.id).length, 0) // HQ's approval, as before
+
+  // A failed step carries it too. What isn't a change of the spec (a note from the TPM) still waits for the mod, as before
+  await change('A search box that finds tags, titles and notes.')
+  assert.equal((await hq.mcp(tpm.id, 'send_message', { to: eng.id, reason: 'fyi', body: 'b370x: no rush.' })).isError, false)
+  const fyi = (await hq.modNext(eng.id)).batch; assert.match(fyi.text, /b370x: no rush/); assert.doesNotMatch(fyi.text, /updated/)
+  await hq.modEvent(eng.id, { kind: 'batch_received', id: fyi.id })
+  const failed = await step('PostToolUseFailure', { error: 'Exit code 1', is_interrupt: false }); assert.ok(carried(failed).endsWith(notice))
+  assert.doesNotMatch(carried(failed), /no rush/)
+
+  // HQ restarts while a change waits for its step: it still waits for that step (HQ reads the turn from its log), not for the turn's end
+  await change('A search box that finds tags, titles, notes and dates.')
+  await hq.restart()
+  assert.deepEqual(await hq.modNext(eng.id), {})
+  assert.ok(carried(await step('PostToolUse')).endsWith(notice), 'after the restart')
+
+  // Its turn ends with a change still unread: the mod gets it at once, as before (the Stop hands nothing over while the mod is alive)
+  await hq.modEvent(eng.id, { kind: 'batch_submitted', id: fyi.id }); await hq.hook(eng.id, { hook_event_name: 'UserPromptSubmit', prompt: `HQ message batch ${fyi.id}:` })
+  await change('A search box that finds everything.')
+  await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'Done for now.' })
+  const after = await waitFor('the mod to get it', async () => (await hq.modNext(eng.id)).batch); assert.match(after.text, /\[spec_change\] from HQ/)
+  assert.equal((await notices()).length, 6)
+  const lines = (await hq.api(`agents/${eng.id}/events`)).json
+  assert.equal(JSON.stringify(lines).match(/Got a message while it worked, with its last step: HQ: the TPM updated/g)?.length, 5, 'its Events say when it read each')
+  } finally { await hq.api('settings', { key: 'replan_on_change', value: 'on' }) }
 })
 
 test('Bug 102: a spec change while a ticket has no engineer waits for the next one, and the TPM hears so', async () => {

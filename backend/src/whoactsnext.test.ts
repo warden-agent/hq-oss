@@ -43,6 +43,8 @@ const MODES: { name: string; repo: Record<string, unknown>; parked?: string; who
   { name: 'auto', repo: { auto_mode: 1 }, who: 'hq', plan: 'hq' },
   { name: 'auto stopped', repo: { auto_mode: 1, auto_stopped_why: "main's own tests fail." }, who: 'user', plan: 'hq' },
   { name: 'a parked ticket', repo: { auto_mode: 1 }, parked: 'Its tests still fail on main after 2 fixes.', who: 'user', plan: 'hq' },
+  // Bug 364: auto mode turned off after it parked a ticket: the park stays (it says why), but auto mode takes nothing back, so no Try again
+  { name: 'a parked ticket, auto off', repo: { auto_mode: 0 }, parked: 'Its tests still fail on main after 2 fixes.', who: 'user', plan: 'user' },
   { name: 'clearing on auto', repo: { auto_mode: 1, clearing_at: 5 }, who: 'nobody', plan: 'nobody' },
   { name: 'clearing in manual mode', repo: { auto_mode: 0, clearing_at: 5 }, who: 'nobody', plan: 'nobody' },
 ]
@@ -113,7 +115,7 @@ test('board: each box\'s words and buttons name whoever moves it on next, in eve
     // a parked ticket's first line is why auto mode parked it: the user's to try again. One with an engineer at work (a plan here: only the user starts one
     // on a parked ticket) says what goes on, as any box: its plan is still HQ's to check (no Approve), and the park comes under it (Bug 336)
     if (!k.noWords) want(boardNames(first), [who], `${at}: "${first}"`)
-    if (m.parked) want(boardNames(first), [k.plan ? 'hq' : 'user'], `${at}: "${first}"`)
+    if (m.parked) want(boardNames(first), [k.plan ? m.plan : 'user'], `${at}: "${first}"`)
     if (m.parked && k.plan) want(v.lines[1]?.text, `parked by auto mode: ${m.parked}`, `${at}: the park under it`)
     want(userActs(v.acts).length > 0, who === 'user', `${at}: buttons for the user ${JSON.stringify(userActs(v.acts))}`)
   } })
@@ -126,7 +128,7 @@ test('Bug 335: during a Clear the pill follows the box (no "ready to merge"), an
     const pill = ticketLabel(v.t, v.hqPlan, v.clearing) // as Nodes.tsx shows it; the Ticket tab (App.tsx) passes the same clearing (needs.ts clearingPlan)
     want(/ready to/.test(pill), !clearing(m) && /ready to/.test(ticketLabel(v.t)), `${at}: pill "${pill}"`)
     if (clearing(m) && k.t.status === 'pr_ready' && !k.noWords) want(pill, 'not merged', `${at}: pill`)
-    want(v.acts.some((a: any) => a.kind === 'auto-retry'), !!m.parked && !clearing(m), `${at}: Try again`)
+    want(v.acts.some((a: any) => a.kind === 'auto-retry'), !!m.parked && !clearing(m) && !!m.repo.auto_mode, `${at}: Try again`) // not with auto off (Bug 364)
     want(v.acts.some((a: any) => a.kind === 'try'), /^pr_/.test(String(k.t.status)) && !k.noWords && !clearing(m), `${at}: Try it`) // the preview is refused too
   } })
 })
@@ -152,11 +154,11 @@ test('the TPM\'s start-up board names who moves each ticket on, and the mode lin
       want(agentNames(words), [k.plan ? m.plan : m.who], `${m.name}, ${k.name}: "${line}"`)
     }
     const mode = text.match(/Auto mode is (on|off) for this project[^\n]*/)![0]
-    if (m.who === 'hq' || m.parked) want(/the user starts|the user merges|meanwhile the user/.test(mode), false, `${m.name}: "${mode}"`)
+    if (m.who === 'hq' || (m.parked && m.repo.auto_mode)) want(/the user starts|the user merges|meanwhile the user/.test(mode), false, `${m.name}: "${mode}"`)
     if (!m.repo.auto_mode) want(/HQ starts|HQ merges/.test(mode), false, `${m.name}: "${mode}"`)
     if (m.repo.auto_stopped_why) want(/until the user presses Resume, and meanwhile the user starts and merges tickets from HQ/.test(mode), true, `${m.name}: "${mode}"`)
     const local = brief(true).match(/HQ can't push to garden[^\n]*/)![0] // a GitHub project worked on locally: who merges into the local main
-    want(agentNames(local), [m.parked ? 'hq' : m.who], `${m.name}: "${local}"`) // the project's line: a parked ticket is the one exception
+    want(agentNames(local), [m.parked && m.repo.auto_mode ? 'hq' : m.who], `${m.name}: "${local}"`) // the project's line: a parked ticket on auto is the one exception
   } })
 })
 
@@ -166,7 +168,8 @@ test('HQ\'s notices on a finished ticket (open_pr) and on its PR name who merges
   allOf((want) => { for (const m of MODES.filter((x) => !clearing(x))) {
     const t = ticketOf(m, KINDS[2]!)
     for (const pushed of [false, true]) for (const why of ['', 'tests', 'changed', 'fixed']) {
-      const w = finishWords(repoOf(m), t, { base: 'main', pushed, tests: why === 'tests', changed: why === 'changed', fixed: why === 'fixed' || why === 'tests', fixedWhat: 'its tests' })
+      const w = finishWords(repoOf(m), t, { base: 'main', pushed, tests: why === 'tests', changed: why === 'changed', fixed: why === 'fixed' || why === 'tests',
+        ...(why === 'tests' ? { again: { back: 'its tests failed with it merged into main: ✖ adds two', did: 'Since then its engineer changed 1 file: add.js.' } } : {}) })
       const at = `${m.name}, ${pushed ? 'pushed' : 'local'}, ${why || 'first finish'}`
       want(agentNames(w.tpm), [m.who], `${at}: to the TPM "${w.tpm}"`); want(agentNames(w.reply), [m.who], `${at}: to the engineer "${w.reply}"`)
       want(w.notice !== null, why === 'fixed' && m.who === 'user', `${at}: "Ready to merge again" is for the user's merge only`)

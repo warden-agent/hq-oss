@@ -5,10 +5,11 @@ import { names } from './localmerge.ts'
 import { git } from './reposync.ts'
 import { DEFAULTS } from './config.ts'
 import { getSetting, now, one, q, run } from './db.ts'
-import { failReport, type Failed } from './testrun.ts'
+import { failedLine, failReport, type Failed } from './testrun.ts'
 import { j } from './util.ts'
 import { getTicket, setTicket, usesGithub, type Fixing, type Repo, type Ticket } from './records.ts'
 import { criteriaOf } from './criteria.ts'
+import { unseenWords } from './hqcheckrules.ts'
 
 /** What a ticket's branch merges into: `main` for a local (or local-only) repo; `origin/main` for a GitHub one (HQ fetches it; engineers can't). */
 export function mergeBase(repo: Repo): { name: string; ref: string } {
@@ -54,14 +55,20 @@ export const conflictFiles = (t: Ticket): string[] => j<string[]>(t.conflict_fil
 export function fixWords(fixing: Fixing, base: string): { to: string; ing: string } {
   return fixing === 'tests_hung' ? { to: `find what never finishes in its tests on ${base}`, ing: `finding what never finishes in its tests on ${base}` }
     : fixing === 'tests' ? { to: `fix its tests on ${base}`, ing: `fixing its tests on ${base}` }
+    // Bug 373: no test failed, so nothing says "fix its tests": the TPM read that as "its tests didn't pass" and told the user so
+    : fixing === 'tests_unseen' ? { to: `get the tests named for its criteria seen running on ${base} (no test failed)`,
+      ing: `getting the tests named for its criteria seen running on ${base} (no test failed)` }
     : fixing === 'look' ? { to: `fix what went wrong when HQ opened the app with it on ${base}`, ing: `fixing what went wrong when HQ opened the app with it on ${base}` }
     : fixing === 'review' ? { to: 'fix what a fresh reader of its changes found', ing: 'fixing what a fresh reader of its changes found' }
     : fixing === 'changes' ? { to: 'build the change to its spec', ing: 'building the change to its spec' }
     : { to: `merge ${base} in and fix its conflicts`, ing: `fixing its conflicts with ${base}` }
 }
-/** It went back for what auto mode's check of it on main showed: its tests (failed, or never finished), HQ's look at the app, or a reader of its changes. Not
- *  its conflicts or a changed spec. What the check showed is kept with the ticket, and whoever takes it up again gets it (keepTestsFailed). */
-export const forTests = (fixing: Fixing): boolean => fixing === 'tests' || fixing === 'tests_hung' || fixing === 'look' || fixing === 'review'
+/** It went back for what auto mode's check of it on main showed: its tests (failed, never finished, or passed without the ones named for its criteria being
+ *  seen), HQ's look at the app, or a reader of its changes. Not its conflicts or a changed spec. What the check showed is kept with the ticket, and whoever
+ *  takes it up again gets it (keepTestsFailed). */
+export const forTests = (fixing: Fixing): boolean => fixing === 'tests' || fixing === 'tests_hung' || fixing === 'tests_unseen' || fixing === 'look' || fixing === 'review'
+/** What a send-back for HQ's check is `resolving` for (tickets.fixing), from what the check showed. */
+export const fixingFor = (failed: Failed): Fixing => failed.review ? 'review' : failed.look ? 'look' : failed.hung ? 'tests_hung' : failed.unproven ? 'tests_unseen' : 'tests'
 /** The ⚠ notice for a sent-back ticket whose engineer stopped: its kind picks the button that starts another (Fix conflicts, Fix tests, Fix the app, Build the
  *  change). */
 export const stalledKind = (fixing: Fixing): string => fixing === 'changes' ? 'change_stalled' : fixing === 'look' ? 'look_stalled' : fixing === 'review' ? 'review_stalled'
@@ -71,20 +78,47 @@ export const fixButton = (fixing: Fixing): string => fixing === 'changes' ? 'Bui
   : forTests(fixing) ? 'Fix tests' : 'Fix conflicts'
 /** Someone is on the ticket's tests, its app or its change again (or it's finished): the "its engineer stopped" notices for those go. */
 export function clearStalled(ticketId: string): void { for (const k of ['fix_stalled', 'look_stalled', 'review_stalled', 'change_stalled']) resolveKindForTicket(k, ticketId) }
-/** What auto mode's failed test of a ticket printed, kept with the ticket so an engineer that takes over gets it too (Bug 84). */
+const handoffOf = (ticketId: string): string => one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'handoff'", `ticket:${ticketId}`)?.text ?? ''
+type Kept = Partial<Failed> & { noted?: number }
+const keptFor = (ticketId: string): Kept | null =>
+  j<Kept | null>(one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'tests_failed'", `ticket:${ticketId}`)?.text ?? null, null)
+/** What auto mode's failed test of a ticket printed, kept with the ticket so an engineer that takes over gets it too (Bug 84). `noted` (Bug 373): how long
+ *  the engineer's handoff log was as the ticket went back, so what it writes while fixing can be told from what it wrote before (notedSince). */
 export function keepTestsFailed(t: Ticket, failed: Failed): void {
   run('INSERT INTO docs(scope, key, text, updated_at) VALUES (?,?,?,?) ON CONFLICT(scope, key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at',
     `ticket:${t.id}`, 'tests_failed',
     JSON.stringify({ test: failed.test, output: failed.output, earlier: failed.earlier, hung: !!failed.hung, unproven: !!failed.unproven, look: !!failed.look, review: !!failed.review,
-      asked: !!failed.asked, tester: !!failed.tester }), now())
+      asked: !!failed.asked, tester: !!failed.tester, ...(failed.missing ? { missing: failed.missing } : {}), noted: handoffOf(t.id).length }), now())
 }
+const NO_OUTPUT = "(HQ doesn't have what they printed any more: run them to see.)"
 /** That kept failure; `test` (the project's command) and a note stand in for it if it's gone. */
 export function testsFailed(t: Ticket, test: string | null): Failed {
-  const kept = j<Partial<Failed> | null>(one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'tests_failed'", `ticket:${t.id}`)?.text ?? null, null)
-  return { kind: 'fail', test: kept?.test ?? test ?? 'the tests', output: kept?.output ?? "(HQ doesn't have what they printed any more: run them to see.)",
-    earlier: kept?.earlier ?? '', hung: kept?.hung ?? t.fixing === 'tests_hung', ...(kept?.unproven ? { unproven: true } : {}), ...(kept?.look ?? t.fixing === 'look' ? { look: true } : {}),
+  const kept = keptFor(t.id)
+  return { kind: 'fail', test: kept?.test ?? test ?? 'the tests', output: kept?.output ?? NO_OUTPUT,
+    earlier: kept?.earlier ?? '', hung: kept?.hung ?? t.fixing === 'tests_hung', ...(kept?.unproven ?? t.fixing === 'tests_unseen' ? { unproven: true } : {}),
+    ...(kept?.missing ? { missing: kept.missing } : {}), ...(kept?.look ?? t.fixing === 'look' ? { look: true } : {}),
     ...(kept?.review ?? t.fixing === 'review' ? { review: true } : {}), ...(kept?.asked ? { asked: true } : {}), ...(kept?.tester ? { tester: true } : {}) }
 }
+/** Bug 373: what the ticket's engineer wrote in its handoff log since the ticket went back to it (update_handoff's entries without their date lines, oldest
+ *  first, one a line), '' when it wrote nothing. Its fix instructions ask for "what was wrong" there, and that used to be read by nobody: what it found stayed
+ *  in its terminal. A ticket sent back before HQ kept the log's length has '' too: HQ can't tell old entries from new. */
+export function notedSince(ticketId: string): string {
+  const from = keptFor(ticketId)?.noted; if (typeof from !== 'number') return ''
+  return handoffOf(ticketId).slice(from).split(/^### \d{4}-\d\d-\d\d \d\d:\d\d — \w+$/m).map((e) => e.trim().replace(/\s*\n\s*/g, ' ')).filter(Boolean).join('\n')
+}
+/** Bug 373: why a finished ticket went back to its engineer, in HQ's own words: one clause that reads after "because". For the TPM, which tells the user: from
+ *  "to fix its tests" alone it guessed "its tests didn't pass" when they had passed. Only what HQ saw: tests it didn't see by name "weren't seen running". */
+export function backWords(r: Failed, base: string): string {
+  const line = r.output === NO_OUTPUT ? '' : failedLine(`${r.earlier}\n${r.output}`)
+  return r.review ? 'a fresh reader of its changes found problems'
+    : r.tester ? `HQ's UI tester found problems when it used the app in a browser with it merged into ${base}`
+    : r.look ? `the app had problems when HQ opened it with it merged into ${base}`
+    : r.unproven ? `its tests passed with it merged into ${base} and none failed, but ${unseenWords(r.missing ?? 0)}`
+    : r.hung ? `its tests never finished with it merged into ${base}: HQ stopped \`${r.test}\` after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes`
+    : `its tests failed with it merged into ${base}${line ? `: ${line}` : ''}`
+}
+/** Who sent it back, as a sentence: the user, after having HQ test it (hqcheck.ts), or auto mode's test before a merge. */
+export const backBy = (r: Failed): string => r.asked ? 'The user had HQ test it and sent it back.' : 'HQ tested it before merging, and sent it back instead of merging it.'
 
 /** How the step that calls open_pr again ends. A ticket with acceptance criteria named a test for each when it finished: open_pr takes those again when
  *  `tests` is left out, and checks them afresh. A ticket with none hears nothing about tests it was never asked for. */

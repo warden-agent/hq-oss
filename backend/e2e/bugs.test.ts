@@ -104,7 +104,7 @@ test('Bug 6: Merge into main for a local repo: refuses with the reason and chang
   assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200)
   await waitFor('the preview', async () => (await hq.state()).previews.find((p: any) => p.id === repo.id && p.status === 'running'), 20_000)
   const t1 = await ticket(f, 'Api'), t2 = await ticket(f, 'Page', ['T-01'])
-  fs.writeFileSync(path.join(dir, 'node_modules', 'marker.js'), 'installed\n')
+  fs.writeFileSync(path.join(dir, 'node_modules', 'marker.js'), 'installed\n'); fs.writeFileSync(path.join(dir, 'node_modules', '.package-lock.json'), '{}') // a finished npm install (Bug 393)
   await launch(t1); const e1 = await liveEngineer(t1)
   // Bug 30: the worktree starts with main's installed packages, and they never count as changes
   assert.equal(fs.readFileSync(path.join(wtOf(dir, t1), 'node_modules', 'marker.js'), 'utf8'), 'installed\n')

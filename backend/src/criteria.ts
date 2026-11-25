@@ -4,12 +4,15 @@
 // Pure: no DB, no git, no files. The page imports it too, so the board and the backend say the same words. What a criterion may not say (a file, code, words
 // too vague to check) is criteriawords.ts.
 import { wordingProblems } from './criteriawords.ts'
+import { shownLine } from './testcounts.ts'
 
 export type Criterion = { id: string; kind: 'ui' | 'backend'; text: string }
 /** What open_pr gives for one criterion: the test that proves it (its file, and its name as written there), or why nothing can test it. */
 export type ProofEntry = { criterion: string; file?: string; name?: string; cant_test?: string }
-/** How HQ's own test run answered for one named test. `passed`: the run printed it (or its file) as passing. `skipped`: printed as skipped. `not_run`: the run
- *  printed other tests by name and never this one. `unconfirmed`: the run passed and prints no test names (`pytest -q`, `go test`), so HQ can't tell by name. */
+/** How HQ's own test run answered for one named test. `passed`: the run printed it (or its file, with no test in it skipped) as passing. `skipped`: printed
+ *  as skipped. `not_run`: the run listed the tests it ran by name, and never this one. `unconfirmed`: the run passed and doesn't list every test by name
+ *  (`pytest -q`, `go test`, vitest's and jest's one line per test file), or its file passed with a test in it skipped (Bug 375), so HQ can't tell by name.
+ *  Never a reason to send a ticket back. */
 export type Confirmed = 'passed' | 'skipped' | 'not_run' | 'unconfirmed'
 /** What git shows about a finished ticket's changes, for the user to look at: test files it deleted, existing tests it took lines out of, and files it changed
  *  that the TPM didn't expect it to touch. Listed, never refused: each can be right. */
@@ -118,7 +121,7 @@ const TEST_DIR = /(^|\/)(tests?|__tests__|specs?|e2e)\//i, TEST_NAME = /[._-](te
 export const isTestFile = (p: string): boolean => TEST_DIR.test(p) || TEST_NAME.test(p) || TEST_PREFIX.test(p)
 /** A lockfile changes whenever its manifest does: not a file outside the plan when the manifest was expected. */
 const LOCK_OF: Record<string, string> = { 'package-lock.json': 'package.json', 'yarn.lock': 'package.json', 'pnpm-lock.yaml': 'package.json', 'uv.lock': 'pyproject.toml',
-  'poetry.lock': 'pyproject.toml', 'Cargo.lock': 'Cargo.toml', 'go.sum': 'go.mod' }
+  'bun.lock': 'package.json', 'bun.lockb': 'package.json', 'poetry.lock': 'pyproject.toml', 'Cargo.lock': 'Cargo.toml', 'go.sum': 'go.mod' }
 const glob = (pattern: string): RegExp => new RegExp(`^${pattern.split('**').map((part) => part.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')).join('.*')}$`)
 /** Does an entry of the TPM's expected_files cover this path? The path itself, a folder it's in, or a pattern with * (not across folders) or **. */
 export function covers(expected: string, file: string): boolean {
@@ -141,42 +144,93 @@ export const flagged = (f: Flags): boolean => f.tests_deleted.length + f.tests_c
 
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 // A line that says a test (or a test file) passed, as the runners print it. Captured through HQ's own sandbox, 2026-11-16: node --test (✔ name (1ms)),
-// cargo (test path::name ... ok), go test -v (--- PASS: Name), pytest -rA / -v (PASSED file::name, file::name PASSED); and by their docs: jest and vitest
-// (✓ name, PASS file), mocha (✓ name), TAP (ok 1 - name). `pytest -q` and plain `go test` print none of these: HQ can't confirm a name there, and says so.
+// cargo (test path::name ... ok), go test -v (--- PASS: Name), pytest -rA / -v (PASSED file::name, file::name PASSED); 2026-11-23 (Bug 372): vitest 1.6, 2.1,
+// 3.2 and 4.1 (✓ file (8 tests) 5ms, ✓ name 452ms), jest 30 (PASS file, ✓ name (1 ms)), mocha 11 (✔ name); by its docs: TAP (ok 1 - name). `pytest -q`
+// and plain `go test` print none of these: HQ can't confirm a name there, and says so.
 const PASS_LINE = [/^\s*[✔✓√]\s/, /^\s*--- PASS: /, /^test .+ \.\.\. ok$/, /^\s*PASS(ED)?\s/, /\sPASSED(\s|$)/, /^\s*ok \d+ /]
-const SKIP_LINE = [/# (SKIP|TODO)\b/i, /^\s*[﹣↓○]\s/, /^\s*--- SKIP: /, /^test .+ \.\.\. ignored/, /^\s*SKIPPED\s/, /\sSKIPPED(\s|$)/]
-/** A file-level line only (jest's `PASS test/a.test.js`): it proves that file ran, and says nothing about whether the runner prints test names. */
-const FILE_ONLY = /^\s*PASS\s/
-export type Watched = { prints: boolean; passed: string[]; skipped: string[] }
+const SKIP_LINE = [/# (SKIP|TODO)\b/i, /^\s*[﹣↓○]\s/, /^\s*--- SKIP: /, /^test .+ \.\.\. ignored/, /^\s*SKIPPED\s/, /\sSKIPPED(\s|$)/,
+  /^ {2,}- \S/] // mocha's pending test (`it.skip`): `  - name`, indented two more for each suite it's in (mocha 11.8 spec and list reporters; Bug 377)
+// A line for a whole test file, not for one test. It proves that file ran and names no test, so it's never a sign that the runner lists tests by name
+// (Bug 372: vitest's were read as that, and every named test "never ran"). Jest's `PASS test/a.test.js`; vitest's `✓ src/a.test.ts (8 tests | 1 skipped) 5ms`,
+// which also says how many tests the file has: vitest's usual output names only the slow ones under it, its `tree` reporter every one. Bug 375: such a line
+// proves only that the file's tests that ran passed. Vitest's says when some were skipped (`| 1 skipped`, `| 1 todo`); jest's says nothing, and only its
+// summary does, for the whole run (`Tests:       1 skipped, 1 todo, 2 passed, 4 total`).
+const JEST_FILE = /^\s*PASS\s/, VITEST_FILE = /\s\((\d+) tests?( \| [^)]*)?\)/, JEST_SKIPS = /^\s*Tests:\s.*\b[1-9]\d* (skipped|todo)\b/
+const PATH_CHAR = /[\p{L}\p{N}_.@~/\\-]/u, PATH_GOES_ON = /^(?:[\p{L}\p{N}_/\\-]|\.[\p{L}\p{N}])/u
+/** Does this line name the test file `file` (its path from the repo's root)? Whole, or as a runner started in a folder prints it: the end of that path
+ *  (`src/a.test.ts` for `frontend/src/a.test.ts`, perhaps after `./` or `../`). The printed path must begin and end where that end does, so `b/a.test.ts`
+ *  and `a.test.tsx` are other files. `folders` (Bug 376): the folders the test command starts its runners in, when HQ knows them (testFolders): then a
+ *  line counts only for a file inside one of them, and an end of its path only from that folder down: `src/a.test.ts` from a run in web/ isn't admin/'s. */
+export function namesFile(s: string, file: string, folders: string[] | null = null): boolean {
+  const tails = (p: string): string[] => p ? [p, ...(p.includes('/') ? tails(p.slice(p.indexOf('/') + 1)) : [])] : []
+  const inside = !folders ? '' : folders.find((d) => file.startsWith(`${d}/`))
+  for (const tail of inside === undefined ? [] : inside ? [file, ...tails(file.slice(inside.length + 1))] : tails(file)) {
+    for (let i = s.indexOf(tail); i >= 0; i = s.indexOf(tail, i + 1)) {
+      const before = s.slice(0, i).replace(/(?:\.{1,2}\/)+$/, '').at(-1) ?? ' ' // a longer printed path (an absolute one) only counts for the whole of `file`
+      if ((!PATH_CHAR.test(before) || (tail === file && before === '/')) && !PATH_GOES_ON.test(s.slice(i + tail.length, i + tail.length + 2))) return true
+    }
+  }
+  return false
+}
+/** What to look for in a run's output: the names of a map's tests, and the files they are in. */
+export type Watch = { names: string[]; files: string[] }
+/** `unsure`: files a line showed with a skipped test in them, so their passing says nothing about a named test that isn't printed by name (Bug 375). */
+export type Watched = { prints: boolean; passed: string[]; skipped: string[]; unsure: string[] }
 /** Watches a test run's output as it streams in for the tests a ticket's map names: which names (and which files) showed up on a line that says "passed", and
- *  which names on a line that says "skipped". `prints`: the runner printed at least one passing test by name, so a name that never showed up wasn't run. */
-export function nameWatch(wanted: string[]): { take: (chunk: string) => void; seen: () => Watched } {
-  const want = [...new Set(wanted.filter(Boolean))], passed = new Set<string>(), skipped = new Set<string>(); let rest = '', prints = false
+ *  which names on a line that says "skipped". `prints`: the runner listed the tests it ran by name, so a name that never showed up wasn't run. One passing
+ *  test printed by name shows that, unless the runner's own file lines counted more tests than it named (vitest naming just its slow ones). A file that a
+ *  skip line names, whose vitest line counts skipped tests, or whose jest PASS line is in a run with skipped tests, is `unsure`, never passed.
+ *  `folders`: where the test command starts its runners, when HQ knows (namesFile). */
+export function nameWatch(wanted: Watch, folders: string[] | null = null): { take: (chunk: string) => void; seen: () => Watched } {
+  const uniq = (xs: string[]) => [...new Set(xs.filter(Boolean))], names = uniq(wanted.names), files = uniq(wanted.files)
+  const passed = new Set<string>(), skipped = new Set<string>(); let rest = '', named = 0, skips = 0, counted = 0
+  const filesOk = new Set<string>(), byJest = new Set<string>(), unsure = new Set<string>(); let jestSkips = false
   const line = (raw: string) => {
-    const s = raw.replace(ANSI, '').trimEnd(); if (!s || s.length > 2000) return
+    const s = shownLine(raw).replace(ANSI, '').trimEnd(); if (!s || s.length > 2000) return
+    if (JEST_SKIPS.test(s)) { jestSkips = true; return }
     const skip = SKIP_LINE.some((re) => re.test(s)), pass = !skip && PASS_LINE.some((re) => re.test(s)); if (!skip && !pass) return
-    if (pass && !FILE_ONLY.test(s)) prints = true
-    for (const w of want) if (s.includes(w)) (skip ? skipped : passed).add(w)
+    const perFile = pass ? VITEST_FILE.exec(s) : null, jest = pass && !perFile && JEST_FILE.test(s)
+    if (skip) skips++; else if (perFile) counted += Number(perFile[1]); else if (!jest) named++
+    for (const w of names) if (s.includes(w)) (skip ? skipped : passed).add(w)
+    for (const f of files) if (namesFile(s, f, folders)) (skip || perFile?.[2] ? unsure : jest ? byJest : filesOk).add(f)
   }
   return {
     take: (chunk) => { const parts = (rest + chunk).split('\n'); rest = parts.pop() ?? ''; parts.forEach(line); if (rest.length > 4000) rest = '' },
-    seen: () => { if (rest) { line(rest); rest = '' } return { prints, passed: [...passed], skipped: [...skipped].filter((w) => !passed.has(w)) } },
+    seen: () => { if (rest) { line(rest); rest = '' }
+      if (jestSkips) byJest.forEach((f) => unsure.add(f))
+      const ok = [...filesOk, ...byJest].filter((f) => !unsure.has(f))
+      return { prints: named > 0 && named + skips >= counted, passed: [...new Set([...passed, ...ok])], skipped: [...skipped].filter((w) => !passed.has(w)),
+        unsure: [...unsure] } },
   }
 }
 /** Every name and file a map's tests name: what nameWatch looks for. */
-export const watchFor = (tests: ProofEntry[]): string[] => tests.flatMap((e) => e.cant_test ? [] : [e.name ?? '', e.file ?? ''])
+export function watchFor(tests: ProofEntry[]): Watch {
+  const named = tests.filter((e) => !e.cant_test)
+  return { names: named.map((e) => e.name ?? ''), files: named.map((e) => e.file ?? '') }
+}
 /** How HQ's run answered for one entry of the map; undefined for a criterion that can't be tested. A name seen skipped (and never passing) is skipped even
- *  when its file passed as a whole. */
+ *  when its file passed as a whole. One not printed, in a file shown with skipped tests, is unconfirmed: it may be one of those (Bug 375). */
 export function confirm(e: ProofEntry, w: Watched): Confirmed | undefined {
   if (e.cant_test || !e.name) return undefined
   if (w.skipped.includes(e.name)) return 'skipped'
   if (w.passed.includes(e.name) || (!!e.file && w.passed.includes(e.file))) return 'passed'
+  if (e.file && w.unsure.includes(e.file)) return 'unconfirmed'
   return w.prints ? 'not_run' : 'unconfirmed'
 }
 /** The entries HQ's passing run didn't prove: skipped, or never run. One line each, for the engineer the ticket goes back to. */
 export function unproven(tests: Proof['tests'], cmd: string): string[] {
   return tests.flatMap((e) => e.state === 'skipped' ? [`${e.criterion}: "${e.name}" in ${e.file} was skipped, so nothing proved ${e.criterion}. Make it run, or name a test that does.`]
     : e.state === 'not_run' ? [`${e.criterion}: "${e.name}" in ${e.file} never ran. \`${cmd}\` listed other tests and not this one: put it where that command runs it.`] : [])
+}
+
+/** The check's words for named tests that are no reason to send the ticket back: every one ran, or the run passed and HQ couldn't see some by name
+ *  (Bug 372: that read "Every test … ran" too, which nobody had seen). */
+export function ranWords(tests: Proof['tests']): string {
+  const named = tests.filter((e) => !e.cant_test), unseen = named.filter((e) => e.state === 'unconfirmed').length, none = tests.length - named.length
+  const noTest = none ? ` (${none} of them ${none === 1 ? 'has' : 'have'} no test)` : ''
+  const which = unseen < named.length ? `${unseen} of the ${named.length} tests` : unseen === 1 ? 'the test' : 'the tests'
+  return unseen ? `The tests passed, but HQ couldn't see ${which} named for its criteria by name${noTest}.`
+    : `Every test named for its criteria ran${noTest}.`
 }
 
 const list = (xs: string[], max = 4): string => xs.length > max ? `${xs.slice(0, max).join(', ')} and ${xs.length - max} more` : xs.join(', ')
@@ -187,7 +241,7 @@ export function lookLines(p: Proof | null): string[] {
   const cant = p.tests.filter((e) => e.cant_test), unseen = p.tests.filter((e) => e.state === 'unconfirmed').map((e) => e.criterion)
   return [
     ...cant.map((e) => `${e.criterion} has no test: ${e.cant_test}`),
-    unseen.length ? `tests passed, but HQ couldn't see ${list([...new Set(unseen)])}'s by name: the test command doesn't print test names` : '',
+    unseen.length ? `tests passed, but HQ couldn't see ${list([...new Set(unseen)])}'s by name: the test command doesn't print every test's name` : '',
     ...flagLines(p.flags),
   ].filter(Boolean)
 }
@@ -207,6 +261,6 @@ export function proofWords(e: (ProofEntry & { state?: Confirmed }) | undefined):
   return e.state === 'passed' ? { text: `${where} · passed in HQ's test run`, tone: 'ok' }
     : e.state === 'skipped' ? { text: `${where} · skipped in HQ's test run`, tone: 'look' }
     : e.state === 'not_run' ? { text: `${where} · HQ's test command didn't run it`, tone: 'look' }
-    : e.state === 'unconfirmed' ? { text: `${where} · in a passing run; the test command prints no names, so HQ couldn't confirm it`, tone: 'look' }
+    : e.state === 'unconfirmed' ? { text: `${where} · in a passing run; the test command doesn't print every test's name, so HQ couldn't confirm it`, tone: 'look' }
     : { text: `${where} · HQ hasn't tested it yet`, tone: 'none' }
 }

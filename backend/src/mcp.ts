@@ -15,7 +15,7 @@ import { addFeature, changeFinished, createTicket, finishedAndStopped, hqOpened,
 import { featureDone, writeFeatureMd, writeProjectMd } from './projectmd.ts'
 import { proposeTestCommand } from './auto.ts'
 import { LEFT_OUT_ASK, leftOutSection } from './leftout.ts'
-import { autoOn, closedWhy, features, featureByHandle, tickets, getFeature, getRepo, repoOfAgent, setTicket, ticketForAgent, ticketInRepo, type Feature } from './records.ts'
+import { autoOn, closedWhy, features, featureByHandle, tickets, getFeature, getRepo, repoOfAgent, setTicket, ticketForAgent, ticketInRepo, type Feature, type Ticket } from './records.ts'
 import { finishTicket } from './mergewatch.ts'
 import { id, j, readJson, TooLarge } from './util.ts'
 import { noteProblem, saveNote } from './notes.ts'
@@ -30,6 +30,8 @@ import { readChange } from './featuremap.ts'
 import { mapForEngineer, recordChange } from './mapstore.ts'
 import { findingTools } from './findings.ts'
 import { suiteProblem } from './suiteran.ts'
+import { changeAsksReplan, replanAsk, replanDue, replanRefusal } from './replan.ts'
+import { planWords } from './planwords.ts'
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean }
 const text = (s: string): ToolResult => ({ content: [{ type: 'text', text: s }] })
@@ -104,12 +106,14 @@ function registerTools(s: McpServer, agent: Agent): void {
       const o = open(); return o.length === 1 ? o[0]! : o.length ? `Say which feature (${o.map((f) => f.handle).join(', ')}).` : 'There is no open feature: start_feature first.'
     }
     const changed = (f: Feature) => writeFeatureMd(getFeature(f.id)!)
+    const plansOf = (t: Ticket) => { const p = planWords(t, repoId); return p ? { plans: p } : {} } // Bug 387: the user answers them on the board
     s.registerTool('list_tickets', { description: 'The project\'s features (by handle, F-1…) and their tickets.', inputSchema: {} }, async () => {
       logCall('list_tickets', {})
       const all = features().filter((f) => f.repo_id === repoId && f.status !== 'cancelled').reverse().map((f) => ({ feature: f.handle, title: f.title,
         done: featureDone(f.id), merge_order: j(f.merge_order, []), tickets: tickets(f.id).filter((t) => t.status !== 'cancelled').map((t) => ({ key: t.key, title: t.title, size: t.size,
           status: t.status, ...(t.status === 'queued' && t.go_ahead ? { go_ahead: GO_AHEAD } : {}), // Bug 127: started (by the user, or auto); not "ready to start" any more
-          assignee: t.assignee_agent_id, expected_files: j(t.expected_files, []), depends_on: j(t.deps, []), branch: t.branch, pr: t.pr_url })) }))
+          assignee: t.assignee_agent_id, expected_files: j(t.expected_files, []), depends_on: j(t.deps, []), branch: t.branch, pr: t.pr_url,
+          ...plansOf(t) })) }))
       return text(JSON.stringify(all, null, 1))
     })
     s.registerTool('start_feature', {
@@ -180,16 +184,21 @@ function registerTools(s: McpServer, agent: Agent): void {
       }
       const what = [spec && 'spec', criteria && 'acceptance criteria', title && `title (now "${title}")`].filter(Boolean).join(' and ')
       if (!what) return text(`${t.key} already says that: nothing changed.`) // the spec, title or criteria it has, given again: nobody is told
-      setTicket(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}) })
+      // Bug 371: with auto off, a change to what a planned ticket builds goes back to a plan the user approves (a new title alone doesn't)
+      const replan = !!(spec || criteria) && changeAsksReplan(t, repoId)
+      setTicket(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}), ...(replan ? { replan_after: t.plan_round } : {}) })
+      if (replan) emit({ agentId: null, source: 'mcp', kind: 'ticket.replan_asked', payload: { ticket: t.id, key: t.key, after_round: t.plan_round } })
       if (done) return text(ok) // a finished ticket's engineer has nothing to do with a new title (and has usually stopped)
       // Bug 102: the engineer on the ticket now hears it. One that has gone never would: its notice waits, and the next engineer on the
       // ticket gets it when it starts (startEngineer hands over). HQ's notice, not the TPM's message: no DM limits (Bug 86)
       const eng = liveEngineerOf(t), to = eng ?? t.assignee_agent_id, news = [spec && 'spec', criteria && 'acceptance criteria', title && 'title'].filter(Boolean).join(' and ')
-      const body = hq ? `HQ: the TPM added to ${t.key}'s spec, under "From the TPM". HQ's own steps and rules are as they were. Call get_ticket to read it.`
-        : `HQ: the TPM updated ${t.key}'s ${what}. Call get_ticket to read it.`
-      if (to) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to, reason: 'fyi', body })
-      if (eng) return text(ok)
-      return text(to ? `${ok} ${t.key}'s engineer (${to}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.`
+      const body = (hq ? `HQ: the TPM added to ${t.key}'s spec, under "From the TPM". HQ's own steps and rules are as they were. Call get_ticket to read it.`
+        : `HQ: the TPM updated ${t.key}'s ${what}. Call get_ticket to read it.`) + (replan ? replanAsk(t.key) : '')
+      // Bug 370: an engineer at work reads it at its next tool step, not once the turn it builds the old version in has ended (delivery.ts MID_TURN_REASONS)
+      if (to) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to, reason: 'spec_change', body })
+      const plan = replan ? ` Auto mode is off, so ${t.key}'s engineer shows the user a new plan for the change before it builds on; they approve it like the first.` : ''
+      if (eng) return text(ok + plan)
+      return text(to ? `${ok} ${t.key}'s engineer (${to}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.${plan}`
         : `${ok} Nobody has started on ${t.key} yet; its engineer gets ${hq ? 'it' : `the new ${news}`} when it starts.`)
     })
     s.registerTool('set_merge_order', {
@@ -289,7 +298,8 @@ function registerTools(s: McpServer, agent: Agent): void {
       const rv = one<{ id: string; round: number; status: string }>("SELECT id, round, status FROM review_requests WHERE ticket_id = ? AND status = 'open'", t.id)
       const hand = one<{ text: string }>('SELECT text FROM docs WHERE scope = ? AND key = ?', `ticket:${t.id}`, 'handoff')
       const last = proofOf(t)?.tests.map((e) => `- ${e.criterion}: ${e.cant_test ? `no test (${e.cant_test})` : `${e.file} · "${e.name}"`}`).join('\n')
-      return text(`# ${t.key} (${t.size}): ${t.title}\nStatus: ${t.status}${rv ? ` (review R-${rv.round} pending)` : ''}\nBranch: ${t.branch}\nExpected files: ${t.expected_files}\n`
+      const owed = replanDue(t, agent.repo_id) ? `\nA new plan is owed:${replanAsk(t.key)}` : '' // Bug 371
+      return text(`# ${t.key} (${t.size}): ${t.title}\nStatus: ${t.status}${rv ? ` (review R-${rv.round} pending)` : ''}${owed}\nBranch: ${t.branch}\nExpected files: ${t.expected_files}\n`
         + `Depends on: ${t.deps}\n\n## Spec\n${t.spec ?? ''}\n${criteriaBlock(criteriaOf(t))}${last ? `\n## The tests you named at your last open_pr\n${last}\n` : ''}`
         + `${mapForEngineer(t, agent.repo_id ?? '')}\n## Handoff so far\n${hand?.text ?? '(none)'}`)
     })
@@ -342,6 +352,7 @@ function registerTools(s: McpServer, agent: Agent): void {
       if (!/## Deviations from approved plan/.test(a.body)) return refused('PR body must contain a "## Deviations from approved plan" section.')
       if (t.repairs_main && !leftOutSection(a.body)) return refused(`This is HQ's repair ticket, so ${LEFT_OUT_ASK.replace('its body', 'the PR body')} Then call open_pr again.`) // Bug 142
       if (!t.handoff_updated_at) return refused('Call update_handoff(kind: before_pr) first.')
+      if (replanDue(t, repoOfAgent(agent))) return refused(replanRefusal(t.key)) // Bug 371: the change of spec waits for a plan the user approves
       const suite = await suiteProblem(t); if (suite) return refused(suite) // Bug 162: with auto off, the project's test command ran since the last edit
       try { return text(await finishTicket(agent, a.title, a.body, a.tests, a.feature_map_unchanged === true)) } catch (e) { return refused((e as Error).message) }
     })

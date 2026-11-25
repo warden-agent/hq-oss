@@ -1,0 +1,52 @@
+[0m[0m
+[32m  [32m✔[39m[0m[90m has due_on[0m
+[0m  book list[0m
+  [32m  [32m✔[39m[0m[90m shows each due date[0m
+  [31m  1) marks a book due soon[0m
+[0m    sorting[0m
+    [31m  2) sorts books by due date[0m
+
+
+[92m [0m[32m 2 passing[0m[90m (4ms)[0m
+[31m  2 failing[0m
+
+[0m  1) book list
+       marks a book due soon:
+
+      [31mAssertionError [ERR_ASSERTION]: 2 == 3[0m
+      [32m+ expected[0m [31m- actual[0m
+
+      [31m-2[0m
+      [32m+3[0m
+      [0m[90m
+      at Context.<anonymous> (test/books.test.js:4:46)
+      at process.processImmediate (node:internal/timers:504:21)
+[0m
+[0m  2) book list
+       sorting
+         sorts books by due date:
+
+      [31mAssertionError [ERR_ASSERTION]: Expected values to be loosely deep-equal:
+
+[
+  2,
+  1
+]
+
+should loosely deep-equal
+
+[
+  1,
+  2
+][0m
+      [32m+ expected[0m [31m- actual[0m
+
+       [
+      [31m-  2[0m
+         1
+      [32m+  2[0m
+       ]
+      [0m[90m
+      at Context.<anonymous> (test/books.test.js:6:50)
+      at process.processImmediate (node:internal/timers:504:21)
+[0m

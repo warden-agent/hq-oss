@@ -60,44 +60,48 @@ export function onPath(tool: string, PATH: string = process.env.PATH ?? ''): boo
     try { const f = path.join(d, tool); fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile() } catch { return false }
   })
 }
-type NodeTool = 'npm' | 'yarn' | 'pnpm'
+type NodeTool = 'npm' | 'yarn' | 'pnpm' | 'bun'
 /** Bug 343: the package manager a Node project uses: the one its package.json's `packageManager` names (what Corepack follows), else the
- *  one whose lockfile it has (npm's first, as before; then yarn.lock, pnpm-lock.yaml), else npm. `lock`: that tool's lockfile, if there is
+ *  one whose lockfile it has (npm's first, as before; then yarn.lock, pnpm-lock.yaml, bun.lock or bun.lockb: Bug 358), else npm. `lock`: that tool's lockfile, if there is
  *  one; `why`: how HQ can tell, in the user's words; `major`: the version `packageManager` names. */
 export function packageManager(repoPath: string): { tool: NodeTool; lock: string | null; why: string; major: number | null } {
   const lockOf = (t: NodeTool) => LOCKS[t].files.find((f) => fs.existsSync(path.join(repoPath, f))) ?? null
   let named: unknown; try { named = JSON.parse(fs.readFileSync(path.join(repoPath, 'package.json'), 'utf8'))?.packageManager } catch { /* none */ }
-  const m = typeof named === 'string' ? /^(npm|yarn|pnpm)@(\d+)/.exec(named) : null
+  const m = typeof named === 'string' ? /^(npm|yarn|pnpm|bun)@(\d+)/.exec(named) : null
   if (m) {
     const tool = m[1] as NodeTool
     return { tool, lock: lockOf(tool), why: `its package.json names ${String(named).split('+')[0]} as its packageManager`, major: Number(m[2]) }
   }
-  for (const tool of ['npm', 'yarn', 'pnpm'] as const) { const lock = lockOf(tool); if (lock) return { tool, lock, why: `it has a ${lock}`, major: null } }
+  for (const tool of ['npm', 'yarn', 'pnpm', 'bun'] as const) { const lock = lockOf(tool); if (lock) return { tool, lock, why: `it has a ${lock}`, major: null } }
   return { tool: 'npm', lock: null, why: 'it has no lockfile', major: null }
 }
 /** Bug 343: what HQ does about the packages before the user's own ⚙ command: an install by the project's own package manager (npm's as
- *  installStep says; Yarn's and pnpm's follow their lockfile, or write none when there is none, and run again when it changes or what they
+ *  installStep says; Yarn's, pnpm's and Bun's (Bug 358) follow their lockfile, or write none when there is none, and run again when it changes or what they
  *  made is gone, as Claude's steps do), nothing, or `stop`: why HQ can't install them (the tool isn't installed; Yarn 2+ with no yarn.lock
- *  would write one), in words for the user (plain text: the App tab shows it as it is). It never falls back to npm, which ignores yarn.lock and pnpm-lock.yaml. A project whose packages
- *  are installed already (node_modules, .pnp.cjs) runs as it is when HQ can't install them, as before. */
-export function ownInstall(repoPath: string, has: (tool: string) => boolean = onPath): { install?: string; install_when?: string; stop?: string } {
+ *  would write one), in words for the user (plain text: the App tab shows it as it is). It never falls back to npm, which ignores the
+ *  others' lockfiles (and with none, writes a package-lock.json). A project whose packages
+ *  are installed already (node_modules, .pnp.cjs) runs as it is when HQ can't install them, as before. `again`: what the user does once it's
+ *  fixed (HQ's own test runs use the same rule, Bug 392). */
+export function ownInstall(repoPath: string, has: (tool: string) => boolean = onPath, again = 'press Start again'): { install?: string; install_when?: string
+  stop?: string } {
   const pkg = path.join(repoPath, 'package.json'); if (!fs.existsSync(pkg) || !listsPackages(pkg)) return {}
   const pm = packageManager(repoPath)
   if (pm.tool === 'npm') { const install = installStep(repoPath); return install ? { install } : {} }
   const berry = pm.tool === 'yarn' && (pm.major !== null ? pm.major >= 2 : yarnBerry(repoPath))
   const install = pm.tool === 'pnpm' ? `pnpm install ${pm.lock ? '--frozen-lockfile' : '--no-lockfile'}`
+    : pm.tool === 'bun' ? `bun install ${pm.lock ? '--frozen-lockfile' : '--no-save'}` // Bug 358: --no-save writes no bun.lock (bun 1.4.5)
     : pm.lock ? `yarn install ${berry ? '--immutable' : '--frozen-lockfile'}` : berry ? null : 'yarn install --pure-lockfile'
   if (install && has(pm.tool)) return { install, install_when: pm.lock ?? 'package.json' }
   const made = install ? installOutputs(install, repoPath) : ['node_modules', '.pnp.cjs'].filter((f) => fs.existsSync(path.join(repoPath, f)))
   if (made.length && made.every((f) => fs.existsSync(path.resolve(repoPath, f)))) return {}
-  const name = pm.tool === 'yarn' ? 'Yarn' : 'pnpm'
+  const name = ({ yarn: 'Yarn', pnpm: 'pnpm', bun: 'Bun' } as const)[pm.tool]
   if (!install) {
     return { stop: `it uses Yarn ${pm.major ?? 2} (${pm.why}) and has no yarn.lock. Yarn 2 and later always write one, and HQ doesn't add files to `
-      + 'your project, so it installed nothing. Run yarn install in the project yourself (and commit the yarn.lock it writes), then press Start again.' }
+      + `your project, so it installed nothing. Run yarn install in the project yourself (and commit the yarn.lock it writes), then ${again}.` }
   }
   return { stop: `it uses ${name} (${pm.why}), and ${pm.tool} isn't installed on this computer (HQ looked in its PATH), so HQ can't install its packages. `
     + `HQ won't install them with npm instead: ${pm.lock ? `npm ignores the ${pm.lock} and could install other versions` : `the project asks for ${name}`}. `
-    + `Install ${name}, then press Start again.` }
+    + `Install ${name}, then ${again}.` }
 }
 
 /** One part of an app: a folder of the repo, how to install it (optional) and run it, and its port. `auto`: HQ picks a free
@@ -150,12 +154,13 @@ function uvLists(ws: string, member: string): boolean {
   return globs('members').some(hit) && !globs('exclude').some(hit)
 }
 /** Each install tool: the file that makes a folder its project, its lockfiles, and whether a folder above is the workspace
- *  root whose lockfile a project follows (npm and yarn: listed in the root package.json's workspaces; pnpm: any folder with a
- *  pnpm-workspace.yaml, as pnpm does; uv: a member of its [tool.uv.workspace]). */
+ *  root whose lockfile a project follows (npm, yarn and bun: listed in the root package.json's workspaces; pnpm: any folder with a
+ *  pnpm-workspace.yaml, as pnpm does; uv: a member of its [tool.uv.workspace]). Bun 1.2 and later write a bun.lock, older ones a bun.lockb (Bug 358). */
 const LOCKS = {
   npm: { manifest: 'package.json', files: ['package-lock.json', 'npm-shrinkwrap.json'], root: lists },
   yarn: { manifest: 'package.json', files: ['yarn.lock'], root: lists },
   pnpm: { manifest: 'package.json', files: ['pnpm-lock.yaml'], root: (ws: string) => fs.existsSync(path.join(ws, 'pnpm-workspace.yaml')) },
+  bun: { manifest: 'package.json', files: ['bun.lock', 'bun.lockb'], root: lists },
   uv: { manifest: 'pyproject.toml', files: ['uv.lock'], root: uvLists },
 }
 /** The lockfile an install of `tool` in `dirPath` follows (Bugs 156, 240): its project's own (the nearest folder with the tool's
@@ -186,8 +191,12 @@ function installProblem(cmd: string, dirPath: string, root: string, installWhen?
   for (const n of npmInstalls(cmd)) {
     const why = npmProblem(n, dirPath, root, installWhen); if (why) return { text: n.text, why, lock: 'package-lock.json', run: false }
   }
-  for (const n of lockedInstalls(cmd)) { const why = lockedProblem(n, dirPath, root, installWhen); if (why) return { text: n.text, why, lock: n.lock, run: n.run } }
+  for (const n of lockedInstalls(cmd)) { const why = lockedProblem(n, dirPath, root, installWhen); if (why) return { text: n.text, why, lock: lockName(n, dirPath, root), run: n.run } }
   return null
+}
+/** The lockfile a refused install follows, by name (a project's older bun.lockb, Bug 358), else the one it would write. */
+function lockName(n: LockedInstall, dirPath: string, root: string): string {
+  const { at } = placed(n, dirPath, root), lock = at && fs.existsSync(at) ? lockOf(n.tool, at, root).lock : null; return lock ? path.basename(lock) : n.lock
 }
 /** Where an install runs: its folder, whether that's inside the checkout, and the words that name it when it isn't the part's own. */
 function placed(n: { text: string; dir: string | null }, dirPath: string, root: string) {
@@ -196,7 +205,7 @@ function placed(n: { text: string; dir: string | null }, dirPath: string, root: 
 }
 /** ` at uv.lock, which this folder follows` when the lockfile is its workspace root's, not the folder's own (Bugs 156, 240). */
 const above = (lock: string, at: string, root: string) => path.dirname(lock) !== at ? ` at ${path.relative(root, lock)}, which this folder follows` : ''
-/** A uv, yarn or pnpm install that would rewrite the lockfile it follows (its own, or its workspace root's, Bug 240), or write
+/** A uv, yarn, pnpm or bun install that would rewrite the lockfile it follows (its own, or its workspace root's, Bug 240), or write
  *  one where there is none (Bug 239). A `uv run` too: with no `--locked`/`--frozen` it rewrites an out-of-date uv.lock (Bug 262). */
 function lockedProblem(n: LockedInstall, dirPath: string, root: string, installWhen?: string): string | null {
   const { at, where } = placed(n, dirPath, root)
@@ -205,7 +214,7 @@ function lockedProblem(n: LockedInstall, dirPath: string, root: string, installW
   if (!fs.existsSync(at)) return `${where}that folder doesn't exist`
   const { lock, project } = lockOf(n.tool, at, root)
   if (lock) return n.frozen || n.noLock ? null // Bug 262: a plain `uv run` follows a uv.lock only while it's up to date, and rewrites it after a pyproject.toml change
-    : `${where}use ${n.fix} (there is a ${n.lock}${above(lock, at, root)}${n.run ? `, and \`${n.text}\` rewrites it when it is out of date` : ''})`
+    : `${where}use ${n.fix} (there is a ${path.basename(lock)}${above(lock, at, root)}${n.run ? `, and \`${n.text}\` rewrites it when it is out of date` : ''})`
   if (n.tool === 'uv' && !project) return null // no pyproject.toml: uv makes no project and no uv.lock (a plain script)
   if (!n.noLock) return `${where}there is no ${n.lock}`
     + `${n.frozen ? ` for \`${n.text}\` to follow` : `, and \`${n.text}\` would write one into the user's project`}: use ${n.bare}`
@@ -246,7 +255,7 @@ function partProblem(p: RecipePart, dir: string, root: string): Refusal | null {
 
 /** What an install leaves in the project besides its lockfile (Bug 263): node_modules, and Yarn 2+'s Plug'n'Play files, install
  *  state and cache (Yarn 4.5.3 writes `.pnp.cjs` and `.yarn/install-state.gz` even with `--immutable`). uv's .venv ignores itself. */
-const LEFTOVERS = { npm: ['node_modules/'], pnpm: ['node_modules/'],
+const LEFTOVERS = { npm: ['node_modules/'], pnpm: ['node_modules/'], bun: ['node_modules/'],
   yarn: ['node_modules/', '.pnp.cjs', '.pnp.loader.mjs', '.pnp.data.json', '.yarn/install-state.gz', '.yarn/cache/', '.yarn/unplugged/', '.yarn/__virtual__/'] }
 /** Where the installs in a recipe's steps (install and run) leave those files, relative to the checkout `root`: the folder each runs in,
  *  and the project whose lockfile it follows (a Yarn workspace's .pnp.cjs is at its root). A folder HQ can't follow is left out. */
@@ -308,16 +317,17 @@ export function commandWarning(command: string, root: string): string | null {
     + ` yourself first, where the command runs, and commit the new ${bad.lock}.` : ''}`
 }
 /** How the user updates each lockfile by hand (Bug 343). */
-const UPDATE_LOCK: Record<string, string> = { 'uv.lock': 'uv lock', 'package-lock.json': 'npm install', 'yarn.lock': 'yarn install', 'pnpm-lock.yaml': 'pnpm install' }
+const UPDATE_LOCK: Record<string, string> = { 'uv.lock': 'uv lock', 'package-lock.json': 'npm install', 'yarn.lock': 'yarn install', 'pnpm-lock.yaml': 'pnpm install',
+  'bun.lock': 'bun install', 'bun.lockb': 'bun install' }
 
 /** Ports for every part: fixed ones as written, auto ones from the preview range (the show part keeps `saved` when it's free).
  *  `taken`: fixed ports something else already holds, so HQ won't start an app that would talk to the wrong server. `avoid`: ports
  *  a Launch helper was given for its test runs (Bug 226), taken only when nothing else in the range is free. `given`: ports this HQ handed to another
- *  app that is starting or running (Bug 354: one that hasn't bound its port yet looks free), never taken. */
+ *  app that is starting or running (Bug 354: one that hasn't bound its port yet looks free), never taken: a fixed one is in `taken` (Bug 362). */
 export async function assignPorts(r: Recipe, saved: number | null, busy: (port: number) => Promise<boolean> = portBusy, avoid: number[] = [],
   given: number[] = []): Promise<{ ports: Record<string, number>; taken: { part: string; port: number }[] } | null> {
   const ports: Record<string, number> = {}, taken: { part: string; port: number }[] = []
-  for (const p of r.parts) if (p.port !== 'auto') { ports[p.name] = p.port; if (await busy(p.port)) taken.push({ part: p.name, port: p.port }) }
+  for (const p of r.parts) if (p.port !== 'auto') { ports[p.name] = p.port; if (given.includes(p.port) || await busy(p.port)) taken.push({ part: p.name, port: p.port }) }
   const order = (p: RecipePart) => p.name === r.show ? 0 : 1 // the page the user sees gets the saved port first
   for (const p of [...r.parts].filter((x) => x.port === 'auto').sort((a, b) => order(a) - order(b))) {
     const prefer = p.name === r.show && saved && PREVIEW_PORTS.includes(saved) && !avoid.includes(saved) ? [saved] : []
@@ -333,9 +343,11 @@ export async function assignPorts(r: Recipe, saved: number | null, busy: (port: 
 /** Bug 226: the Launch helper's test runs use ports HQ gives it, from the preview range, never a port of its own choosing (it once ran an app on
  *  3180, outside its HQ's 4080–4089, where another HQ's app could answer). Up to `n` free ports, from the top of the range (previews take theirs
  *  from the bottom), in order: ones no other helper holds first, then (a busy HQ with many helpers) free ones another helper was given too, since
- *  they are still HQ's own. [] when no port in the range is free. */
-export async function testPorts(held: number[], busy: (port: number) => Promise<boolean> = portBusy, n = 3, range: number[] = PREVIEW_PORTS): Promise<number[]> {
-  const got: number[] = [], top = [...range].reverse()
+ *  they are still HQ's own. `given`: ports this HQ gave an app that is starting or running (Bug 363: one that hasn't bound its port yet looks free, and
+ *  a test server there would take it from the app or answer in its place), never taken. [] when no port in the range is free. */
+export async function testPorts(held: number[], busy: (port: number) => Promise<boolean> = portBusy, n = 3, range: number[] = PREVIEW_PORTS,
+  given: number[] = []): Promise<number[]> {
+  const got: number[] = [], top = [...range].reverse().filter((x) => !given.includes(x))
   for (const c of [...top.filter((x) => !held.includes(x)), ...top.filter((x) => held.includes(x))]) {
     if (got.length >= n) break; if (!(await busy(c))) got.push(c)
   }
@@ -377,7 +389,7 @@ function yarnPnp(dir: string): boolean {
 const readIn = (dir: string, f: string) => { try { return fs.readFileSync(path.join(dir, f), 'utf8') } catch { return null } }
 /** A Yarn 2+ project: a .yarnrc.yml, or a yarn.lock with `__metadata` (Yarn 1's has none). */
 const yarnBerry = (dir: string): boolean => readIn(dir, '.yarnrc.yml') !== null || /^__metadata:/m.test(readIn(dir, 'yarn.lock') ?? '')
-/** What the installs in a part's `install` make that its app needs (Bug 303), as absolute paths: npm's and pnpm's node_modules, Yarn's
+/** What the installs in a part's `install` make that its app needs (Bug 303), as absolute paths: npm's, pnpm's and Bun's node_modules, Yarn's
  *  .pnp.cjs or node_modules, uv's .venv, each where the tool puts it (the project whose lockfile it follows). None for a package.json
  *  that lists no packages (npm makes no node_modules then), nor for installs HQ can't read (go build, pip) or follow (`cd $X`). */
 export function installOutputs(install: string, dirPath: string, root: string = dirPath): string[] {

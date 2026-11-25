@@ -39,7 +39,7 @@ test('a folder HQ can\'t follow comes back unknown', () => {
 })
 
 test('what is not an npm install is left alone', () => {
-  for (const c of ['pnpm install', 'yarn install', 'yarn', 'uv sync', 'pip install -r requirements.txt', 'bun install',
+  for (const c of ['pnpm install', 'yarn install', 'yarn', 'uv sync', 'pip install -r requirements.txt', 'bun install', 'bun ci',
     'echo npm install', 'echo "cd web && npm install"', "sh -c 'npm install'", 'npx npm-install-peers',
     'npm start', 'npm run dev', 'npm run install', 'npm test', 'npm run build -- --prefix web', 'npm exec -- npm install',
     './npm-install.sh', 'node_modules/.bin/npm-run-all build', 'cd npm && make', 'cd web && npminstall', 'make install',
@@ -96,4 +96,18 @@ test('installs that write no lockfile, and `uv run`, which installs before it ru
   for (const c of ['pnpm i --no-lockfile', 'pnpm install --lockfile=false', 'pnpm install --config.lockfile=false'])
     assert.deepEqual(kinds(c), [['pnpm', '', false, true, false]], c)
   assert.deepEqual(kinds('pnpm install --lockfile-only'), [['pnpm', '', false, false, false]]) // writes only the lockfile
+})
+
+test('bun installs: where they run, whether they follow the lockfile or write none (Bug 358)', () => {
+  assert.deepEqual(locked('bun install'), [['bun.lock', '', false]]); assert.deepEqual(locked('cd web && bun i'), [['bun.lock', 'web', false]])
+  assert.deepEqual(locked('bun install --frozen-lockfile'), [['bun.lock', '', true]]); assert.deepEqual(locked('bun ci'), [['bun.lock', '', true]])
+  assert.deepEqual(locked('bun --cwd web install'), [['bun.lock', 'web', false]]); assert.deepEqual(locked('bun i --cwd=web --frozen-lockfile'), [['bun.lock', 'web', true]])
+  assert.deepEqual(locked('bun --config ./bunfig.toml install'), [['bun.lock', '', false]]) // an option's value isn't the subcommand
+  assert.deepEqual(kinds('bun install --no-save'), [['bun', '', false, true, false]])
+  assert.deepEqual(kinds('BUN_CONFIG_SKIP_SAVE_LOCKFILE=1 bun i'), [['bun', '', false, true, false]])
+  assert.deepEqual(locked('bun i --cwd "$WEB"').map((n) => n[1]), [null])
+  // what it must not catch: bun running things, adding a package (the user's own change to package.json), bunx
+  for (const c of ['bun run dev', 'bun dev', 'bun start', 'bun test', 'bun server.ts', 'bun --version', 'bun', 'bunx vite', 'bun add ms', 'bun x vite',
+    'echo bun install', 'npm install', 'cd bun && make'])
+    assert.deepEqual(locked(c), [], c)
 })

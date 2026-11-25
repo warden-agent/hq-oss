@@ -10,14 +10,17 @@ import { execFileSync, spawn } from 'node:child_process'
 
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-testrun-')))
 // A made-up home with secrets to go after. Not under the temp folder: Linux's runs get their own /tmp, which hides it whatever the rules say.
-const home = fs.mkdtempSync(path.join(import.meta.dirname, '..', '.test-home-'))
+// Bug 378: nor under a folder the Mac sandbox lets every run write to (/private/tmp, /private/var/folders), or a write to it isn't refused.
+// So a checkout there (a scratch worktree) makes it in the real home instead, under a name of its own, removed after.
+const anyRunWrites = (p: string) => /^\/(private\/)?(tmp|var\/folders)\//.test(`${fs.realpathSync(p)}/`)
+const home = fs.mkdtempSync(path.join(anyRunWrites(import.meta.dirname) ? os.homedir() : path.join(import.meta.dirname, '..'), '.test-home-'))
 after(() => fs.rmSync(home, { recursive: true, force: true }))
 const SECRETS = ['.ssh/id_rsa', '.netrc', '.npmrc', '.git-credentials', '.config/gh/hosts.yml', '.config/gcloud/creds.json', '.docker/config.json', '.gnupg/key', '.kube/config', '.claude.json',
   '.cargo/credentials.toml', '.cargo/credentials']
 for (const f of SECRETS) { fs.mkdirSync(path.dirname(path.join(home, f)), { recursive: true }); fs.writeFileSync(path.join(home, f), 'secret') }
 process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup') // the toolchain stays where it's installed, whatever HOME says
 process.env.HOME = home; process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_ENGINEER_CACHE = path.join(tmp, 'cache')
-const { bwrapArgs, detectTests, failReport, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase, testCombined, sweepTestWorktrees,
+const { bwrapArgs, detectTests, testFolders, failReport, failedLine, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase, testCombined, sweepTestWorktrees,
   testRunViews, testWorktree } = await import('./testrun.ts')
 const { db, migrate } = await import('./db.ts'); migrate(); void db
 const { bus } = await import('./events.ts')
@@ -43,7 +46,59 @@ test('detectTests: reads the project\'s files, and skips npm\'s placeholder', ()
   assert.equal(detectTests(dir({ Makefile: 'build:\n\tcc\ntest:\n\t./t\n' }))?.test, 'make test')
   assert.equal(detectTests(dir({ 'README.md': 'hi' })), null)
 })
+test('Bug 376: testFolders reads the folders back from the command detectTests builds, and from no other', () => {
+  const two = detectTests(dir({ 'admin/package.json': '{"scripts":{"test":"x"}}', 'web/package.json': '{"scripts":{"test":"y"}}' }))!.test
+  assert.deepEqual(testFolders(two), ['admin', 'web']); assert.deepEqual(testFolders(' (cd "web" && npm test) '), ['web']); assert.deepEqual(testFolders('(cd "my app" && npm test)'), ['my app'])
+  for (const c of ['npm test', 'cd web && npm test', '(cd web && npm test)', '(cd "web" && npm test) && npm run lint', '(cd "web" && npm test) || (cd "admin" && npm test)',
+    '(cd "web/app" && npm test)', '(cd ".." && npm test)', '(cd "$HOME" && npm test)', '(cd "web" && npm test -- src/api.test.ts)', '(cd "web" && npm test)(cd "admin" && npm test)', ''])
+    assert.equal(testFolders(c), null, c)
+})
 
+/** Bug 392: stand-ins for Yarn, pnpm and Bun on PATH, each logging what it was asked to do (and where pnpm was told to keep its store); `pnpm test` runs node's tests. */
+// In the engineer cache, which Linux's sandbox binds in: its runs get a /tmp of their own, where a stand-in under the temp folder isn't there
+fs.mkdirSync(path.join(tmp, 'cache'), { recursive: true })
+const toolBin = fs.mkdtempSync(path.join(tmp, 'cache', 'bin-')), noTools = fs.mkdtempSync(path.join(tmp, 'cache', 'none-')), pmLog = path.join(tmp, 'cache', 'pm.log')
+for (const t of ['pnpm', 'yarn', 'bun']) {
+  const script = [`echo "${t} $* store=$npm_config_store_dir" >> "${pmLog}"`, '[ "$1" = install ] && mkdir -p node_modules', '[ "$1" = test ] && exec node --test', 'exit 0']
+  fs.writeFileSync(path.join(toolBin, t), `#!/bin/sh\n${script.join('\n')}\n`, { mode: 0o755 })
+}
+/** `fn` with PATH set to `dirs`, until it has ended (a run reads PATH after its git steps). */
+const withPath = <T>(dirs: string, fn: () => T): T => {
+  const was = process.env.PATH, back = () => { process.env.PATH = was }; process.env.PATH = dirs
+  try { const r = fn(); if (r instanceof Promise) return r.finally(back) as T; back(); return r } catch (e) { back(); throw e }
+}
+const DEPS = '{"scripts":{"test":"node --test"},"dependencies":{"ms":"2.1.3"}}'
+test('Bug 392: a Yarn, pnpm or Bun project installs by its lockfile and runs its test script with its own tool, as the preview would; npm\'s as before', () => {
+  withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => {
+    const plan = (files: Record<string, string>) => detectTests(dir({ 'package.json': DEPS, ...files }))
+    assert.deepEqual(plan({ 'pnpm-lock.yaml': '' }), { install: 'pnpm install --frozen-lockfile', test: 'pnpm test' })
+    assert.deepEqual(plan({ 'yarn.lock': '' }), { install: 'yarn install --frozen-lockfile', test: 'yarn test' })
+    assert.deepEqual(plan({ 'yarn.lock': '__metadata:\n  version: 8\n', '.yarnrc.yml': 'nodeLinker: node-modules\n' }), { install: 'yarn install --immutable', test: 'yarn test' })
+    assert.deepEqual(plan({ 'bun.lock': '{}' }), { install: 'bun install --frozen-lockfile', test: 'bun run test' }) // `bun test` is Bun's own runner, not the script
+    assert.deepEqual(plan({ 'bun.lockb': '' }), { install: 'bun install --frozen-lockfile', test: 'bun run test' })
+    assert.deepEqual(detectTests(dir({ 'package.json': DEPS.replace('{', '{"packageManager":"pnpm@10.4.0",') })), { install: 'pnpm install --no-lockfile', test: 'pnpm test' })
+    assert.deepEqual(plan({ 'pnpm-lock.yaml': '', 'node_modules/ms/index.js': '' }), { install: null, test: 'pnpm test' }) // the main checkout's, copied
+    assert.deepEqual(plan({ 'package-lock.json': '{}' }), { install: 'npm ci', test: 'npm test' }) // npm's own: as before, other tools or not
+    assert.deepEqual(plan({}), { install: 'npm install', test: 'npm test' })
+    const two = detectTests(dir({ 'api/package.json': DEPS, 'api/package-lock.json': '{}', 'web/package.json': DEPS, 'web/pnpm-lock.yaml': '' }))!
+    assert.deepEqual(two, { install: '(cd "api" && npm ci) && (cd "web" && pnpm install --frozen-lockfile)', test: '(cd "api" && npm test) && (cd "web" && pnpm test)' })
+    assert.deepEqual(testFolders(two.test), ['api', 'web']); assert.deepEqual(testFolders('(cd "web" && bun run test) && (cd "x" && yarn test)'), ['web', 'x'])
+    assert.equal(testFolders('(cd "web" && bun test)'), null)
+    const berry = detectTests(dir({ 'package.json': DEPS.replace('{', '{"packageManager":"yarn@4.5.0",') }))! // Yarn 2+ with no yarn.lock would write one
+    assert.equal(berry.install, null); assert.match(berry.stop!, /no yarn\.lock.*then test again\.$/)
+  })
+})
+test('Bug 392: its tool not installed, HQ says so in the preview\'s words and never installs with npm instead; packages already there still run', () => {
+  withPath(noTools, () => {
+    const lone = detectTests(dir({ 'package.json': DEPS, 'pnpm-lock.yaml': '' }))!
+    assert.equal(lone.install, null); assert.equal(lone.test, 'npm test')
+    assert.match(lone.stop!, /^it uses pnpm \(it has a pnpm-lock\.yaml\), and pnpm isn't installed on this computer .*npm ignores the pnpm-lock\.yaml .*Install pnpm, then test again\.$/)
+    assert.deepEqual(detectTests(dir({ 'package.json': DEPS, 'bun.lock': '{}', 'node_modules/ms/index.js': '' })), { install: null, test: 'npm test' })
+    assert.deepEqual(detectTests(dir({ 'package.json': '{"scripts":{"test":"node --test"}}', 'yarn.lock': '' })), { install: null, test: 'npm test' }) // nothing to install
+    const two = detectTests(dir({ 'api/package.json': DEPS, 'api/package-lock.json': '{}', 'web/package.json': DEPS, 'web/yarn.lock': '' }))!
+    assert.equal(two.install, '(cd "api" && npm ci)'); assert.match(two.stop!, /^web: it uses Yarn \(it has a yarn\.lock\), and yarn isn't installed/)
+  })
+})
 test('CI really has the sandbox: these tests can\'t quietly go back to being skipped', { skip: process.env.CI ? false : 'only matters in CI' }, () => assert.equal(problem, null))
 
 test('runSandboxed: the tests can use their own folder and localhost, and nothing of the user\'s', boxed, async () => {
@@ -90,6 +145,32 @@ test('runSandboxed: another program\'s socket is out of reach, network on or off
     .on('data',(b)=>{console.log(String(b));s.close()}))"`, { network: false, timeoutMs: 10_000 })
   assert.equal(own.output, 'here')
 })
+
+// Bug 374: HQ runs its copy of an app on another port when the project's hard-wired one is in use (testports.ts), and the run is refused the old one, where
+// somebody else's server answers (the user's preview, with their data). Linux: a run has a network of its own, with nothing of the machine's on it.
+const PROBE = `const net = require('net'), port = Number(process.argv[2])
+const call = (host, p) => new Promise((r) => { let out = ''; const c = net.connect({ host, port: p }); c.on('data', (b) => { out += b }); c.on('end', () => r(out)); c.on('error', (e) => r(e.code)) })
+const listen = (host) => new Promise((r) => { const s = net.createServer(); s.on('error', (e) => r(e.code)); s.listen(port, host, () => s.close(() => r('listening'))) })
+;(async () => {
+  console.log('call 127.0.0.1:', await call('127.0.0.1', port))
+  for (const h of ['127.0.0.1', '0.0.0.0', '::1', '::']) console.log('listen ' + h + ':', await listen(h))
+  const own = net.createServer((c) => c.end('here')); own.listen(0, '127.0.0.1', async () => { console.log('own:', await call('127.0.0.1', own.address().port)); own.close() })
+})()
+`
+test('Bug 374: a run is refused the port HQ moved its copy of the app off, to call or to listen on, and every other localhost port still works',
+  { skip: boxed.skip || (process.platform === 'darwin' ? false : 'macOS only: on Linux a run has a network of its own') }, async () => {
+    const held = net.createServer((c) => c.end('the preview')); await new Promise<void>((r) => held.listen(0, '127.0.0.1', r))
+    const port = (held.address() as net.AddressInfo).port, d = dir({ 'probe.js': PROBE })
+    const probe = async (block?: number[]) => (await runSandboxed(d, `node probe.js ${port}`, { network: false, timeoutMs: 20_000, block })).output.split('\n')
+    try {
+      const open = await probe()
+      assert.equal(open[0], 'call 127.0.0.1: the preview'); assert.equal(open.at(-1), 'own: here') // with no block the run reaches whoever has the port
+      assert.deepEqual(await probe([port]), ['call 127.0.0.1: EPERM', 'listen 127.0.0.1: EPERM', 'listen 0.0.0.0: EPERM', 'listen ::1: EPERM', 'listen ::: EPERM', 'own: here'])
+      assert.equal((await probe([port + 1]))[0], 'call 127.0.0.1: the preview', 'only the ports named')
+      // the install step has the whole network, and runs no app: nothing is blocked there
+      assert.equal((await runSandboxed(d, `node probe.js ${port}`, { network: true, timeoutMs: 20_000, block: [port] })).output.split('\n')[0], 'call 127.0.0.1: the preview')
+    } finally { held.close() }
+  })
 
 test('runSandboxed: `open` can\'t start a program outside the sandbox', { skip: boxed.skip || (process.platform === 'darwin' ? false : 'macOS only') }, async () => {
   const app = path.join(tmp, 'Probe.app'), marker = path.join(home, 'escaped'); fs.mkdirSync(path.join(app, 'Contents', 'MacOS'), { recursive: true })
@@ -149,6 +230,20 @@ test('testCombined: the user\'s own command', boxed, async () => {
   const d = oneFile()
   assert.equal((await testCombined(d, 'main', 'b', 'T1', 'grep -q 2 a.txt')).kind, 'pass')
   assert.equal((await testCombined(d, 'main', 'b', 'T1', 'grep -q 3 a.txt')).kind, 'fail')
+})
+test('Bug 392: a pnpm project\'s run installs and tests with pnpm in the sandbox, its store in the cache; with no pnpm nothing runs, the user\'s command neither', boxed, async () => {
+  const d = fs.mkdtempSync(path.join(tmp, 'r-')); sh(d, 'init', '-q', '-b', 'main')
+  write(d, { '.gitignore': 'node_modules/\n.claude/\n', 'package.json': DEPS, 'pnpm-lock.yaml': '', 'a.test.js': `${TEST}t.test('one',()=>a.ok(1))` })
+  sh(d, 'add', '.'); sh(d, 'commit', '-qm', 'base'); fs.rmSync(pmLog, { force: true })
+  const r = await withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => testBase(d, 'main', 'P1', null))
+  assert.equal(r.kind, 'pass', JSON.stringify(r)); assert.equal((r as { test: string }).test, 'pnpm test')
+  assert.deepEqual(fs.readFileSync(pmLog, 'utf8').trim().split('\n'), [`pnpm install --frozen-lockfile store=${path.join(tmp, 'cache', 'pnpm-store')}`, 'pnpm test store='])
+  for (const custom of [null, 'touch "$HOME/../ran.txt"']) {
+    const x = await withPath(`${noTools}${path.delimiter}${process.env.PATH!.split(path.delimiter).filter((p) => !fs.existsSync(path.join(p, 'pnpm'))).join(path.delimiter)}`,
+      () => testBase(d, 'main', 'P2', custom))
+    assert.equal(x.kind, 'error'); assert.match((x as { why: string }).why, /^it uses pnpm .*Install pnpm, then test again\.$/)
+  }
+  assert.equal(fs.readFileSync(pmLog, 'utf8').trim().split('\n').length, 2); assert.equal(fs.existsSync(testWorktree(d, 'P2-main')), false)
 })
 const noCargo = (() => { try { execFileSync('cargo', ['--version'], { stdio: 'ignore' }); return false } catch { return 'no cargo here' } })()
 test('Bug 58: a Rust project with a dependency installs and tests in the sandbox, and nothing lands in ~/.cargo', { skip: boxed.skip || noCargo }, async () => {
@@ -214,6 +309,39 @@ test('Bug 82: failureLines keeps what names a failure or an error and a few line
     `    at ${x} (/app/server/check-a-monitor-that-is-meant-to-be-down.js:1:1)`), ...passing(1, i)].join('\n')).join('\n')
   const g = failureLines(); g.take(`${logged}\n✖ shows the outage (3ms)\n  AssertionError: 1 == 2\n✔ next\n`); const kept = g.before(Infinity)
   assert.match(kept, /✖ shows the outage \(3ms\)\n {2}AssertionError: 1 == 2$/); assert.ok(kept.length < 3000, String(kept.length)) // errors alone: half the room
+})
+test('Bug 383: failureLines and failedLine read a line as a terminal shows it (mocha --reporter list draws a test over its title)', () => {
+  const f = failureLines(); f.take('✖ one fails\n  AssertionError: 1 == 2\n    two: \r  ✔ two: 0ms\n    after a pass\n'); f.take('x\n')
+  assert.equal(f.before(Infinity), '✖ one fails\n  AssertionError: 1 == 2')
+  assert.equal(failedLine('  one: \r  ✖ one fails (2ms)\n  two: \r  ✔ two: 0ms\n'), '✖ one fails') // the line a user names, as a terminal shows it
+})
+// Failing runs captured through HQ's own sandbox (bug372capture.mts) on 2026-11-24: mocha 11.8 (spec, list, dot, spec with --color), node 25 --test, vitest 3.2,
+// jest 30, go 1.26, cargo 1.88; the project paths renamed /tmp/b391. In testdata/bug391.
+const cap391 = (name: string): string => fs.readFileSync(new URL(`./testdata/bug391/${name}.txt`, import.meta.url), 'utf8')
+test('Bug 391: failedLine names the first test mocha lists as failing, whatever the reporter, and the other runners\' lines stay as they were', () => {
+  for (const r of ['', '-list', '-dot', '-color']) assert.equal(failedLine(cap391(`mocha-11.8.0${r}`)), '1) book list marks a book due soon', r)
+  assert.equal(failedLine(cap391('node-25.4.0')), '✖ shows who has the book'); assert.equal(failedLine(cap391('go-1.26.4')), '--- FAIL: TestList (0.00s)')
+  assert.equal(failedLine(cap391('jest-30.1.3')), 'FAIL ./j.jest.js'); assert.equal(failedLine(cap391('cargo-1.88.0')), 'error: test failed, to rerun pass `--lib`')
+  assert.equal(failedLine(cap391('vitest-3.2.4')), '× book list > marks a book due soon 3ms') // its colours are gone: before, the line was escape codes
+  // a hook's failure; a title with no ":" line in reach is its first line alone; what comes first in the output wins
+  assert.equal(failedLine('  1 failing\n\n  1) shelf\n       "before each" hook for "lends a book":\n     Error: no db\n'), '1) shelf "before each" hook for "lends a book"')
+  assert.equal(failedLine('1 failing\n1) shelf\na\nb\nc\nd\ne\nf\ng\nh:\n'), '1) shelf')
+  assert.equal(failedLine('✖ first (1ms)\n1 failing\n1) later:\n'), '✖ first')
+})
+test('Bug 391: what failedLine must not read as mocha\'s, and an error\'s name before a stack frame', () => {
+  assert.equal(failedLine('1) step one\n2) step two\n  at x (a.js:1:1)'), 'at x (a.js:1:1)') // a numbered line with no "N failing" over it
+  assert.equal(failedLine('2 failing\n  AssertionError: 1 == 2\n  at y (b.js:1:1)'), 'AssertionError: 1 == 2') // the list cut off
+  assert.equal(failedLine('  TypeError: list.map is not a function\n      at Context.<anonymous> (test/a.js:3:9)'), 'TypeError: list.map is not a function')
+})
+test('Bug 391: a long mocha run whose failure list starts before the tail keeps its first failure in `earlier`, and failedLine names it', () => {
+  const diff = Array.from({ length: 12 }, (_, i) => `      +  "a line of the expected value, number ${i}, long enough to fill the tail"`).join('\n')
+  const fail = (n: number) => `  ${n}) book list\n       case ${n}:\n\n      AssertionError [ERR_ASSERTION]: values differ\n${diff}\n      at Context.<anonymous> (test/a.js:${n}:1)\n`
+  const text = `${passing(5).join('\n')}\n\n  5 passing (9ms)\n  30 failing\n\n${Array.from({ length: 30 }, (_, i) => fail(i + 1)).join('\n')}`
+  const f = failureLines(); for (let i = 0; i < text.length; i += 500) f.take(text.slice(i, i + 500))
+  const at = text.length - 8000, tail = text.slice(at)
+  assert.ok(!tail.includes('30 failing') && !tail.includes('  1) book list'))
+  assert.match(f.before(at), /^30 failing\n\n {2}1\) book list\n {7}case 1:/)
+  assert.equal(failedLine(`${f.before(at)}\n${tail}`), '1) book list case 1')
 })
 test('Bug 82: failReport puts the early failures first, then the end of the output, cut between lines, in about the size asked', () => {
   const output = passing(200).join('\n'), earlier = 'Error: boom\n    at x'

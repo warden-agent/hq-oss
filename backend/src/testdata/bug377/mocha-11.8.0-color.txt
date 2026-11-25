@@ -1,0 +1,17 @@
+[0m[0m
+[32m  [32m✔[39m[0m[90m has due_on[0m
+[36m  - a top-level skipped one[0m
+[36m  - a pending one with no body[0m
+[0m  nested[0m
+[0m    deeper[0m
+    [36m  - deep skip[0m
+    [32m  [32m✔[39m[0m[90m deep pass[0m
+
+[0m  book list[0m
+  [32m  [32m✔[39m[0m[90m shows each due date[0m
+  [32m  [32m✔[39m[0m[90m marks a book due soon[0m
+  [36m  - sorts books by due date[0m
+
+
+[92m [0m[32m 4 passing[0m[90m (2ms)[0m
+[36m [0m[36m 4 pending[0m

@@ -2,7 +2,8 @@
 // a merge may record the check as its test. Pure (hqcheckrules.ts), so the page shows what these say.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { allSteps, canSend, checkButton, checkFacts, checkHeadline, checkOf, outOfDate, testedFor, type HqCheck } from './hqcheckrules.ts'
+import { allSteps, canSend, changedWords, checkButton, checkFacts, checkHeadline, checkOf, checksOf, checkTone, outOfDate, pastChecks, pastWith, testedFor, unseenCount,
+  unseenOnly, unseenWords, type HqCheck } from './hqcheckrules.ts'
 
 const base: HqCheck = { id: 'check-1', state: 'pass', sha: 'aaaaaaa1', base: 'main', base_sha: 'bbbbbbb2', finished_sha: 'aaaaaaa1', started_at: 1_000, ended_at: 66_000,
   steps: [{ kind: 'tests', state: 'pass', words: '`npm test` passed' }], tested: { test: 'npm test', counts: { passed: 3, failed: 0, skipped: 0 }, ms: 900, output: 'ok' } }
@@ -69,4 +70,58 @@ test('the results: each check in order, the ones not reached say why, and the he
   assert.equal(checkHeadline({ ...base, state: 'stopped', why: 'you stopped it' }), 'Stopped: you stopped it')
   assert.equal(checkFacts({ ...base, cost_usd: 0.162, read_tokens: 4200 }), 'aaaaaaa merged into main (bbbbbbb) · took 1 min 5 s · UI tester $0.16 · reader 4k tokens')
   assert.equal(checkOf({ hq_check: 'not json' }), null); assert.equal(checkOf({ hq_check: '{"state":"pass"}' }), null); assert.equal(checkOf({}), null)
+})
+
+// Bug 373: on the live run eight named tests "never ran" (they had run and passed: Bug 372), and the box showed the same red ✗ as a failed test.
+const UNSEEN: Partial<HqCheck> = { state: 'fail', send: { kind: 'fix', test: 'npm test', unproven: true, missing: 8, earlier: '', output: "The tests that didn't run:\n- A1: …" },
+  steps: [{ kind: 'tests', state: 'pass', words: '`npm test` passed' }, { kind: 'criteria', state: 'fail', words: '', lines: [{ text: 'A1: …', tone: 'bad' }, { text: 'A2: …', tone: 'bad' },
+    { text: 'A3: …', tone: 'ok' }] }] }
+test('Bug 373: tests that passed with named ones unseen never look like a failed test: amber, in their own words, on the button and in the results', () => {
+  const unseen = { ...base, ...UNSEEN } as HqCheck, failed = { ...base, state: 'fail', send: { kind: 'fix', test: 'npm test', output: '✖ adds two', earlier: '' } } as HqCheck
+  assert.equal(unseenOnly(unseen), true); assert.equal(unseenCount(unseen), 8); assert.equal(checkTone(unseen), 'amber')
+  const b = checkButton(tk(UNSEEN), true)!
+  assert.deepEqual([b.label, b.tone, b.start], ['View results ⚠', 'amber', false])
+  assert.match(b.tip, /The tests passed when HQ tested T-01, and none failed, but 8 tests named for its criteria weren't seen running/)
+  assert.equal(checkHeadline(unseen), "The tests passed, but 8 tests named for its criteria weren't seen running")
+  assert.match(allSteps(unseen)[2]!.words, /an earlier check didn't pass/) // not "failed": nothing did
+  assert.equal(canSend({ finished_sha: 'aaaaaaa1' }, unseen), true) // it can still go to the engineer
+  // what it must not catch: a failed test, findings from the app, the reader or the tester, conflicts, and a check that couldn't finish stay as they were
+  assert.equal(unseenOnly(failed), false); assert.equal(unseenCount(failed), 0); assert.equal(checkTone(failed), 'red')
+  assert.deepEqual([checkButton(tk(failed), true)!.label, checkButton(tk(failed), true)!.tone], ['View results ✗', 'red'])
+  const fixOf = (more: object) => ({ kind: 'fix' as const, test: 'x', output: '', earlier: '', ...more })
+  for (const send of [{ kind: 'conflicts' as const }, fixOf({ look: true }), fixOf({ review: true })]) {
+    assert.equal(unseenOnly({ ...base, state: 'fail', send }), false); assert.equal(checkTone({ ...base, state: 'fail', send }), 'red')
+  }
+  assert.equal(unseenOnly({ ...base, state: 'error', send: UNSEEN.send }), false, 'only a check that ended on it')
+  assert.deepEqual([checkTone(base), checkTone({ ...base, state: 'error' }), checkTone({ ...base, state: 'stopped' }), checkTone({ ...base, state: 'running' })], ['green', 'amber', 'amber', 'plain'])
+  // finished again since: out of date comes first, as for any result
+  assert.deepEqual(checkButton(tk(UNSEEN, { finished_sha: 'ccccccc3' }), true)!.label, 'Results out of date')
+  // a check kept before HQ counted them: counted from the step's lines; and the words for one, some and many
+  assert.equal(unseenCount({ ...unseen, send: { ...unseen.send!, missing: undefined } as HqCheck['send'] }), 2)
+  assert.equal(unseenWords(1), "1 test named for its criteria wasn't seen running"); assert.equal(unseenWords(0), "some tests named for its criteria weren't seen running")
+})
+
+test('Bug 373: Test again keeps the check before it: the last few, without a passing run\'s output, and the one sent to the engineer outlives the rest', () => {
+  const c = (n: number, more: Partial<HqCheck> = {}): HqCheck => ({ ...base, id: `check-${n}`, started_at: n * 1000, ...more })
+  assert.deepEqual(pastWith([], null), [])
+  const one = pastWith([], c(1)); assert.equal(one.length, 1); assert.equal(one[0]!.id, 'check-1')
+  assert.equal(one[0]!.tested, undefined, 'only the latest check can be a merge\'s test, so its 4,000 characters of output go')
+  assert.deepEqual(pastWith(one, c(2, { state: 'stopped', why: 'you stopped it', steps: [] })).map((x) => x.id), ['check-1'], 'stopped before anything ran: nothing to keep')
+  assert.deepEqual(pastWith(one, c(2, { state: 'running' })).map((x) => x.id), ['check-1'], 'never one still under way')
+  assert.deepEqual(pastWith(one, c(2, { state: 'stopped', why: 'you stopped it' })).map((x) => x.id), ['check-1', 'check-2'], 'stopped part-way: what it had said is kept')
+  // over the limit the oldest goes, but not the last one sent to the engineer while another can go
+  let past = [c(1, { ...UNSEEN, sent_at: 5 })]
+  for (let n = 2; n <= 8; n++) past = pastWith(past, c(n), 3)
+  assert.deepEqual(past.map((x) => x.id), ['check-1', 'check-7', 'check-8'])
+  past = pastWith(past, c(9, { state: 'fail', sent_at: 9 }), 3); assert.deepEqual(past.map((x) => x.id), ['check-7', 'check-8', 'check-9'], 'a newer sent one takes its place')
+  // read back: newest first, the latest on top; a record HQ can't read is no check
+  const t = { hq_check: JSON.stringify(c(10)), hq_checks: JSON.stringify(past) }
+  assert.deepEqual(checksOf(t).map((x) => x.id), ['check-10', 'check-9', 'check-8', 'check-7'])
+  assert.deepEqual(pastChecks({ hq_checks: 'not json' }), []); assert.deepEqual(pastChecks({ hq_checks: '[{"state":"pass"},null,7]' }), []); assert.deepEqual(pastChecks({}), [])
+  assert.deepEqual(checksOf({ hq_check: null, hq_checks: null }), [])
+})
+
+test('Bug 373: what the engineer changed, in words', () => {
+  assert.equal(changedWords([]), 'changed no files'); assert.equal(changedWords(['package.json']), 'changed 1 file: package.json')
+  assert.equal(changedWords(['a.js', 'b.js', 'c.js']), 'changed 3 files: a.js, b.js, c.js'); assert.equal(changedWords(['a.js', 'b.js'], 9), 'changed 11 files: a.js, b.js and 9 more')
 })

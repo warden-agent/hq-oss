@@ -11,6 +11,8 @@ import { noteLine } from '../../frontend/src/api.ts'
 import { deliveryMark } from '../../frontend/src/msgmark.ts'
 
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-b338-'))
+// Bug 368's test types into a terminal that isn't there: its tmux calls go to a socket of this test's own (none runs there), never the user's
+process.env.TMUX_TMPDIR = process.env.HQ_HOME; delete process.env.TMUX
 const { migrate, run, one, q } = await import('./db.ts')
 migrate()
 const { freshStart, retarget } = await import('./freshstart.ts')
@@ -104,4 +106,16 @@ test('Bug 338, what must not change: nothing new once the note is in, the sessio
   // a normal fresh start's single request is still handed out (the guard against replaced ones lets it through)
   await freshStart(idle, { how: 'after_turn', then: 'continue' })
   assert.match(nextBatchFor(getAgent(idle)!, 'mod')!.text, /Fresh start/)
+})
+
+test('Bug 368: the "Asked (again)" line is written before HQ types the request, so a restart that cuts the typing leaves it', async () => {
+  const id = agent('b368-tpm-typing', 'tpm')
+  // No await yet: HQ is still in its Escape and typing (into a terminal that isn't there) when these lines are read
+  const first = freshStart(id, { how: 'now', then: 'continue' }).catch(() => null)
+  assert.deepEqual(requested(id), ['Asked for its handoff note: a fresh start. A new session takes over from it'])
+  await first
+  const again = retarget(id, 'clear')
+  assert.equal(requested(id).at(-1), 'Asked again for its handoff note: you are clearing the project. A new TPM takes over from it after the clear')
+  await again
+  assert.equal(requested(id).length, 2, 'once each: not again when the typing ends')
 })

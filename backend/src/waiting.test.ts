@@ -37,3 +37,13 @@ test('Bug 149: a half-written line in its prompt box holds the message, and the 
   assert.equal(why(agent({ status: 'working', interrupted_at: null, type_waits: 'draft' })), 'waits for its current turn to end')
   assert.match(why(agent({ interrupted_at: NOW - 5000, type_waits: 'draft', takeover_locked_until: NOW + 60_000 }))!, /you typed in its terminal/)
 })
+test('Bug 370: a change to its spec goes in with the next step of a working agent; what else waits, when its turn ends', () => {
+  const spec = { to_id: 'tpm-1', delivered_at: null, channel: 'dm', reason: 'spec_change' }, fyi = { to_id: 'tpm-1', delivered_at: null, channel: 'dm', reason: 'fyi' }
+  assert.equal(why(agent({ status: 'working' }), state({ messages: [spec] })), 'goes in with its next step')
+  assert.equal(why(agent({ status: 'plan_review' }), state({ messages: [spec, spec] })), 'goes in with its next step') // once its plan is answered
+  assert.equal(why(agent({ status: 'working' }), state({ messages: [spec, fyi] })), '1 with its next step, the rest when its turn ends')
+  // what it must not catch: an idle agent (the mod gives it at once), an ordinary note, a hold that comes first
+  assert.equal(why(agent(), state({ messages: [spec] })), 'delivering…')
+  assert.equal(why(agent({ status: 'working' }), state({ messages: [fyi] })), 'waits for its current turn to end')
+  assert.equal(why(agent({ status: 'paused' }), state({ messages: [spec] })), 'held · paused')
+})

@@ -1,6 +1,6 @@
 // The npm installs inside a recipe's shell command, and the folder each one runs in (Bug 191): a Launch helper can write
-// `cd web && npm install`, `npm --prefix web ci` or `(cd web; npm i)`, not just `npm install`. The same for uv, yarn and pnpm
-// installs (Bug 211): `cd server && uv sync`, `yarn --cwd web install`, `pnpm -C web i`. A small reading of the shell
+// `cd web && npm install`, `npm --prefix web ci` or `(cd web; npm i)`, not just `npm install`. The same for uv, yarn, pnpm and bun
+// installs (Bugs 211, 358): `cd server && uv sync`, `yarn --cwd web install`, `pnpm -C web i`, `bun i --cwd web`. A small reading of the shell
 // words, not a full shell: what it can't follow (`cd $DIR`, `cd ~`, an absolute path) comes back as an unknown folder.
 import path from 'node:path'
 
@@ -107,12 +107,12 @@ export function npmInstalls(cmd: string): NpmInstall[] {
   })
 }
 
-/** A uv, yarn or pnpm install found in a command (Bug 211). `lock`: the lockfile it would rewrite; `frozen`: it follows
+/** A uv, yarn, pnpm or bun install found in a command (Bugs 211, 358). `lock`: the lockfile it would rewrite; `frozen`: it follows
  *  that lockfile instead (`--locked`, `--frozen-lockfile`, ...); `fix`: the command to use instead. `dir` as in NpmInstall.
  *  `noLock`: it writes no lockfile (`--pure-lockfile`, `--no-lockfile`, `uv run --no-sync`); `bare`: what to use instead when
  *  there is no lockfile, where a plain install would write one (Bug 239). `run`: a `uv run`, which installs before it runs:
  *  it writes a uv.lock where there is none, and rewrites one that's out of date unless `--locked`/`--frozen` (Bug 262). */
-export type LockedInstall = { text: string; dir: string | null; tool: 'uv' | 'yarn' | 'pnpm'; lock: string; frozen: boolean; noLock: boolean; run: boolean
+export type LockedInstall = { text: string; dir: string | null; tool: 'uv' | 'yarn' | 'pnpm' | 'bun'; lock: string; frozen: boolean; noLock: boolean; run: boolean
   fix: string; bare: string }
 
 const truthy = (env: Word[], names: string[]) => env.some((w) => { const [k, v] = w.text.split(/=(.*)/s); return names.includes(k!) && /^(1|true|yes)$/i.test(v ?? '') })
@@ -136,6 +136,12 @@ const TOOLS = [
   { tool: 'pnpm' as const, lock: 'pnpm-lock.yaml', subs: ['install', 'i'], frozen: ['--frozen-lockfile'], env: [], noLock: ['--no-lockfile', '--lockfile=false',
     '--config.lockfile=false'], noLockEnv: [], fix: '`pnpm install --frozen-lockfile`', bare: '`pnpm install --no-lockfile` with install_when `package.json`', run: false,
     dir: ['-C', '--dir'], valued: ['--filter', '-F', '--loglevel', '--reporter', '--store-dir', '--virtual-store-dir'] },
+  // Bug 358, checked on bun 1.4.5: `bun ci` is `bun install --frozen-lockfile`; with no lockfile both, `--no-save` and BUN_CONFIG_SKIP_SAVE_LOCKFILE
+  // write none, and a plain install writes a bun.lock (or keeps rewriting the bun.lockb a project has)
+  { tool: 'bun' as const, lock: 'bun.lock', subs: ['install', 'i', 'ci'], frozen: ['--frozen-lockfile'], env: [], noLock: ['--no-save'],
+    noLockEnv: ['BUN_CONFIG_SKIP_SAVE_LOCKFILE'], fix: '`bun install --frozen-lockfile`', bare: '`bun install --no-save` with install_when `package.json`', run: false,
+    dir: ['--cwd'], valued: ['-c', '--config', '--ca', '--cafile', '--cache-dir', '--env-file', '--backend', '--registry', '--concurrent-scripts',
+      '--network-concurrency', '--omit', '--linker', '--minimum-release-age', '--minimum-release-age-excludes', '--cpu', '--os', '--libc', '--filter', '-F'] },
 ].map((t) => ({ ...t, dir: new Set(t.dir), valued: new Set(t.valued) }))
 /** `yarn --version` and the like: no subcommand, but not an install. */
 const NOT_INSTALL = new Set(['--version', '-v', '-V', '--help', '-h'])
@@ -148,13 +154,13 @@ function uvsOwn(args: Word[]): Word[] {
   return [...args.slice(0, i), ...(end < 0 ? after : after.slice(0, end))]
 }
 
-/** Every uv, yarn or pnpm install in `cmd`, in order, with the folder it runs in: `cd server && uv sync` too, and `uv run`. */
+/** Every uv, yarn, pnpm or bun install in `cmd`, in order, with the folder it runs in: `cd server && uv sync` too, and `uv run`. */
 export function lockedInstalls(cmd: string): LockedInstall[] {
   return commands(cmd).flatMap((c) => TOOLS.flatMap((t) => {
     const r = read(c, t.tool, t.dir, t.valued)
     if (!r || !(t.subs as (string | null)[]).includes(r.sub) || (r.sub === null && r.args.some((a) => NOT_INSTALL.has(a.text)))) return []
     const own = t.run ? uvsOwn(r.args) : r.args
-    const frozen = own.some((a) => t.frozen.includes(a.text)) || truthy(c.env, t.env)
+    const frozen = own.some((a) => t.frozen.includes(a.text)) || truthy(c.env, t.env) || r.sub === 'ci' // only bun has a `ci` among these
     const noLock = own.some((a) => t.noLock.includes(a.text)) || truthy(c.env, t.noLockEnv)
     return [{ text: r.text, dir: r.dir, tool: t.tool, lock: t.lock, frozen, noLock, run: t.run, fix: t.fix, bare: t.bare }]
   }))

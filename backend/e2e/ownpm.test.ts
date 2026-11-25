@@ -1,5 +1,5 @@
-// Bug 343: the user's own ⚙ command in a Yarn or pnpm project with nothing installed. HQ installs with the project's own package manager
-// (it used `npm install --no-package-lock`, ignoring yarn.lock / pnpm-lock.yaml), and when that tool isn't installed it says so and starts
+// Bug 343: the user's own ⚙ command in a Yarn or pnpm project (and a Bun one, Bug 358) with nothing installed. HQ installs with the project's own package manager
+// (it used `npm install --no-package-lock`, ignoring yarn.lock / pnpm-lock.yaml / bun.lock), and when that tool isn't installed it says so and starts
 // nothing, never npm in its place. Stand-ins play yarn and pnpm, so the test doesn't depend on either being on the machine: the test HQ's
 // PATH starts with the stand-ins' folder and leaves out any folder holding a real one (its other programs are linked in a folder of their own).
 import { test, before, after } from 'node:test'
@@ -9,9 +9,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { startHq, waitFor, sh, type Hq } from './harness.ts'
 
-const TOOLS = ['yarn', 'pnpm', 'yarnpkg', 'pnpx', 'corepack']
+const TOOLS = ['yarn', 'pnpm', 'yarnpkg', 'pnpx', 'corepack', 'bun', 'bunx']
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-b343-')), bin = path.join(scratch, 'bin'), calls = path.join(scratch, 'calls.log')
-/** PATH with every folder that holds a real yarn or pnpm swapped for a folder of links to its other programs. */
+/** PATH with every folder that holds a real yarn, pnpm or bun swapped for a folder of links to its other programs. */
 function pathWithout(): string {
   return (process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((d, i) => {
     if (!TOOLS.some((t) => fs.existsSync(path.join(d, t)))) return d
@@ -41,9 +41,10 @@ function project(name: string, extra: Record<string, string>): string {
   sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'needs ms'); return dir
 }
 
-for (const [tool, lock, install] of [['yarn', 'yarn.lock', 'yarn install --frozen-lockfile'], ['pnpm', 'pnpm-lock.yaml', 'pnpm install --frozen-lockfile']]) {
-  test(`Bug 343: ${tool} start in a project with a ${lock} and nothing installed installs with ${tool}, or says ${tool} isn't installed`, async () => {
-    const name = `b343${tool[0]}`, dir = project(name, { [lock]: '# a lockfile\n' }), repo = (await hq.api('repos', { path: dir })).json
+for (const [tool, lock, install, bug] of [['yarn', 'yarn.lock', 'yarn install --frozen-lockfile', '343'], ['pnpm', 'pnpm-lock.yaml', 'pnpm install --frozen-lockfile', '343'],
+  ['bun', 'bun.lock', 'bun install --frozen-lockfile', '358']]) {
+  test(`Bug ${bug}: ${tool} start in a project with a ${lock} and nothing installed installs with ${tool}, or says ${tool} isn't installed`, async () => {
+    const name = `b${bug}${tool[0]}`, dir = project(name, { [lock]: '# a lockfile\n' }), repo = (await hq.api('repos', { path: dir })).json
     fs.rmSync(path.join(bin, tool), { force: true }) // not installed
     assert.equal((await hq.api(`previews/${repo.id}/command`, { command: `${tool} start` })).status, 200)
     const r = await hq.api(`previews/${repo.id}/start`, {}); assert.notEqual(r.status, 200)

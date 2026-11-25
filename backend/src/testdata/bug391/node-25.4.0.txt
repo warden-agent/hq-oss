@@ -1,0 +1,31 @@
+> test
+> node --test
+
+✖ shows who has the book (0.897584ms)
+✔ passes (0.0725ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 1
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 58.72775
+
+✖ failing tests:
+
+test at a.test.js:2:1
+✖ shows who has the book (0.897584ms)
+  AssertionError [ERR_ASSERTION]: 1 == 2
+      at TestContext.<anonymous> (/tmp/b391/nodet/a.test.js:2:47)
+      at Test.runInAsyncScope (node:async_hooks:213:14)
+      at Test.run (node:internal/test_runner/test:1095:25)
+      at Test.start (node:internal/test_runner/test:992:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:358:17) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 2,
+    operator: '==',
+    diff: 'simple'
+  }

@@ -9,7 +9,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { Browser, Page } from 'playwright-core'
 import { headlessShell } from '../src/smoke.ts'
-import { startHq, waitFor, exitPlanMode, type Hq } from './harness.ts'
+import { startHq, waitFor, exitPlanMode, sh, type Hq } from './harness.ts'
 
 const WIDTHS = [1440, 1100, 820], HEIGHT = 900
 const EXE = headlessShell()
@@ -98,14 +98,14 @@ const covered = (page: Page): Promise<string[]> => page.evaluate(() => {
     return r.left < zoom.right - 1 && zoom.left < r.right - 1 && r.top < zoom.bottom - 1 && zoom.top < r.bottom - 1 })
     .map((n) => `the zoom buttons cover part of "${(n.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 30)}"`)
 })
-type Look = { panel: boolean; app: boolean; then?: (page: Page) => Promise<void>; check?: (page: Page) => Promise<string[]> }
+type Look = { panel: boolean; app: boolean; height?: number; then?: (page: Page) => Promise<void>; check?: (page: Page) => Promise<string[]> }
 /** HQ_UISWEEP_SHOTS=<folder>: a picture of every view at every width goes there, for a person to look at what the checks looked at. */
 const SHOTS = process.env.HQ_UISWEEP_SHOTS
 let shot = 0
 /** The page at one width with the side panel and the app pane as asked (the page remembers both in the browser's storage), `then` done, and
  *  the layout settled. The caller closes it. */
 async function opened(width: number, look: Look): Promise<Page> {
-  const page = await browser.newPage({ viewport: { width, height: HEIGHT } })
+  const page = await browser.newPage({ viewport: { width, height: look.height ?? HEIGHT } })
   try {
     await page.addInitScript((kv) => { for (const [k, v] of Object.entries(kv)) localStorage.setItem(k, v) },
       { 'hq.panelOpen': look.panel ? '1' : '0', [`hq.preview.${repoId}`]: JSON.stringify({ open: look.app }) })
@@ -210,4 +210,35 @@ test('the zoom buttons cover no box, the side panel open (Bug 307), and stay in 
 test('the zoom buttons cover no box, with the board at its smallest (side panel and app pane open; Bug 344)', { skip: SKIP }, async () => {
   const check = async (page: Page) => [...await covered(page), ...(page.viewportSize()!.width > 820 ? await moved(page) : [])]
   assert.deepEqual(await sweep({ panel: true, app: true, check }), [])
+})
+
+/** Bug 365: the box with the plan waiting on the user not whole in the board, or its Approve out of sight, in words. */
+const planShows = (page: Page): Promise<string[]> => page.evaluate(() => {
+  const pane = document.querySelector('.react-flow')?.getBoundingClientRect(); if (!pane) return ['no board found']
+  const n = [...document.querySelectorAll('.react-flow__node')].find((e) => /plan for you/.test(e.textContent ?? '')); if (!n) return ['no plan for you on the board']
+  const inside = (r: DOMRect) => r.left >= pane.left - 0.5 && r.right <= pane.right + 0.5 && r.top >= pane.top - 0.5 && r.bottom <= pane.bottom + 0.5
+  const approve = [...n.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Approve')
+  return [...inside(n.getBoundingClientRect()) ? [] : [`the plan for you is cut or out of view (board ${Math.round(pane.width)}×${Math.round(pane.height)})`],
+    ...approve && inside(approve.getBoundingClientRect()) ? [] : ['its Approve is out of sight']]
+})
+
+// Bug 365: a 700 px tall window with the side panel and the app pane open leaves the board about 280 px tall at 820 px. The feature waiting on the
+// user doesn't fit there at the floor, and the view showed it from its top: T-05, the plan for you, was cut at the bottom with Approve out of sight.
+test('the plan waiting on you shows whole, Approve in sight, with the board at its shortest (700 px window, side panel and app pane open; Bug 365)',
+  { skip: SKIP }, async () => {
+    assert.deepEqual(await sweep({ panel: true, app: true, height: 700, check: async (page) => [...await planShows(page), ...await problems(page)] }), [])
+  })
+
+// Bug 365 follow-up (the combined branch's UI tester): with finished work waiting to be merged above the plan, the view showed the first box waiting
+// on the user in board order (T-01, to merge) and the plan, which holds an engineer up, sat below it. Runs last: it finishes T-01 on the board.
+test('a plan waiting on you comes before finished work to merge, the board at its shortest (Bug 365 follow-up)', { skip: SKIP }, async () => {
+  const s = await hq.state(), t1 = s.tickets.find((t: any) => t.key === 'T-01'), dir = s.repos.find((r: any) => r.id === repoId).path
+  const eng = s.agents.find((a: any) => a.role === 'engineer' && a.ticket_id === t1.id && a.status === 'working')
+  const wt = path.join(dir, '.claude', 'worktrees', 'T-01')
+  fs.writeFileSync(path.join(wt, 'books.txt'), 'books\n'); sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', 'books')
+  assert.equal((await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'done' })).isError, false)
+  const r = await hq.mcp(eng.id, 'open_pr', { title: 'Pick books', body: 'Picks books.\n\n## Deviations from approved plan\nNone' }); assert.equal(r.isError, false, r.text)
+  await waitFor('T-01 ready to merge', async () => (await hq.state()).tickets.find((t: any) => t.id === t1.id).status === 'pr_ready')
+  const check = async (page: Page) => [...await planShows(page), ...await problems(page)]
+  for (const height of [700, 900]) assert.deepEqual(await sweep({ panel: true, app: true, height, check }), [], `${height} px tall`)
 })

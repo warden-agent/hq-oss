@@ -18,12 +18,14 @@ import { cacheEnv } from './roles.ts'
 import { git } from './reposync.ts'
 import { id, real } from './util.ts'
 import { seedPackages } from './worktrees.ts'
-import { summaryLines, testCounts, type Counts } from './testcounts.ts'
-import { nameWatch, type Watched } from './criteria.ts'
+import { onPath, ownInstall, packageManager } from './apprun.ts'
+import { shownLine, summaryLines, testCounts, type Counts } from './testcounts.ts'
+import { nameWatch, type Watch, type Watched } from './criteria.ts'
 import { lookIn, type LookPlan } from './smoke.ts'
 import type { Seen } from './smokerules.ts'
 
-export type TestPlan = { install: string | null; test: string }
+/** `stop`: HQ can't install the packages the project's own way (its package manager isn't installed, say), in words for the user: nothing runs (Bug 392). */
+export type TestPlan = { install: string | null; test: string; stop?: string }
 const has = (root: string, ...p: string[]) => fs.existsSync(path.join(root, ...p))
 const npmTest = (root: string): boolean => {
   try {
@@ -38,16 +40,37 @@ const nodeInstall = (root: string, rel: string): string | null => {
   const install = has(root, rel, 'package-lock.json') ? 'npm ci' : 'npm install'
   return rel === '.' ? install : `(cd ${JSON.stringify(rel)} && ${install})`
 }
+/** How each package manager runs a package.json's test script (`bun test` is Bun's own test runner, not the script). */
+const TEST_SCRIPT = { npm: 'npm test', yarn: 'yarn test', pnpm: 'pnpm test', bun: 'bun run test' } as const
+/** Bug 392: how a Node folder of the checkout installs its packages and runs its test script: with its own package manager, by the preview's rule
+ *  (apprun.ts packageManager, ownInstall: the lockfile followed, never written). npm's as before. Its tool missing: `stop`, never npm instead, which ignores
+ *  the others' lockfiles; but packages already there (seedPackages copied the main checkout's) need no install, and npm runs the script as well. */
+function nodePart(root: string, rel: string): { install: string | null; test: string; stop?: string } {
+  const dir = path.join(root, rel), pm = packageManager(dir), test = TEST_SCRIPT[onPath(pm.tool) ? pm.tool : 'npm']
+  if (pm.tool === 'npm') return { install: nodeInstall(root, rel), test }
+  if (has(dir, 'node_modules')) return { install: null, test }
+  const own = ownInstall(dir, onPath, 'test again'), install = own.install ? (rel === '.' ? own.install : `(cd ${JSON.stringify(rel)} && ${own.install})`) : null
+  return { install, test, ...(own.stop ? { stop: rel === '.' ? own.stop : `${rel}: ${own.stop}` } : {}) }
+}
+const partTest = (p: string, run: string): string => `(cd ${JSON.stringify(p)} && ${run})`
+/** Bug 376: the folders a test command starts its runners in, when it is the command HQ builds for a repo split into folders (detectTests:
+ *  `(cd "web" && npm test) && …`, also when the user saved it as theirs). A runner prints its files from the folder it starts in, so a file line in its
+ *  output counts only for a file in one of these (criteria.ts namesFile). null for any other command: HQ can't tell where the user's own command starts
+ *  its runners (`npm test` at the root may run each workspace's), so a file line counts for every file whose path ends the same, as before. */
+export function testFolders(cmd: string): string[] | null {
+  const c = cmd.trim(), ms = [...c.matchAll(/\(cd ("[^"\\$`/]+") && (npm test|yarn test|pnpm test|bun run test)\)/g)], ds = ms.map((m) => JSON.parse(m[1]!) as string)
+  return ds.length && !ds.some((d) => d === '.' || d === '..') && ms.map((m, i) => partTest(ds[i]!, m[2]!)).join(' && ') === c ? ds : null // that command exactly, or none
+}
 /** How to test the checkout at `root`, worked out from its files with no model and no tokens; null when it has no tests HQ can find.
  *  The root's own test script wins; a repo split into folders (server/, web/) runs each folder's. */
 export function detectTests(root: string): TestPlan | null {
   try {
-    if (has(root, 'package.json') && npmTest(root)) return { install: nodeInstall(root, '.'), test: 'npm test' }
+    if (has(root, 'package.json') && npmTest(root)) return nodePart(root, '.')
     const parts = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules' && has(root, d.name,
       'package.json') && npmTest(path.join(root, d.name))).map((d) => d.name).sort()
     if (parts.length) {
-      const installs = parts.flatMap((p) => nodeInstall(root, p) ?? [])
-      return { install: installs.join(' && ') || null, test: parts.map((p) => `(cd ${JSON.stringify(p)} && npm test)`).join(' && ') }
+      const each = parts.map((p) => ({ p, ...nodePart(root, p) })), stop = each.find((e) => e.stop)?.stop
+      return { install: each.flatMap((e) => e.install ?? []).join(' && ') || null, test: each.map((e) => partTest(e.p, e.test)).join(' && '), ...(stop ? { stop } : {}) }
     }
   } catch { return null }
   if (has(root, 'pyproject.toml') || has(root, 'pytest.ini') || has(root, 'requirements.txt')) {
@@ -65,8 +88,11 @@ const q = (s: string): string => JSON.stringify(s)
  *  package's install script could send what it reads. */
 const hiddenPaths = (): string[] => [PATHS.home, GH_CONFIG_DIR, ...['.claude', '.claude.json', '.ssh', '.aws', '.config/gh', '.config/gcloud', '.netrc', '.git-credentials', '.npmrc', '.pypirc',
   '.docker', '.kube', '.gnupg', '.cargo/credentials.toml', '.cargo/credentials'].map((p) => path.join(os.homedir(), p))].map(real)
-/** macOS's sandbox for a test run. `network`: outside access for installing packages, else localhost only. */
-export function sandboxProfile(wt: string, o: { network: boolean }): string {
+/** macOS's sandbox for a test run. `network`: outside access for installing packages, else localhost only. `block` (Bug 374): localhost ports the run may
+ *  neither call nor listen on: the ones HQ moved its copy of the app off (testports.ts), where somebody else's server answers (the user's preview). A place
+ *  that still names one fails there; it never reaches that server. Later rules win, so these come last. */
+export function sandboxProfile(wt: string, o: { network: boolean; block?: number[] }): string {
+  const block = (o.block ?? []).filter((p) => Number.isInteger(p) && p > 0 && p < 65536)
   const tmp = real(os.tmpdir())
   const writes = [wt, ENGINEER_CACHE, tmp, '/private/tmp', '/private/var/folders'].map((p) => `(subpath ${q(p)})`).join(' ')
   const hidden = hiddenPaths().map((p) => `(subpath ${q(p)})`).join(' ')
@@ -77,7 +103,8 @@ export function sandboxProfile(wt: string, o: { network: boolean }): string {
     '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd" "com.apple.coreservices.quarantine-resolver") (global-name-prefix "com.apple.lsd"))',
     // The only sockets a run can reach are its own, and the one macOS looks names up through (spike 2026-11-03: DNS fails without it).
     ...(o.network ? ['(deny network-outbound (remote unix-socket))', '(allow network-outbound (remote unix-socket (literal "/private/var/run/mDNSResponder")))']
-      : ['(deny network-outbound)', `(allow network-outbound (remote ip "localhost:*") (remote unix-socket (subpath ${q(wt)})))`, '(allow network-bind (local ip "localhost:*"))']),
+      : ['(deny network-outbound)', `(allow network-outbound (remote ip "localhost:*") (remote unix-socket (subpath ${q(wt)})))`, '(allow network-bind (local ip "localhost:*"))',
+        ...block.flatMap((p) => [`(deny network-outbound (remote ip "localhost:${p}"))`, `(deny network-bind (local ip "*:${p}"))`])]),
   ].join('\n')
 }
 /** macOS's sandbox for the UI tester's browser (uitester.ts): it writes only in `dir` (its own temp folder) and reaches only the app, on localhost `port`.
@@ -104,12 +131,11 @@ export function bwrapArgs(wt: string, o: { network: boolean }): string[] {
     '--unshare-all', ...(o.network ? ['--share-net'] : []), '--die-with-parent', '--new-session', '--chdir', wt]
 }
 const sandboxBin = (): string => process.env.HQ_SANDBOX_BIN ?? (process.platform === 'darwin' ? '/usr/bin/sandbox-exec' : 'bwrap')
-/** How to run `cmd` sandboxed on this machine. */
-export function sandboxCommand(cwd: string, cmd: string, o: { network: boolean }): { bin: string; args: string[] } {
+/** How to run `cmd` sandboxed on this machine. `block`: see sandboxProfile (Linux gives the run a network of its own, with nothing of the machine's in it). */
+export function sandboxCommand(cwd: string, cmd: string, o: { network: boolean; block?: number[] }): { bin: string; args: string[] } {
   const wt = real(cwd), sh = ['/bin/sh', '-c', cmd]
   return { bin: sandboxBin(), args: [...(process.platform === 'darwin' ? ['-p', sandboxProfile(wt, o)] : bwrapArgs(wt, o)), ...sh] }
 }
-const onPath = (bin: string): boolean => (process.env.PATH ?? '').split(path.delimiter).some((d) => fs.existsSync(path.join(d, bin)))
 let worked: string | null = null // the sandbox last seen working; a failure is looked at again each time, the user may have just fixed it
 /** Why this machine can't run auto mode, in words for the user with the fix, or null when it can. It runs the sandbox for real: a Linux
  *  can have bubblewrap and still refuse it (Ubuntu can block what it needs). Engineers' sandbox on Linux needs bubblewrap and socat too. */
@@ -134,8 +160,8 @@ const TAIL = 8000, EARLIER = 4000
  *  macOS; on Linux bubblewrap doesn't pass the signal on, so the run goes at once, as it always did. */
 const GRACE_MS = 10_000
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
-// A line that names a failure, as node, pytest, go, cargo and jest print them (all that failedLine picks), and one that names an error
-const FAILED = /^(✖|×|---\s*FAIL\b|FAIL(ED)?\b|not ok\b|E\s|Traceback\b|thread '.*' panicked)/i, ERRORED = /^\w*(error|exception)\b/i
+// A line that names a failure, as node, pytest, go, cargo, jest and mocha (`2 failing`, its list of failures follows) print them, and one that names an error
+const FAILED = /^(✖|×|---\s*FAIL\b|FAIL(ED)?\b|not ok\b|E\s|Traceback\b|thread '.*' panicked|\d+ failing$)/i, ERRORED = /^\w*(error|exception)\b/i
 const PASSED = /^(✔|✓|▶|ok\b|PASS(ED)?\b|---\s*PASS\b)/ // a test that passed, or the next one starting: what failed has been told
 /** The lines of a run's output that name a failure (and up to 10 after it) or an error (up to 3), wherever they come. node
  *  prints why a test file crashed where it happens, and its summary at the end only says "test failed" (Bug 82). The first
@@ -145,7 +171,7 @@ export function failureLines(): { take: (chunk: string) => void; before: (at: nu
   const kept: { n: number; at: number; text: string }[] = []
   let rest = '', seen = 0, n = 0, left = 0, used = 0, strong = false
   const line = (raw: string, at: number) => {
-    const text = raw.replace(ANSI, '').trimEnd().slice(0, 300), s = text.trim()
+    const text = shownLine(raw).replace(ANSI, '').trimEnd().slice(0, 300), s = text.trim()
     if (FAILED.test(s)) { left = 11; strong = true } else if (ERRORED.test(s)) { strong &&= left > 0; left = Math.max(left, 4) } else if (PASSED.test(s)) left = 0
     if (left > 0 && used < (strong ? EARLIER : EARLIER / 2)) { kept.push({ n, at, text }); used += text.length + 1 }
     left = Math.max(0, left - 1); n++
@@ -183,7 +209,8 @@ export function sweepRunTmp(): string[] {
 }
 /** Runs `cmd` in `cwd` in the sandbox with a clean environment: no tokens, no agent ids, nothing of the backend's but PATH and HOME.
  *  With no sandbox nothing runs: HQ never runs this code bare. `env`: added to that (a test run's own ports, Bug 273). */
-export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; watch?: string[]; env?: Record<string, string> }):
+export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; watch?: Watch; env?: Record<string, string>
+  block?: number[] }):
   Promise<RunResult> {
   return new Promise((resolve) => {
     if (o.signal?.aborted) return resolve({ code: null, output: '', earlier: '', timedOut: false, sandboxFailed: false }) // stopped before it began: nothing runs
@@ -192,7 +219,7 @@ export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; ti
     const { bin, args } = sandboxCommand(cwd, cmd, o)
     const p = spawn(bin, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); if (p.pid) running.set(p.pid, cwd)
     let output = '', total = 0, timedOut = false, hard: NodeJS.Timeout | undefined
-    const fails = failureLines(), sums = summaryLines(), names = nameWatch(o.watch ?? [])
+    const fails = failureLines(), sums = summaryLines(), names = nameWatch(o.watch ?? { names: [], files: [] }, testFolders(cmd))
     const take = (s: string) => { total += s.length; output = (output + s).slice(-TAIL); fails.take(s); sums.take(s); names.take(s) }
     p.stdout.setEncoding('utf8').on('data', take); p.stderr.setEncoding('utf8').on('data', take)
     const signal = (s: NodeJS.Signals) => { try { process.kill(-p.pid!, s) } catch { /* gone */ } }, kill = () => signal('SIGKILL')
@@ -222,14 +249,14 @@ export async function sweepTestWorktrees(repoPath: string): Promise<void> {
 }
 
 /** `hung`: it never finished, and HQ stopped it at the time limit. `unproven`: the run passed, but it skipped or never ran a test the ticket named for one of
- *  its criteria (criteria.ts); `output` is then HQ's own list of those, not the run's. `names`: what a passing run printed about the tests it was asked to
+ *  its criteria (criteria.ts); `output` is then HQ's own list of those, not the run's, and `missing` how many they are (Bug 373). `names`: what a passing run printed about the tests it was asked to
  *  watch for. `output` and `earlier` are a run's (RunResult). `stopped`: auto mode went off
  *  or stopped the project during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bugs 89, 115).
  *  `seen`: what HQ's look at the app showed, when the run was asked to look once the tests had passed (smoke.ts). `looked`: a look with no tests before it
  *  (main alone, to tell what a ticket changed). `look` on a failure: it's HQ's look that failed, not the tests, and `output` is HQ's report of it. `review`:
  *  likewise for what a fresh reader of the ticket's changes found (diffcheck.ts). */
 export type TestResult = { kind: 'pass'; test: string; output: string; counts: Counts | null; ms: number; names: Watched; seen?: Seen }
-  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; look?: boolean; review?: boolean
+  | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; missing?: number; look?: boolean; review?: boolean
     asked?: boolean; tester?: boolean } | { kind: 'no_tests' } // asked: the user's check found it (hqcheck.ts), not auto mode; tester: the UI tester's findings (with look)
   | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' } | { kind: 'looked'; seen: Seen }
 /** Auto mode's own runs under way, by project folder (Bug 89). A repair's try of a test command isn't one: with auto off its result goes to the user. */
@@ -280,6 +307,12 @@ function onPage(s: Shown | null): { state: (to: TestRunView['state'], behind?: s
     over: () => { if (views.delete(v.id)) patch('test_run', v.id, null) },
   }
 }
+/** Bug 392: where Yarn, pnpm and Bun keep what they download, for an install in the sandbox: their own folders in the home can't be written there, and
+ *  each fell back to a folder of the one run (Yarn 1.22, Yarn 4.19, pnpm 10.34, Bun 1.4: spike 2026-11-24), so every run downloaded everything again.
+ *  pnpm's only for a pnpm install: npm 11 warns about any npm_config_ setting it doesn't know. */
+const toolCaches = (install: string): Record<string, string> => ({ YARN_CACHE_FOLDER: path.join(ENGINEER_CACHE, 'yarn'),
+  YARN_GLOBAL_FOLDER: path.join(ENGINEER_CACHE, 'yarn-berry'), BUN_INSTALL_CACHE_DIR: path.join(ENGINEER_CACHE, 'bun'),
+  ...(/\bpnpm install\b/.test(install) ? { npm_config_store_dir: path.join(ENGINEER_CACHE, 'pnpm-store') } : {}) })
 /** The clean environment everything in the sandbox runs with: no tokens, no agent ids, nothing of the backend's but PATH and HOME. `tmp`: its own temp folder. */
 export const cleanEnv = (tmp: string | null): Record<string, string> => ({ HOME: os.homedir(), PATH: process.env.PATH ?? '/usr/bin:/bin', TMPDIR: tmp ?? '/tmp',
   LANG: process.env.LANG ?? 'en_US.UTF-8', CI: '1', ...cacheEnv(), ...(process.env.RUSTUP_HOME ? { RUSTUP_HOME: process.env.RUSTUP_HOME } : {}) }) // rustup's toolchains, if they aren't in ~/.rustup
@@ -307,6 +340,24 @@ export const showing = (s: Shown): { over: () => void } => onPage(s)
 /** A signal that auto mode going off or stopping the project fires, for work of auto mode's that isn't a test run (Bugs 89, 115): `gen` is autoGen's count as
  *  auto read it, and `done` gives the signal up. */
 export const autoWork = (repoPath: string, gen: Owner): { signal: AbortSignal; done: () => void } => ownedBy(repoPath, gen)
+/** What failed, for the user: the first line that names it, never a stack trace. The engineer gets the whole output. */
+export function failedLine(output: string): string {
+  const lines = output.split('\n').map((l) => shownLine(l).replace(ANSI, '').trim()).filter(Boolean)
+  let hit: string | undefined
+  for (const [i, l] of lines.entries()) {
+    hit = /^(✖|×|---\s*FAIL\b|FAIL\b|FAILED\b|not ok\b|error\b|E\s)/i.test(l) && !/^✖ failing tests/i.test(l) ? l : /^\d+ failing$/.test(l) ? mochaFailure(lines, i + 1) : undefined
+    if (hit) break
+  }
+  hit ??= lines.find((l) => /\berror\b|\bfailed?\b/i.test(l) && !/^(at |ℹ|#)/.test(l)) ?? lines.find((l) => /^\w+(Error|Exception)\b/.test(l)) ?? lines.at(-1) ?? ''
+  return hit.replace(/\s*\(\d[\d.]*ms\)$/, '').slice(0, 140)
+}
+/** Bug 391: the first test in the list mocha prints after `2 failing`, its suites and title on lines of their own, the last one ending in ":":
+ *  `1) book list` / `marks a book due soon:` reads `1) book list marks a book due soon`, as mocha's `list` reporter names it. */
+function mochaFailure(lines: string[], at: number): string | undefined {
+  if (!/^\d+\) /.test(lines[at] ?? '')) return undefined
+  const end = lines.slice(at, at + 8).findIndex((l) => l.endsWith(':'))
+  return end < 0 ? lines[at] : lines.slice(at, at + end + 1).join(' ').slice(0, -1)
+}
 // At most `max` characters of the start or the end, cut between lines
 const firstChars = (s: string, max: number): string => { if (s.length <= max) return s; const i = s.lastIndexOf('\n', max); return `${s.slice(0, i > 0 ? i : max)}\n…` }
 const lastChars = (s: string, max: number): string => s.length <= max ? s : `…\n${s.slice(s.indexOf('\n', s.length - max) + 1 || s.length - max)}`
@@ -322,7 +373,7 @@ export function failReport(r: Pick<Failed, 'output' | 'earlier'>, max: number): 
  *  from when HQ knows there are tests to run; a run stopped before that is never shown. */
 /** `watch`: test names and files to look for in what the run prints (a ticket's map of its criteria's tests). `look`: once the tests pass, start the app in the
  *  same checkout and open its pages (smoke.ts). `only`: the look alone, with no tests before it. */
-export type RunOpts = { watch?: string[]; look?: LookPlan | null; only?: 'look' }
+export type RunOpts = { watch?: Watch; look?: LookPlan | null; only?: 'look' }
 async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: Owner, show: Shown | null, o: RunOpts = {}): Promise<TestResult> {
   const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto), stopped = { kind: 'stopped' } as const
   let page = onPage(null)
@@ -341,8 +392,9 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
         page.state('running'); const seen = await look(plan); return seen ? { kind: 'looked', seen } : stopped
       }, (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath })
     }
-    const found = detectTests(wt); const plan: TestPlan | null = custom ? { install: found?.install ?? null, test: custom } : found
+    const found = detectTests(wt); const plan: TestPlan | null = custom ? { install: found?.install ?? null, test: custom, stop: found?.stop } : found
     if (!plan) return { kind: 'no_tests' }
+    if (plan.stop) return { kind: 'error', why: plan.stop } // Bug 392: never npm in its place
     const timeoutMs = getSetting('test_timeout_min', DEFAULTS.test_timeout_min) * 60_000
     page = onPage(signal.aborted ? null : show)
     return await withTurn(`HQ's test of ${key}`, 'tests', async (): Promise<TestResult> => { // in line with engineers' own builds and test runs (Bug 76); the time limit starts with the run
@@ -355,7 +407,7 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
       try {
         if (signal.aborted) return stopped
         if (plan.install) {
-          const i = await runSandboxed(wt, plan.install, { network: true, timeoutMs, signal, env })
+          const i = await runSandboxed(wt, plan.install, { network: true, timeoutMs, signal, env: { ...env, ...toolCaches(plan.install) } })
           if (signal.aborted) return stopped
           if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
           if (i.code !== 0) return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier }
@@ -365,7 +417,7 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
         if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
         if (r.code === 0) {
           const pass: TestResult = { kind: 'pass', test: plan.test, output: r.output.replace(ANSI, ''), counts: testCounts(r.summary ?? null), ms: Date.now() - began, // Bug 126
-            names: r.names ?? { prints: false, passed: [], skipped: [] } }
+            names: r.names ?? { prints: false, passed: [], skipped: [], unsure: [] } }
           if (!o.look) return pass
           page.what(show?.what === 'main' ? 'look_main' : 'look'); const seen = await look(o.look) // the tests passed: now, does the app open?
           return seen ? { ...pass, seen } : stopped
