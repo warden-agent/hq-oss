@@ -1,0 +1,17 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.14, pytest-9.2.0, pluggy-1.7.0
+rootdir: /tmp/shelf
+configfile: pyproject.toml
+collected 5 items
+
+tests/test_due.py ..                                                     [ 40%]
+tests/test_shelf.py .s.                                                  [100%]
+
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED tests/test_due.py::test_due_date_is_shown
+PASSED tests/test_due.py::test_due_soon_is_marked
+PASSED tests/test_shelf.py::test_shelf_lists_books
+PASSED tests/test_shelf.py::test_shelf_counts_books
+SKIPPED [1] tests/test_shelf.py:8: needs the cover service
+========================= 4 passed, 1 skipped in 0.01s =========================

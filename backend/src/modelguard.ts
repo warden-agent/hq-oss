@@ -1,10 +1,9 @@
 // "Never degrade silently": classify model switches and per-request models.
-import { getSetting, setSetting, run, one, now } from './db.ts'
+import { getSetting, run, one, now } from './db.ts'
 import { DEFAULTS } from './config.ts'
-import { emit } from './events.ts'
 import { attention } from './attention.ts'
 import { update, type Agent } from './agents.ts'
-import { wakeAll } from './wake.ts'
+import { pauseRole, roleWord } from './pause.ts'
 
 export function familyOf(model: string | null | undefined): string {
   const m = (model ?? '').toLowerCase()
@@ -22,12 +21,6 @@ export function expectedFamilies(agent: Agent, inPlanMode = !!agent.in_plan_mode
   if (a === 'best') return ['fable', 'opus']
   return [familyOf(a) === 'unknown' ? a : familyOf(a)]
 }
-export function pauseRole(role: string, reason: string): void {
-  const paused = getSetting<string[]>('paused_roles', []); if (!paused.includes(role)) setSetting('paused_roles', [...paused, role])
-  emit({ agentId: null, source: 'system', kind: 'role.paused', payload: { role, reason } })
-}
-export function resumeRole(role: string): void { setSetting('paused_roles', getSetting<string[]>('paused_roles', []).filter((r) => r !== role)); emit({ agentId: null, source: 'system', kind: 'role.resumed', payload: { role } }); wakeAll() }
-
 export function onPostModelSwitch(agent: Agent, body: Record<string, unknown>): void {
   const from = String(body.from_model ?? ''), to = String(body.to_model ?? ''), source = String(body.source ?? ''), requested = body.requested_model == null ? null : String(body.requested_model)
   const window = getSetting('opusplan_switch_window_s', DEFAULTS.opusplan_switch_window_s) * 1000
@@ -45,8 +38,15 @@ export function onPostModelSwitch(agent: Agent, body: Record<string, unknown>): 
   if (!expected) {
     const detail = `${agent.role} ${agent.id}: model switched ${from} → ${to} (source ${source}); role paused`
     update(agent.id, { paused_reason: detail })
-    pauseRole(agent.role, detail); attention('model_fallback', detail, { agentId: agent.id, ticketId: agent.ticket_id })
+    // Bug 195: the pause stops the role's agents too (pause.ts), so the notice says so, in plain words, and what ends it
+    pauseRole(agent.role, detail); attention('model_fallback', fallbackWords(agent, from, to), { agentId: agent.id, ticketId: agent.ticket_id })
   }
+}
+/** Bug 195: the notice for a switch nobody asked for. It stays until Resume (the page gives it the button), which answers it (pause.ts resumeRole). */
+export const fallbackWords = (agent: Pick<Agent, 'id' | 'role' | 'display_name'>, from: string, to: string): string => {
+  const all = roleWord(agent.role)
+  return `${agent.display_name ?? `${agent.role} ${agent.id}`} switched models by itself: ${from} → ${to}. So that nothing runs on a model you didn't choose, HQ stopped `
+    + `every ${all.replace(/s$/, '')} at work and holds the messages for ${all}. Resume lets them carry on, on the model each is on now.`
 }
 /** The agent's own last tool call (not a helper's) is EnterPlanMode: it is going back into plan mode. */
 const enteringPlan = (agentId: string): boolean => one<{ kind: string }>(`SELECT kind FROM events WHERE agent_id = ? AND kind LIKE 'hook.PreToolUse:%'

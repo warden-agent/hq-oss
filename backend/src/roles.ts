@@ -6,6 +6,7 @@ import { PATHS, PORTS, DEFAULTS, ENGINEER_CACHE, GH_CONFIG_DIR, TURN_WAIT_S, HQ_
 import { getSetting } from './db.ts'
 import { real, shq } from './util.ts'
 import { BROWSER_TOOLS } from './uitesterrules.ts'
+import { hostProblem } from './downloads.ts'
 
 export type Role = 'tpm' | 'architect' | 'engineer' | 'launcher' | 'tester'
 const HOME = os.homedir()
@@ -20,8 +21,17 @@ const hook = (token: string, timeout: number, extra: Record<string, unknown> = {
 
 export const ENGINEER_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'LSP', 'ToolSearch', 'EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'Agent']
 export const ENGINEER_DISALLOWED = ['EnterWorktree', 'ExitWorktree', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'AskUserQuestion', 'Monitor', 'Skill']
-/** Where engineers may download packages from: npm, PyPI and crates.io (each index + files; Bug 71). */
-export const PACKAGE_REGISTRIES = ['registry.npmjs.org', 'registry.yarnpkg.com', 'pypi.org', 'files.pythonhosted.org', 'index.crates.io', 'static.crates.io']
+/** Where engineers may download packages from: npm, PyPI and crates.io (each index + files; Bug 71), and Go's module mirror and checksum database
+ *  (Bug 415: the mirror serves the modules' zips itself, so `go mod download` needs no other host; real 2.1.322, 2026-11-26). Any other host is
+ *  refused, and HQ tells the user which one (downloads.ts). On a Mac, Go also needs `sandbox_system_certs` (systemCerts below). */
+export const PACKAGE_REGISTRIES = ['registry.npmjs.org', 'registry.yarnpkg.com', 'pypi.org', 'files.pythonhosted.org', 'index.crates.io', 'static.crates.io',
+  'proxy.golang.org', 'sum.golang.org']
+export { REGISTRY_WORDS } from './downloads.ts' // PACKAGE_REGISTRIES in a user's words (there, so the page can say them too)
+/** Bugs 412, 415: whether agents' sandbox may use macOS's certificate checker (trustd). Claude Code's sandbox blocks it, and pip (24.2 and later) and Go
+ *  check every download with it, so both fail there with "OSStatus -26276" (not the proxy's doing: it doesn't decrypt anything, and uv, npm and cargo,
+ *  which carry their own list of certificates, download through it fine). The user's setting, off unless they turn it on: trustd fetches what a
+ *  certificate names (its issuer, revocation lists) from any host, and a sandboxed command can hand it a certificate of its own. Linux has no trustd. */
+export const systemCerts = (): boolean => process.platform === 'darwin' && getSetting('sandbox_system_certs', DEFAULTS.sandbox_system_certs) === 'on'
 /** Bug 71: rustup puts `cargo` and `rustc` in ~/.cargo/bin and the toolchains in ~/.rustup, and an engineer's sandbox reads nothing in home
  *  (blockReadsOutsideWorkingDirectories), so its `cargo` was "operation not permitted". The sandbox may read those two folders and nothing
  *  else of home: not the rest of ~/.cargo (its credentials; crates download to the engineers' CARGO_HOME, cacheEnv). Both spellings of a
@@ -29,6 +39,75 @@ export const PACKAGE_REGISTRIES = ['registry.npmjs.org', 'registry.yarnpkg.com',
 export function rustReads(): string[] {
   const dirs = [path.join(process.env.CARGO_HOME || path.join(HOME, '.cargo'), 'bin'), process.env.RUSTUP_HOME || path.join(HOME, '.rustup')]
   return [...new Set(dirs.filter((d) => fs.existsSync(d)).flatMap((d) => [d, real(d)]))]
+}
+/** Places in home that hold credentials or HQ's and Claude's own files: nothing a sandboxed run does may read them (testrun.ts), and no folder
+ *  that holds one is ever opened to an agent (toolReads). */
+export const HOME_SECRETS = ['.claude', '.claude.json', '.ssh', '.aws', '.config/gh', '.config/gcloud', '.netrc', '.git-credentials', '.npmrc', '.pypirc',
+  '.docker', '.kube', '.gnupg', '.cargo/credentials.toml', '.cargo/credentials']
+/** Bug 413: the package tools and language runtimes an engineer runs, which their installers often put in home (uv in ~/.local/bin, Poetry
+ *  in a venv under ~/Library or ~/.local/share, pnpm and Yarn from npm's global folder or Corepack, node from nvm). */
+export const HOME_TOOLS = ['node', 'npm', 'npx', 'corepack', 'pnpm', 'yarn', 'bun', 'deno', 'uv', 'uvx', 'poetry', 'pdm', 'pipenv', 'hatch',
+  'python', 'python3', 'pip', 'pip3', 'go']
+/** Folders of home many programs share: never opened whole, only a tool's own folder inside them. */
+const SHARED = ['', '.local', '.local/share', '.local/lib', '.local/state', '.config', '.cache', 'Library', 'Library/Application Support',
+  'Library/Caches', 'Library/Preferences', 'bin', 'Documents', 'Desktop', 'Downloads']
+/** Bug 413: an agent's sandbox reads nothing in home (blockReadsOutsideWorkingDirectories), so a package tool installed there was unseen
+ *  (`which uv`: not found, and `sh -c uv` too) or couldn't run at all (Poetry, a script in its own venv). For each of HOME_TOOLS that HQ's
+ *  PATH finds in home: the program (both spellings: the link on PATH and its real file) and the folder it belongs to, and nothing else of
+ *  home: a node package's folder (npm's global pnpm and Yarn, Corepack's shims), else the folder holding a `bin` or `shims` folder (a venv,
+ *  nvm's node, pyenv), and the Python a venv was made from when that is in home too. Never a folder many programs share (~/.local), nor
+ *  one that holds a HOME_SECRETS place (~/.cargo): a lone program (uv in ~/.local/bin) is opened by itself. */
+export function toolReads(PATH: string = process.env.PATH ?? '', home: string = HOME): string[] {
+  const homes = [...new Set([home, real(home)])]
+  const inHome = (p: string) => homes.some((h) => { const r = path.relative(h, p); return r !== '' && !r.startsWith('..') && !path.isAbsolute(r) })
+  const secrets = [...homes.flatMap((h) => HOME_SECRETS.map((s) => path.join(h, s))), PATHS.home, real(PATHS.home), GH_CONFIG_DIR]
+  const shared = new Set(homes.flatMap((h) => SHARED.map((s) => path.join(h, s))))
+  const within = (a: string, b: string) => a === b || a.startsWith(b + path.sep)
+  const safe = (d: string) => inHome(d) && !shared.has(d) && !secrets.some((s) => within(s, d) || within(d, s))
+  const reads: string[] = []
+  const at = (p: string) => path.join(real(path.dirname(p)), path.basename(p)) // a link's own place by its real path
+  const add = (p: string) => { for (const q of [p, at(p), real(p)]) if (inHome(q) && safe(q)) reads.push(q) }
+  const ownFolder = (file: string): string | null => { // a node package, or the folder a bin/ or shims/ folder belongs to
+    for (let d = path.dirname(file); inHome(d); d = path.dirname(d)) {
+      const up = path.dirname(d)
+      if (path.basename(up) === 'node_modules' || (path.basename(up).startsWith('@') && path.basename(path.dirname(up)) === 'node_modules')) return d
+    }
+    const d = path.dirname(file)
+    return ['bin', 'shims'].includes(path.basename(d)) && safe(path.dirname(d)) ? path.dirname(d) : null
+  }
+  const dirs = PATH.split(path.delimiter).filter(Boolean)
+  for (const tool of HOME_TOOLS) {
+    const found = dirs.map((d) => path.join(d, tool)).find((f) => { try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile() } catch { return false } })
+    if (!found) continue
+    const file = real(found)
+    if (!inHome(found) && !inHome(file)) continue
+    add(found); add(file)
+    const own = ownFolder(file); if (!own) continue
+    add(own)
+    let base = '' // a venv's Python: `home = <its bin folder>` in pyvenv.cfg
+    try { base = /^home\s*=\s*(.+?)\s*$/m.exec(fs.readFileSync(path.join(own, 'pyvenv.cfg'), 'utf8'))?.[1] ?? '' } catch { /* not a venv */ }
+    if (path.basename(base) === 'bin') add(path.dirname(base)) // uv's own Pythons live in ~/.local/share/uv/python/<one>/bin
+  }
+  // A file in a folder that's opened anyway: once. Its folder by its real path (the sandbox compares those), but a link on PATH stays itself.
+  const all = [...new Set(reads)]
+  return all.filter((p) => !all.some((o) => o !== p && real(o) !== at(p) && within(at(p), real(o))))
+}
+/** Bug 423: config files that tools look for in the folder they run in and every folder above it until one counts: pytest's (a pyproject.toml,
+ *  setup.cfg or tox.ini counts only with a pytest section), uv's settings and workspace search, ruff's. */
+export const PARENT_CONFIGS = ['pyproject.toml', 'setup.cfg', 'tox.ini', 'pytest.ini', '.pytest.ini', 'pytest.toml', '.pytest.toml', 'setup.py', 'uv.toml',
+  'ruff.toml', '.ruff.toml']
+/** Bug 423: an agent's worktree sits in <repo>/.claude/worktrees/<name>, so those searches walk up out of it into the main checkout, which
+ *  the sandbox refuses even to stat ("Operation not permitted"): uv stopped there, and so did pytest on Python 3.12 and 3.13 (pathlib's
+ *  is_file raises on it), when the project's pyproject.toml has no pytest or uv section. The sandbox may read those few files of the main
+ *  checkout and of the two folders in between, as they are now (a regular file, not a link, by both spellings), and nothing else there.
+ *  No setting stops the searches at the worktree without changing which config the project gets: pytest's `--rootdir` doesn't end its
+ *  search, only `-c <file>` does, and uv's `--no-config` drops the project's own [tool.uv] settings too. */
+export function checkoutReads(repo: string | undefined): string[] {
+  if (!repo) return []
+  const dirs = [repo, path.join(repo, '.claude'), path.join(repo, '.claude', 'worktrees')]
+  const file = (p: string) => { try { return fs.lstatSync(p).isFile() } catch { return false } }
+  const found = dirs.flatMap((d) => PARENT_CONFIGS.map((n) => path.join(d, n))).filter(file)
+  return [...new Set(found.flatMap((p) => [p, path.join(real(path.dirname(p)), path.basename(p))]))]
 }
 /** The Launch helper looks around and tries things in its sandbox; it never changes the project (launchhelper.ts). */
 export const LAUNCHER_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'ToolSearch']
@@ -75,7 +154,7 @@ function bashHook(agentDir: string, repoId: string | undefined) {
 
 function hookGroup(token: string) { return [{ hooks: [hook(token, 10)] }] }
 
-type SettingsOpts = { agentDir: string; repoId?: string; repoAllowlist?: string[]; editOverrides?: string[]; localOnly?: boolean }
+type SettingsOpts = { agentDir: string; repoId?: string; repoPath?: string; repoAllowlist?: string[]; editOverrides?: string[]; localOnly?: boolean }
 export function buildSettings(role: Role, token: string, opts: SettingsOpts): Record<string, unknown> {
   const gateTimeout = getSetting('gate_timeout_s', DEFAULTS.gate_timeout_s)
   const sessionStartCmd = `curl -s -m 5 -X POST -H 'Content-Type: application/json' -H @${shq(path.join(opts.agentDir, HOOK_HEADER_FILE))} --data-binary @- ${HOOK_URL()}`
@@ -119,15 +198,19 @@ export function buildSettings(role: Role, token: string, opts: SettingsOpts): Re
     // Every package cache sits in ENGINEER_CACHE, outside home: npm's (with the log npm writes on every run), Go's (spike S5), Rust's and
     // Python's. Spike 2026-10-31 (`-p` runs with these settings): `npm test` passed with and without npm_config_cache, so the old
     // "exit 255 in the spike HQ" isn't explained by the npm cache; with it set, nothing is written under ~/.npm at all.
-    // Python venvs live in the worktree; uv uses the machine's Python, since downloading one needs github.com, which stays off
-    // the allowlist (spike 2026-10-29: uv sync + pytest pass in this sandbox).
+    // Python venvs live in the worktree; uv uses the machine's Python, since downloading one needs github.com, which stays off HQ's
+    // own list (spike 2026-10-29: uv sync + pytest pass in this sandbox). Bug 412: on a Mac, pip can't download here (systemCerts), uv can.
     env: cacheEnv(),
     sandbox: {
       enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true,
-      network: { allowedDomains: ['127.0.0.1', 'localhost', '[::1]', ...(opts.localOnly ? [] : [...PACKAGE_REGISTRIES, ...(opts.repoAllowlist ?? [])])],
+      // Bug 425: the project's own hosts as checked (only the user sets them, allowhosts.ts)
+      network: { allowedDomains: ['127.0.0.1', 'localhost', '[::1]',
+        ...(opts.localOnly ? [] : [...PACKAGE_REGISTRIES, ...(opts.repoAllowlist ?? []).filter((h) => !hostProblem(h))])],
         strictAllowlist: true, allowLocalBinding: true },
+      ...(systemCerts() && !opts.localOnly ? { enableWeakerNetworkIsolation: true } : {}), // only the macOS certificate checker (trustd), nothing else
       // On a Linux with no keyring, gh keeps its token in a file in GH_CONFIG_DIR. HQ's own folder by its real path: that's what the sandbox compares (Bug 59).
-      filesystem: { allowWrite: [ENGINEER_CACHE], allowRead: rustReads(), // Bug 71: rustup's cargo and toolchains
+      filesystem: { allowWrite: [ENGINEER_CACHE], allowRead: [...new Set([...rustReads(), ...toolReads(), ...checkoutReads(opts.repoPath)])], // Bugs 71, 413, 423: rustup's, package
+        // tools in home, the main checkout's config files
         denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, real(PATHS.home), `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`, GH_CONFIG_DIR] },
       credentials: { envVars: [{ name: 'HQ_AGENT_ID', mode: 'deny' }, { name: 'HQ_BACKEND', mode: 'deny' }, { name: 'ANTHROPIC_API_KEY', mode: 'deny' }, { name: 'GH_TOKEN', mode: 'deny' }, { name: 'GITHUB_TOKEN', mode: 'deny' }] },
     },
@@ -146,6 +229,9 @@ export const cacheEnv = (): Record<string, string> => ({
   // throwaway checkout takes them with it
   POETRY_CACHE_DIR: path.join(ENGINEER_CACHE, 'poetry'), POETRY_VIRTUALENVS_IN_PROJECT: 'true', PIPENV_CACHE_DIR: path.join(ENGINEER_CACHE, 'pipenv'), PIPENV_VENV_IN_PROJECT: '1',
   PDM_CACHE_DIR: path.join(ENGINEER_CACHE, 'pdm'),
+  // Bug 413: the pnpm and Yarn that Corepack downloads, kept with the other caches: its own folder is in home (~/.cache/node/corepack), where a
+  // sandboxed run can neither read nor write. A registry named makes it fetch Yarn 2+ from npm's (allowed), not repo.yarnpkg.com (2.1.322, corepack 0.34)
+  COREPACK_HOME: path.join(ENGINEER_CACHE, 'corepack'), COREPACK_NPM_REGISTRY: process.env.COREPACK_NPM_REGISTRY || 'https://registry.npmjs.org',
 })
 
 const RELAY = path.join(import.meta.dirname, 'mcprelay.mjs')

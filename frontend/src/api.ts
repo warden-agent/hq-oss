@@ -1,5 +1,5 @@
 import type { TestRun } from './testruns.ts'
-import { hqAnswersPlan, workingEngineers, type Question } from './needs.ts'
+import { hqAnswersPlan, slotEngineers, workingEngineers, type Question } from './needs.ts'
 import { planCheckOf } from '../../backend/src/checks.ts'
 import { LIMIT_REACHED } from '../../backend/src/readiness.ts'
 import { sendHere } from './atend.ts'
@@ -67,7 +67,8 @@ export function waitingFor(a: Agent, s: State, now = Date.now()): { count: numbe
   const waiting = s.messages.filter((m) => !m.delivered_at && (m.to_id === a.id || team(m))), count = waiting.length
   if (!count) return null
   const hold = holdWhy(a, now); if (hold) return { count, held: true, why: hold }
-  if (a.status === 'paused' || (s.settings.paused_roles ?? []).includes(a.role)) return { count, held: true, why: 'held · paused' }
+  if (a.status === 'paused') return { count, held: true, why: 'held · paused' }
+  if (rolePaused(a, s)) return { count, held: true, why: `held · ${pausedWords(a.role)}` } // Bug 195: who is paused, and what ends it
   // Bug 110: its turn was interrupted (Escape), so HQ types its messages into its terminal, and something there is in the way: a question, or a menu
   // such as Claude Code's Rewind (Escape twice). HQ never types into those: Enter would pick an option.
   if (a.interrupted_at && (a.type_waits === 'dialog' || a.type_waits === 'screen')) return { count, held: true, why: 'held · its terminal shows a menu or a question · answer or close it there' }
@@ -83,8 +84,24 @@ export function waitingFor(a: Agent, s: State, now = Date.now()): { count: numbe
 export function waitLine(a: Agent, s: State, now = Date.now()): { text: string; held: boolean } | null {
   const w = waitingFor(a, s, now); if (w) return { text: `✉ ${w.count} waiting · ${w.why}`, held: w.held }
   const hold = a.status === 'exited' ? null : holdWhy(a, now)
-  return hold ? { text: `✉ messages ${hold}`, held: true } : null
+  if (hold) return { text: `✉ messages ${hold}`, held: true }
+  return rolePaused(a, s) ? { text: `⏸ ${pausedWords(a.role)}`, held: true } : null // Bug 195: with nothing waiting too: it starts nothing until then
 }
+/** Bug 195: a role's agents in a sentence, as the backend's notice names them (pause.ts roleWord). */
+export const roleWord = (role: string): string => role === 'tpm' ? 'TPMs' : role === 'launcher' ? 'Launch helpers' : `${role}s`
+/** Bug 195: the agent's role is paused (a model switched by itself, backend modelguard.ts): HQ stops what its agents do and holds their messages until
+ *  the user's Resume. An ended agent isn't held, nor one writing its handoff note (backend pause.ts heldByPause). */
+export const rolePaused = (a: Agent, s: Pick<State, 'settings'>): boolean => a.status !== 'exited' && !a.fresh_start_at && (s.settings.paused_roles ?? []).includes(a.role)
+/** Bug 195: what a paused role's boxes say: who is paused and where the way out is (the notice's Resume button, Nodes.tsx AttentionList). */
+export const pausedWords = (role: string): string => `${roleWord(role)} are paused · Resume is in the ⚠ menu`
+/** Bug 195: the role a "model switched by itself" notice paused, while it is still paused: its agents are stopped until Resume, so the notice gets that
+ *  button (Nodes.tsx AttentionList) and no ✓ (ticked away, nothing would say why they stand still). Null once resumed, or with its agent gone from the page: ✓ as any notice. */
+export const pausedBy = (a: any, s: Pick<State, 'agents' | 'settings'>): string | null => {
+  const role = a.kind === 'model_fallback' ? s.agents.find((x) => x.id === a.agent_id)?.role : null
+  return role && (s.settings.paused_roles ?? []).includes(role) ? role : null
+}
+/** Bug 195: idle because HQ cut its turn short for the pause (the backend's `pause_stopped_at`, cleared at Resume): not "interrupted" by a person. */
+export const pauseStopped = (a: Agent): boolean => a.status === 'idle' && !!a.pause_stopped_at
 /** Bug 72: blocked because its turn ended with an API error. No dialog: it sits at its prompt (the backend's `blocked_why`, agents.ts). */
 export const apiErrored = (a: Agent): boolean => a.status === 'blocked' && a.blocked_why === 'api_error'
 /** A dialog or menu is on its terminal (or must be assumed): the backend's onDialog. */
@@ -92,7 +109,10 @@ export const onDialog = (a: Agent): boolean => a.status === 'paused' || (a.statu
 /** What an agent is doing, in words. */
 /** Bug 148: idle because its turn was stopped by Escape in its terminal (no turn has ended normally since): the backend's `interrupted_at`. */
 export const interrupted = (a: Agent): boolean => a.status === 'idle' && !!a.interrupted_at
-export const agentWord = (a: Agent): string => apiErrored(a) ? 'stopped by an API error' : interrupted(a) ? 'interrupted' : ({ working: 'working', idle: 'idle', plan_review: 'at the plan gate',
+/** Bug 437: at its prompt because its turn was cut short, by the pause (Bug 195) or by a person's Escape (Bug 148), in the words its box uses; null otherwise.
+ *  Its ticket's pill, its own pill and the top bar's busy count read it, so none of them says "building", "idle" or busy meanwhile. */
+export const stopWord = (a: Agent): 'stopped by the pause' | 'interrupted' | null => pauseStopped(a) ? 'stopped by the pause' : interrupted(a) ? 'interrupted' : null
+export const agentWord = (a: Agent): string => apiErrored(a) ? 'stopped by an API error' : stopWord(a) ?? ({ working: 'working', idle: 'idle', plan_review: 'at the plan gate',
   blocked: 'waiting on a dialog', paused: 'paused', launching: 'starting', exited: 'stopped' } as Record<string, string>)[a.status] ?? a.status
 /** Bug 179: the hooks' activity line ("Thinking", "Running: …") while it means something. On a dialog, a usage pause or at the plan gate (Bug 216) it is
  *  what the agent did before that came, so it is not shown; it is kept, and comes back once the agent works again (the dialog answered, the next hook). */
@@ -145,8 +165,21 @@ export const shownStatus = (a: Agent, s: PlanState): string => a.status === 'pla
 const gatePill = (a: Agent, s: PlanState): string => { const w = agentPlanWait(a, s); return w.closed ? gateClosed(a, s).pill : w.hq ? 'plan check' : 'plan for you' }
 /** Bug 216: an agent's status pill, in words (the status itself is the pill's colour): never a raw status word such as `plan_review`. At the plan gate it reads
  *  as its ticket's pill does. */
-export const agentPill = (a: Agent, s: PlanState): string => apiErrored(a) ? 'API error' : a.status === 'plan_review' ? gatePill(a, s)
-  : ({ blocked: 'on a dialog', launching: 'starting' } as Record<string, string>)[a.status] ?? a.status
+export const agentPill = (a: Agent, s: PlanState): string => apiErrored(a) ? 'API error' : stopWord(a) ?? (a.status === 'plan_review' ? gatePill(a, s)
+  : ({ blocked: 'on a dialog', launching: 'starting' } as Record<string, string>)[a.status] ?? a.status)
+/** Bug 437: the top bar's "N/cap busy" counts the engineers at work in a parallel slot (slotEngineers, the backend's canLaunch rule). One whose turn was cut
+ *  short (stopWord) isn't busy and is named after it. It still holds its slot (its ticket stays its own; a message or Resume sets it going again), so the
+ *  hover says why no other engineer starts in its place. */
+export function busyWords(s: Pick<State, 'agents' | 'tickets'>, cap: number): { text: string; tip: string } {
+  const held = slotEngineers(s), n = (w: string) => held.filter((a) => stopWord(a) === w).length, cut = n('interrupted'), paused = n('stopped by the pause')
+  const busy = held.length - cut - paused, are = (k: number) => k === 1 ? 'is' : 'are'
+  const text = [`${busy}/${cap} busy`, cut ? `${cut} interrupted` : '', paused ? `${paused} stopped by the pause` : ''].filter(Boolean).join(' · ')
+  const tip = [`${busy} of ${cap} engineers ${are(busy)} working.`,
+    cut ? `${cut} ${are(cut)} interrupted (Escape in ${cut === 1 ? 'its terminal): a message to it' : 'their terminals): a message to one'} sets it going again.` : '',
+    paused ? `${paused} ${are(paused)} stopped by the pause: Resume in the ⚠ menu sets ${paused === 1 ? 'it' : 'them'} going again.` : '',
+    cut || paused ? `${cut + paused === 1 ? 'It keeps its place' : 'They keep their places'} among the ${cap}, so no other engineer starts in ${cut + paused === 1 ? 'it' : 'them'}.` : '']
+  return { text, tip: tip.filter(Boolean).join(' ') }
+}
 /** A newer agent has its place: the same ticket's engineer, or the same project's TPM. */
 const replaced = (a: Agent, s: Pick<State, 'agents'>): boolean => s.agents.some((x) => x.id !== a.id && x.role === a.role && (x.started_at ?? 0) > (a.started_at ?? 0)
   && (a.ticket_id ? x.ticket_id === a.ticket_id : x.repo_id === a.repo_id))

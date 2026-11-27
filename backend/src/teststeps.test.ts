@@ -51,6 +51,10 @@ test('what HQ would run on a commit and the test files that leaves out: by its r
   const py = project('py', { 'pyproject.toml': '[project]\nname = "x"\n', 'tests/test_a.py': '' })
   assert.deepEqual(await stepsGap(py.repo(), 'HEAD'), { runs: 'uv run pytest -q', gaps: [], shaky: ['.'], key: '.:python-setup' })
   assert.equal((await stepsGap(project('uv', { 'pyproject.toml': '', 'uv.lock': '', 'tests/test_a.py': '' }).repo(), 'HEAD')).key, '')
+  // Bug 416: Poetry's own pyproject.toml, with an old uv.lock beside it: the rules' `uv sync` passes having installed nothing, so that is a guess too
+  const poetry = '[tool.poetry]\nname = "x"\n\n[tool.poetry.group.dev.dependencies]\npytest = "^8"\n'
+  assert.equal((await stepsGap(project('poetry', { 'pyproject.toml': poetry, 'uv.lock': '', 'tests/test_a.py': '' }).repo(), 'HEAD')).key, '.:python-setup')
+  assert.equal((await stepsGap(project('poetry2', { 'pyproject.toml': `[project]\nname = "x"\n\n${poetry}`, 'uv.lock': '', 'tests/test_a.py': '' }).repo(), 'HEAD')).key, '')
   assert.equal((await stepsGap(project('pip', { 'requirements.txt': 'flask\npytest>=8\n', 'tests/test_a.py': '' }).repo(), 'HEAD')).key, '')
   assert.equal((await stepsGap(project('plain', { 'package.json': '{"scripts":{"test":"node --test"}}', 'test/a.test.js': '' }).repo(), 'HEAD')).key, '') // one project the rules cover
 })
@@ -87,6 +91,10 @@ test('ready to test without a helper: the user\'s own command, nothing left out,
   assert.equal(await stepsReady(p.repo(), p.sha), 'ready') // the steps run every test file there is
   writeSteps('ready', { ...readSteps('ready'), job: { agent_id: 'launch-x', worktree: '/nowhere', saves: 0, state: 'working', started_at: 1, sha: p.sha, why: 'again', ticket_id: null, gap: '' } })
   assert.equal(await stepsReady(p.repo(), p.sha), 'working')
+  // Bug 416: with the user's own command, a helper at work on steps for any other reason doesn't hold up a test; one working out the install it needs does
+  run("UPDATE repos SET test_cmd = 'make check' WHERE id = 'ready'"); assert.equal(await stepsReady(p.repo(), p.sha), 'ready')
+  writeSteps('ready', { ...readSteps('ready'), job: { ...readSteps('ready').job!, gap: 'install:uv sync' } }); assert.equal(await stepsReady(p.repo(), p.sha), 'working')
+  run("UPDATE repos SET test_cmd = NULL WHERE id = 'ready'")
   const plain = project('one', { 'package.json': '{"scripts":{"test":"node --test"}}', 'test/a.test.js': '' })
   assert.equal(await stepsReady(plain.repo(), plain.sha), 'ready'); assert.equal(readSteps('one').job, null) // what it must not start: a project the rules cover
 })

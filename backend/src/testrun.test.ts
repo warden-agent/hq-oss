@@ -21,7 +21,7 @@ for (const f of SECRETS) { fs.mkdirSync(path.dirname(path.join(home, f)), { recu
 process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup') // the toolchain stays where it's installed, whatever HOME says
 process.env.HOME = home; process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_ENGINEER_CACHE = path.join(tmp, 'cache')
 const { bwrapArgs, detectTests, testFolders, testParts, runParts, rulesSkip, failReport, failedLine, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase,
-  testCombined, sweepTestWorktrees, testRunViews, testWorktree } = await import('./testrun.ts')
+  testCombined, sweepTestWorktrees, testRunViews, testWorktree, failedAnyway, exitedAnyway } = await import('./testrun.ts')
 const { confirm, outsideParts } = await import('./criteria.ts')
 const { db, migrate } = await import('./db.ts'); migrate(); void db
 const { bus } = await import('./events.ts')
@@ -46,6 +46,17 @@ test('detectTests: reads the project\'s files, and skips npm\'s placeholder', ()
   assert.equal(detectTests(dir({ 'Cargo.toml': '' }))?.test, 'cargo test')
   assert.equal(detectTests(dir({ Makefile: 'build:\n\tcc\ntest:\n\t./t\n' }))?.test, 'make test')
   assert.equal(detectTests(dir({ 'README.md': 'hi' })), null)
+})
+test('Bug 424: a requirements.txt project installs with uv when uv is on the PATH (engineers can run that on a Mac), with pip when it isn\'t', () => {
+  const bin = dir({}), PATH = process.env.PATH, py = dir({ 'requirements.txt': 'pytest\n', 'test_a.py': '' })
+  try {
+    fs.writeFileSync(path.join(bin, 'uv'), '#!/bin/sh\n', { mode: 0o755 }); fs.mkdirSync(path.join(bin, 'sub', 'uv'), { recursive: true }) // a folder named uv is no uv
+    process.env.PATH = `${bin}/sub:/usr/bin:/bin`
+    assert.deepEqual(detectTests(py), { install: 'python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt', test: '.venv/bin/python -m pytest -q' })
+    process.env.PATH = `${bin}/sub:${bin}:/usr/bin:/bin`
+    assert.deepEqual(detectTests(py), { install: 'uv venv -q --allow-existing .venv && uv pip install -q -r requirements.txt', test: '.venv/bin/python -m pytest -q' })
+    assert.deepEqual(detectTests(dir({ 'pyproject.toml': '' })), { install: 'uv sync', test: 'uv run pytest -q' }) // a uv project: as before
+  } finally { process.env.PATH = PATH }
 })
 test('Bug 376: testFolders reads the folders back from the command detectTests builds, and from no other', () => {
   const two = detectTests(dir({ 'admin/package.json': '{"scripts":{"test":"x"}}', 'web/package.json': '{"scripts":{"test":"y"}}' }))!.test
@@ -89,16 +100,83 @@ test('Bug 392: a Yarn, pnpm or Bun project installs by its lockfile and runs its
     assert.equal(berry.install, null); assert.match(berry.stop!, /no yarn\.lock.*then test again\.$/)
   })
 })
-test('Bug 392: its tool not installed, HQ says so in the preview\'s words and never installs with npm instead; packages already there still run', () => {
+test('Bug 392: its tool not installed, HQ says so in the preview\'s words and never installs with npm instead', () => {
   withPath(noTools, () => {
     const lone = detectTests(dir({ 'package.json': DEPS, 'pnpm-lock.yaml': '' }))!
-    assert.equal(lone.install, null); assert.equal(lone.test, 'npm test')
+    assert.equal(lone.install, null); assert.equal(lone.test, 'pnpm test')
     assert.match(lone.stop!, /^it uses pnpm \(it has a pnpm-lock\.yaml\), and pnpm isn't installed on this computer .*npm ignores the pnpm-lock\.yaml .*Install pnpm, then test again\.$/)
-    assert.deepEqual(detectTests(dir({ 'package.json': DEPS, 'bun.lock': '{}', 'node_modules/ms/index.js': '' })), { install: null, test: 'npm test' })
-    assert.deepEqual(detectTests(dir({ 'package.json': '{"scripts":{"test":"node --test"}}', 'yarn.lock': '' })), { install: null, test: 'npm test' }) // nothing to install
     const two = detectTests(dir({ 'api/package.json': DEPS, 'api/package-lock.json': '{}', 'web/package.json': DEPS, 'web/yarn.lock': '' }))!
     assert.equal(two.install, '(cd "api" && npm ci)'); assert.match(two.stop!, /^web: it uses Yarn \(it has a yarn\.lock\), and yarn isn't installed/)
+    assert.equal(two.test, '(cd "api" && npm test) && (cd "web" && yarn test)')
   })
+})
+// Bug 403: with the tool missing, HQ's command was `npm test`, so it depended on HQ's PATH: the Auto box offered `(cd "web" && npm test)`, engineers were
+// asked to run npm in a pnpm project, and a project whose packages were there ran its script with npm. The command names the project's tool whatever PATH holds
+test('Bug 403: the test command names the project\'s own tool whatever HQ\'s PATH holds; with that tool missing HQ says so (noTool), in the words of whoever shows it', () => {
+  const NO_TOOL = (tool: string, name: string, why: string, run: string, again = 'test again') => new RegExp(`^it uses ${name} \\(${why}\\), and ${tool} isn't installed on this `
+    + `computer \\(HQ looked in its PATH\\), so HQ can't run its tests \\(${run}\\)\\. Install ${name}, then ${again}\\.$`)
+  const cases: [Record<string, string>, string, string, string, string][] = [
+    [{ 'package.json': DEPS, 'bun.lock': '{}', 'node_modules/ms/index.js': '' }, 'bun', 'Bun', 'it has a bun\\.lock', 'bun run test'], // packages there: nothing to install
+    [{ 'package.json': '{"scripts":{"test":"node --test"}}', 'yarn.lock': '' }, 'yarn', 'Yarn', 'it has a yarn\\.lock', 'yarn test'], // no packages: nothing to install
+    [{ 'package.json': DEPS, 'pnpm-lock.yaml': '', 'node_modules/ms/index.js': '' }, 'pnpm', 'pnpm', 'it has a pnpm-lock\\.yaml', 'pnpm test']]
+  for (const [files, tool, name, why, run] of cases) {
+    const d = dir(files), missing = withPath(noTools, () => detectTests(d))!, there = withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => detectTests(d))!
+    assert.deepEqual(there, { install: null, test: run }, `${tool} on PATH`)
+    assert.equal(missing.test, run, `${tool} missing: the same command, never npm's`); assert.equal(missing.install, null); assert.equal(missing.stop, undefined)
+    assert.match(missing.noTool!, NO_TOOL(tool, name, why, run))
+    assert.match(withPath(noTools, () => detectTests(d, 'press Resume'))!.noTool!, NO_TOOL(tool, name, why, run, 'press Resume'))
+  }
+  // a missing tool can't install either: both are said, the install first; a folder of a split repo says which one
+  const both = withPath(noTools, () => detectTests(dir({ 'package.json': DEPS, 'pnpm-lock.yaml': '' }), 'press Resume'))!
+  assert.match(both.stop!, /can't install its packages.*then press Resume\.$/); assert.match(both.noTool!, /^it uses pnpm .*then press Resume\.$/)
+  const split = withPath(noTools, () => detectTests(dir({ 'api/package.json': DEPS, 'api/node_modules/ms/index.js': '', 'web/package.json': DEPS, 'web/pnpm-lock.yaml': '',
+    'web/node_modules/ms/index.js': '' })))!
+  assert.equal(split.test, '(cd "api" && npm test) && (cd "web" && pnpm test)'); assert.equal(split.stop, undefined); assert.match(split.noTool!, /^web: it uses pnpm /)
+  // npm's own project never asks for anything: HQ runs on node, so npm is there
+  assert.deepEqual(withPath(noTools, () => detectTests(dir({ 'package.json': DEPS, 'node_modules/ms/index.js': '' }))), { install: null, test: 'npm test' })
+})
+// Bug 430, the npm twin of Bugs 399/400: an npm workspace member looked for a package-lock.json only in its own folder, so it got `npm install`, not `npm ci`
+// by its workspace root's lockfile; and a workspace root whose package.json lists no packages itself (its members do) got no install at all
+test('Bug 430: an npm workspace member installs with npm ci by its root\'s lockfile, there; a root that lists no packages itself still installs', () => {
+  const WS = '{"name":"ws","private":true,"workspaces":["web","api"]}', WEB = '{"name":"web","scripts":{"test":"node --test"},"dependencies":{"ms":"2.1.3"}}'
+  const ws = (files: Record<string, string>) => detectTests(dir({ '.git/HEAD': '', 'package.json': WS, 'package-lock.json': '{}', 'web/package.json': WEB, ...files }))
+  assert.deepEqual(ws({}), { install: 'npm ci', test: '(cd "web" && npm test)' })
+  assert.deepEqual(ws({ 'api/package.json': WEB.replace('"web"', '"api"') }), { install: 'npm ci', test: '(cd "api" && npm test) && (cd "web" && npm test)' }) // once
+  assert.deepEqual(ws({ 'node_modules/ms/index.js': '' }), { install: null, test: '(cd "web" && npm test)' }) // the main checkout's, copied where npm puts them
+  const root = '{"name":"ws","private":true,"workspaces":["web"],"scripts":{"test":"npm test --workspaces"}}' // the root's own test script, and no packages
+  assert.deepEqual(ws({ 'package.json': root }), { install: 'npm ci', test: 'npm test' })
+  assert.deepEqual(detectTests(dir({ 'package.json': root, 'web/package.json': WEB })), { install: 'npm install', test: 'npm test' }) // no lockfile: as before
+  // what it must not catch: a member's own lockfile, a folder the root doesn't list, a package with nothing to install
+  assert.deepEqual(ws({ 'web/package-lock.json': '{}' }), { install: '(cd "web" && npm ci)', test: '(cd "web" && npm test)' })
+  assert.deepEqual(ws({ 'package.json': WS.replace('"web",', '') }), { install: '(cd "web" && npm install)', test: '(cd "web" && npm test)' })
+  assert.deepEqual(ws({ 'web/package.json': '{"scripts":{"test":"node --test"},"dependencies":{}}' }), { install: null, test: '(cd "web" && npm test)' })
+  assert.deepEqual(detectTests(dir({ 'package.json': '{"scripts":{"test":"node --test"}}', 'package-lock.json': '{}' })), { install: null, test: 'npm test' })
+  // Yarn and Bun (PR #402's rules, through ownInstall): the same two cases already follow the root
+  withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => {
+    for (const [lock, install, run] of [['yarn.lock', 'yarn install --frozen-lockfile', 'yarn test'], ['bun.lock', 'bun install --frozen-lockfile', 'bun run test']]) {
+      const yb = (files: Record<string, string>) => detectTests(dir({ '.git/HEAD': '', 'package.json': WS, [lock!]: '', 'web/package.json': WEB, ...files }))
+      assert.deepEqual(yb({}), { install: `(cd "web" && ${install})`, test: `(cd "web" && ${run})` }, lock)
+      assert.deepEqual(yb({ 'package.json': root }), { install, test: run }, lock)
+    }
+  })
+})
+/** Bug 430: an npm workspace whose web/ needs its sibling b430-shared (a link npm ci makes from the root's lockfile; no registry), committed with no node_modules. */
+function npmWorkspace(rootTest?: string): string {
+  const d = fs.mkdtempSync(path.join(tmp, 'r-')); sh(d, 'init', '-q', '-b', 'main')
+  write(d, { '.gitignore': 'node_modules/\n.claude/\n', '.npmrc': 'audit=false\nfund=false\n',
+    'package.json': JSON.stringify({ name: 'b430ws', private: true, workspaces: ['shared', 'web'], ...(rootTest ? { scripts: { test: rootTest } } : {}) }),
+    'shared/package.json': '{"name":"b430-shared","version":"1.0.0"}', 'shared/index.js': 'module.exports = 42\n',
+    'web/package.json': '{"name":"web","version":"1.0.0","scripts":{"test":"node --test"},"dependencies":{"b430-shared":"*"}}',
+    'web/a.test.js': `${TEST}t.test('shared',()=>a.equal(require('b430-shared'),42))\n` })
+  execFileSync('npm', ['install', '--offline', '--no-audit', '--no-fund'], { cwd: d, stdio: 'ignore' }); fs.rmSync(path.join(d, 'node_modules'), { recursive: true })
+  sh(d, 'add', '.'); sh(d, 'commit', '-qm', 'base'); return d
+}
+test('Bug 430: in the sandbox, an npm workspace installs by its root\'s lockfile and its tests pass, from a member\'s test script or the root\'s', boxed, async () => {
+  for (const [rootTest, test] of [[undefined, '(cd "web" && npm test)'], ['npm test --workspace web', 'npm test']] as const) {
+    const d = npmWorkspace(rootTest), r = await testBase(d, 'main', 'W1', null)
+    assert.equal(r.kind, 'pass', JSON.stringify(r)); assert.equal((r as { test: string }).test, test)
+    assert.equal(sh(d, 'status', '--porcelain'), ''); assert.equal(fs.existsSync(path.join(d, 'node_modules')), false) // nothing left in the project
+  }
 })
 test('CI really has the sandbox: these tests can\'t quietly go back to being skipped', { skip: process.env.CI ? false : 'only matters in CI' }, () => assert.equal(problem, null))
 
@@ -183,6 +261,23 @@ test('runSandboxed: `open` can\'t start a program outside the sandbox', { skip: 
   assert.equal(fs.existsSync(marker), false, `open: ${r.code} ${r.output}`)
 })
 
+// Bug 431: pnpm 12 installed before `pnpm test` by itself, and with the network off it retried for 70 s and failed (an install it started emptied the
+// node_modules HQ copied in). Runs with the network off tell it not to; the install step, with the network on, is left as it was.
+test('Bug 431: a run with the network off tells pnpm not to install or fetch pnpm before a script; the install step isn\'t told', boxed, async () => {
+  const say = 'echo "verify=$pnpm_config_verify_deps_before_run pm=$pnpm_config_pm_on_fail"', d = dir({})
+  assert.equal((await runSandboxed(d, say, { network: false, timeoutMs: 20_000 })).output, 'verify=false pm=ignore')
+  assert.equal((await runSandboxed(d, say, { network: true, timeoutMs: 20_000 })).output, 'verify= pm=')
+  assert.equal((await runSandboxed(d, 'env | grep -c "^npm_config_verify\\|^npm_config_pm"', { network: false, timeoutMs: 20_000 })).output, '0') // npm warns about those
+  const bin = fs.mkdtempSync(path.join(tmp, 'cache', 'pn12-')), log = path.join(bin, 'log') // a stand-in for pnpm 12 that installs before a script unless told not to
+  fs.writeFileSync(path.join(bin, 'pnpm'), `#!/bin/sh\necho "$1 verify=$pnpm_config_verify_deps_before_run" >> "${log}"\n[ "$1" = install ] && mkdir -p node_modules && exit 0\n`
+    + '[ "$pnpm_config_verify_deps_before_run" = false ] || { echo "WARN GET https://registry.npmjs.org/ms error (ENOTFOUND)"; exit 1; }\nexec node --test\n', { mode: 0o755 })
+  const r0 = fs.mkdtempSync(path.join(tmp, 'r-')); sh(r0, 'init', '-q', '-b', 'main')
+  write(r0, { '.gitignore': 'node_modules/\n.claude/\n', 'package.json': DEPS, 'pnpm-lock.yaml': '', 'a.test.js': `${TEST}t.test('one',()=>a.ok(1))` })
+  sh(r0, 'add', '.'); sh(r0, 'commit', '-qm', 'base')
+  const r = await withPath(`${bin}${path.delimiter}${process.env.PATH}`, () => testBase(r0, 'main', 'B431', null))
+  assert.equal(r.kind, 'pass', JSON.stringify(r)); assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n'), ['install verify=', 'test verify=false'])
+})
+
 test('bwrapArgs: what\'s hidden is mounted after what\'s writable, and only the install step has the network', () => {
   const a = bwrapArgs(tmp, { network: false }), hideAt = a.indexOf(path.join(fs.realpathSync(home), '.ssh'))
   assert.ok(a.indexOf('--ro-bind') === 0 && a.indexOf('--tmpfs') < a.indexOf('--bind') && a.indexOf('--bind') < hideAt)
@@ -245,6 +340,14 @@ test('Bug 392: a pnpm project\'s run installs and tests with pnpm in the sandbox
     assert.equal(x.kind, 'error'); assert.match((x as { why: string }).why, /^it uses pnpm .*Install pnpm, then test again\.$/)
   }
   assert.equal(fs.readFileSync(pmLog, 'utf8').trim().split('\n').length, 2); assert.equal(fs.existsSync(testWorktree(d, 'P2-main')), false)
+  // Bug 403: the packages there (the main checkout's, copied) and pnpm missing: HQ's own command is `pnpm test`, so nothing runs, never npm in its place, and
+  // the words say what the user presses; the user's own command doesn't need pnpm, so it runs
+  fs.mkdirSync(path.join(d, 'node_modules'), { recursive: true }); fs.writeFileSync(path.join(d, 'node_modules', '.modules.yaml'), '') // a finished pnpm install (Bug 393)
+  const off = `${noTools}${path.delimiter}${process.env.PATH!.split(path.delimiter).filter((p) => !fs.existsSync(path.join(p, 'pnpm'))).join(path.delimiter)}`
+  const y = await withPath(off, () => testBase(d, 'main', 'P3', null, null, null, { again: 'press Resume' }))
+  assert.equal(y.kind, 'error'); assert.match((y as { why: string }).why, /^it uses pnpm .*so HQ can't run its tests \(pnpm test\)\. Install pnpm, then press Resume\.$/)
+  assert.equal((await withPath(off, () => testBase(d, 'main', 'P4', 'node --test'))).kind, 'pass')
+  assert.equal(fs.readFileSync(pmLog, 'utf8').trim().split('\n').length, 2)
 })
 // Bug 411: a repo split into folders ran as one command, and one suite's output was read as the whole run's. HQ takes the command it builds apart again
 // and runs each folder's suite as a part of its own.
@@ -297,6 +400,42 @@ test('Bug 411: the parts share one time limit, and the part it runs out in says 
   assert.equal(r.timedOut, true); assert.equal(r.cmd, '(cd "b" && node t.js)'); assert.ok(Date.now() - t0 < 25_000, 'b was stopped when the shared limit ran out')
   const none = await runParts(d, [{ dir: 'a', run: 'node t.js' }, { dir: 'a', run: 'node t.js' }], { timeoutMs: 1 }) // nothing left before the first part: it never starts
   assert.equal(none.timedOut, true); assert.equal(none.code, null)
+})
+// Bug 426: a test command that exits 0 though a test failed (`mocha || true`) passed HQ's check: "`npm test` passed: 1 passed, 1 failed". HQ goes by the
+// counts its output gives then. Real runners' output (testdata/bug426) printed by a command that exits 0, as `|| true` makes it
+const cap426 = (name: string): string => fs.readFileSync(path.join(import.meta.dirname, 'testdata', 'bug426', `${name}.txt`), 'utf8')
+const RUNNERS_426 = ['mocha-11.8.0', 'jest-30.1.2', 'vitest-4.1.11', 'pytest-9.2.0', 'node-25.4.0', 'unittest-3.14']
+test('Bug 426: failedAnyway: only a run that exited 0 with a failed test in its counts; skipped, pending, todo and expected failures are none', () => {
+  assert.deepEqual(failedAnyway({ code: 0, summary: ['1 passing (2ms)', '1 failing'] }), { passed: 1, failed: 1, skipped: 0 })
+  assert.deepEqual(failedAnyway({ code: 0, summary: ['ℹ pass 2', 'ℹ fail 0', 'ℹ cancelled 1'] }), { passed: 2, failed: 1, skipped: 0 }, 'node: a test cancelled')
+  for (const summary of [['2 passing (2ms)', '1 pending'], ['2 passed, 1 skipped, 1 xfailed, 1 xpassed in 0.01s'], ['Tests:       1 skipped, 1 todo, 3 passed, 5 total'],
+    ['Ran 4 tests in 0.000s', 'OK (skipped=1, expected failures=1)'], ['test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s'], [], null])
+    assert.equal(failedAnyway({ code: 0, summary }), null, JSON.stringify(summary))
+  assert.equal(failedAnyway({ code: 1, summary: ['1 failing'] }), null, 'a run that failed anyway is a plain failure')
+  assert.equal(failedAnyway({ code: null, summary: ['1 failing'] }), null, 'nor a run that was stopped')
+  assert.equal(exitedAnyway({ test: 'npm test', exit0: { passed: 1, failed: 1, skipped: 1 } }), ' (`npm test` exited 0 all the same, but its output says 1 passed, 1 failed, 1 skipped)')
+  assert.equal(exitedAnyway({ test: 'npm test' }), '')
+})
+test('Bug 426: a command that exits 0 but prints a failed test fails, and says it exited 0; the same runner with none failed passes', boxed, async () => {
+  const files = Object.fromEntries(RUNNERS_426.flatMap((r) => ['fail', 'pass'].map((k) => [`out/${r}-${k}.txt`, cap426(`${r}-${k}`)])))
+  const d = splitRepo(files)
+  for (const r of RUNNERS_426) {
+    const f = await testBase(d, 'main', `X-${r}`, `cat out/${r}-fail.txt; true`)
+    assert.equal(f.kind, 'fail', `${r}: ${JSON.stringify(f)}`); if (f.kind !== 'fail') return
+    assert.equal(f.exit0?.failed, 1, r); assert.equal(f.hung, false); assert.equal(f.test, `cat out/${r}-fail.txt; true`)
+    assert.match(exitedAnyway(f), /^ \(`cat out\/.*` exited 0 all the same, but its output says \d+ passed, 1 failed/)
+    const p = await testBase(d, 'main', `Y-${r}`, `cat out/${r}-pass.txt; true`)
+    assert.equal(p.kind, 'pass', `${r}: ${JSON.stringify(p)}`); assert.equal((p as { counts: { failed: number } }).counts.failed, 0)
+  }
+  const plain = await testBase(d, 'main', 'Z1', 'cat out/mocha-11.8.0-fail.txt; exit 1') // a failure HQ always saw: no exit0 on it
+  assert.equal(plain.kind, 'fail'); assert.equal((plain as { exit0?: unknown }).exit0, undefined)
+})
+test('Bug 426: a part that exits 0 with a failed test ends a run made of parts, named by its own command; the next part never runs', boxed, async () => {
+  const d = splitRepo({ 'api/package.json': '{"scripts":{"test":"node --test || true"}}', 'api/users.test.js': `${TEST}t.test('lists the users',()=>a.equal(1,2))`, ...WEB })
+  const f = await testBase(d, 'main', 'S9', null)
+  assert.equal(f.kind, 'fail', JSON.stringify(f)); if (f.kind !== 'fail') return
+  assert.equal(f.test, '(cd "api" && npm test)'); assert.deepEqual(f.exit0, { passed: 0, failed: 1, skipped: 0 })
+  assert.match(`${f.earlier}\n${f.output}`, /lists the users/); assert.doesNotMatch(`${f.earlier}\n${f.output}`, /shows the list/)
 })
 test('Bug 411: rulesSkip lists the test files the found command runs nothing of, from git\'s own list', async () => {
   const d = splitRepo({ ...WEB, 'backend/pyproject.toml': '[project]\nname = "x"\n', 'backend/tests/test_app.py': 'def test_a(): pass\n', 'backend/tests/test_b.py': '',
@@ -406,15 +545,34 @@ test('Bug 383: failureLines and failedLine read a line as a terminal shows it (m
 // Failing runs captured through HQ's own sandbox (bug372capture.mts) on 2026-11-24: mocha 11.8 (spec, list, dot, spec with --color), node 25 --test, vitest 3.2,
 // jest 30, go 1.26, cargo 1.88; the project paths renamed /tmp/b391. In testdata/bug391.
 const cap391 = (name: string): string => fs.readFileSync(new URL(`./testdata/bug391/${name}.txt`, import.meta.url), 'utf8')
-test('Bug 391: failedLine names the first test mocha lists as failing, whatever the reporter, and the other runners\' lines stay as they were', () => {
+test('Bug 391: failedLine names the first test mocha lists as failing, whatever the reporter, and node\'s and go\'s lines stay as they were', () => {
   for (const r of ['', '-list', '-dot', '-color']) assert.equal(failedLine(cap391(`mocha-11.8.0${r}`)), '1) book list marks a book due soon', r)
   assert.equal(failedLine(cap391('node-25.4.0')), '✖ shows who has the book'); assert.equal(failedLine(cap391('go-1.26.4')), '--- FAIL: TestList (0.00s)')
-  assert.equal(failedLine(cap391('jest-30.1.3')), 'FAIL ./j.jest.js'); assert.equal(failedLine(cap391('cargo-1.88.0')), 'error: test failed, to rerun pass `--lib`')
-  assert.equal(failedLine(cap391('vitest-3.2.4')), '× book list > marks a book due soon 3ms') // its colours are gone: before, the line was escape codes
   // a hook's failure; a title with no ":" line in reach is its first line alone; what comes first in the output wins
   assert.equal(failedLine('  1 failing\n\n  1) shelf\n       "before each" hook for "lends a book":\n     Error: no db\n'), '1) shelf "before each" hook for "lends a book"')
   assert.equal(failedLine('1 failing\n1) shelf\na\nb\nc\nd\ne\nf\ng\nh:\n'), '1) shelf')
   assert.equal(failedLine('✖ first (1ms)\n1 failing\n1) later:\n'), '✖ first')
+})
+test('Bug 395: failedLine names the first failing test for jest and cargo, and drops vitest\'s time after it', () => {
+  assert.equal(failedLine(cap391('jest-30.1.3')), '● book list › marks a book due soon') // was the file: FAIL ./j.jest.js
+  assert.equal(failedLine(cap391('cargo-1.88.0')), 'test tests::it_lists ... FAILED') // was error: test failed, to rerun pass `--lib`
+  assert.equal(failedLine(cap391('vitest-3.2.4')), '× book list > marks a book due soon') // was … 3ms; its colours went in Bug 391
+  // jest: what a test logged isn't a failure; with no heading in reach its ✕ line, timing cut; a suite that didn't run says so; neither: the file
+  assert.equal(failedLine('FAIL ./a.test.js\n  ● Console\n    console.log\n      hi\n  ● shelf › lends a book\n    expect(1).toBe(2)'), '● shelf › lends a book')
+  assert.equal(failedLine('FAIL ./a.test.js\n  shelf\n    ✓ ok (2 ms)\n    ✕ lends a book (1 ms)\n'), '✕ lends a book')
+  assert.equal(failedLine('FAIL ./a.test.js\n  ● Test suite failed to run\n    SyntaxError: x'), '● Test suite failed to run')
+  assert.equal(failedLine('FAIL ./a.test.js\nTests: 1 failed'), 'FAIL ./a.test.js')
+  // cargo: only its tail kept (the long run's test lines gone): the panic names the test
+  const tail = cap391('cargo-1.88.0').split('failures:\n')[1]
+  assert.equal(failedLine(tail), "thread 'tests::it_lists' panicked at src/lib.rs:2:37:")
+})
+test('Bug 395: what the jest, cargo and vitest readings must not catch', () => {
+  assert.equal(failedLine('--- FAIL: TestList (0.00s)\nFAIL\tcarp\t0.003s'), '--- FAIL: TestList (0.00s)') // go's FAIL lines aren't jest's
+  assert.equal(failedLine('FAILED tests/test_a.py::test_x - assert 1 == 2'), 'FAILED tests/test_a.py::test_x - assert 1 == 2') // pytest's
+  assert.equal(failedLine(' FAIL  v.test.mjs > shelf > lends a book\n● not jest'), 'FAIL  v.test.mjs > shelf > lends a book') // vitest's names its test
+  assert.equal(failedLine('test tests::ok ... ok\ntest result: ok.'), 'test result: ok.') // a passing cargo test isn't a failure: the last line
+  assert.equal(failedLine('✖ times out after 200ms'), '✖ times out after 200ms') // a name's own "ms": only vitest's × time goes
+  assert.equal(failedLine('× waits 200ms (3ms)'), '× waits 200ms')
 })
 test('Bug 391: what failedLine must not read as mocha\'s, and an error\'s name before a stack frame', () => {
   assert.equal(failedLine('1) step one\n2) step two\n  at x (a.js:1:1)'), 'at x (a.js:1:1)') // a numbered line with no "N failing" over it
@@ -477,7 +635,9 @@ test('Bug 89: auto off ends its test run at once and says stopped, not failed; t
 })
 test('Bug 89: auto off while packages install: the tests never run', boxed, async () => {
   const d = fs.mkdtempSync(path.join(tmp, 'r-')); sh(d, 'init', '-q', '-b', 'main')
-  write(d, { 'package.json': JSON.stringify({ name: 'p', private: true, dependencies: {}, scripts: { test: 'node --test', preinstall: `touch "${cache}/s2" && ${SLEEP}` } }) })
+  // a package to install, from the project itself (no registry): one that lists none installs nothing (Bug 430, the preview's rule since Bug 90)
+  write(d, { 'package.json': JSON.stringify({ name: 'p', private: true, dependencies: { loc: 'file:loc' }, scripts: { test: 'node --test',
+    preinstall: `touch "${cache}/s2" && ${SLEEP}` } }), 'loc/package.json': '{"name":"loc","version":"1.0.0"}' })
   sh(d, 'add', '.'); sh(d, 'commit', '-qm', 'base')
   const r = testBase(d, 'main', 'S2', `touch "${cache}/s2-tested"`, autoGen(d))
   await until('the install', () => seen('s2') && sleeping()); stopAutoTests(d)

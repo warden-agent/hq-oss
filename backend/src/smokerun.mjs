@@ -5,7 +5,7 @@
 // spec: { parts: [{ name, cwd, run, port: number | 'auto' }], show, out, pwCore, startMs, pageMs, maxPages, depth }
 import fs from 'node:fs'
 import path from 'node:path'
-import { startApp } from './appstart.mjs'
+import { allowPorts, startApp } from './appstart.mjs'
 
 const spec = JSON.parse(process.argv[2])
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
@@ -26,7 +26,8 @@ try {
   if (!app.port) await finish(app.kind === 'skipped' ? { kind: 'skipped', why: app.why } : { kind: 'no_start', why: app.why, output: app.output })
   const port = app.port
   const { chromium } = await import(path.join(spec.pwCore, 'index.mjs'))
-  try { browser = await chromium.launch({ headless: true }) } catch (e) {
+  // The app's own ports, even one browsers refuse (Bug 433)
+  try { browser = await chromium.launch({ headless: true, args: allowPorts([port, ...Object.values(app.ports)]) }) } catch (e) {
     await finish({ kind: 'skipped', why: `HQ's browser didn't start (${cut(String(e.message).split('\n')[0], 200)})` })
   }
   const origin = `http://localhost:${port}`, ctx = await browser.newContext()

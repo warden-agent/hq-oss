@@ -51,15 +51,19 @@ export async function portHolders(port: number, only: 'bound' | 'listening' = 'b
   return Promise.all(ps.map(async (x) => ({ ...x, pgid: await pgidOf(x.pid), cwd: cwds.get(x.pid) ?? null })))
 }
 
+/** Bug 410: is this working folder inside one of HQ's own throwaway test checkouts (testrun.ts testWorktree: `<repo>/.claude/worktrees/hq-test-<key>`)? */
+export const inTestCopy = (cwd: string | null): boolean => !!cwd && /(^|\/)\.claude\/worktrees\/hq-test-[^/]+(\/|$)/.test(cwd)
 /** Bug 44: may the preview show what answers on its port? `group` is the preview's process group (its supervisor's). `show`:
- *  this app listens there and nothing else does, or lsof sees nobody. `clash`: another program listens on the same port too (one
- *  on 127.0.0.1 and one on all addresses can share it, and localhost may reach either), so the page could be the wrong app.
+ *  this app listens there and nothing else does. `clash`: another program listens on the same port too (one
+ *  on 127.0.0.1 and one on all addresses can share it, and localhost may reach either), so the page could be that one.
  *  `wait`: only something else is there so far, and this app may still be starting; after `patience` ms that is shown anyway
- *  (a port Docker forwards is never in the preview's group). */
+ *  (a port Docker forwards is never in the preview's group). Bug 410: never HQ's own test copy of an app (its folder is a test checkout): that is never
+ *  this app, and it ends by itself. And lsof seeing nobody is waited for too: the reply may have come from a program that has just gone (a test copy as
+ *  its run ended), and the next look finds this app's own; after `patience` it is shown, for a machine whose lsof can't see the app. */
 export function whoAnswers(holders: Holder[], group: number | null, waited: number, patience = 15_000): { kind: 'show' } | { kind: 'wait' } | { kind: 'clash'; others: Holder[] } {
   const mine = holders.filter((h) => group !== null && h.pgid === group), others = holders.filter((h) => !mine.includes(h))
-  if (!others.length) return { kind: 'show' }
-  if (mine.length) return { kind: 'clash', others }
+  if (mine.length) return others.length ? { kind: 'clash', others } : { kind: 'show' }
+  if (others.some((h) => inTestCopy(h.cwd))) return { kind: 'wait' }
   return waited < patience ? { kind: 'wait' } : { kind: 'show' }
 }
 

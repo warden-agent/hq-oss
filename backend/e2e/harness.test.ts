@@ -375,3 +375,23 @@ test('Bug 118: a second backend on a running HQ\'s ports stops before it touches
     assert.equal((await hq.api('state')).status, 200, 'the running HQ carries on')
   } finally { await hq.stop() }
 })
+
+test('Bug 434: a port browsers and fetch refuse stops HQ at start-up, naming the port and its variable; the usual ports start it', async () => {
+  const hq = await startHq()
+  try {
+    const started = () => { // a backend that got past its port check would go on to say so
+      const db = hq.db({ readOnly: true })
+      try { return db.prepare("SELECT count(*) AS n FROM events WHERE kind = 'backend.started'").get()!.n } finally { db.close() }
+    }
+    await hq.down(); const before = started()
+    const r = spawnSync(process.execPath, ['--experimental-strip-types', 'src/index.ts'], { cwd: path.resolve(import.meta.dirname, '..'),
+      env: { ...hq.env, HQ_UI_PORT: '6000', HQ_MCP_PORT: '6665' }, encoding: 'utf8', timeout: 30_000 })
+    assert.equal(r.status, PORT_TAKEN_EXIT, r.stderr)
+    assert.match(r.stderr, /^HQ can't start: web browsers and fetch refuse to connect to some of its ports\.\n {2}port 6000 \(the page and its API, HQ_UI_PORT\)\n/m)
+    assert.match(r.stderr, /^ {2}port 6665 \(agents' tools \(MCP\), HQ_MCP_PORT\)$/m)
+    assert.doesNotMatch(r.stderr, new RegExp(`port ${hq.ports.hooks}`), 'its hooks port is a usual one')
+    assert.doesNotMatch(r.stdout, /HQ backend up/)
+    assert.equal(started(), before, 'it stopped before writing anything')
+    await hq.up(); assert.equal((await hq.api('state')).status, 200, 'its own ports start it')
+  } finally { await hq.stop() }
+})

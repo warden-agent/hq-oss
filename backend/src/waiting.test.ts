@@ -1,7 +1,7 @@
 // What a box says about messages that haven't reached its agent yet (frontend/src/api.ts waitingFor), and why they wait.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { waitingFor, type Agent, type State } from '../../frontend/src/api.ts'
+import { agentWord, pausedBy, pauseStopped, rolePaused, waitingFor, waitLine, type Agent, type State } from '../../frontend/src/api.ts'
 
 const NOW = 1_000_000
 const agent = (o: Record<string, unknown> = {}): Agent => ({ id: 'tpm-1', role: 'tpm', status: 'idle', feature_id: null, ...o })
@@ -46,4 +46,36 @@ test('Bug 370: a change to its spec goes in with the next step of a working agen
   assert.equal(why(agent(), state({ messages: [spec] })), 'delivering…')
   assert.equal(why(agent({ status: 'working' }), state({ messages: [fyi] })), 'waits for its current turn to end')
   assert.equal(why(agent({ status: 'paused' }), state({ messages: [spec] })), 'held · paused')
+})
+
+test('Bug 195: a paused role: each of its boxes says who is paused and where Resume is, with messages waiting or not', () => {
+  const on = state({ settings: { paused_roles: ['engineer'] } }), eng = (o: Record<string, unknown> = {}) => agent({ id: 'eng-1', role: 'engineer', ...o })
+  const mine = { to_id: 'eng-1', delivered_at: null, channel: 'dm' }, line = 'engineers are paused · Resume is in the ⚠ menu'
+  assert.deepEqual(waitingFor(eng(), { ...on, messages: [mine, mine] } as State, NOW), { count: 2, held: true, why: `held · ${line}` })
+  assert.deepEqual(waitLine(eng(), { ...on, messages: [mine] } as State, NOW), { text: `✉ 1 waiting · held · ${line}`, held: true })
+  // nothing waiting: the line is there all the same, working or stopped: it starts nothing until Resume
+  for (const status of ['idle', 'working', 'blocked']) assert.deepEqual(waitLine(eng({ status }), { ...on, messages: [] } as State, NOW), { text: `⏸ ${line}`, held: true }, status)
+  assert.equal(waitLine(agent({ role: 'tpm' }), state({ settings: { paused_roles: ['tpm'] }, messages: [] }), NOW)!.text, '⏸ TPMs are paused · Resume is in the ⚠ menu')
+  // the one HQ stopped says so, not "interrupted" (that is a person's Escape); once resumed it is an interrupted turn like any other
+  const stopped = eng({ interrupted_at: NOW - 5000, pause_stopped_at: NOW - 5000 })
+  assert.equal(pauseStopped(stopped), true); assert.equal(agentWord(stopped), 'stopped by the pause')
+  assert.equal(agentWord(eng({ interrupted_at: NOW - 5000, pause_stopped_at: null })), 'interrupted')
+  assert.equal(agentWord(eng({ status: 'working', pause_stopped_at: NOW })), 'working') // refused a step, its turn not over yet
+  // what it must not catch: another role, an ended agent, one writing its handoff note, a role that isn't paused, a hold that comes first
+  const tpm = agent(), waits = state({ settings: { paused_roles: ['engineer'] } })
+  assert.equal(rolePaused(tpm, waits), false); assert.equal(why(tpm, waits), 'delivering…'); assert.equal(waitLine(tpm, { ...waits, messages: [] } as State, NOW), null)
+  assert.equal(waitLine(eng({ status: 'exited' }), { ...on, messages: [] } as State, NOW), null)
+  assert.equal(waitLine(eng({ fresh_start_at: NOW - 1000 }), { ...on, messages: [] } as State, NOW), null)
+  assert.equal(waitLine(eng(), state({ messages: [] }), NOW), null)
+  assert.match(why(eng({ takeover_locked_until: NOW + 60_000 }), { ...on, messages: [mine] } as State)!, /you typed in its terminal/)
+  assert.equal(why(eng({ status: 'paused' }), { ...on, messages: [mine] } as State), 'held · paused') // a usage pause is its own agent's
+})
+
+test('Bug 195: the notice of the switch carries Resume while its role is paused; resumed, or with its agent not on the page, it is a notice like any other', () => {
+  const s = { agents: [{ id: 'eng-1', role: 'engineer', status: 'idle' }, { id: 'tpm-1', role: 'tpm', status: 'idle' }], settings: { paused_roles: ['engineer'] } } as never
+  assert.equal(pausedBy({ kind: 'model_fallback', agent_id: 'eng-1' }, s), 'engineer')
+  assert.equal(pausedBy({ kind: 'model_fallback', agent_id: 'tpm-1' }, s), null) // its role was resumed already, or never paused
+  assert.equal(pausedBy({ kind: 'model_fallback', agent_id: 'eng-gone' }, s), null) // the ⚠ menu's own row has the Resume then (App.tsx Bell)
+  assert.equal(pausedBy({ kind: 'model_mismatch', agent_id: 'eng-1' }, s), null); assert.equal(pausedBy({ kind: 'stuck', agent_id: 'eng-1' }, s), null)
+  assert.equal(pausedBy({ kind: 'model_fallback', agent_id: 'eng-1' }, { agents: [{ id: 'eng-1', role: 'engineer', status: 'idle' }], settings: {} } as never), null)
 })

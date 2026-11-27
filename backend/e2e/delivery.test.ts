@@ -23,6 +23,7 @@ async function takeLaunch(agentId: string): Promise<void> {
   const b = (await hq.modNext(agentId)).batch; assert.ok(b, 'a launch batch'); await hq.modEvent(agentId, { kind: 'batch_received', id: b.id })
   await hq.hook(agentId, { hook_event_name: 'UserPromptSubmit', prompt: b.text })
 }
+const NO_REPEAT = " Don't message the engineer about this change yourself: HQ's notice tells it what changed and what to do." // Bug 406
 const say = (agentId: string, body: string) => hq.api(`agents/${agentId}/message`, { body, reason: 'fyi' })
 const ticketOf = async (t: any) => (await hq.state()).tickets.find((x: any) => x.id === t.id)
 
@@ -220,6 +221,35 @@ test('Bug 149: nothing is typed after a half-written line in the prompt box; the
   assert.deepEqual(await waiting, {}); assert.equal((await agentNow(tpm)).type_waits, null)
 })
 
+test('Bug 436: why a message waits to be typed ends with its interrupt: at the next prompt, a turn that ends normally, the agent stopping', async () => {
+  const { tpm } = await setup('b436waits')
+  await takeLaunch(tpm.id); await interrupt(tpm)
+  const waits = async (why: string) => {
+    assert.deepEqual(await hq.modNext(tpm.id), {}); await waitFor(`HQ to hold back (${why})`, async () => (await agentNow(tpm)).type_waits === why)
+  }
+  const take = async (body: string) => {
+    const b = (await hq.modNext(tpm.id)).batch; assert.equal(b?.text, body) // the mod hands it out again: no interrupt any more
+    await hq.modEvent(tpm.id, { kind: 'batch_received', id: b.id }); await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: b.text })
+  }
+  // a half-written line holds the message back. The person sends it: its prompt starts a turn, so the line is no longer in the way
+  await draw(tpm, DRAFT_BOX, 'half-typed words'); await say(tpm.id, 'First note for b436.'); await waits('draft')
+  await draw(tpm, WORKING, 'esc to interrupt'); await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'half-typed words of mine' })
+  const now = await agentNow(tpm); assert.equal(now.type_waits, null); assert.ok(now.interrupted_at, 'interrupted until a turn ends normally')
+  // that turn holds it back; it ends normally (the Stop hook): the interrupt is over, and its reason with it
+  await waits('busy'); await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Sent.' })
+  assert.equal((await agentNow(tpm)).interrupted_at, null); assert.equal((await agentNow(tpm)).type_waits, null)
+  await take('First note for b436.')
+  // interrupted again and held for the same reason as before: the box hears it again. The mod says the next turn ended normally
+  await interrupt(tpm); await say(tpm.id, 'Second note for b436.'); await waits('busy')
+  await hq.modEvent(tpm.id, { kind: 'turn.complete', turnId: 't2', agentId: null, isAborted: false, durationMs: 900, answer: 'Done.' })
+  assert.equal((await agentNow(tpm)).interrupted_at, null); assert.equal((await agentNow(tpm)).type_waits, null)
+  await take('Second note for b436.')
+  // and an agent that stops while a menu holds its message back has nothing holding anything back
+  await interrupt(tpm); await draw(tpm, MENU, 'Do you want to proceed?'); await say(tpm.id, 'Third note for b436.'); await waits('dialog')
+  await hq.api(`agents/${tpm.id}/stop`, {}); await waitFor('the TPM to stop', async () => (await agentNow(tpm)).status === 'exited')
+  assert.equal((await agentNow(tpm)).type_waits, null)
+})
+
 test('Bug 149: an urgent message that finds a half-written line after its Escape goes back in the queue: the mod takes it, or it is typed once the box is empty', async () => {
   const { tpm } = await setup('urgent-draft')
   await takeLaunch(tpm.id); await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Ready.' }) // idle: the Escape has no turn to stop
@@ -291,6 +321,50 @@ test('Bug 110: a batch the mod submitted whose prompt never started is typed the
   assert.equal((await msgNow('Lost after Escape.')).delivery_method, 'failed'); assert.equal((await payloads(tpm.id, 'batch.typed')).length, 2)
 })
 
+test('Bug 435: an old typed line a person sends after HQ took its batch back delivers its messages, once; they aren\'t typed again', async () => {
+  const { tpm } = await setup('b435-old-line')
+  await takeLaunch(tpm.id); await draw(tpm, INTERRUPTED, 'Interrupted'); await interrupt(tpm)
+  const notSent = async (line: string, n: number): Promise<string> => { // typed, but it stays in the box and no prompt starts
+    const id = await typed(tpm, n); await waitFor('the line in the terminal', () => pane(tpm).includes(line))
+    await draw(tpm, styledBox(line), line); ageBatch(id) // past the 90 s wait: HQ takes it back...
+    assert.deepEqual(await hq.modNext(tpm.id), {}); await waitFor('HQ to hold back (draft)', async () => (await agentNow(tpm)).type_waits === 'draft') // ...and holds the retry
+    assert.deepEqual((await payloads(tpm.id, 'batch.requeued')).at(-1), { id, why: 'not_acked', launch: false }); return id
+  }
+  // the user's own words, typed as they are
+  await say(tpm.id, 'Old line of mine.'); assert.deepEqual(await hq.modNext(tpm.id), {}); const first = await notSent('Old line of mine.', 1)
+  assert.equal((await msgNow('Old line of mine.')).delivered_at, null, 'back in the queue')
+  await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'Old line of mine.' }) // the person presses Enter on it
+  const m = await msgNow('Old line of mine.'); assert.ok(m.ack_at, 'delivered by the old line'); assert.equal(m.batch_id, first); assert.equal(m.delivery_method, 'tmux')
+  await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Noted.' }); await draw(tpm, INTERRUPTED, 'Interrupted'); await interrupt(tpm)
+  // a labelled line (HQ's notice and a message that starts with "/"): each message it names counts
+  await say(tpm.id, '/tidy the list'); assert.deepEqual(await hq.modNext(tpm.id), {})
+  const second = await typed(tpm, 2), slash = await msgNow('/tidy the list')
+  await draw(tpm, styledBox(`HQ message batch ${second}`), `HQ message batch ${second}`); ageBatch(second)
+  assert.deepEqual(await hq.modNext(tpm.id), {}); await waitFor('HQ to hold back (draft)', async () => (await agentNow(tpm)).type_waits === 'draft')
+  await say(tpm.id, 'Came in meanwhile.') // not on the old line: it is typed later, on its own
+  await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: `HQ message batch ${second}: [fyi] from the user [msg ${slash.id}]: /tidy the list` })
+  assert.ok((await msgNow('/tidy the list')).ack_at); assert.equal((await msgNow('Came in meanwhile.')).delivered_at, null)
+  await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Noted.' }); await draw(tpm, INTERRUPTED, 'Interrupted'); await interrupt(tpm)
+  assert.deepEqual(await hq.modNext(tpm.id), {})
+  const third = await typed(tpm, 3); await waitFor('the next line in the terminal', () => pane(tpm).includes('Came in meanwhile.'))
+  assert.equal((await msgNow('Came in meanwhile.')).batch_id, third, 'on a line of its own')
+  assert.equal((await msgNow('Old line of mine.')).batch_id, first); assert.equal((await msgNow('/tidy the list')).batch_id, second)
+  assert.equal((await payloads(tpm.id, 'batch.typed')).length, 3, 'each message typed once')
+})
+
+test('Bug 435: an old line that carries only part of its batch delivers nothing; its messages are typed again', async () => {
+  const { tpm } = await setup('b435-edited')
+  await takeLaunch(tpm.id); await draw(tpm, INTERRUPTED, 'Interrupted'); await interrupt(tpm)
+  await say(tpm.id, 'First words. Second words.'); assert.deepEqual(await hq.modNext(tpm.id), {}); const id = await typed(tpm)
+  await waitFor('the line in the terminal', () => pane(tpm).includes('First words. Second words.'))
+  await draw(tpm, styledBox('First words.'), 'First words.'); ageBatch(id) // the person cut the line short
+  assert.deepEqual(await hq.modNext(tpm.id), {}); await waitFor('HQ to hold back (draft)', async () => (await agentNow(tpm)).type_waits === 'draft')
+  await hq.hook(tpm.id, { hook_event_name: 'UserPromptSubmit', prompt: 'First words.' })
+  assert.equal((await msgNow('First words. Second words.')).delivered_at, null, 'not delivered: the agent never got all of it')
+  await hq.hook(tpm.id, { hook_event_name: 'Stop', last_assistant_message: 'Hm.' }); await draw(tpm, INTERRUPTED, 'Interrupted'); await interrupt(tpm)
+  assert.deepEqual(await hq.modNext(tpm.id), {}); await typed(tpm, 2)
+})
+
 test('Bug 146: a message that starts with / or ! goes to the mod labelled, not as the user\'s own prompt; a plain one still does', async () => {
   const { tpm } = await setup('slash-mod')
   await takeLaunch(tpm.id)
@@ -337,7 +411,11 @@ test('only an answer answers an engineer\'s question; HQ\'s notices come from HQ
   // Bug 129: the page is told whom it asked and what, so the box can say so and open it
   const open = async () => (await hq.state()).questions.filter((x: any) => x.ticket_id === t.id)
   assert.deepEqual((await open()).map((x: any) => [x.to_target, x.from_agent_id, x.body]), [[tpm.id, eng.id, 'Wood or metal?']])
-  assert.equal((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, spec: 'A wooden shelf.', user_asked: true })).isError, false)
+  // Bug 406: the TPM is told HQ's notice went to the engineer, and that the question it asked (named, so it isn't taken for another) still needs its answer
+  const qid = (await open())[0].message_id
+  assert.equal((await hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, spec: 'A wooden shelf.', user_asked: true })).text, `Updated. HQ has told ${t.key}'s engineer`
+    + ` (${eng.id}). HQ's notice tells the engineer what changed. Its question to you ("Wood or metal?", ${qid}) still waits for your answer: send that with`
+    + ` send_message (reason "answer", in_reply_to ${qid}).`)
   assert.equal((await ticketOf(t)).status, 'awaiting_answer') // the "spec updated" FYI is not an answer
   assert.equal((await hq.mcp(tpm.id, 'send_message', { to: eng.id, reason: 'fyi', body: 'Thinking about it.' })).isError, false)
   assert.equal((await ticketOf(t)).status, 'awaiting_answer')
@@ -537,10 +615,10 @@ test('Bug 168: the spec or title a ticket already has, given again, changes noth
   }
   assert.deepEqual([(await ticketOf(t)).title, (await ticketOf(t)).spec], ['Shelf', 'A shelf.'])
   // Only what is new is news: the same spec with a new title tells the engineer about the title alone
-  assert.equal((await spec(t, { spec: 'A shelf.', title: 'Pine shelf' })).text, 'Updated.')
+  assert.equal((await spec(t, { spec: 'A shelf.', title: 'Pine shelf' })).text, `Updated. HQ has told ${t.key}'s engineer (${eng.id}).${NO_REPEAT}`)
   const one = await waitFor('the engineer to be told', async () => { const m = await told(eng.id); return m.length ? m : null })
   assert.deepEqual(one.map((m: any) => m.body), [`HQ: the TPM updated ${t.key}'s title (now "Pine shelf"). Call get_ticket to read it.`])
-  assert.equal((await spec(t, { spec: 'A pine shelf.', title: 'Pine shelf' })).text, 'Updated.')
+  assert.equal((await spec(t, { spec: 'A pine shelf.', title: 'Pine shelf' })).text, `Updated. HQ has told ${t.key}'s engineer (${eng.id}).${NO_REPEAT}`)
   await waitFor('the spec notice', async () => (await told(eng.id)).some((m: any) => m.body === `HQ: the TPM updated ${t.key}'s spec. Call get_ticket to read it.`))
   assert.equal((await told(eng.id)).length, 2) // and nothing for the unchanged parts
 })
@@ -630,12 +708,12 @@ test('Bug 102: a spec change while a ticket has no engineer waits for the next o
   const eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
   await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
   assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', eng.id, 'prompt.md'), 'utf8'), /## Spec\nA pine shelf\./)
-  assert.equal((await spec(t, { spec: 'An oak shelf.' })).text, 'Updated.') // the engineer on it now is told, as before
+  assert.equal((await spec(t, { spec: 'An oak shelf.' })).text, `Updated. HQ has told ${t.key}'s engineer (${eng.id}).${NO_REPEAT}`) // the engineer on it now is told, as before
   const oak = await msgs(eng.id); assert.equal(oak.length, 1)
   await hq.mcp(eng.id, 'read_inbox') // it has read that one
   await hq.api(`agents/${eng.id}/stop`, {})
   await waitFor('the engineer to stop', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id).status === 'exited')
-  const gone = `Updated. ${t.key}'s engineer (${eng.id}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.`
+  const gone = `Updated. ${t.key}'s engineer (${eng.id}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.${NO_REPEAT}`
   assert.equal((await spec(t, { spec: 'A walnut shelf.' })).text, gone)
   assert.equal((await spec(t, { title: 'Walnut shelf' })).text, gone)
   const waiting = (await msgs(eng.id)).filter((m: any) => !m.delivered_at); assert.equal(waiting.length, 2)
@@ -644,7 +722,7 @@ test('Bug 102: a spec change while a ticket has no engineer waits for the next o
   assert.match(fs.readFileSync(path.join(hq.hqHome, 'agents', r.json.id, 'prompt.md'), 'utf8'), /A walnut shelf\./)
   assert.deepEqual((await msgs(r.json.id)).map((m: any) => m.id).sort(), waiting.map((m: any) => m.id).sort())
   assert.equal((await msgs(eng.id)).filter((m: any) => !m.delivered_at).length, 0, 'nothing left for the engineer that has gone')
-  assert.equal((await spec(t, { spec: 'A cherry shelf.' })).text, 'Updated.') // the one on it now is told at once
+  assert.equal((await spec(t, { spec: 'A cherry shelf.' })).text, `Updated. HQ has told ${t.key}'s engineer (${r.json.id}).${NO_REPEAT}`) // the one on it now is told at once
   assert.equal((await msgs(r.json.id)).length, 3)
 })
 

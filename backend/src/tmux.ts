@@ -82,6 +82,8 @@ export async function typeLine(name: string, text: string): Promise<void> {
   for (const p of pieces(text, PIECE)) await tmux('send-keys', '-t', name, '-l', '--', p)
   await tmux('send-keys', '-t', name, 'Enter')
 }
+/** Enter alone: for a line HQ typed that Claude Code left unsent in its box (delivery.ts confirmSent). */
+export async function sendEnter(name: string): Promise<void> { await tmux('send-keys', '-t', name, 'Enter') }
 export async function setHook(name: string, hook: string, shell: string): Promise<void> { await tmux('set-hook', '-t', name, hook, `run-shell ${JSON.stringify(shell)}`).catch(() => {}) }
 export async function paneDead(name: string): Promise<boolean> { const out = await tmux('display-message', '-p', '-t', name, '#{pane_dead}').catch(() => '1'); return out.trim() === '1' }
 /** Exit code of a dead pane's command (null while it runs or when the session is gone). One a signal ended has no code of its own: 128 plus the signal,

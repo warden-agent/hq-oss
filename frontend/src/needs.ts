@@ -38,9 +38,10 @@ export function forRepo<T extends S & { messages: any[] }>(s: T, repoId: string 
     ...(s.testRuns ? { testRuns: s.testRuns.filter((r) => r.repo_id === repoId) } : {}), // HQ's own test runs (Bug 106)
     messages: s.messages.filter((m) => m.repo_id ? m.repo_id === repoId : m.feature_id ? fids.has(m.feature_id) : [m.from_id, m.to_id].every((x) => !x || x === 'user' || x === 'hq' || aids.has(x))) }
 }
-/** Engineers using a parallel slot (finished ones don't). */
-export const workingEngineers = (s: { agents: any[]; tickets: any[] }): number =>
-  s.agents.filter((a) => a.role === 'engineer' && a.status !== 'exited' && !FINISHED.includes(s.tickets.find((t) => t.id === a.ticket_id)?.status ?? '')).length
+/** Engineers using a parallel slot (finished ones don't): the backend's canLaunch rule. One interrupted or stopped by the pause keeps its slot (Bug 437). */
+export const slotEngineers = <A extends { role: string; status: string; ticket_id?: string | null }>(s: { agents: A[]; tickets: any[] }): A[] =>
+  s.agents.filter((a) => a.role === 'engineer' && a.status !== 'exited' && !FINISHED.includes(s.tickets.find((t) => t.id === a.ticket_id)?.status ?? ''))
+export const workingEngineers = (s: { agents: any[]; tickets: any[] }): number => slotEngineers(s).length
 /** An engineer's open question (Bug 129; the backend's delivery.ts QuestionView). `to_target`: an agent id, 'user' or 'team'. */
 export type Question = { id: string; ticket_id: string | null; from_agent_id: string; to_target: string; message_id: string; asked_at: number; answered_at?: number | null; body: string }
 /** The question a ticket waits on: the newest open one, and only while the ticket says it has a question. */
@@ -96,6 +97,8 @@ export const ALERT_KINDS = new Set(['stuck', 'blocked', 'dialog', 'message_for_u
   'fresh_start_failed', 'merge_conflict', 'fix_stalled', 'look_stalled',
   'review_stalled', 'change_stalled', 'delivery_failed', 'dm_refused', 'tpm_away', 'unexpected_prompt', 'usage_limit', 'rate_limit', 'api_error',
   'pr_failed', 'push_failed', 'auto_parked', 'leftovers_stuck', 'leftovers_cant_check', 'bg_stalled', 'engineer_idle',
+  'model_fallback', // Bug 195: its role is paused and its agents stopped until the user's Resume
+  'download_refused', // Bug 444: its Allow <host> (PR #418) is the user's to press; it closes once every host is allowed and its agent ended
   'claude_unchecked']) // Bug 97: agents on a Claude Code HQ wasn't checked on. A newer one merely installed (claude_newer) is information
 /** Good news: green, not red, because nothing is wrong (Bug 61). */
 export const goodNews = (kind: string): boolean => kind === 'merged' || kind === 'conflicts_fixed' || kind.startsWith('auto_finished:') || kind.startsWith('project_removed') // Bug 66's notice

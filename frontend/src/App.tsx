@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { agentPill, agentPlanWait, answerAsk, api, clearErrors, connectWs, endedLine, jsonList, menuActivity, nextHoldEnd, noteLine, onDialog, outdatedBar, showError, shownStatus, waitLine, FINISHED,
+import { agentPill, agentPlanWait, answerAsk, api, clearErrors, connectWs, endedLine, jsonList, menuActivity, nextHoldEnd, noteLine, onDialog, outdatedBar, pausedBy, roleWord,
+  busyWords, showError, shownStatus, waitLine,
   type Agent, type State, type WsMsg } from './api'
 import { AgentTerminal } from './Terminal'
 import { Graph, type Focus } from './Graph'
-import { AttentionList, CheckLine, CheckResults, FreshBtn, MergeAct, ReviewPanel } from './Nodes'
-import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel,
+import { AttentionList, CheckLine, CheckResults, FreshBtn, MergeAct, ResumeRoleAct, ReviewPanel } from './Nodes'
+import { BoardCtx, buildBoard, clearConfirm, ctxLimit, ctxShare, forRepo, freshBlocker, freshConfirm, kTok, liveEngineer, localOnly, mergeActs, OPEN_PREVIEW, stopOthers, ticketLabel, ticketTone,
   noteTakers, parkWords, removeConfirm, openAuto, openSummary, boardKeeper, turnOn, useBoard, type Board, type Pop, type PopKind } from './board'
-import { ActBtn, Elapsed, ErrorBar, LiveDot, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
+import { ActBtn, DownloadsDialog, Elapsed, ErrorBar, LiveDot, Md, Menu, NewProjectDialog, Pill, StopDialog } from './ui'
+import { useEscape } from './layers.ts'
 import { mergeTestOf, mergeTestWords, runWords } from './testruns.ts'
 import { byKind, criteriaOf, flagLines, KIND_HEADING, proofOf, proofWords } from '../../backend/src/criteria.ts'
-import { checksOf, outOfDate } from '../../backend/src/hqcheckrules.ts'
+import { checkOf, checksOf, fixBack, outOfDate, roundOf } from '../../backend/src/hqcheckrules.ts'
 import { lookWords } from '../../backend/src/smokerules.ts'
 import { diffCheckOf, diffCheckWords, planCheckOf, planCheckWords } from '../../backend/src/checks.ts'
 import { messageRoute } from '../../backend/src/msgroute.ts'
@@ -74,7 +76,7 @@ export default function App() {
   const [panelW, setPanelW] = useState(() => { try { return Number(localStorage.getItem(PANEL_KEY)) || PANEL_DEFAULT } catch { return PANEL_DEFAULT } })
   const [win, setWin] = useState(() => ({ w: window.innerWidth, h: window.innerHeight })) // the panes are sized from it, so a resize redraws
   useEffect(() => { const r = () => setWin({ w: window.innerWidth, h: window.innerHeight }); window.addEventListener('resize', r); return () => window.removeEventListener('resize', r) }, [])
-  useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') setPop(null) }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k) }, [])
+  useEscape(() => setPop(null), !!pop) // a box's popover is a layer: Escape over a confirm it opened closes only the confirm (Bug 407)
   const [now, setNow] = useState(() => Date.now()) // the board's clock: "held · until 14:12" expires without a state change
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 15_000); return () => clearInterval(t) }, [])
   const [conn, setConn] = useState<'connecting' | 'open' | 'token' | 'down'>('connecting')
@@ -279,6 +281,7 @@ function Splitter({ dir, size, set, save, def, label }: { dir: 'col' | 'row'; si
 function RepoBar({ state, all, repo, onRepo, onRemoved, now }: { state: State; all: State; repo: any | null; onRepo: (id: string) => void
   onRemoved: (id: string, next: string | null) => void; now: number }) {
   const [busy, setBusy] = useState<null | 'pick' | 'add' | 'sync' | 'clear' | 'remove'>(null), [making, setMaking] = useState(false)
+  const [hostsFor, setHostsFor] = useState<string | null>(null) // Bug 425: + Project → Downloads, for this project
   const [choices, setChoices] = useState<{ in: string; repos: { path: string; name: string; github: string | null }[] } | null>(null) // a picked folder held several repos
   const account = state.defaults.github_account ?? 'warden-agent'
   const addRepo = () => { if (busy) return; setBusy('pick'); setChoices(null); api('repos/pick', {}).then((r) => { if (r.choose) setChoices({ in: r.in, repos: r.choose }); else if (!r.cancelled) onRepo(r.id) }).catch((e) => showError(e)).finally(() => setBusy(null)) }
@@ -310,6 +313,7 @@ function RepoBar({ state, all, repo, onRepo, onRemoved, now }: { state: State; a
         Clearing…{noting ? ` ${noting} note${noting === 1 ? '' : 's'} to go` : ''}</span>
       : <button className="btn" onClick={() => void clear()} disabled={!!busy} title={`Clear ${repo.name}: archive and delete its board, and start fresh`}>Clear…</button>)}
     {making && <NewProjectDialog onClose={() => setMaking(false)} onMade={(id) => { setMaking(false); onRepo(id) }} />}
+    {repo && hostsFor === repo.id && <DownloadsDialog repo={repo} onClose={() => setHostsFor(null)} />}
     <div className="relative">{busy === 'pick' || busy === 'add' || busy === 'remove'
       ? <button className="btn" disabled>{busy === 'pick' ? 'Choose a folder…' : busy === 'add' ? 'Adding…' : 'Removing…'}</button>
       : <Menu label="+ Project" align="left" title="Start a new project, add a repo you already have, or take this one off HQ's list">{(close) => <div className="flex w-64 flex-col gap-1 text-xs">
@@ -317,6 +321,8 @@ function RepoBar({ state, all, repo, onRepo, onRemoved, now }: { state: State; a
           New project…<div className="text-zinc-500">A new folder and repo, on this Mac or on GitHub too</div></button>
         <button className="btn text-left" disabled={!!busy} onClick={() => { close(); addRepo() }}>
           Add repo…<div className="text-zinc-500">A folder that's already a git repo</div></button>
+        {repo && <button className="btn break-words text-left" onClick={() => { close(); setHostsFor(repo.id) }}>
+          Downloads for {repo.name}…<div className="text-zinc-500">Hosts its agents may download from, besides the usual package sites</div></button>}
         {repo && <button className="btn break-words text-left text-rose-300!" disabled={!!busy || !!repo.clearing_at} onClick={() => { close(); void remove() }}>
           Remove {repo.name} from HQ…<div className="text-zinc-500">Takes it off this list. Its folder stays as it is</div></button>}</div>}</Menu>}
       {choices && <div className="absolute left-0 top-full z-50 mt-1 flex w-72 flex-col gap-1 rounded-lg border border-zinc-700 bg-zinc-900 p-2 shadow-xl"><div className="text-zinc-400">Several repos in {choices.in.split('/').pop()}. Pick one:</div>
@@ -327,9 +333,9 @@ function RepoBar({ state, all, repo, onRepo, onRemoved, now }: { state: State; a
 function ParallelLimit({ state }: { state: State }) {
   const [draft, setDraft] = useState<number | null>(null) // shown until the next snapshot carries the saved value
   const cap = draft ?? Number(state.settings.concurrency_cap ?? state.defaults.concurrency_cap ?? 2)
-  const working = state.agents.filter((a) => a.role === 'engineer' && a.status !== 'exited' && !FINISHED.includes(state.tickets.find((t) => t.id === a.ticket_id)?.status ?? '')).length
+  const busy = busyWords(state, cap) // Bug 437: an engineer interrupted or stopped by the pause isn't busy, and is named after the figure
   const set = (n: number) => { if (!Number.isInteger(n) || n < 1) return; setDraft(n); api('settings', { key: 'concurrency_cap', value: n }).catch((e) => showError(e)) }
-  return <div className="flex items-center gap-1.5 text-zinc-400" title="How many engineers may work at the same time">Engineers at once <input type="number" min={1} max={10} className="input w-14! py-0.5! text-xs!" value={cap} onChange={(e) => set(Number(e.target.value))} /><span className="text-zinc-600" title={`${working} of ${cap} engineers are working`}>{working}/{cap} busy</span></div>
+  return <div className="flex items-center gap-1.5 text-zinc-400" title="How many engineers may work at the same time">Engineers at once <input type="number" min={1} max={10} className="input w-14! py-0.5! text-xs!" value={cap} onChange={(e) => set(Number(e.target.value))} /><span className="text-zinc-600" title={busy.tip}>{busy.text}</span></div>
 }
 /** Bug 76: how many builds and full test runs go at once on this computer, engineers' own and HQ's together. The rest wait their turn, and their boxes say so. */
 function TestLimit({ state }: { state: State }) {
@@ -391,7 +397,7 @@ function Elsewhere({ all, repo, needs, onRepo }: { all: State; repo: any | null;
 /** Everything that needs the user: open plan reviews, finished tickets waiting for their merge (shown until they're merged, so
  *  nothing to tick away), then every attention item. Show pans to the box; a review whose ticket has no box gets its form right here.
  *  `count` is what the tab title counts for this project (Bug 63), so plain information in the list doesn't light it up. */
-function Bell({ state, board, count }: { state: State; board: Board; count: number }) {
+function Bell({ state, board, count: alerts }: { state: State; board: Board; count: number }) {
   const b = useBoard()
   const reviews = state.reviews.filter((r) => r.status === 'open' && !hqAnswersPlan(state, r) && !clearingPlan(state, r)) // on auto: HQ's to answer; during a Clear: nobody's
     .sort((x, y) => (y.opened_at ?? 0) - (x.opened_at ?? 0))
@@ -400,7 +406,11 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
   const merges = state.tickets.flatMap((t) => { const f = base(t), acts = f.cancelled || (b.repo && nextMover(b.repo, t) !== 'user') ? [] : mergeActs(t, f.branch, liveEngineer(t, state));
     return acts.length ? [{ t, acts }] : [] })
   const repo = b.repo, turn = repo ? yourTurn(state, repo.id) : { asks: [], start: [] } // Bug 43, on the project's TPM since Bug 52
-  const n = turn.asks.length + (turn.start.length ? 1 : 0) + uncountedQuestions(state, turn).length + reviews.length + merges.length + state.attention.length
+  // Bug 195: a paused role with no notice here that carries its Resume (the notice is another project's: a pause is for every project; or the role
+  // was paused in the settings): its own row, so the way out is always in this menu, as each stopped box says
+  const pausedHere = (state.settings.paused_roles ?? [] as string[]).filter((r: string) => !state.attention.some((a) => pausedBy(a, state) === r))
+  const count = alerts + pausedHere.length
+  const n = turn.asks.length + (turn.start.length ? 1 : 0) + uncountedQuestions(state, turn).length + reviews.length + merges.length + state.attention.length + pausedHere.length
   const good = n > 0 && state.attention.filter((a) => goodNews(a.kind)).length === n // only good news: green, not red
   const showT = (close: () => void) => <button className="btn-sm shrink-0" onClick={() => { b.focus('tpm'); close() }}>Show</button>
   /** Where a notice's Show goes: this project's finished run has its summary, a test command engineers can't run the box it's written in (Bug 107), anything else its box. */
@@ -426,6 +436,9 @@ function Bell({ state, board, count }: { state: State; board: Board; count: numb
         <span className="min-w-0 grow break-words text-amber-200">{keysText(turn.start)} {turn.start.length > 1 ? 'are' : 'is'} ready to start</span>
         <ActBtn primary label="Start" busyLabel="Starting…" run={() => api(`repos/${repo.id}/start-ready`, {})} />{showT(close)}</div>}
     </div>}
+    {pausedHere.map((role: string) => <div key={role} className="flex items-start gap-2 rounded-md border border-rose-500/40 p-2">
+      <span className="min-w-0 grow break-words text-rose-200">{roleWord(role)} are paused, in every project: HQ stopped the ones at work and holds their messages.</span>
+      <ResumeRoleAct role={role} /></div>)}
     {reviews.length > 0 && <div className="font-semibold text-zinc-400">Plan reviews</div>}
     {reviews.map((r) => {
       const t = state.tickets.find((x) => x.id === r.ticket_id), eng = state.agents.find((a) => a.id === r.agent_id)
@@ -449,7 +462,8 @@ function TicketInfo({ t, state }: { t: any | null; state: State }) {
   // break-words: a long run with no spaces (a path in a stack trace) wraps instead of making the tab scroll sideways (Bug 144)
   return <div className="h-full overflow-y-auto break-words pr-1 text-xs">
     <div className="flex items-center gap-2"><span className="font-semibold">{t.key}</span><span className="text-zinc-500">{t.size}</span>
-      <Pill s={t.status} label={ticketLabel(t, state.reviews.some((r) => r.ticket_id === t.id && r.status === 'open' && hqAnswersPlan(state, r)), clearingPlan(state, { ticket_id: t.id }))} /></div>
+      <Pill s={ticketTone(t, liveEngineer(t, state))} label={ticketLabel(t, state.reviews.some((r) => r.ticket_id === t.id && r.status === 'open' && hqAnswersPlan(state, r)),
+        clearingPlan(state, { ticket_id: t.id }), !!repo && nextMover(repo, t) === 'user' && fixBack(t, checkOf(t)), liveEngineer(t, state))} /></div>
     <div className="mt-1 text-sm text-zinc-200">{t.title}</div>
     {/* Bug 349: why auto mode parked it and what comes next, as its box says; Try again here too while auto mode can take it (Bug 364), as on its box */}
     {park && <div className="mt-2 rounded-md border border-rose-900 p-2">
@@ -483,7 +497,7 @@ function HqTests({ t }: { t: any }) {
   const all = checksOf(t); if (!all.length) return null
   return <><div className="mt-3 font-semibold text-zinc-400">HQ's tests of it</div>
     <div className="mt-1 space-y-1">{all.map((c, i) => <details key={c.id} className="rounded-md border border-zinc-800 px-2 py-1">
-      <summary className="cursor-pointer break-words"><CheckLine c={c} /></summary>
+      <summary className="cursor-pointer break-words"><CheckLine c={c} n={roundOf(t, c)} /></summary>
       <div className="mt-1 flex flex-col gap-2 pb-1"><CheckResults t={t} c={c} old={i === 0 && outOfDate(t, c)} head={false} /></div></details>)}</div></>
 }
 /** A ticket's acceptance criteria, each with the test its engineer named for it at open_pr and how that test did in HQ's own run, then what git flagged about

@@ -2,8 +2,8 @@
 // a merge may record the check as its test. Pure (hqcheckrules.ts), so the page shows what these say.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { allSteps, canSend, changedWords, checkButton, checkFacts, checkHeadline, checkOf, checksOf, checkTone, commandGap, outOfDate, pastChecks, pastWith, testedFor, unseenCount,
-  unseenOnly, unseenWords, type HqCheck } from './hqcheckrules.ts'
+import { allSteps, canSend, changedWords, checkButton, checkFacts, checkHeadline, checkOf, checksOf, checkTone, commandGap, fixBack, nextRound, outOfDate, pastChecks, pastWith,
+  roundOf, testedFor, unseenCount, unseenOnly, unseenWords, type HqCheck } from './hqcheckrules.ts'
 
 const base: HqCheck = { id: 'check-1', state: 'pass', sha: 'aaaaaaa1', base: 'main', base_sha: 'bbbbbbb2', finished_sha: 'aaaaaaa1', started_at: 1_000, ended_at: 66_000,
   steps: [{ kind: 'tests', state: 'pass', words: '`npm test` passed' }], tested: { test: 'npm test', counts: { passed: 3, failed: 0, skipped: 0 }, ms: 900, output: 'ok' } }
@@ -151,4 +151,39 @@ test('Bug 411: a check that waits for the project\'s test steps says so, on its 
   assert.equal(checkHeadline(waiting), 'Testing… Claude is working out how to test this project first (once, a few minutes)')
   assert.match(checkButton(tk(waiting), true)!.tip, /^HQ is testing T-01: Claude is working out how to test this project first \(once, a few minutes\)\. Click to watch it or stop it\.$/)
   assert.equal(checkHeadline({ ...waiting, prep: undefined, now: 'tests' } as HqCheck), 'Testing… running the tests') // and nothing else changes
+})
+
+test('Bug 401: sent to its engineer and finished again since: the button says the fix is back and invites the next round, not a grey "out of date"', () => {
+  const sent: Partial<HqCheck> = { state: 'fail', sent_at: 5_000, round: 1, back: { at: 9_000, sha: 'ccccccc3', files: ['a.js', 'b.js'], note: 'fixed it' } }
+  const b = checkButton(tk(sent, { finished_sha: 'ccccccc3' }), true)!
+  assert.deepEqual([b.label, b.tone, b.start], ['Fix is back · test again', 'sky', false]) // opens the results: what it did, and Test again
+  assert.equal(b.tip, "You sent round 1 of HQ's test to T-01's engineer, and it has finished the ticket again (it changed 2 files). Click to read what it did, "
+    + 'then test it again: round 2.')
+  assert.equal(fixBack(tk(sent, { finished_sha: 'ccccccc3' }), checkOf(tk(sent))), true)
+  // a conflicts send keeps no record of what came back, but its engineer is back all the same
+  const conflicts = checkButton(tk({ ...sent, back: undefined }, { finished_sha: 'ccccccc3' }), true)!
+  assert.equal(conflicts.label, 'Fix is back · test again'); assert.doesNotMatch(conflicts.tip, /changed/)
+  // what it must not catch: not sent (plain out of date), sent and not back yet (its engineer has it: no button), sent and not finished again, auto mode
+  assert.deepEqual(checkButton(tk({ state: 'fail' }, { finished_sha: 'ccccccc3' }), true)!.label, 'Results out of date')
+  assert.equal(checkButton(tk(sent, { status: 'resolving' }), true), null)
+  assert.equal(fixBack({ status: 'resolving', finished_sha: 'ccccccc3' }, { ...base, ...sent }), false)
+  assert.deepEqual(checkButton(tk(sent), true)!.label, 'View results ✗', 'same commit: nothing new came back')
+  assert.equal(checkButton(tk(sent, { finished_sha: 'ccccccc3' }), false), null)
+  assert.equal(fixBack({ status: 'merged', finished_sha: 'ccccccc3' }, { ...base, ...sent }), false); assert.equal(fixBack({ status: 'pr_ready' }, null), false)
+})
+
+test('Bug 401: each check is a round, numbered from 1; the numbers never shift as old ones go, and checks from before keep their place', () => {
+  const c = (n: number, more: Partial<HqCheck> = {}): HqCheck => ({ ...base, id: `check-${n}`, started_at: n * 1000, ...more })
+  assert.equal(nextRound([]), 1)
+  // checks kept before HQ numbered them: counted by their place, then numbered as the next one starts
+  const old = { hq_check: JSON.stringify(c(3)), hq_checks: JSON.stringify([c(1), c(2)]) }
+  assert.deepEqual(checksOf(old).map((x) => roundOf(old, x)), [3, 2, 1])
+  let past = pastWith([c(1), c(2)], c(3)); assert.deepEqual(past.map((x) => x.round), [1, 2, 3]); assert.equal(nextRound(past), 4)
+  // over the limit the oldest go; the rest keep their numbers, and the next one carries on
+  for (let n = 4; n <= 8; n++) past = pastWith(past, c(n, { round: nextRound(past) }), 3)
+  assert.deepEqual(past.map((x) => [x.id, x.round]), [['check-6', 6], ['check-7', 7], ['check-8', 8]]); assert.equal(nextRound(past), 9)
+  const t = { hq_check: JSON.stringify(c(9, { round: 9 })), hq_checks: JSON.stringify(past) }
+  assert.deepEqual(checksOf(t).map((x) => roundOf(t, x)), [9, 8, 7, 6])
+  // what it must not catch: a check stopped before anything ran isn't kept, so the next one takes its number
+  const kept = pastWith(past, c(9, { round: 9, state: 'stopped', steps: [] }), 3); assert.equal(nextRound(kept), 9)
 })

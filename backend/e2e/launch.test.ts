@@ -447,7 +447,10 @@ test('Bugs 276, 299: a helper stopped from its Agent tab ends as after "Stop Cla
   await waitFor('its branch to go', () => sh(dir, 'branch', '--list', 'hq-launch/*') === '')
   await waitFor('its test server to stop', () => !alive(test.pid!))
   const done = (await hq.api('events?limit=200')).json.filter((e: any) => e.kind === 'launch.helper_done' && e.agent_id === h).map((e: any) => JSON.parse(e.payload))
-  assert.deepEqual(done, [{ repo: 'stopped', state: null, note: null }])
+  assert.deepEqual(done, [{ repo: 'stopped', state: null, note: null, why: 'user_stopped' }])
+  // Bug 417: no banner, but its Events tab says plainly that the user stopped it
+  const said = ((await hq.api(`agents/${h}/events`)).json.events as any[]).map((x) => x.text)
+  assert.ok(said.includes('You stopped it') && said.includes('Done with the launch steps: you stopped Claude before it finished'), JSON.stringify(said))
 
   // a restart finds nothing left to finish and says nothing either
   await hq.restart()

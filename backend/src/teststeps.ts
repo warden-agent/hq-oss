@@ -21,7 +21,7 @@ import { sendMessage } from './delivery.ts'
 import { repush, serial } from './preview.ts'
 import { onPath } from './apprun.ts'
 import { saveTestCmds } from './heavy.ts'
-import { detectTests, failReport, filesAt, testBase, testParts } from './testrun.ts'
+import { detectTests, exitedAnyway, failReport, filesAt, testBase, testParts, type Failed } from './testrun.ts'
 import { countWords } from './testcounts.ts'
 import { notRun, notRunWords, ruleParts, type NotRun } from './testcensus.ts'
 import { chain, checkSteps, gapKey, hasTests, readSteps, stepsSkip, writeSteps, type SavedSteps, type StepsFile, type TestSteps } from './teststepsstore.ts'
@@ -51,7 +51,8 @@ export const stepsHelperOf = (repoId: string): string | null => readSteps(repoId
 
 /** What commit `ref` of this project has in test files that HQ would run nothing of, with what it runs now: the saved steps, else its rules. Nothing for a
  *  project with a test command of the user's own: HQ can't tell what that runs, and it is theirs to say. `shaky`: a Python project of the rules' whose setup
- *  they can't be sure of (no uv.lock, and no requirements.txt that names pytest: the rules' `uv sync` and pytest are a guess there). */
+ *  they can't be sure of (no uv.lock, and no requirements.txt that names pytest: the rules' `uv sync` and pytest are a guess there; or, Bug 416, a pyproject.toml
+ *  that is Poetry's alone, with no [project] table: there `uv sync` passes having installed nothing, not even pytest, whatever uv.lock is left beside it). */
 export async function stepsGap(repo: Repo, ref: string, o: { own?: boolean } = {}): Promise<{ runs: string | null; gaps: NotRun[]; shaky: string[]; key: string }> {
   if (o.own !== false && repo.test_cmd?.trim()) return { runs: repo.test_cmd.trim(), gaps: [], shaky: [], key: '' } // own: false = what HQ would run without the user's command
   const files = await filesAt(repo.path, ref).catch(() => [] as string[]), set = new Set(files), has = (p: string) => set.has(p)
@@ -59,8 +60,10 @@ export async function stepsGap(repo: Repo, ref: string, o: { own?: boolean } = {
   const steps = readSteps(repo.id).steps
   if (steps) { const gaps = stepsSkip(files, steps, has, read); return { runs: chain(steps.parts), gaps, shaky: [], key: gapKey(gaps) } }
   const plan = detectTests(repo.path), parts = plan ? ruleParts(plan.test) : [], gaps = notRun(files, parts, has, read)
-  const shaky = parts.filter((p) => p.kind === 'python' && !has(p.dir === '.' ? 'uv.lock' : `${p.dir}/uv.lock`)
-    && !/^\s*pytest\b/im.test(read(p.dir === '.' ? 'requirements.txt' : `${p.dir}/requirements.txt`))).map((p) => p.dir)
+  const at = (dir: string, f: string): string => dir === '.' ? f : `${dir}/${f}`
+  const poetryOnly = (dir: string): boolean => { const t = read(at(dir, 'pyproject.toml')); return /^\s*\[tool\.poetry[\].]/m.test(t) && !/^\s*\[project\]/m.test(t) }
+  const shaky = parts.filter((p) => p.kind === 'python' && ((!has(at(p.dir, 'uv.lock')) && !/^\s*pytest\b/im.test(read(at(p.dir, 'requirements.txt'))))
+    || (!has(at(p.dir, 'requirements.txt')) && poetryOnly(p.dir)))).map((p) => p.dir)
   return { runs: plan?.test ?? null, gaps, shaky, key: [gapKey(gaps), ...shaky.map((d) => `${d}:python-setup`)].filter(Boolean).join(',') }
 }
 /** The package and build tools on HQ's PATH, as the backend (outside any sandbox) sees them. The helper's own sandbox hides the user's home folder, where
@@ -70,9 +73,13 @@ function toolsLine(): string {
   const there = all.filter((t) => onPath(t)), gone = all.filter((t) => !there.includes(t))
   return `Tools HQ found installed on this computer: ${there.join(', ') || 'none of the ones it looks for'}.${gone.length ? ` Not found: ${gone.join(', ')}.` : ''}`
 }
-function prompt(repo: Repo, why: 'first' | 'again' | 'gap', gap: Awaited<ReturnType<typeof stepsGap>>, current: SavedSteps | null, ticketKey: string | null): string {
+function prompt(repo: Repo, why: 'first' | 'again' | 'gap', gap: Awaited<ReturnType<typeof stepsGap>>, current: SavedSteps | null, ticketKey: string | null,
+  install?: Install): string {
   return [`Project: ${repo.name}. Your job this time is the TEST STEPS (the "Test steps" section of your instructions), not the start steps.`, '',
     ...(ticketKey ? [`You are looking at ${mergeBase(repo).name} with ticket ${ticketKey} merged in: the ticket adds tests HQ's steps don't run yet.`] : []),
+    ...(install ? [`HQ's own rules install this project's packages with \`${install.cmd}\`, and that failed on ${mergeBase(repo).name} in HQ's sandbox (network on), so HQ `
+      + 'can\'t test the project at all. Work out how each part installs with the project\'s own tool, and save that as its install. What the install printed:', '```',
+    install.output, '```', ...(repo.test_cmd?.trim() ? ['The user\'s own test command stays what HQ tests with: HQ runs your parts\' installs before it.'] : [])] : []),
     `What HQ runs now: ${gap.runs ? `\`${gap.runs}\`` : 'nothing: its rules found no tests they know how to run'}`,
     ...(gap.gaps.length ? [`Test files that leaves out: ${gap.gaps.map((g) => `${notRunWords(g)}, e.g. ${g.example}`).join('; ')}`] : []),
     ...(gap.shaky.length ? [`HQ's rules can't be sure how the Python project in ${gap.shaky.map((d) => d === '.' ? 'the root' : `${d}/`).join(', ')} installs its packages.`] : []),
@@ -84,10 +91,14 @@ function prompt(repo: Repo, why: 'first' | 'again' | 'gap', gap: Awaited<ReturnT
 
 /** Starts the helper for this project. One at a time per project: in the preview's queue, so a second click (another tab) finds the first one on it.
  *  `sha`: the commit to work on (default: the tip of the project's base branch); `ticketId`: the ticket whose merge that commit is, when it is one. */
-export function startStepsHelper(repoId: string, o: { why?: 'first' | 'again' | 'gap'; sha?: string; ticketId?: string | null } = {}): Promise<StepsFile> {
+export function startStepsHelper(repoId: string, o: Start = {}): Promise<StepsFile> {
   return serial(repoId, () => startOne(repoId, o))
 }
-async function startOne(repoId: string, o: { why?: 'first' | 'again' | 'gap'; sha?: string; ticketId?: string | null }): Promise<StepsFile> {
+/** `install` (Bug 416): HQ's own install step failed on `sha`; that is what the helper is asked about, and what its job remembers having looked at. */
+type Start = { why?: 'first' | 'again' | 'gap'; sha?: string; ticketId?: string | null; install?: Install }
+type Install = { cmd: string; output: string }
+const INSTALL = 'install:' // a job's gap when it was started by a failed install of HQ's rules (Bug 416)
+async function startOne(repoId: string, o: Start): Promise<StepsFile> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
   notClearing(repoId)
   const f = readSteps(repoId)
@@ -103,11 +114,11 @@ async function startOne(repoId: string, o: { why?: 'first' | 'again' | 'gap'; sh
   let a: Agent
   try {
     a = await launchAgent({ role: 'launcher', repoId, model: model(), cwd: repo.path, displayName: `test steps ${repo.name}`, worktreeName: name,
-      launchPrompt: prompt(repo, why, gap, f.steps, o.ticketId ? getTicket(o.ticketId)?.key ?? null : null), repoAllowlist: j<string[]>(repo.network_allowlist, []) }) // it tries installs
+      launchPrompt: prompt(repo, why, gap, f.steps, o.ticketId ? getTicket(o.ticketId)?.key ?? null : null, o.install), repoAllowlist: j<string[]>(repo.network_allowlist, []) }) // it tries installs
   } catch (e) { await removeWorktree(repo.path, wt); throw e }
-  const next = update(repoId, (x) => ({ ...x, job: { agent_id: a.id, worktree: wt, saves: 0, state: 'working', started_at: Date.now(), sha, why, ticket_id: o.ticketId ?? null, gap: gap.key },
-    ended: null }))
-  emit({ agentId: a.id, source: 'system', kind: 'teststeps.helper_started', payload: { repo: repo.name, why } })
+  const next = update(repoId, (x) => ({ ...x, job: { agent_id: a.id, worktree: wt, saves: 0, state: 'working', started_at: Date.now(), sha, why, ticket_id: o.ticketId ?? null,
+    gap: o.install ? `${INSTALL}${o.install.cmd}` : gap.key }, ended: null }))
+  emit({ agentId: a.id, source: 'system', kind: 'teststeps.helper_started', payload: { repo: repo.name, why, ...(o.install ? { install: o.install.cmd } : {}) } })
   return next
 }
 
@@ -123,8 +134,9 @@ export function stepsDone(repoId: string, signal?: AbortSignal): Promise<void> {
   })
 }
 const checks = new Map<string, AbortController>() // HQ's check of a save under way, by project: ended with the job
-/** The helper is done (or gone): stop it, end HQ's check of its last save, delete its worktree, and let go of what waited. `ended`: what the page says next. */
-export async function finishSteps(repoId: string, ended: StepsFile['ended']): Promise<void> {
+/** The helper is done (or gone): stop it, end HQ's check of its last save, delete its worktree, and let go of what waited. `ended`: what the page says next.
+ *  `byUser`: the user stopped it (Bug 417): its Events tab says so. */
+export async function finishSteps(repoId: string, ended: StepsFile['ended'], byUser = false): Promise<void> {
   const f = readSteps(repoId), repo = getRepo(repoId)
   checks.get(repoId)?.abort(); checks.delete(repoId)
   if (!f.job) return
@@ -132,7 +144,8 @@ export async function finishSteps(repoId: string, ended: StepsFile['ended']): Pr
   update(repoId, (x) => ({ ...x, job: null, ended, ...(ended ? { looked: [...x.looked.filter((l) => l.gap !== gap), { gap, at: Date.now(), result: ended.state }].slice(-20) } : {}) }))
   if (live(f.job.agent_id)) await stopAgent(f.job.agent_id, 'test steps helper done').catch(() => {})
   if (repo) await removeWorktree(repo.path, f.job.worktree)
-  emit({ agentId: f.job.agent_id, source: 'system', kind: 'teststeps.helper_done', payload: { repo: repo?.name ?? repoId, state: ended?.state ?? 'saved', note: ended?.note ?? null } })
+  emit({ agentId: f.job.agent_id, source: 'system', kind: 'teststeps.helper_done',
+    payload: { repo: repo?.name ?? repoId, state: ended?.state ?? 'saved', note: ended?.note ?? null, ...(byUser ? { by: 'user' } : {}) } })
   for (const go of [...(waiting.get(repoId) ?? [])]) go()
 }
 async function removeWorktree(repoPath: string, wt: string): Promise<void> {
@@ -151,7 +164,7 @@ export async function checkStepsRun(repo: Repo, steps: TestSteps, sha: string, s
   const r = await testBase(repo.path, sha, `steps-${repo.id.slice(-6)}`, null, signal, { repoId: repo.id, ticketId: null, what: 'steps_check' }, { steps: { parts: all } })
   if (r.kind === 'stopped' || signal.aborted) return { problem: 'HQ\'s check was stopped', words: '', stopped: true }
   if (r.kind === 'error') return { problem: r.why, words: '' }
-  if (r.kind === 'fail') return { problem: `\`${r.test}\` failed${r.hung ? ' (it ran out of time)' : ''}. Its output:\n${failReport(r, 3000)}`, words: '' }
+  if (r.kind === 'fail') return { problem: `\`${r.test}\` failed${r.hung ? ' (it ran out of time)' : exitedAnyway(r)}. Its output:\n${failReport(r, 3000)}`, words: '' }
   if (r.kind !== 'pass') return { problem: `HQ couldn't run the steps (${r.kind})`, words: '' }
   const none = (r.parts ?? []).find((p) => p.counts && p.counts.passed + p.counts.failed + p.counts.skipped === 0)
   if (none) return { problem: `\`${none.cmd}\` passed but ran no tests: its command has to run that folder's test suite`, words: '' }
@@ -230,12 +243,15 @@ export function cantSteps(agent: Agent, reason: string): Result {
 /** The user stops the helper, or says they've seen the steps. */
 export async function dismissSteps(repoId: string): Promise<StepsFile> {
   untell(repoId)
-  if (readSteps(repoId).job) await finishSteps(repoId, { state: 'failed', note: 'Stopped before it finished.', at: Date.now() })
+  if (readSteps(repoId).job) await finishSteps(repoId, { state: 'failed', note: YOU_STOPPED, at: Date.now() }, true)
   return update(repoId, (x) => ({ ...x, seen: true }))
 }
-/** A helper that exited by itself or was lost. */
-export function onStepsAgentGone(agentId: string | null): void {
+/** The words a helper the user stopped ends with (its gap counts as looked at, so the next test doesn't start another one by itself). */
+const YOU_STOPPED = 'You stopped Claude before it finished.'
+/** A helper that exited by itself, was lost, or was stopped from its Agent tab (`stoppedWhy` 'user', Bug 417: it ends as the Auto box's Stop Claude does). */
+export function onStepsAgentGone(agentId: string | null, stoppedWhy: string | null = null): void {
   const repoId = agentId ? repoOfAgent(agentId) : null; if (!repoId) return
+  if (stoppedWhy === 'user') { void finishSteps(repoId, { state: 'failed', note: YOU_STOPPED, at: Date.now() }, true); return }
   void finishSteps(repoId, { state: 'failed', note: 'Claude stopped before it finished.', at: Date.now() })
 }
 /** On backend start: helpers that didn't survive the restart are finished (a check in flight was lost with the backend), and worktrees nobody owns go. */
@@ -252,8 +268,9 @@ export async function recoverStepsHelpers(repos: Repo[]): Promise<void> {
  *  rules: nothing is left out, or a helper has already looked at what is). `working`: a helper is on it now (this call may have started it): wait for
  *  stepsDone, then ask again. Started at most once for the same gap; the user's "Work it out again" is what asks twice. */
 export async function stepsReady(repo: Repo, sha: string, o: { ticketId?: string | null } = {}): Promise<'ready' | 'working'> {
-  if (repo.test_cmd?.trim()) return 'ready'
-  const f = readSteps(repo.id); if (f.job) return 'working'
+  const f = readSteps(repo.id)
+  if (repo.test_cmd?.trim()) return f.job?.gap.startsWith(INSTALL) ? 'working' : 'ready' // the user's command runs after the install it works out (Bug 416)
+  if (f.job) return 'working'
   const gap = await stepsGap(repo, sha)
   if (!gap.key || f.looked.some((l) => l.gap === gap.key)) return 'ready'
   try { await startStepsHelper(repo.id, { why: f.steps ? 'gap' : 'first', sha, ticketId: o.ticketId ?? null }) } catch (e) {
@@ -261,4 +278,22 @@ export async function stepsReady(repo: Repo, sha: string, o: { ticketId?: string
     return 'ready' // being cleared, or the launch failed: HQ tests with what it has
   }
   return readSteps(repo.id).job ? 'working' : 'ready'
+}
+
+/** Bug 416: HQ's own rules couldn't install the project's packages on commit `sha` (a uv.lock uv can't read, a tool that isn't
+ *  installed), with no saved steps. A repair ticket can only change the test command, not that install, so it would fail the same way until auto stops.
+ *  The helper works out steps with installs of their own instead (with the user's own command, their installs run before it). `working`: a helper is on it
+ *  now, and the user is told why; `ready`: nothing was started, because it's another failure, a helper already looked at this install, or it couldn't start. */
+export async function stepsForInstall(repo: Repo, sha: string, b: Failed): Promise<'ready' | 'working'> {
+  if (!b.rulesInstall) return 'ready'
+  const f = readSteps(repo.id); if (f.job) return 'working'
+  if (f.looked.some((l) => l.gap === `${INSTALL}${b.test}`)) return 'ready'
+  try { await startStepsHelper(repo.id, { sha, install: { cmd: b.test, output: failReport(b, 2000) } }) } catch (e) {
+    emit({ agentId: null, source: 'system', kind: 'teststeps.not_started', payload: { repo: repo.name, error: (e as Error).message } })
+    return 'ready'
+  }
+  if (!readSteps(repo.id).job) return 'ready'
+  tell(repo.id, `${repo.name}: HQ couldn't install its packages on ${mergeBase(repo).name} with its own rule (\`${b.test}\`), so it can't test anything yet. A repair ticket `
+    + 'can\'t change that step, so Claude is working out how this project installs and runs its tests instead (once, a few minutes).')
+  return 'working'
 }

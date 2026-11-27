@@ -2,10 +2,12 @@
 // see harness.ts) and press what a user presses. HQ runs auto mode's checks in the real sandbox and only reports: green, red, or amber when it couldn't finish;
 // Send to engineer sends what failed; a newer open_pr makes the results out of date; a merge of the tested version records the test. Stop, auto mode coming
 // on, a restart, a merge and a Clear each end a check under way and say why, with nothing left behind.
-import { test, beforeEach, afterEach } from 'node:test'
+import { test, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import net from 'node:net'
+import os from 'node:os'
 import path from 'node:path'
 import { startHq, waitFor, sh, type Hq } from './harness.ts'
 import { checkButton, checkHeadline, checkOf, checksOf } from '../src/hqcheckrules.ts'
@@ -54,6 +56,16 @@ async function commitAndOpen(p: P, t: any, eng: any, files: Record<string, strin
   await waitFor(`${t.key} finished`, async () => (await tk(t))?.status === 'pr_ready')
 }
 const check = (t: any) => hq.api(`tickets/${t.id}/check`, {})
+/** Bug 403: this PATH with `tool` taken off it. A folder that holds it is replaced by one of links to everything else in it (node and git may share it). */
+const linkDirs: string[] = []; after(() => { for (const d of linkDirs) fs.rmSync(d, { recursive: true, force: true }) })
+function without(tool: string): string {
+  return process.env.PATH!.split(path.delimiter).filter(Boolean).map((d) => {
+    if (!fs.existsSync(path.join(d, tool))) return d
+    const links = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-b403-path-')); linkDirs.push(links)
+    for (const f of fs.readdirSync(d)) if (f !== tool) fs.symlinkSync(path.join(d, f), path.join(links, f))
+    return links
+  }).join(path.delimiter)
+}
 /** Bug 411: when HQ's command would leave test files out, HQ first asks a helper for the project's test steps (teststeps.ts; its own tests are in
  *  teststeps.test.ts). Here the helper says it can't, so HQ tests with what its rules find. */
 async function noSteps(p: P): Promise<void> {
@@ -180,6 +192,23 @@ test('Bug 411: a named test where HQ\'s test command runs nothing is the command
   assert.equal(again.state, 'pass', JSON.stringify(again)); assert.deepEqual(await states(), ['passed', 'passed'])
 })
 
+// Bug 403: with pnpm missing from HQ's PATH, HQ's command was `npm test`: the Auto box offered it, and auto then stopped at once with "Install pnpm, then test
+// again" beside a Resume button. The command names the project's tool whatever PATH holds, the box says up front that it's missing, and the words name the button
+test('Bug 403: a pnpm project with no pnpm on HQ\'s PATH: the Auto box names `pnpm test` and says pnpm is missing; a check and auto stop with their own button\'s words', async () => {
+  await hq.stop(); hq = await startHq({ env: { ...ENV, PATH: without('pnpm') } })
+  const p = await project('b403pn', { 'package.json': JSON.stringify({ name: 'b403pn', private: true, scripts: { test: 'node --test' } }), 'pnpm-lock.yaml': '', 'test/ok.test.js': PASS })
+  const box = (await hq.api(`repos/${p.repo.id}/auto-check`, {})).json
+  assert.equal(box.found, 'pnpm test'); assert.equal(box.stop, null)
+  assert.match(box.no_tool, /^it uses pnpm \(it has a pnpm-lock\.yaml\), and pnpm isn't installed on this computer \(HQ looked in its PATH\), /)
+  assert.match(box.no_tool, /, so HQ can't run its tests \(pnpm test\)\. Install pnpm, then HQ can test it\.$/)
+  const { t } = await finished(p, 'Hello', { 'test/hello.test.js': PASS }, 'pnpm test')
+  assert.equal((await check(t)).status, 200); const c = await ended(t)
+  assert.equal(c.state, 'error', JSON.stringify(c)); assert.match(c.why!, /^HQ couldn't test it: it uses pnpm .*Install pnpm, then press Test again\.$/)
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
+  const why = await waitFor('auto to stop', async () => (await hq.state()).repos.find((r: any) => r.id === p.repo.id)?.auto_stopped_why, 60_000)
+  assert.match(why, /^HQ couldn't test (T-01|main): it uses pnpm .*Install pnpm, then press Resume\.$/)
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: false })).status, 200)
+})
 test('a failing check is red; main alone decides whose it is; Send goes to the engineer once; a new open_pr makes it out of date; Test again', async () => {
   const p = await project('red')
   const { t, eng } = await finished(p, 'Add maths', { 'test/maths.test.js': FAIL })
@@ -192,6 +221,8 @@ test('a failing check is red; main alone decides whose it is; Send goes to the e
   assert.equal(s.json.engineer, eng.id) // still running: it gets a message
   const told = await waitFor('the engineer told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /so the user sent it back to you/.test(m.body)))
   assert.match(told.body, /adds two/); assert.doesNotMatch(told.body, /HQ didn't merge/)
+  // Bug 405: the same as the results say: main passed without it, so no "another ticket may have merged first"
+  assert.match(told.body, /main passes them without your ticket, so the failure is your ticket's/); assert.doesNotMatch(told.body, /may have merged first/)
   // Bug 373: the TPM hears what came back and why, in HQ's words: here a test did fail, and it is named
   assert.match((await toTpm(p, /went back/)).body, new RegExp(`^HQ: T-01 went back to its engineer \\(${eng.id}, still running\\) because its tests failed with it merged into main: `
     + '.*adds two.*\\. The user had HQ test it and sent it back\\.$'))
@@ -200,7 +231,7 @@ test('a failing check is red; main alone decides whose it is; Send goes to the e
   assert.match((await hq.api(`tickets/${t.id}/check-send`, {})).json.error, /sent to its engineer already/)
   // the engineer fixes it and finishes again: the old results are about older code
   await commitAndOpen(p, t, eng, { 'test/maths.test.js': PASS })
-  assert.deepEqual(await button(t), ['Results out of date', 'grey'])
+  assert.deepEqual(await button(t), ['Fix is back · test again', 'sky']) // Bug 401: not a grey "out of date": the fix of what the user sent is back
   // Bug 373: and the TPM hears what its engineer did, not "fixed its tests"; the check that was sent keeps it on the ticket
   const done = (await toTpm(p, /finished it again/)).body
   assert.match(done, /^HQ: T-01's engineer finished it again \(hq\/red\/T-01-add-maths\)\. It had gone back because its tests failed with it merged into main: .*adds two/)
@@ -210,6 +241,24 @@ test('a failing check is red; main alone decides whose it is; Send goes to the e
   assert.deepEqual(await button(t), ['View results ✓', 'green'])
   // Test again didn't wipe the first results: they are still on the ticket, with what was sent and what came of it
   assert.deepEqual(checksOf((await tk(t))!).map((x) => [x.id, x.state, !!x.sent_at, !!x.back]), [[checkOf((await tk(t))!)!.id, 'pass', false, false], [c.id, 'fail', true, true]])
+  assert.deepEqual(checksOf((await tk(t))!).map((x) => x.round), [2, 1], 'Bug 401: round 2 is the test of the fix that came back from round 1')
+})
+
+// Bug 426: a project whose `npm test` exits 0 though a test failed (`node --test || true`): the check said "`npm test` passed: 1 passed, 1 failed", then
+// "The tests themselves passed: none failed" and that the test named for its criterion didn't run. HQ goes by the counts: red, and it says the command exited 0
+test('Bug 426: a test command that exits 0 though a test failed is a failure, said as one, with main alone still passing', async () => {
+  const p = await project('b426x', { 'package.json': JSON.stringify({ name: 'b426x', private: true, scripts: { test: 'node --test || true' } }), 'test/ok.test.js': PASS })
+  const proof = { criteria: [{ kind: 'backend', text: 'Two and two make four.' }], tests: [{ criterion: 'A1', file: 'test/maths.test.js', name: 'adds two' }] }
+  const { t, eng } = await finished(p, 'Add maths', { 'test/maths.test.js': FAIL }, 'npm test', proof)
+  assert.equal((await check(t)).status, 200)
+  const c = await ended(t)
+  assert.equal(c.state, 'fail', JSON.stringify(c)); assert.equal(c.steps.length, 1); assert.deepEqual(await button(t), ['View results ✗', 'red'])
+  assert.match(c.steps[0]!.words, /^They failed: .*adds two \(`npm test` exited 0 all the same, but its output says 1 passed, 1 failed\) · main passes them without T-01, so the /)
+  assert.doesNotMatch(c.steps[0]!.words, /`npm test` passed/)
+  assert.equal((await hq.api(`tickets/${t.id}/check-send`, {})).status, 200)
+  const told = await waitFor('the engineer told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /so the user sent it back to you/.test(m.body)))
+  assert.match(told.body, /`npm test` exits 0 even when a test fails, so don't go by its exit code: read what it prints\. HQ went by its counts, 1 passed, 1 failed\./)
+  assert.match((await toTpm(p, /went back/)).body, /because its tests failed with it merged into main: .*adds two \(`npm test` exited 0 all the same, but its output says 1 passed, 1 failed\)/)
 })
 
 test('main\'s own tests failing too: amber, not the ticket\'s fault, and nothing to send', async () => {
@@ -222,6 +271,26 @@ test('main\'s own tests failing too: amber, not the ticket\'s fault, and nothing
   assert.match(c.steps[0]!.words, /main fails them too, without T-01/)
   assert.deepEqual(await button(t), ["Couldn't finish", 'amber'])
   assert.match((await hq.api(`tickets/${t.id}/check-send`, {})).json.error, /found nothing to send/)
+})
+
+// Bug 428: HQ's run of main alone can't be done (its checkout fails, as a full disk would). A `git` in front of the real one on HQ's PATH fails only that one
+test('Bug 428: when HQ can\'t test main alone, the results don\'t say the failure is the ticket\'s, as its engineer hears', async () => {
+  await hq.stop()
+  const bin = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-e2e-git-'))), real = execFileSync('which', ['git'], { encoding: 'utf8' }).trim()
+  fs.writeFileSync(path.join(bin, 'git'), '#!/bin/sh\ncase " $* " in *" worktree add "*"/b428/"*"hq-test-T-01-check-main "*) '
+    + `echo "fatal: could not create work tree dir: No space left on device" >&2; exit 128;; esac\nexec ${JSON.stringify(real)} "$@"\n`, { mode: 0o755 })
+  try {
+    hq = await startHq({ env: { ...ENV, PATH: `${bin}:${process.env.PATH}` } })
+    const p = await project('b428'), { t, eng } = await finished(p, 'Add maths', { 'test/maths.test.js': FAIL })
+    assert.equal((await check(t)).status, 200); const c = await ended(t)
+    assert.equal(c.state, 'fail', JSON.stringify(c)); assert.deepEqual(await button(t), ['View results ✗', 'red'])
+    assert.match(c.steps[0]!.words, new RegExp(/^They failed: .*adds two · HQ couldn't test main without T-01 \(fatal: could not create work tree dir: No space left /.source
+      + /on device\), so it can't tell whether the failure is T-01's\.$/.source)); assert.doesNotMatch(c.steps[0]!.words, /main passes them/)
+    // its engineer hears the same: maybe another ticket's (Bug 405's hedge)
+    assert.equal((await hq.api(`tickets/${t.id}/check-send`, {})).status, 200)
+    const told = await waitFor('the engineer told', async () => (await hq.state()).messages.find((m: any) => m.to_id === eng.id && /so the user sent it back to you/.test(m.body)))
+    assert.match(told.body, /Another ticket may have merged first/); assert.doesNotMatch(told.body, /main passes them without your ticket/)
+  } finally { await hq.stop(); fs.rmSync(bin, { recursive: true, force: true }) }
 })
 
 /** The UI tester's planning calls so far (fake-claude.mjs logs each call to its home). */
@@ -438,7 +507,7 @@ test('Bug 373: tests that pass with a named one unseen are amber, not a failed t
   // on the ticket: the check that was sent says what its engineer did with it (it used to stay in the engineer's terminal)
   now = await tk(t); const sent = checkOf(now)!
   assert.equal(sent.id, c.id); assert.ok(sent.sent_at); assert.deepEqual(sent.back!.files, ['checks/add.js', 'test/add.test.js']); assert.equal(sent.back!.note, notes.join('\n'))
-  assert.equal(sent.back!.sha, now.finished_sha); assert.deepEqual(await button(t), ['Results out of date', 'grey'])
+  assert.equal(sent.back!.sha, now.finished_sha); assert.deepEqual(await button(t), ['Fix is back · test again', 'sky'])
 
   // Test again: it passes now, and the first results are still on the ticket, after a restart too
   assert.equal((await check(t)).status, 200); const c2 = await ended(t); assert.equal(c2.state, 'pass', JSON.stringify(c2))

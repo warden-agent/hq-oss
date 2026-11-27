@@ -14,7 +14,8 @@ export const shownLine = (raw: string): string => { const s = raw.replace(/\r+$/
 const NODE = /^[ℹ#] (pass|fail|skipped|cancelled|todo) (\d+)$/
 const PYTEST = /^=*\s*(\d+ [a-z]+(?:, \d+ [a-z]+)*) in [\d.]+s\b/
 const JEST = /^Tests:\s+(\d+ [a-z]+(?:, \d+ [a-z]+)*)$/
-const VITEST = /^Tests\s+(\d+ [a-z]+(?: \| \d+ [a-z]+)*) \(\d+\)$/
+// Bug 426: vitest 4 says `1 expected fail` for a `test.fails` that failed as it should: two words, and neither a pass nor a failure (pairs reads one word)
+const VITEST = /^Tests\s+(\d+ [a-z]+(?: [a-z]+)?(?: \| \d+ [a-z]+(?: [a-z]+)?)*) \(\d+\)$/
 const CARGO = /^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored;/
 const RAN = /^Ran (\d+) tests? in /, UNITTEST_END = /^(OK|FAILED)(?: \((.+)\))?$/
 const MOCHA = /^(\d+) (passing|failing|pending)(?: \(.+\))?$/

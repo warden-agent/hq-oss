@@ -15,6 +15,7 @@ import { beingStopped, getAgent, liveAgents, update, type Agent } from './agents
 import { resolveKind } from './attention.ts'
 import { sendMessage } from './delivery.ts'
 import { heavyKind } from './heavy.ts'
+import { heldByPause } from './pause.ts'
 import { savedCmd, stepsOf } from './teststepsstore.ts'
 import { lstartMs, psEnv } from './procs.ts'
 import { getRepo, repoOfAgent, type Ticket } from './records.ts'
@@ -186,6 +187,7 @@ export async function stopFrozen(agentId: string, by: 'user' | 'auto'): Promise<
 export function idleTooLong(t: Ticket, a: Agent | undefined): a is Agent {
   if (!['planning', 'implementing', 'resolving'].includes(t.status) || t.parked_at || t.auto_parked_why) return false
   if (!a || a.status !== 'idle' || a.fresh_start_at || hasRuns(a.id)) return false
+  if (heldByPause(a)) return false // Bug 195: idle because its role is paused; Resume is what wakes it, and a fresh engineer couldn't start anyway
   if (now() - (a.last_event_at ?? a.started_at) < getSetting('stuck_idle_min', DEFAULTS.stuck_idle_min) * 60_000) return false
   return !one('SELECT 1 AS x FROM messages WHERE to_id = ? AND delivered_at IS NULL', a.id)
 }

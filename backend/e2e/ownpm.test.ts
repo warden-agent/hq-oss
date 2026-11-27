@@ -76,3 +76,23 @@ for (const [tool, lock, install, bug] of [['yarn', 'yarn.lock', 'yarn install --
     assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
   })
 }
+
+// Bug 399: a pnpm workspace root lists no packages in its own package.json (its members do, pnpm-workspace.yaml names them), so HQ took it for
+// "nothing to install" and the user's own command started with nothing installed. It installs with pnpm, following the root's pnpm-lock.yaml.
+test('Bug 399: start in a pnpm workspace root whose package.json lists no packages installs with pnpm, by the root\'s lockfile', async () => {
+  const name = 'b399ws', dir = hq.repo(name); fs.rmSync(path.join(dir, 'node_modules'), { recursive: true })
+  const files: Record<string, string> = { 'package.json': JSON.stringify({ name, private: true, scripts: { start: 'node server.js' } }),
+    'pnpm-workspace.yaml': 'packages:\n  - web\n', 'pnpm-lock.yaml': "lockfileVersion: '9.0'\n",
+    'web/package.json': JSON.stringify({ name: 'web', private: true, dependencies: { ms: '2.1.3' } }),
+    'server.js': "require('http').createServer((q, s) => s.end(require('ms')())).listen(process.env.PORT)\n" }
+  for (const [f, t] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), t) }
+  sh(dir, 'add', '.'); sh(dir, 'commit', '-qm', 'a pnpm workspace'); standIn('pnpm')
+  const repo = (await hq.api('repos', { path: dir })).json, before = log('pnpm').length
+  assert.equal((await hq.api(`previews/${repo.id}/command`, { command: 'pnpm start' })).status, 200)
+  assert.equal((await hq.api(`previews/${repo.id}/start`, {})).status, 200)
+  await waitFor('the app', async () => (await preview(repo.id)).status === 'running', 20_000)
+  assert.equal(await (await fetch((await preview(repo.id)).url)).text(), 'ms is here')
+  assert.deepEqual(log('pnpm').slice(before), ['pnpm install --frozen-lockfile', 'pnpm start'])
+  assert.equal(sh(dir, 'status', '--porcelain'), '')
+  assert.equal((await hq.api(`previews/${repo.id}/stop`, {})).status, 200)
+})

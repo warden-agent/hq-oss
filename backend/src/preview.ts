@@ -10,8 +10,10 @@ import { PATHS } from './config.ts'
 import { one, q, run, now } from './db.ts'
 import { emit, patch, type HqEvent } from './events.ts'
 import { assignPorts, commandRecipe, commandWarning, detectCommand, frameBlocked, installLeftovers, PREVIEW_PORTS, portBusy, printedPorts, recipeProblem, refusedWords, runScript, supervisorSpec,
-  ownInstall, testPorts, type Recipe, type Refusal } from './apprun.ts'
+  httpReply, ownInstall, testPorts, type Recipe, type Refusal } from './apprun.ts'
+import { badPort } from './badports.ts'
 import { groupPids, pgidOf, portHolders, whoAnswers, whose, type Holder, type Whose } from './procs.ts'
+import { copyPorts, handing, oneChoice } from './copyports.ts'
 import { markFor, runOver, runStarting, sweepNow } from './leftovers.ts'
 import { git } from './reposync.ts'
 import { getFeature, getRepo, getTicket, repos, type Repo, notClearing } from './records.ts'
@@ -107,12 +109,13 @@ export function serial<T>(repoId: string, job: () => Promise<T>): Promise<T> {
 
 /** Is there an HTTP reply on this port, and may HQ show it in a frame? */
 async function probe(port: number): Promise<{ frameable: boolean } | null> {
-  try {
-    const r = await fetch(`http://localhost:${port}/`, { redirect: 'manual', signal: AbortSignal.timeout(2000) })
-    void r.body?.cancel().catch(() => {})
-    return { frameable: !frameBlocked((n) => r.headers.get(n)) }
-  } catch { return null }
+  const get = await httpReply(port, 2000)
+  return get ? { frameable: !frameBlocked(get) } : null
 }
+/** Bug 409: an app the user's steps put on a port browsers refuse is running, but its page can't show in HQ or open in a browser: the pane says why. */
+const unsafeWords = (port: number): string | null => badPort(port)
+  ? `Browsers won't open port ${port} (they block it as unsafe), so the page can't show here: have the app use another port.`
+  : null
 async function waitFor(cond: () => Promise<boolean>, ms: number): Promise<boolean> {
   const end = Date.now() + ms
   for (;;) { if (await cond()) return true; if (Date.now() > end) return false; await sleep(100) }
@@ -148,7 +151,7 @@ function watch(repoId: string, since: number, done: string | null): void {
         const pane = await tmux.panePid(session), who = whoAnswers(await portHolders(p, 'listening'), pane ? await pgidOf(pane) : null, Date.now() - since)
         if (who.kind === 'wait') continue // something else answers there and this app isn't listening yet
         if (who.kind === 'clash') { unwatch(repoId); void clash(repoId, since, p, who.others); return }
-        save(repoId, { status: 'running', url: `http://localhost:${p}/`, frameable: r.frameable ? 1 : 0, detail: done })
+        save(repoId, { status: 'running', url: `http://localhost:${p}/`, frameable: r.frameable ? 1 : 0, detail: [done, unsafeWords(p)].filter(Boolean).join(' ') || null })
         emit({ agentId: null, source: 'system', kind: 'preview.running', payload: { repo: repoId, port: p } }); break
       }
       if (row(repoId)?.status === 'starting' && Date.now() - since > 5 * 60_000 && !cur.detail?.startsWith('No reply')) save(repoId, { detail: `No reply on port ${cur.port} yet. See Server output.` })
@@ -224,8 +227,6 @@ export function heldText(port: number, part: string, hs: PortHolder[]): string {
   return `port ${port} (${part}) is being used by ${h.cmd} in ${h.name} (${ids})`
 }
 const SUPERVISOR = path.join(import.meta.dirname, 'supervise.mjs')
-/** Bug 354: ports chosen for a start still on its way (its row not yet saved "starting"), by repo; startPreview drops them when that start ends. */
-const handing = new Map<string, number[]>()
 /** Bug 354: every port this HQ gave another repo's app that is starting or running, or is giving one now. An app that hasn't bound its port yet (still
  *  installing, or slow to listen) leaves it looking free. Every part's port, from its run's spec.json (the row keeps the page's only); read from the
  *  rows, so it holds after a backend restart too. A stopped or crashed app's ports are free again. */
@@ -242,18 +243,18 @@ function givenElsewhere(repoId: string): Map<number, string> { // each port with
   for (const [id, ps] of handing) if (id !== repoId) for (const n of ps) to.set(n, id)
   return to
 }
-/** Bug 354: one port choice at a time across this HQ (each repo's own queue lets two repos' starts overlap). Reading what the others were given, the busy
- *  checks and keeping this start's choice happen in one go, so two starts a moment apart can't both take the same free port. Bug 362: that holds for
- *  a fixed port too: one another app here was given is in `taken`, and `given` says whose app it is, as nothing may listen on it yet. */
-let choosing: Promise<unknown> = Promise.resolve()
-type Choice = NonNullable<Awaited<ReturnType<typeof assignPorts>>> & { given: Map<number, string> }
+/** Bug 354: one port choice at a time across this HQ (copyports.ts oneChoice). Reading what the others were given, the busy checks and keeping this
+ *  start's choice happen in one go, so two starts a moment apart can't both take the same free port. Bug 362: that holds for a fixed port too: one
+ *  another app here was given is in `taken`, and `given` says whose app it is, as nothing may listen on it yet. Bug 410: so does one HQ's own test copy of
+ *  an app (this project's or another's) was given, and `copies` says whose app that copy is. */
+type Choice = NonNullable<Awaited<ReturnType<typeof assignPorts>>> & { given: Map<number, string>; copies: Map<number, string | null> }
 function choosePorts(repoId: string, recipe: Recipe, saved: number | null): Promise<Choice | null> {
-  const job = async () => {
-    const given = givenElsewhere(repoId), got = await assignPorts(recipe, saved, portBusy, helperPortsHeld(repoId), [...given.keys()])
+  return oneChoice(async () => {
+    const given = givenElsewhere(repoId), copies = copyPorts()
+    const got = await assignPorts(recipe, saved, portBusy, helperPortsHeld(repoId), [...given.keys(), ...copies.keys()])
     if (got && !got.taken.length) handing.set(repoId, Object.values(got.ports)) // kept before the next choice can start
-    return got && { ...got, given }
-  }
-  const p = choosing.then(job, job); choosing = p.catch(() => {}); return p
+    return got && { ...got, given, copies }
+  })
 }
 
 /** `helperRun` (Bug 351): this is the Launch helper's first run of the steps the user OK'd; the row keeps its `started_at` as `helper_run`. */
@@ -272,8 +273,7 @@ export function startPreview(repoId: string, why: string | null = null, opts: { 
  *  project's id; a test server there would meet that app too). `held`: the other helpers' ports, read when its turn comes; `keep` records the choice
  *  before the next one can start. */
 export function chooseTestPorts(held: () => number[], keep: (ports: number[]) => void): Promise<number[]> {
-  const job = async () => { const got = await testPorts(held(), portBusy, 3, PREVIEW_PORTS, portsOnly(givenElsewhere(''))); keep(got); return got }
-  const p = choosing.then(job, job); choosing = p.catch(() => {}); return p
+  return oneChoice(async () => { const got = await testPorts(held(), portBusy, 3, PREVIEW_PORTS, portsOnly(givenElsewhere(''))); keep(got); return got })
 }
 /** The ports of `givenElsewhere`, whichever shape it has (Bug 362 makes it a Map of port → whose app). */
 const portsOnly = (g: number[] | Map<number, string>): number[] => Array.isArray(g) ? g : [...g.keys()]
@@ -315,14 +315,18 @@ async function startJob(repoId: string, why: string | null, opts: { ticket?: str
   const range = `ports ${PREVIEW_PORTS[0]}–${PREVIEW_PORTS.at(-1)} are all in use`
   if (!got) { save(repoId, { status: 'stopped', detail: range, port_holders: null, stopping: null }); throw new Error(range) }
   if (got.taken.length) { // something else answers there (the user's own dev server, say): this app would talk to it, not to its own part
-    const all = repos(), held = await Promise.all(got.taken.map(async (x) =>
+    // Bug 410: HQ's own test copy of an app has the port (listening or not yet): it is named as HQ's test, never offered to the user to stop (Stop it…)
+    const tested = got.taken.map((x) => got.copies.has(x.port) ? getRepo(got.copies.get(x.port) ?? '')?.name ?? 'another project' : null)
+    const all = repos(), held = await Promise.all(got.taken.map(async (x, i) => tested[i] !== null ? [] :
       (await portHolders(x.port)).map((h): PortHolder => ({ ...h, ...whose(h.cwd, all, repoId), port: x.port, part: x.part }))))
     // Bug 362: another app here was given the port and doesn't listen yet (installing, slow to start), so no program holds it: that app is named
-    const apps = got.taken.map((x, i) => held[i]!.length ? null : getRepo(got.given.get(x.port) ?? '')?.name ?? null)
-    const says = (x: { port: number; part: string }, i: number) => apps[i] ? `port ${x.port} (${x.part}) is being used by ${apps[i]}'s app` : heldText(x.port, x.part, held[i]!)
-    const known = held.flat(), mine = [...new Set(apps.filter((x) => x !== null))], msg = `Can't start ${repo.name}: ${got.taken.map(says).join('; ')}.`
-      + (known.length ? ' Stop it here, then Launch.' : mine.length ? ` Stop ${mine.map((x) => `${x}'s app`).join(' and ')}, then start ${repo.name} again.`
-        : ' Stop it, then Launch.')
+    const apps = got.taken.map((x, i) => held[i]!.length || tested[i] !== null ? null : getRepo(got.given.get(x.port) ?? '')?.name ?? null)
+    const says = (x: { port: number; part: string }, i: number) => tested[i] !== null ? `port ${x.port} (${x.part}) is being used by HQ's own test of ${tested[i]}'s app`
+      : apps[i] ? `port ${x.port} (${x.part}) is being used by ${apps[i]}'s app` : heldText(x.port, x.part, held[i]!)
+    const known = held.flat(), mine = [...new Set(apps.filter((x) => x !== null))], tests = tested.some((x) => x !== null)
+    const msg = `Can't start ${repo.name}: ${got.taken.map(says).join('; ')}.` + (known.length ? ' Stop it here, then Launch.'
+      : mine.length ? ` Stop ${mine.map((x) => `${x}'s app`).join(' and ')}, then start ${repo.name} again.` : tests ? '' : ' Stop it, then Launch.')
+      + (tests ? ` HQ's test ends by itself: start ${repo.name} again once it has.` : '')
     save(repoId, { status: 'stopped', detail: msg, url: null, port_holders: known.length ? JSON.stringify(known) : null, stopping: null })
     throw new PortTaken(msg, got.taken.map((x) => x.port))
   }

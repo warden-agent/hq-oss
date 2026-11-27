@@ -135,7 +135,7 @@ export async function launchWithoutRecipe(repoId: string, ticket: string | null 
 
 /** The helper is done (or gone): stop it, stop its leftover test servers, delete its worktree. `state`/`note` are what the
  *  preview pane says next (null: nothing to say). `why`: for its Events tab, when the pane says nothing. */
-export async function finish(repoId: string, state: string | null, note: string | null, why: 'app_stopped' | 'own_command' | null = null): Promise<void> {
+export async function finish(repoId: string, state: string | null, note: string | null, why: 'app_stopped' | 'own_command' | 'user_stopped' | null = null): Promise<void> {
   const p = row(repoId); const repo = getRepo(repoId); if (!p || !repo) return
   const ticket = state === 'needs_ok' ? {} : { helper_ticket_id: null } // steps still to OK keep their ticket
   save(repoId, { helper_agent_id: null, helper_worktree: null, helper_state: state, helper_note: note, helper_ports: null, ...ticket })
@@ -242,7 +242,8 @@ export async function approve(repoId: string): Promise<ReturnType<typeof preview
 export async function dismiss(repoId: string): Promise<ReturnType<typeof previewView>> {
   const p = row(repoId), repo = getRepo(repoId); if (!p || !repo) throw new Error('unknown repo')
   resolveKind(notice(repoId), null)
-  await finish(repoId, !dropRepeat(repoId) && p.draft_recipe ? 'needs_ok' : null, null)
+  const waits = !dropRepeat(repoId) && !!p.draft_recipe
+  await finish(repoId, waits ? 'needs_ok' : null, null, !waits && live(p.helper_agent_id) ? 'user_stopped' : null) // Bug 417: its Events tab says the user stopped it
   return previewView(repo)
 }
 
@@ -369,8 +370,9 @@ export function onAgentGone(agentId: string | null, stoppedWhy: string | null = 
   if (dropRepeat(repoId)) { void finish(repoId, null, null); return } // it only repeated the OK'd steps: nothing to wait for
   const p = row(repoId)!
   if (p.draft_recipe) { void finish(repoId, 'needs_ok', null); return } // its steps still wait for the user's OK, as after "Not now"
-  // Bug 299 (the owner's call): the user's own Stop leaves no banner, as the pane's "Stop Claude" doesn't; only a helper that ended by itself says so
-  if (stoppedWhy === 'user') { void finish(repoId, null, null); return }
+  // Bug 299 (the owner's call): the user's own Stop leaves no banner, as the pane's "Stop Claude" doesn't; only a helper that ended by itself says so.
+  // Bug 417: its Events tab says plainly that the user stopped it
+  if (stoppedWhy === 'user') { void finish(repoId, null, null, 'user_stopped'); return }
   void finish(repoId, 'failed', 'Claude stopped before it finished.')
 }
 

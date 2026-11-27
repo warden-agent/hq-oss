@@ -162,10 +162,12 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
 }
 
 /** The browser tools as Claude Code starts them: Playwright MCP in the browser's sandbox, with nothing of the backend's environment, its home and temp folder
- *  its own (`b`), told the app's address as the one origin it may ask for. */
+ *  its own (`b`), told the app's address as the one origin it may ask for. Its Chromium may open that port even when it's one browsers refuse (6000, Bug
+ *  433): a flag Playwright MCP takes only from a config file, written in `b`. */
 function browserServer(b: string, port: number, project: string, exe: string): { type: 'stdio'; command: string; args: string[] } {
   const env = { HOME: path.join(b, 'home'), TMPDIR: b, PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: process.env.LANG ?? 'en_US.UTF-8' }
-  const flags = ['--headless', '--isolated', '--browser', 'chromium', '--executable-path', exe, '--no-sandbox', '--output-dir', path.join(b, 'out'),
+  const config = path.join(b, 'browser.json'); fs.writeFileSync(config, JSON.stringify({ browser: { launchOptions: { args: [`--explicitly-allowed-ports=${port}`] } } }))
+  const flags = ['--headless', '--isolated', '--browser', 'chromium', '--executable-path', exe, '--no-sandbox', '--output-dir', path.join(b, 'out'), '--config', config,
     '--viewport-size', '1280x800', '--allowed-origins', `http://localhost:${port}`, '--block-service-workers', '--image-responses', 'allow']
   const run = `cd ${shq(path.join(b, 'empty'))} && exec ${shq(process.execPath)} ${shq(MCP_CLI())} ${flags.map(shq).join(' ')}`
   // Chromium's own sandbox is off (--no-sandbox): macOS refuses a sandbox inside a sandbox, and the page then crashes at once (spike). HQ's holds.

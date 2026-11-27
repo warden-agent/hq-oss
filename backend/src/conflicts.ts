@@ -5,7 +5,8 @@ import { names } from './localmerge.ts'
 import { git } from './reposync.ts'
 import { DEFAULTS } from './config.ts'
 import { getSetting, now, one, q, run } from './db.ts'
-import { failedLine, failReport, type Failed } from './testrun.ts'
+import { exitedAnyway, failedLine, failReport, type Failed } from './testrun.ts'
+import { countWords } from './testcounts.ts'
 import { j } from './util.ts'
 import { getTicket, setTicket, usesGithub, type Fixing, type Repo, type Ticket } from './records.ts'
 import { criteriaOf } from './criteria.ts'
@@ -89,7 +90,7 @@ export function keepTestsFailed(t: Ticket, failed: Failed): void {
     `ticket:${t.id}`, 'tests_failed',
     JSON.stringify({ test: failed.test, output: failed.output, earlier: failed.earlier, hung: !!failed.hung, unproven: !!failed.unproven, look: !!failed.look, review: !!failed.review,
       asked: !!failed.asked, tester: !!failed.tester, ...(failed.missing ? { missing: failed.missing } : {}), ...(failed.outside ? { outside: failed.outside } : {}),
-      noted: handoffOf(t.id).length }), now())
+      ...(failed.basePassed ? { basePassed: true } : {}), ...(failed.exit0 ? { exit0: failed.exit0 } : {}), noted: handoffOf(t.id).length }), now())
 }
 const NO_OUTPUT = "(HQ doesn't have what they printed any more: run them to see.)"
 /** That kept failure; `test` (the project's command) and a note stand in for it if it's gone. */
@@ -98,7 +99,8 @@ export function testsFailed(t: Ticket, test: string | null): Failed {
   return { kind: 'fail', test: kept?.test ?? test ?? 'the tests', output: kept?.output ?? NO_OUTPUT,
     earlier: kept?.earlier ?? '', hung: kept?.hung ?? t.fixing === 'tests_hung', ...(kept?.unproven ?? t.fixing === 'tests_unseen' ? { unproven: true } : {}),
     ...(kept?.missing ? { missing: kept.missing } : {}), ...(kept?.outside ? { outside: kept.outside } : {}), ...(kept?.look ?? t.fixing === 'look' ? { look: true } : {}),
-    ...(kept?.review ?? t.fixing === 'review' ? { review: true } : {}), ...(kept?.asked ? { asked: true } : {}), ...(kept?.tester ? { tester: true } : {}) }
+    ...(kept?.review ?? t.fixing === 'review' ? { review: true } : {}), ...(kept?.asked ? { asked: true } : {}), ...(kept?.tester ? { tester: true } : {}),
+    ...(kept?.basePassed ? { basePassed: true } : {}), ...(kept?.exit0 ? { exit0: kept.exit0 } : {}) }
 }
 /** Bug 373: what the ticket's engineer wrote in its handoff log since the ticket went back to it (update_handoff's entries without their date lines, oldest
  *  first, one a line), '' when it wrote nothing. Its fix instructions ask for "what was wrong" there, and that used to be read by nobody: what it found stayed
@@ -119,7 +121,7 @@ export function backWords(r: Failed, base: string): string {
     : r.unproven ? `its tests passed with it merged into ${base} and none failed, but ${unseenWords(r.missing ?? 0)}`
       + (r.outside ? `${allOutside(r) ? '' : `, ${r.outside} of them`} in a folder HQ's test command runs nothing in` : '')
     : r.hung ? `its tests never finished with it merged into ${base}: HQ stopped \`${r.test}\` after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes`
-    : `its tests failed with it merged into ${base}${line ? `: ${line}` : ''}`
+    : `its tests failed with it merged into ${base}${line ? `: ${line}` : ''}${exitedAnyway(r)}`
 }
 /** Who sent it back, as a sentence: the user, after having HQ test it (hqcheck.ts), or auto mode's test before a merge. */
 export const backBy = (r: Failed): string => r.asked ? 'The user had HQ test it and sent it back.' : 'HQ tested it before merging, and sent it back instead of merging it.'
@@ -127,6 +129,15 @@ export const backBy = (r: Failed): string => r.asked ? 'The user had HQ test it 
 /** How the step that calls open_pr again ends. A ticket with acceptance criteria named a test for each when it finished: open_pr takes those again when
  *  `tests` is left out, and checks them afresh. A ticket with none hears nothing about tests it was never asked for. */
 const again = (t: Ticket): string => criteriaOf(t).length ? ' (leave `tests` out unless a criterion\'s test moved or changed its name: HQ checks the ones you gave last time again).' : '.'
+/** Bug 405: who the failure belongs to, as far as HQ knows. Main passed alone in HQ's own run: the ticket's (the check's results say the same). HQ didn't run main
+ *  alone (a ticket that repairs main, main's run couldn't be done, or a send-back kept from before HQ recorded it): maybe another ticket's. */
+const sure = (r: Failed, base: string): string => r.basePassed ? `${base} passes them without your ticket, so the failure is your ticket's: its work alone, or`
+  + ` next to what is on ${base} now.` : 'Another ticket may have merged first.'
+const hangs = (r: Failed, base: string): string => r.basePassed ? `${base} finishes them without your ticket, so something your ticket brings waits forever`
+  + ' (a test, a server or a timer that never ends).' : 'Something waits forever (a test, a server or a timer that never ends), maybe only next to what another ticket merged first.'
+/** Bug 426: the command exited 0 though a test failed: an engineer that runs it sees it "pass", so it is told to go by what the command prints. */
+const exit0Words = (r: Failed): string => r.exit0 ? ` \`${r.test}\` exits 0 even when a test fails, so don't go by its exit code: read what it prints.`
+  + ` HQ went by its counts, ${countWords(r.exit0)}.` : ''
 /** HQ's instructions to the engineer when auto mode's test of its ticket on main fails: alone it passed, together it doesn't. A run
  *  that never finished is told as one: the engineer looks for what waits forever, not for a failure that wasn't printed (Bug 82). */
 export function fixTestsText(o: { t: Ticket; base: string; failed: Failed; launch?: { worktree: string } }): string {
@@ -142,8 +153,8 @@ export function fixTestsText(o: { t: Ticket; base: string; failed: Failed; launc
     : r.look ? `${t.branch} merged with ${base} passes its tests, but the app has problems when HQ opens it with your ticket merged in, ${didnt}.`
     : r.unproven ? `${t.branch} merged with ${base} passes \`${r.test}\`, but that run didn't run every test you named for the ticket's criteria, ${didnt}.`
     : r.hung ? `${t.branch} merged with ${base} never finished its tests: HQ stopped \`${r.test}\` after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)}`
-    + ` minutes, ${didnt}. Something waits forever (a test, a server or a timer that never ends), maybe only next to what another ticket merged first.`
-    + ' What it printed:' : `${t.branch} merged with ${base} fails its tests, ${didnt}. Another ticket may have merged first. \`${r.test}\` said:`
+    + ` minutes, ${didnt}. ${hangs(r, base)} What it printed:`
+    : `${t.branch} merged with ${base} fails its tests, ${didnt}. ${sure(r, base)}${exit0Words(r)} \`${r.test}\` said:`
   const steps = [`git merge --no-edit ${base} (merge, never rebase, never push).`, r.review
     ? `Fix what the reader found, keeping your ticket's work and what is on ${base}. If a finding is wrong, say why in your handoff instead of changing the code`
       + `${r.asked ? '' : ': this read happens once, and your next open_pr is merged on its tests'}. Then run the tests.`

@@ -20,7 +20,7 @@ export type StepLine = { text: string; tone: 'ok' | 'bad' | 'plain' }
 export type CheckStep = { kind: StepKind; state: 'pass' | 'fail' | 'skipped'; words: string; lines?: StepLine[]; output?: string; trouble?: boolean }
 /** What Send to engineer sends: its conflicts (Fix conflicts), or a report of what failed, as auto mode sends one (tickets.ts fixTests; testrun.ts Failed). */
 export type SendBack = { kind: 'conflicts' } | { kind: 'fix'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; missing?: number
-  outside?: number; look?: boolean; review?: boolean; tester?: boolean }
+  outside?: number; look?: boolean; review?: boolean; tester?: boolean; basePassed?: boolean; exit0?: Counts } // exit0: Bug 426 (testrun.ts Failed)
 /** Bug 373: what the ticket's engineer did with a check the user sent it, kept on that check once the engineer finishes the ticket again (mergewatch.ts
  *  finishTicket): when, the commit it handed over, the files it changed since the commit HQ tested (`more`: how many more the list leaves out) and what it wrote
  *  in its handoff log meanwhile ('' when nothing). What it found used to stay in its terminal. */
@@ -33,7 +33,8 @@ export type CheckTested = { test: string; counts: Counts | null; ms: number; out
  *  UI tester cost; `read_tokens`: the reader's tokens. `sent_at`: when the user sent the failure to its engineer; `back`: what that engineer did with it. */
 export type HqCheck = { id: string; state: 'running' | 'pass' | 'fail' | 'error' | 'stopped'; sha: string; base: string; base_sha: string; finished_sha: string | null
   started_at: number; ended_at?: number; why?: string; now?: StepKind; steps: CheckStep[]; cost_usd?: number; read_tokens?: number; send?: SendBack; sent_at?: number
-  back?: CheckBack; tested?: CheckTested; prep?: string } // prep (Bug 411): what HQ waits for before its first step (a helper working out the project's test steps)
+  back?: CheckBack; tested?: CheckTested; prep?: string // prep (Bug 411): what HQ waits for before its first step (a helper working out the project's test steps)
+  round?: number } // Bug 401: which round of test → send back → fix → test again this is, from 1 (roundOf)
 
 /** The ticket's check, or null: never tested, or a record HQ can't read. */
 export function checkOf(t: { hq_check?: string | null }): HqCheck | null {
@@ -57,11 +58,20 @@ export const PAST_CHECKS = 5
 export function pastWith(past: HqCheck[], prev: HqCheck | null, max = PAST_CHECKS): HqCheck[] {
   const all = [...past]
   if (prev && prev.state !== 'running' && (prev.steps.length > 0 || prev.sent_at)) { const { tested: _, ...kept } = prev; all.push(kept) }
+  all.forEach((c, i) => { if (c.round == null) all[i] = { ...c, round: (all[i - 1]?.round ?? 0) + 1 } }) // Bug 401: numbered before any goes, so none renumbers
   while (all.length > max) {
     let sent = -1; all.forEach((c, i) => { if (c.sent_at) sent = i })
     all.splice(sent === 0 && all.length > 1 ? 1 : 0, 1)
   }
   return all
+}
+/** Bug 401: the round a new check is, once `past` (pastWith) holds the ones before it: one after the last kept. A check that said nothing isn't kept, so the
+ *  next one takes its number. */
+export const nextRound = (past: HqCheck[]): number => (past.at(-1)?.round ?? past.length) + 1
+/** Bug 401: a check's round. One from before HQ numbered them counts by its place among the ticket's checks, oldest first. */
+export function roundOf(t: { hq_check?: string | null; hq_checks?: string | null }, c: HqCheck): number {
+  const all = checksOf(t), i = all.findIndex((x) => x.id === c.id)
+  return c.round ?? (i < 0 ? all.length + 1 : all.length - i)
 }
 export const FINISHED = ['pr_ready', 'pr_open']
 /** Bug 373: the tests passed and no test failed; the check didn't pass only because HQ didn't see every test named for the ticket's criteria run. That isn't
@@ -75,6 +85,8 @@ export function unseenCount(c: HqCheck): number {
 /** "8 tests named for its criteria weren't seen running": what HQ knows. It didn't see them by name; whether they ran is for the engineer to find out. */
 export const unseenWords = (n: number): string => n === 1 ? "1 test named for its criteria wasn't seen running"
   : `${n > 0 ? n : 'some'} tests named for its criteria weren't seen running`
+/** "changed 2 files", "changed no files": the count alone, for a tooltip (Bug 401). */
+const countWords = (n: number): string => n ? `changed ${n === 1 ? '1 file' : `${n} files`}` : 'changed no files'
 /** "changed 1 file: a.json", "changed 3 files: a, b, c", "changed 12 files: a, b, c and 9 more", "changed no files". */
 export function changedWords(files: string[], more = 0): string {
   const n = files.length + more
@@ -83,13 +95,17 @@ export function changedWords(files: string[], more = 0): string {
 /** The engineer finished it again (a new open_pr) after HQ's check began: those results are about older code. A ticket finished before HQ kept the commit
  *  (finished_sha null on both) can't tell, and isn't. */
 export const outOfDate = (t: { finished_sha?: string | null }, c: HqCheck): boolean => c.state !== 'running' && (t.finished_sha ?? null) !== c.finished_sha
+/** Bug 401: the user sent this check's failure to the ticket's engineer, and the engineer has finished the ticket again since (a new open_pr): its fix is back,
+ *  for HQ to test again. Its box and results say so, and lead with Test again, instead of a plain out of date and Merge. */
+export const fixBack = (t: { status: string; finished_sha?: string | null }, c: HqCheck | null): boolean =>
+  !!c && FINISHED.includes(t.status) && !!c.sent_at && outOfDate(t, c)
 
-export type Tone = 'plain' | 'green' | 'red' | 'amber' | 'grey'
+export type Tone = 'plain' | 'green' | 'red' | 'amber' | 'grey' | 'sky' // sky: the engineer's fix is back, to test again (Bug 401)
 /** A check's colour by how it ended: green all passed, red something failed, amber HQ couldn't finish or (Bug 373) the tests passed with named ones unseen. */
 export const checkTone = (c: HqCheck): Tone => c.state === 'running' ? 'plain' : c.state === 'pass' ? 'green' : c.state === 'fail' && !unseenOnly(c) ? 'red' : 'amber'
 /** The ticket's button: what it says, its colour, and its tooltip. `start`: a click starts a check (otherwise it opens the results). Null: no button: the ticket
  *  isn't finished and unmerged, or the user doesn't move it on (auto mode does, or the project is being cleared: board.ts nextMover). */
-export function checkButton(t: { key: string; status: string; finished_sha?: string | null; hq_check?: string | null }, userMoves: boolean):
+export function checkButton(t: { key: string; status: string; finished_sha?: string | null; hq_check?: string | null; hq_checks?: string | null }, userMoves: boolean):
   { label: string; tone: Tone; start: boolean; tip: string } | null {
   if (!userMoves || !FINISHED.includes(t.status)) return null
   const c = checkOf(t)
@@ -99,6 +115,9 @@ export function checkButton(t: { key: string; status: string; finished_sha?: str
   if (!c) return fresh
   if (c.state === 'running') return { label: 'Testing…', tone: 'plain', start: false,
     tip: `HQ is testing ${t.key}: ${c.prep ?? (c.now ? STEP_DOING[c.now] : 'starting')}. Click to watch it or stop it.` }
+  if (fixBack(t, c)) { const n = roundOf(t, c); return { label: 'Fix is back · test again', tone: 'sky', start: false, tip: `You sent round ${n} of HQ's test to `
+    + `${t.key}'s engineer, and it has finished the ticket again${c.back ? ` (it ${countWords(c.back.files.length + (c.back.more ?? 0))})` : ''}. Click to read what it did, `
+    + `then test it again: round ${n + 1}.` } }
   if (outOfDate(t, c)) return { label: 'Results out of date', tone: 'grey', start: false,
     tip: `${t.key}'s engineer finished it again after HQ's test, so the results are about older code. Click to read them or test again.` }
   if (c.state === 'pass') return { label: 'View results ✓', tone: 'green', start: false, tip: `Everything HQ tested on ${t.key} passed. Click for the results.` }

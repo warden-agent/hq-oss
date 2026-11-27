@@ -55,6 +55,7 @@ const sessions = () => hq.tmux('list-sessions', '-F', '#{session_name}').split('
 const why = async (e: any) => JSON.parse((await hq.api(`events?agent=${e.id}`)).json.find((x: any) => x.kind === 'agent.stopped').payload).reason
 const prompt = (id: string) => fs.readFileSync(path.join(hq.hqHome, 'agents', id, 'prompt.md'), 'utf8')
 const gone = (e: any, t: any, next: string) => `${t.key} is finished and its engineer (${e.id}) has stopped, so nobody would read this. Nothing was sent. ${next}`
+const NO_REPEAT = " Don't message the engineer about this change yourself: HQ's notice tells it what changed and what to do." // Bug 406
 
 test('a spec changed after the ticket is finished goes back to its engineer, and the ticket waits for the change', async () => {
   const { dir, f, tpm } = await setup('s1')
@@ -67,7 +68,7 @@ test('a spec changed after the ticket is finished goes back to its engineer, and
   assert.equal((await sent(tpm, e.id)).length + (await sent('hq', e.id)).length, 0)
   // The spec changes: the ticket goes back to its engineer, with the new spec and title saved.
   r = await spec(tpm, t, { spec: 'Orders, newest first.', title: 'Orders by date' }); assert.equal(r.isError, false, r.text)
-  assert.equal(r.text, `Updated. T-01 was already finished, so HQ told its engineer (${e.id}) to build the change. It can't be merged until that's done; HQ tells you when it is.`)
+  assert.equal(r.text, `Updated. T-01 was already finished, so HQ told its engineer (${e.id}) to build the change. It can't be merged until that's done; HQ tells you when it is.${NO_REPEAT}`)
   now = await tk(t); assert.deepEqual([now.status, now.fixing, now.spec, now.title, now.assignee_agent_id], ['resolving', 'changes', 'Orders, newest first.', 'Orders by date', e.id])
   const told = await sent('hq', e.id); assert.equal(told.length, 1)
   assert.match(told[0].body, /^HQ: the TPM changed the spec of T-01 after it was finished\. It isn't merged yet; it waits for the change\. Build it now, in your worktree:\n1\. Call get_ticket/)
@@ -77,7 +78,7 @@ test('a spec changed after the ticket is finished goes back to its engineer, and
   assert.equal(sh(dir, 'rev-parse', 'HEAD'), head)
   assert.match((await fix(t)).json.error, /is already building the change to its spec$/) // the button isn't there while it works; the API says why
   // A second change while the first is being built: the engineer is told the usual way; it's still the same job.
-  r = await spec(tpm, t, { spec: 'Orders, newest first, ten a page.' }); assert.equal(r.text, 'Updated.')
+  r = await spec(tpm, t, { spec: 'Orders, newest first, ten a page.' }); assert.equal(r.text, `Updated. HQ has told T-01's engineer (${e.id}).${NO_REPEAT}`)
   assert.equal((await sent('hq', e.id)).filter((m: any) => /^HQ: the TPM updated T-01's spec\. Call get_ticket to read it\.$/.test(m.body)).length, 1)
   assert.match((await hq.mcp(e.id, 'get_ticket')).text, /Orders, newest first, ten a page\./)
   // The engineer builds it and finishes again: ready to merge, with the TPM told what happened (and no "conflicts fixed").
@@ -104,7 +105,7 @@ test("a change HQ can't send back changes nothing; with no engineer left a fresh
   await hq.api(`agents/${e.id}/stop`, {})
   r = await spec(tpm, t, { spec: 'Invoices with totals.' }); assert.equal(r.isError, false, r.text)
   const e2 = await liveEngineer(t, e.id)
-  assert.equal(r.text, `Updated. T-01 was already finished, so HQ started an engineer (${e2.id}) to build the change. It can't be merged until that's done; HQ tells you when it is.`)
+  assert.equal(r.text, `Updated. T-01 was already finished, so HQ started an engineer (${e2.id}) to build the change. It can't be merged until that's done; HQ tells you when it is.${NO_REPEAT}`)
   now = await tk(t); assert.deepEqual([now.status, now.fixing, now.spec, now.assignee_agent_id, now.worktree_path], ['resolving', 'changes', 'Invoices with totals.', e2.id, wtOf(dir, t)])
   assert.match(prompt(e2.id), /^You are the engineer for ticket T-01 \(S\): Invoices\. Its work was finished and is committed on branch hq\/s2\/T-01-invoices in your worktree /)
   assert.match(prompt(e2.id), /get_ticket has the handoff so far\.\n\nHQ: the TPM changed the spec of T-01 after it was finished\./)
@@ -118,7 +119,7 @@ test("a change HQ can't send back changes nothing; with no engineer left a fresh
   assert.equal((await merge(t)).status, 409)
   // Bug 102: another change meanwhile waits for the next engineer (the TPM hears so), and Build the change hands it to that one.
   r = await spec(tpm, t, { spec: 'Invoices with totals and tax.' })
-  assert.equal(r.text, `Updated. T-01's engineer (${e2.id}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on T-01.`)
+  assert.equal(r.text, `Updated. T-01's engineer (${e2.id}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on T-01.${NO_REPEAT}`)
   const waiting = (await sent('hq', e2.id)).filter((m: any) => !m.delivered_at); assert.equal(waiting.length, 1)
   const again = await fix(t); assert.equal(again.status, 200, JSON.stringify(again.json)); assert.equal(again.json.via, 'launch')
   const e3 = await liveEngineer(t, e2.id); assert.equal(e3.id, again.json.engineer)
@@ -267,7 +268,8 @@ test('a ticket that comes back while its engineer is being stopped gets a fresh 
     await turnEnds(e4.id); await stopBegun(e4); assert.equal((await agent(e4.id)).status, 'idle')
     const changed = await spec(tpm, t3, { spec: 'Totals, with tax.' }); assert.equal(changed.isError, false, changed.text)
     const e5 = await liveEngineer(t3, e4.id)
-    assert.equal(changed.text, `Updated. T-03 was already finished, so HQ started an engineer (${e5.id}) to build the change. It can't be merged until that's done; HQ tells you when it is.`)
+    assert.equal(changed.text, `Updated. T-03 was already finished, so HQ started an engineer (${e5.id}) to build the change. It can't be merged until that's done;`
+      + ` HQ tells you when it is.${NO_REPEAT}`)
     assert.equal((await agent(e4.id)).status, 'exited'); assert.equal(await why(e4), 'finished')
     now = await tk(t3); assert.deepEqual([now.status, now.fixing, now.spec, now.assignee_agent_id], ['resolving', 'changes', 'Totals, with tax.', e5.id])
   })
@@ -309,4 +311,64 @@ test('auto mode: a finished ticket whose tests fail on main goes to a fresh engi
     const pr = await hq.mcp(e3.id, 'open_pr', { title: 'Done', body: 'Done.\n\n## Deviations from approved plan\nNone' }); assert.equal(pr.isError, false, pr.text)
     await until(t1, 'merged'); assert.equal((await tk(t1)).auto_tries, 1)
   })
+})
+
+test("Bug 421: a change's engineer that asked a question and is replaced (Fresh start, Resume): the new one gets HQ's change instructions, not the old plan", async () => {
+  await hq.api('settings', { key: 'concurrency_cap', value: 20 }) // the earlier tests' engineers still run
+  const { dir, f, tpm } = await setup('b421c')
+  const t = (await hq.api('tickets', { featureId: f.id, title: 'Orders', size: 'L', spec: 'Orders.' })).json; await launch(t); const e = await liveEngineer(t)
+  const held = hq.hook(e.id, exitPlanMode('Plan: list the orders (PLAN-421).')) // an approved plan, from before the change
+  const rv = await waitFor('the review', async () => (await hq.state()).reviews.find((r: any) => r.ticket_id === t.id && r.status === 'open'))
+  await hq.api(`reviews/${rv.id}/answer`, { verdict: 'approve' }); await held
+  await finish(e, wtOf(dir, t), 'v1\norders\n')
+  assert.equal((await spec(tpm, t, { spec: 'Orders, newest first.' })).isError, false)
+  // Building the change, it asks the user something: the ticket waits on the answer.
+  assert.equal((await hq.mcp(e.id, 'send_message', { to: 'user', reason: 'question', body: 'Newest by date or by number? (Q-421)' })).isError, false)
+  let now = await tk(t); assert.deepEqual([now.status, now.prior_status, now.fixing], ['awaiting_answer', 'resolving', 'changes'])
+  const asked = async () => (await hq.state()).questions.filter((x: any) => x.ticket_id === t.id).map((x: any) => [x.from_agent_id, x.to_target, x.body])
+  /** The engineer that took over: briefed for the change it was building (no plan to carry on with), on the S model, with the question still its own. */
+  const tookOver = async (eng: any, before: string) => {
+    const p = prompt(eng.id)
+    assert.match(p, /It was building the change to its spec; HQ's instructions for that are below\./)
+    assert.match(p, /## HQ's instructions\nHQ: the TPM changed the spec of T-01 after it was finished\./)
+    assert.doesNotMatch(p, /PLAN-421|Approved plan|carry on/); assert.doesNotMatch(p, /conflict|its tests/)
+    assert.deepEqual([eng.model_alias, eng.in_plan_mode], ['sonnet', 0]) // a fix's model: no plan, so no opusplan switch
+    now = await tk(t); assert.deepEqual([now.status, now.prior_status, now.fixing, now.assignee_agent_id], ['awaiting_answer', 'resolving', 'changes', eng.id])
+    assert.deepEqual(await asked(), [[eng.id, 'user', 'Newest by date or by number? (Q-421)']]); assert.notEqual(eng.id, before)
+  }
+  // Fresh start: it writes its note and a new session takes over at once.
+  assert.equal((await hq.api(`agents/${e.id}/fresh-start`, {})).status, 200)
+  assert.equal((await hq.mcp(e.id, 'write_handoff_note', { text: '## Where I stopped\n- asked the user (NOTE-421)' })).isError, false)
+  const e2 = await waitFor('the fresh start', async () => { const a = await liveEngineer(t, e.id); return (await tk(t)).assignee_agent_id === a.id && a })
+  await tookOver(e2, e.id); assert.match(prompt(e2.id), /NOTE-421/)
+  // That one stops too: Resume starts another, the same way.
+  await hq.api(`agents/${e2.id}/stop`, {}); await stopped(e2)
+  const r = await hq.api(`tickets/${t.id}/resume`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  const e3 = await waitFor('the resumed engineer', async () => (await agent(r.json.id))?.status === 'working' && agent(r.json.id))
+  await tookOver(e3, e2.id)
+  // The answer goes to it, the ticket is back to building the change, and the change finishes as usual.
+  assert.equal((await hq.api(`agents/${e3.id}/message`, { body: 'By date.', reason: 'answer' })).status, 200)
+  now = await tk(t); assert.deepEqual([now.status, now.fixing], ['resolving', 'changes']); assert.deepEqual(await asked(), [])
+  await finish(e3, wtOf(dir, t), 'v1\norders, newest first\n')
+  now = await tk(t); assert.deepEqual([now.status, now.fixing], ['pr_ready', null])
+})
+
+test("Bug 421: the same for Fix conflicts: an engineer that asked a question while fixing them is replaced by one with HQ's conflict instructions", async () => {
+  await hq.api('settings', { key: 'concurrency_cap', value: 20 }) // the earlier tests' engineers still run
+  const { dir, f, tpm } = await setup('b421x')
+  const t1 = await ticket(f, 'Orders'), t2 = await ticket(f, 'Invoices'); await launch(t1); await launch(t2)
+  const e1 = await liveEngineer(t1), e2 = await liveEngineer(t2)
+  await finish(e1, wtOf(dir, t1), 'v1\norders\n'); await finish(e2, wtOf(dir, t2), 'v1\ninvoices\n')
+  assert.equal((await merge(t1)).status, 200); await waitFor('T-02 flagged', async () => (await tk(t2)).conflict_files === '["version.txt"]')
+  assert.equal((await fix(t2)).status, 200)
+  assert.equal((await hq.mcp(e2.id, 'send_message', { to: 'tpm', reason: 'question', body: 'Keep both lines? (Q-421x)' })).isError, false)
+  let now = await tk(t2); assert.deepEqual([now.status, now.prior_status, now.fixing], ['awaiting_answer', 'resolving', null])
+  await hq.api(`agents/${e2.id}/stop`, {}); await stopped(e2)
+  const r = await hq.api(`tickets/${t2.id}/resume`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  const e3 = await waitFor('the resumed engineer', async () => (await agent(r.json.id))?.status === 'working' && agent(r.json.id))
+  const p = prompt(e3.id)
+  assert.match(p, /It was fixing its conflicts with main; HQ's instructions for that are below\.[\s\S]*conflicts with main in version\.txt/)
+  assert.doesNotMatch(p, /Approved plan|carry on/)
+  now = await tk(t2); assert.deepEqual([now.status, now.prior_status, now.assignee_agent_id], ['awaiting_answer', 'resolving', e3.id])
+  assert.deepEqual((await hq.state()).questions.filter((x: any) => x.ticket_id === t2.id).map((x: any) => [x.from_agent_id, x.to_target]), [[e3.id, tpm]])
 })

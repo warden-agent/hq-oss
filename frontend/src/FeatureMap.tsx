@@ -1,7 +1,7 @@
 // The feature map on screen (backend mapstore.ts, firstmap.ts): a "Map" button in the top bar and the box it opens, which shows the project's map (what is
 // on each screen of the app, in a user's words), who changed it last, the changes waiting on unmerged tickets, and, for a project with no map yet, the
 // button that has HQ write the first one by clicking through the running app.
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { api, errText, type MapView, type State } from './api'
 import { runnable, useBusy } from './board'
 import { Backdrop, Elapsed, Md } from './ui'
@@ -22,7 +22,6 @@ export function MapBtn({ all, repo }: { all: State; repo: any }) {
 
 function MapDialog({ all, repo, m, onClose }: { all: State; repo: any; m: MapView | null; onClose: () => void }) {
   const [busy, go] = useBusy(), [err, setErr] = useState('')
-  useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }; document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k) })
   const text = m?.text ?? '', first = m?.first ?? null, running = first?.running === true
   const canStart = runnable((all.previews ?? []).find((p) => p.id === repo.id))
   const closed = repo.clearing_at ? `${repo.name} is being cleared; wait until it's done.` : '' // Bug 333: HQ refuses it now, as it does Launch app

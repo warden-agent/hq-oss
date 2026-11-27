@@ -14,20 +14,22 @@ import { withTurn } from './heavy.ts'
 import { combinedCommit } from './localmerge.ts'
 import { killUnder } from './procs.ts'
 import { runPorts } from './runports.ts'
-import { cacheEnv } from './roles.ts'
+import { cacheEnv, HOME_SECRETS } from './roles.ts'
 import { git } from './reposync.ts'
 import { id, real } from './util.ts'
 import { seedPackages } from './worktrees.ts'
-import { onPath, ownInstall, packageManager } from './apprun.ts'
-import { shownLine, summaryLines, testCounts, type Counts } from './testcounts.ts'
+import { listsPackages, npmLock, onPath, ownInstall, packageManager } from './apprun.ts'
+import { countWords, shownLine, summaryLines, testCounts, type Counts } from './testcounts.ts'
 import { mergeWatched, nameWatch, type Watch, type Watched } from './criteria.ts'
 import { lookIn, type LookPlan } from './smoke.ts'
 import { notRun, ruleParts, type NotRun } from './testcensus.ts'
 import { chain, partCmd, partsHere, type SavedPart } from './teststepsstore.ts'
 import type { Seen } from './smokerules.ts'
+import { releaseCopy } from './copyports.ts'
 
-/** `stop`: HQ can't install the packages the project's own way (its package manager isn't installed, say), in words for the user: nothing runs (Bug 392). */
-export type TestPlan = { install: string | null; test: string; stop?: string }
+/** `stop`: HQ can't install the packages the project's own way (its package manager isn't installed, say), in words for the user: nothing runs (Bug 392).
+ *  `noTool` (Bug 403): the tool `test` names isn't on HQ's PATH, so HQ can't run that command itself; a command of the user's own doesn't need it. */
+export type TestPlan = { install: string | null; test: string; stop?: string; noTool?: string }
 const has = (root: string, ...p: string[]) => fs.existsSync(path.join(root, ...p))
 const npmTest = (root: string): boolean => {
   try {
@@ -35,25 +37,32 @@ const npmTest = (root: string): boolean => {
     return !!t.trim() && !/no test specified/i.test(t) // npm init's placeholder always fails
   } catch { return false }
 }
+/** npm's install for the folder `rel` of the checkout, as the preview's installStep reads it. Bug 430: an npm workspace root that lists no packages itself
+ *  still installs (its members list theirs), and a member with no lockfile of its own follows its workspace root's: `npm ci` there, where npm puts the
+ *  packages (and seedPackages copies the main checkout's). */
 const nodeInstall = (root: string, rel: string): string | null => {
-  if (has(root, rel, 'node_modules')) return null // seedPackages copied the main checkout's
-  const pkg = JSON.parse(fs.readFileSync(path.join(root, rel, 'package.json'), 'utf8')) as { dependencies?: object; devDependencies?: object }
-  if (!pkg.dependencies && !pkg.devDependencies) return null
-  const install = has(root, rel, 'package-lock.json') ? 'npm ci' : 'npm install'
-  return rel === '.' ? install : `(cd ${JSON.stringify(rel)} && ${install})`
+  const dir = path.join(root, rel); if (!listsPackages(path.join(dir, 'package.json'))) return null
+  const lock = npmLock(dir, root), at = lock ? path.relative(root, path.dirname(lock)) || '.' : rel
+  if (has(root, at, 'node_modules')) return null // seedPackages copied the main checkout's
+  const install = lock ? 'npm ci' : 'npm install'
+  return at === '.' ? install : `(cd ${JSON.stringify(at)} && ${install})`
 }
 /** How each package manager runs a package.json's test script (`bun test` is Bun's own test runner, not the script). */
 const TEST_SCRIPT = { npm: 'npm test', yarn: 'yarn test', pnpm: 'pnpm test', bun: 'bun run test' } as const
 /** Bug 392: how a Node folder of the checkout installs its packages and runs its test script: with its own package manager, by the preview's rule
  *  (apprun.ts packageManager, ownInstall: the lockfile followed, never written). npm's as before. Its tool missing: `stop`, never npm instead, which ignores
- *  the others' lockfiles; but packages already there (seedPackages copied the main checkout's) need no install, and npm runs the script as well. */
-function nodePart(root: string, rel: string): { install: string | null; test: string; stop?: string } {
-  const dir = path.join(root, rel), pm = packageManager(dir), test = TEST_SCRIPT[onPath(pm.tool) ? pm.tool : 'npm']
+ *  the others' lockfiles; packages already there (seedPackages copied the main checkout's) need no install. Bug 403: the test script runs with the project's
+ *  own tool whatever HQ's PATH holds (engineers run the same command, and npm in its place made it depend on HQ's PATH); with that tool missing, `noTool`.
+ *  `again`: what the user does once the tool is installed, in the words of whoever shows it (auto's red bar has Resume, a ticket's test Test again). */
+function nodePart(root: string, rel: string, again: string): Omit<TestPlan, 'install'> & { install: string | null } {
+  const dir = path.join(root, rel), pm = packageManager(dir), test = TEST_SCRIPT[pm.tool], at = (s: string) => rel === '.' ? s : `${rel}: ${s}`
   if (pm.tool === 'npm') return { install: nodeInstall(root, rel), test }
-  if (has(dir, 'node_modules')) return { install: null, test }
-  const own = ownInstall(dir, onPath, 'test again'), install = own.install ? (rel === '.' ? own.install : `(cd ${JSON.stringify(rel)} && ${own.install})`) : null
-  return { install, test, ...(own.stop ? { stop: rel === '.' ? own.stop : `${rel}: ${own.stop}` } : {}) }
+  const own = has(dir, 'node_modules') ? {} : ownInstall(dir, onPath, again), install = own.install ? (rel === '.' ? own.install : `(cd ${JSON.stringify(rel)} && ${own.install})`) : null
+  const name = TOOL_NAME[pm.tool], noTool = onPath(pm.tool) ? null : `it uses ${name} (${pm.why}), and ${pm.tool} isn't installed on this computer (HQ looked in its PATH), `
+    + `so HQ can't run its tests (${test}). Install ${name}, then ${again}.`
+  return { install, test, ...(own.stop ? { stop: at(own.stop) } : {}), ...(noTool ? { noTool: at(noTool) } : {}) }
 }
+const TOOL_NAME = { yarn: 'Yarn', pnpm: 'pnpm', bun: 'Bun' } as const
 const partTest = (p: string, run: string): string => `(cd ${JSON.stringify(p)} && ${run})`
 /** One part of a test command HQ builds for a repo split into folders: the folder, and what runs in it. */
 export type TestPart = { dir: string; run: string; install?: string | null }
@@ -70,21 +79,29 @@ export function testParts(cmd: string): TestPart[] | null {
  *  command: HQ can't tell where the user's own command starts its runners (`npm test` at the root may run each workspace's), so a file line counts for every
  *  file whose path ends the same, as before. */
 export const testFolders = (cmd: string): string[] | null => testParts(cmd)?.map((p) => p.dir) ?? null
+/** Bug 424: how a requirements.txt project's packages go into a .venv of its own, the way engineers are told to (engineer.prompt.md): with uv when it is
+ *  installed. pip works in HQ's own sandbox, but on a Mac it can't download in an engineer's (Bug 412: it checks certificates through macOS's trustd, which
+ *  that sandbox blocks), so an engineer given HQ's install to run got a certificate error; uv carries its own list. pip when there is no uv, as before.
+ *  `--allow-existing`: an engineer may run it again in its worktree, and uv 0.12 refuses a .venv that is already there. */
+const reqsInstall = (): string => onPath('uv') ? 'uv venv -q --allow-existing .venv && uv pip install -q -r requirements.txt'
+  : 'python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt'
 /** How to test the checkout at `root`, worked out from its files with no model and no tokens; null when it has no tests HQ can find.
- *  The root's own test script wins; a repo split into folders (server/, web/) runs each folder's. */
-export function detectTests(root: string): TestPlan | null {
+ *  The root's own test script wins; a repo split into folders (server/, web/) runs each folder's. `again`: see nodePart. */
+export function detectTests(root: string, again = 'test again'): TestPlan | null {
   try {
-    if (has(root, 'package.json') && npmTest(root)) return nodePart(root, '.')
+    if (has(root, 'package.json') && npmTest(root)) return nodePart(root, '.', again)
     const parts = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules' && has(root, d.name,
       'package.json') && npmTest(path.join(root, d.name))).map((d) => d.name).sort()
     if (parts.length) {
-      const each = parts.map((p) => ({ p, ...nodePart(root, p) })), stop = each.find((e) => e.stop)?.stop
-      return { install: each.flatMap((e) => e.install ?? []).join(' && ') || null, test: each.map((e) => partTest(e.p, e.test)).join(' && '), ...(stop ? { stop } : {}) }
+      const each = parts.map((p) => ({ p, ...nodePart(root, p, again) })), stop = each.find((e) => e.stop)?.stop, noTool = each.find((e) => e.noTool)?.noTool
+      // two members of one workspace: its install once (Bug 430)
+      return { install: [...new Set(each.flatMap((e) => e.install ?? []))].join(' && ') || null, test: each.map((e) => partTest(e.p, e.test)).join(' && '), ...(stop ? { stop } : {}),
+        ...(noTool ? { noTool } : {}) }
     }
   } catch { return null }
   if (has(root, 'pyproject.toml') || has(root, 'pytest.ini') || has(root, 'requirements.txt')) {
     if (has(root, 'pyproject.toml') && !has(root, 'requirements.txt')) return { install: 'uv sync', test: 'uv run pytest -q' }
-    if (has(root, 'requirements.txt')) return { install: 'python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt', test: '.venv/bin/python -m pytest -q' }
+    if (has(root, 'requirements.txt')) return { install: reqsInstall(), test: '.venv/bin/python -m pytest -q' }
   }
   if (has(root, 'Cargo.toml')) return { install: 'cargo fetch', test: 'cargo test' }
   if (has(root, 'go.mod')) return { install: 'go mod download', test: 'go test ./...' }
@@ -108,8 +125,7 @@ export const filesAt = (checkout: string, ref = 'HEAD'): Promise<string[]> => ne
 const q = (s: string): string => JSON.stringify(s)
 /** What a test run can't read: HQ's and Claude's own files and the user's credentials. The install step has the network on, so a
  *  package's install script could send what it reads. */
-const hiddenPaths = (): string[] => [PATHS.home, GH_CONFIG_DIR, ...['.claude', '.claude.json', '.ssh', '.aws', '.config/gh', '.config/gcloud', '.netrc', '.git-credentials', '.npmrc', '.pypirc',
-  '.docker', '.kube', '.gnupg', '.cargo/credentials.toml', '.cargo/credentials'].map((p) => path.join(os.homedir(), p))].map(real)
+const hiddenPaths = (): string[] => [PATHS.home, GH_CONFIG_DIR, ...HOME_SECRETS.map((p) => path.join(os.homedir(), p))].map(real)
 /** macOS's sandbox for a test run. `network`: outside access for installing packages, else localhost only. `block` (Bug 374): localhost ports the run may
  *  neither call nor listen on: the ones HQ moved its copy of the app off (testports.ts), where somebody else's server answers (the user's preview). A place
  *  that still names one fails there; it never reaches that server. Later rules win, so these come last. */
@@ -241,7 +257,7 @@ export function runSandboxed(cwd: string, cmd: string, o: { network: boolean; ti
   return new Promise((resolve) => {
     if (o.signal?.aborted) return resolve({ code: null, output: '', earlier: '', timedOut: false, sandboxFailed: false }) // stopped before it began: nothing runs
     const tmp = process.platform === 'darwin' ? runTmp() : null
-    const env = { ...cleanEnv(tmp), ...o.env }
+    const env = { ...cleanEnv(tmp), ...(o.network ? {} : NO_NETWORK_ENV), ...o.env }
     const { bin, args } = sandboxCommand(cwd, cmd, o)
     const p = spawn(bin, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }); if (p.pid) running.set(p.pid, cwd)
     let output = '', total = 0, timedOut = false, hard: NodeJS.Timeout | undefined
@@ -280,19 +296,30 @@ export async function runParts(cwd: string, parts: TestPart[], o: { timeoutMs: n
     }
     const cmd = partCmd(p.dir, p.run); if (left() <= 0) return late(cmd)
     const r = await runSandboxed(cwd, cmd, { network: false, timeoutMs: left(), signal: o.signal, watch: o.watch, env: o.env, folders: p.dir === '.' ? null : [p.dir] })
-    if (o.signal?.aborted || r.sandboxFailed || r.code !== 0) return { ...r, cmd }
+    if (o.signal?.aborted || r.sandboxFailed || r.code !== 0 || failedAnyway(r)) return { ...r, cmd } // Bug 426: a part that hid its failure ends it too
     seen.push({ dir: p.dir, seen: r.names ?? { prints: false, passed: [], skipped: [], unsure: [] } }); out.push(`$ ${cmd}\n${r.output}`)
     ran.push({ dir: p.dir, cmd, counts: testCounts(r.summary ?? null) })
     summary = summary && r.summary ? [...summary, ...r.summary] : null // one part with too many to keep: no count for the whole
   }
   return { code: 0, output: out.join('\n\n').slice(-TAIL), earlier: '', timedOut: false, sandboxFailed: false, summary, names: mergeWatched(seen), ran }
 }
+/** Bug 426: a run that exited 0 although its output says a test failed (`mocha || true`, a script that hides its runner's exit code): the counts, read from
+ *  the runners' summary lines (testcounts.ts), with at least one failed. null for any other run. HQ goes by the counts then: the run failed. Only a failed
+ *  count does it (failing, fail, failed, error, cancelled); pending, skipped, todo, pytest's xfailed and vitest's "expected fail" are no failure. */
+export function failedAnyway(r: Pick<RunResult, 'code' | 'summary'>): Counts | null {
+  const c = r.code === 0 ? testCounts(r.summary ?? null) : null
+  return c && c.failed > 0 ? c : null
+}
+/** Bug 426: what HQ adds after what failed, for such a run: why it says failed when the command said all was well. '' for any other. */
+export const exitedAnyway = (r: Pick<Failed, 'test' | 'exit0'>): string =>
+  r.exit0 ? ` (\`${r.test}\` exited 0 all the same, but its output says ${countWords(r.exit0)})` : ''
 
 export const testWorktree = (repoPath: string, key: string): string => path.join(repoPath, '.claude', 'worktrees', `hq-test-${key}`)
 async function dropWorktree(repoPath: string, wt: string): Promise<void> {
   if (fs.existsSync(wt)) await killUnder(wt).catch(() => []) // a run that outlived its backend: on a Mac its working folder is all that still names it (Bug 69)
   await git(repoPath, ['worktree', 'remove', '--force', wt]).catch(() => {})
-  fs.rmSync(wt, { recursive: true, force: true }); await git(repoPath, ['worktree', 'prune']).catch(() => {})
+  fs.rmSync(wt, { recursive: true, force: true }); releaseCopy(wt) // Bug 410: what its app was given is free again, once nothing runs there
+  await git(repoPath, ['worktree', 'prune']).catch(() => {})
 }
 /** What a backend that stopped mid-test left behind. */
 export async function sweepTestWorktrees(repoPath: string): Promise<void> {
@@ -307,10 +334,13 @@ export async function sweepTestWorktrees(repoPath: string): Promise<void> {
  *  or stopped the project during the run, which HQ ended there; it says nothing about the code, and nothing may follow from it (Bugs 89, 115).
  *  `seen`: what HQ's look at the app showed, when the run was asked to look once the tests had passed (smoke.ts). `looked`: a look with no tests before it
  *  (main alone, to tell what a ticket changed). `look` on a failure: it's HQ's look that failed, not the tests, and `output` is HQ's report of it. `review`:
- *  likewise for what a fresh reader of the ticket's changes found (diffcheck.ts). */
+ *  likewise for what a fresh reader of the ticket's changes found (diffcheck.ts). `exit0` (Bug 426): the command exited 0, but these counts from its output
+ *  have a failed test in them, so HQ calls it a failure (failedAnyway). */
 export type TestResult = { kind: 'pass'; test: string; output: string; counts: Counts | null; ms: number; names: Watched; seen?: Seen; parts?: PartRan[] }
   | { kind: 'fail'; test: string; output: string; earlier: string; hung?: boolean; unproven?: boolean; missing?: number; outside?: number; look?: boolean; review?: boolean
-    asked?: boolean; tester?: boolean } | { kind: 'no_tests' } // asked: the user's check found it (hqcheck.ts), not auto mode; tester: the UI tester's findings (with look)
+    asked?: boolean; tester?: boolean; basePassed?: boolean; rulesInstall?: boolean; exit0?: Counts } | { kind: 'no_tests' } // asked: the user's check found it
+  // (hqcheck.ts), not auto mode; tester: the UI tester's findings (with look); basePassed (Bug 405): HQ ran main alone too, and its tests passed (or it has none),
+  // so the failure is the ticket's; rulesInstall (Bug 416): it was the install step of HQ's own rules (detectTests) that failed, with no saved test steps
   | { kind: 'conflicts'; files: string[] } | { kind: 'error'; why: string } | { kind: 'stopped' } | { kind: 'looked'; seen: Seen }
 /** Auto mode's own runs under way, by project folder (Bug 89). A repair's try of a test command isn't one: with auto off its result goes to the user. */
 const autoRuns = new Map<string, Set<AbortController>>(), stops = new Map<string, number>()
@@ -366,6 +396,13 @@ function onPage(s: Shown | null): { state: (to: TestRunView['state'], behind?: s
 const toolCaches = (install: string): Record<string, string> => ({ YARN_CACHE_FOLDER: path.join(ENGINEER_CACHE, 'yarn'),
   YARN_GLOBAL_FOLDER: path.join(ENGINEER_CACHE, 'yarn-berry'), BUN_INSTALL_CACHE_DIR: path.join(ENGINEER_CACHE, 'bun'),
   ...(/\bpnpm install\b/.test(install) ? { npm_config_store_dir: path.join(ENGINEER_CACHE, 'pnpm-store') } : {}) })
+/** Bug 431: what a run with the network off (the tests, HQ's look at the app) tells package managers, so none goes looking for the network on its own.
+ *  pnpm 12 does before a script: `verifyDepsBeforeRun` installs when node_modules is missing or is the copy seedPackages made (to pnpm a moved folder is
+ *  out of date), and a v12 `packageManager` pin not yet in pnpm-lock.yaml fetches pnpm's own details. Offline, each retried for 70 s, then failed, and the
+ *  install had emptied the copy first, so tests that pass failed too. `false`, not `error`: `error` fails every run with a copied node_modules. Spelled
+ *  pnpm_config_: pnpm 12 reads no npm_config_ settings, and npm warns about any it doesn't know. Spike 2026-11-26 (pnpm 12.23.0, Yarn 4.19.0, Bun
+ *  1.4.5): Yarn and Bun install nothing before a script, and a missing install fails in a second either way. */
+const NO_NETWORK_ENV = { pnpm_config_verify_deps_before_run: 'false', pnpm_config_pm_on_fail: 'ignore' }
 /** The clean environment everything in the sandbox runs with: no tokens, no agent ids, nothing of the backend's but PATH and HOME. `tmp`: its own temp folder. */
 export const cleanEnv = (tmp: string | null): Record<string, string> => ({ HOME: os.homedir(), PATH: process.env.PATH ?? '/usr/bin:/bin', TMPDIR: tmp ?? '/tmp',
   LANG: process.env.LANG ?? 'en_US.UTF-8', CI: '1', ...cacheEnv(), ...(process.env.RUSTUP_HOME ? { RUSTUP_HOME: process.env.RUSTUP_HOME } : {}) }) // rustup's toolchains, if they aren't in ~/.rustup
@@ -398,11 +435,20 @@ export function failedLine(output: string): string {
   const lines = output.split('\n').map((l) => shownLine(l).replace(ANSI, '').trim()).filter(Boolean)
   let hit: string | undefined
   for (const [i, l] of lines.entries()) {
-    hit = /^(✖|×|---\s*FAIL\b|FAIL\b|FAILED\b|not ok\b|error\b|E\s)/i.test(l) && !/^✖ failing tests/i.test(l) ? l : /^\d+ failing$/.test(l) ? mochaFailure(lines, i + 1) : undefined
+    hit = /^FAIL\s+\S+$/.test(l) ? jestFailure(lines, i + 1) ?? l // Bug 395: jest's `FAIL ./a.test.js` names the file; the test comes after it
+      : /^(✖|×|---\s*FAIL\b|FAIL\b|FAILED\b|not ok\b|error\b|E\s|thread '.+' panicked\b)/i.test(l) && !/^✖ failing tests/i.test(l) ? l
+      : /^test .+ \.\.\. FAILED$/.test(l) ? l : /^\d+ failing$/.test(l) ? mochaFailure(lines, i + 1) : undefined // cargo's: its own, then its panic
     if (hit) break
   }
   hit ??= lines.find((l) => /\berror\b|\bfailed?\b/i.test(l) && !/^(at |ℹ|#)/.test(l)) ?? lines.find((l) => /^\w+(Error|Exception)\b/.test(l)) ?? lines.at(-1) ?? ''
-  return hit.replace(/\s*\(\d[\d.]*ms\)$/, '').slice(0, 140)
+  // node's `(1.2ms)`, jest's `(1 ms)`; vitest's bare `3ms` after a failed test (Bug 395)
+  return hit.replace(/^(×.*?)\s+\d+ms$/, '$1').replace(/\s*\(\d[\d.]* ?ms\)$/, '').slice(0, 140)
+}
+/** Bug 395: the first test jest says failed after its `FAIL <file>` line: its `● suite › test` heading (`● Console` is what a test logged), else
+ *  its `✕ test` line in the file's list. */
+function jestFailure(lines: string[], at: number): string | undefined {
+  const rest = lines.slice(at)
+  return rest.find((l) => /^● /.test(l) && l !== '● Console') ?? rest.find((l) => /^✕ /.test(l))
 }
 /** Bug 391: the first test in the list mocha prints after `2 failing`, its suites and title on lines of their own, the last one ending in ":":
  *  `1) book list` / `marks a book due soon:` reads `1) book list marks a book due soon`, as mocha's `list` reporter names it. */
@@ -428,7 +474,7 @@ export function failReport(r: Pick<Failed, 'output' | 'earlier'>, max: number): 
  *  same checkout and open its pages (smoke.ts). `only`: the look alone, with no tests before it. `steps` (Bug 411): the project's saved test steps
  *  (teststepsstore.ts). With no command of the user's own they are what runs, part by part, each part installing first; with one, their installs still run
  *  before it (the user's command says what to test, not what it needs installed). */
-export type RunOpts = { watch?: Watch; look?: LookPlan | null; only?: 'look'; steps?: { parts: SavedPart[] } | null }
+export type RunOpts = { watch?: Watch; look?: LookPlan | null; only?: 'look'; steps?: { parts: SavedPart[] } | null; again?: string } // again: see nodePart
 async function runAt(repoPath: string, sha: string, key: string, custom: string | null, auto: Owner, show: Shown | null, o: RunOpts = {}): Promise<TestResult> {
   const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto), stopped = { kind: 'stopped' } as const
   let page = onPage(null)
@@ -447,13 +493,13 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
         page.state('running'); const seen = await look(plan); return seen ? { kind: 'looked', seen } : stopped
       }, (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath })
     }
-    const found = detectTests(wt)
+    const found = detectTests(wt, o.again)
     // Bug 411: saved steps come before the rules. A part whose folder has no tests on this commit is left out; with none left, the rules decide as before
     const mine = o.steps ? partsHere(o.steps.parts, await filesAt(wt).catch(() => [])).map((p): TestPart => ({ dir: p.dir, run: p.test, install: p.install ?? null })) : []
     const plan: TestPlan | null = custom ? (mine.length ? { install: null, test: custom } : { install: found?.install ?? null, test: custom, stop: found?.stop })
       : mine.length ? { install: null, test: chain(mine.map((p) => ({ dir: p.dir, test: p.run }))) } : found
     if (!plan) return { kind: 'no_tests' }
-    if (plan.stop) return { kind: 'error', why: plan.stop } // Bug 392: never npm in its place
+    if (plan.stop || plan.noTool) return { kind: 'error', why: (plan.stop || plan.noTool)! } // Bug 392: never npm in its place; Bug 403: nor for the test script
     const timeoutMs = getSetting('test_timeout_min', DEFAULTS.test_timeout_min) * 60_000
     page = onPage(signal.aborted ? null : show)
     return await withTurn(`HQ's test of ${key}`, 'tests', async (): Promise<TestResult> => { // in line with engineers' own builds and test runs (Bug 76); the time limit starts with the run
@@ -469,7 +515,9 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
           const i = await runSandboxed(wt, plan.install, { network: true, timeoutMs, signal, env: { ...env, ...toolCaches(plan.install) } })
           if (signal.aborted) return stopped
           if (i.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${i.output.slice(0, 200)}` }
-          if (i.code !== 0) return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier }
+          if (i.code !== 0) {
+            return { kind: 'fail', test: plan.install, output: i.timedOut ? `Installing packages took over ${timeoutMs / 60_000} minutes.` : i.output, earlier: i.earlier, rulesInstall: true }
+          }
         }
         // Bug 411: a command HQ built from several folders' suites runs one part at a time, each judged on its own output; any other runs whole
         const late = (): string => `Installing packages took over ${timeoutMs / 60_000} minutes.`
@@ -485,7 +533,8 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
         const r = parts ? await runParts(wt, parts, { timeoutMs, signal, watch: o.watch, env }) : await runSandboxed(wt, plan.test, { network: false, timeoutMs, signal, watch: o.watch, env })
         if (signal.aborted) return stopped
         if (r.sandboxFailed) return { kind: 'error', why: `HQ couldn't start its sandbox: ${r.output.slice(0, 200)}` }
-        if (r.code === 0) {
+        const anyway = failedAnyway(r) // Bug 426: exited 0, but its output says a test failed
+        if (r.code === 0 && !anyway) {
           const pass: TestResult = { kind: 'pass', test: plan.test, output: r.output.replace(ANSI, ''), counts: testCounts(r.summary ?? null), ms: Date.now() - began, // Bug 126
             names: r.names ?? { prints: false, passed: [], skipped: [], unsure: [] }, ...(r.ran ? { parts: r.ran } : {}) }
           if (!o.look) return pass
@@ -493,7 +542,8 @@ async function runAt(repoPath: string, sha: string, key: string, custom: string 
           return seen ? { ...pass, seen } : stopped
         }
         if ('installed' in r && r.installed === false) return { kind: 'fail', test: r.cmd ?? plan.test, output: r.timedOut ? late() : r.output, earlier: r.earlier } // a part's install
-        return { kind: 'fail', test: r.cmd ?? plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier } // a run that hung: whoever reads it says so; the part that failed, by its own command
+        // a run that hung: whoever reads it says so; the part that failed, by its own command
+        return { kind: 'fail', test: r.cmd ?? plan.test, hung: r.timedOut, output: r.output, earlier: r.earlier, ...(anyway ? { exit0: anyway } : {}) }
       } finally { ports?.done() }
     }, (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath }) // Bugs 309, 312
   } catch (e) { return { kind: 'error', why: (e as Error).message.split('\n')[0] ?? 'unknown error' } }

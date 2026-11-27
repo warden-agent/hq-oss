@@ -54,8 +54,8 @@ const ended = (t: any, not?: string) => waitFor(`${t.key}'s check to end`, async
 const steps = async (p: P) => (await hq.state()).previews.find((x: any) => x.id === p.repo.id)?.test_steps
 const helpers = async () => (await hq.state()).agents.filter((a: any) => a.role === 'launcher' && /^test steps /.test(a.display_name ?? ''))
 /** The helper HQ started for this project, once it is running. */
-const helper = (p: P, not: string[] = []) => waitFor('a test steps helper', async () => { const id = (await steps(p))?.helper_agent_id
-  return id && !not.includes(id) ? (await hq.state()).agents.find((a: any) => a.id === id && a.status === 'working') : null }, 30_000)
+const helper = (p: P, not: string[] = [], ms = 30_000) => waitFor('a test steps helper', async () => { const id = (await steps(p))?.helper_agent_id
+  return id && !not.includes(id) ? (await hq.state()).agents.find((a: any) => a.id === id && a.status === 'working') : null }, ms)
 /** The mod hands the helper its next batch and Claude Code submits it. */
 async function nextBatch(agentId: string): Promise<string> {
   const b = await waitFor('a batch for the helper', async () => (await hq.modNext(agentId)).batch, 40_000)
@@ -157,12 +157,20 @@ test('Bug 411: a helper that can\'t, one the user stops, and the user\'s own com
   assert.equal((await hq.api(`repos/${p.repo.id}/test-steps`, {})).status, 200); assert.equal((await steps(p)).helper_agent_id, h2.id) // a second press finds the first one on it
   assert.equal((await hq.api(`repos/${p.repo.id}/test-steps`, { action: 'dismiss' })).status, 200)
   const stopped = await over(p)
-  assert.deepEqual([stopped.state, stopped.note], ['failed', 'Stopped before it finished.']); await gone(p)
+  assert.deepEqual([stopped.state, stopped.note], ['failed', 'You stopped Claude before it finished.']); await gone(p)
   await waitFor('the stopped helper to exit', async () => (await hq.state()).agents.find((a: any) => a.id === h2.id)?.status === 'exited')
+  // Bug 417: its Agent tab's Stop ends it the same way (was "Claude stopped before it finished."), and its Events tab says the user stopped it
+  assert.equal((await hq.api(`repos/${p.repo.id}/test-steps`, {})).status, 200)
+  const h3 = await helper(p, [h.id, h2.id]); await nextBatch(h3.id)
+  assert.equal((await hq.api(`agents/${h3.id}/stop`, {})).status, 200)
+  const byTab = await over(p); assert.deepEqual([byTab.state, byTab.note], ['failed', 'You stopped Claude before it finished.']); await gone(p)
+  const said = async () => ((await hq.api(`agents/${h3.id}/events`)).json.events as any[]).map((e) => e.text) // its end is logged as its worktree goes
+  await waitFor('its Events tab to say the user stopped it', async () => { const l = await said()
+    return l.includes('You stopped it') && l.includes('Done with the test steps: you stopped Claude before it finished') })
   // a command of the user's own: that is what HQ runs, and no helper is asked
   assert.equal((await hq.api(`repos/${p.repo.id}/test-cmd`, { cmd: 'cd frontend && npm test && cd ../backend && node print.js' })).status, 200)
   const last = checkOf(await tk(t))!.id
-  assert.equal((await check(t)).status, 200); assert.equal((await ended(t, last)).state, 'pass'); assert.equal((await helpers()).length, 2)
+  assert.equal((await check(t)).status, 200); assert.equal((await ended(t, last)).state, 'pass'); assert.equal((await helpers()).length, 3)
 })
 
 test('Bug 411: a restart while HQ checks a save ends that helper and says so; a ticket that adds the first tests of a folder gets its steps, and they leave other tickets alone', async () => {
@@ -212,4 +220,53 @@ test('Bug 411: an engineer at work hears the project\'s test command when the st
   assert.equal((await hq.api(`repos/${p.repo.id}/remove`, {})).status, 200)
   await waitFor('the helper to be stopped', async () => { const a = (await hq.state()).agents.find((x: any) => x.id === h2.id); return !a || a.status === 'exited' })
   await gone(p); await waitFor('what HQ kept for the project to go, and stay gone', () => !fs.existsSync(path.dirname(kept)))
+})
+
+// Bug 416: a project whose install by HQ's own rules fails on main: a uv project whose uv.lock uv can't read, so the rules' `uv sync` fails (as it does where
+// uv isn't installed at all). A repair could only change the test command, never that install
+const B416 = { 'pyproject.toml': '[project]\nname = "b416"\nversion = "0.1.0"\n', 'uv.lock': '', 'tests/test_app.py': 'def test_answers():\n    assert True\n',
+  'print.js': "console.log('tests/test_app.py::test_answers PASSED'); console.log('tests/test_hi.py::test_hi PASSED'); console.log('2 passed in 0.01s')\n" }
+const events = async (kind: string) => (await hq.api('events?limit=500')).json.filter((e: any) => e.kind === kind).map((e: any) => ({ ...e, payload: JSON.parse(e.payload) }))
+const repoNow = async (p: P) => (await hq.state()).repos.find((r: any) => r.id === p.repo.id)
+const repairs = async (p: P) => { const fs0 = (await hq.state()).features.filter((f: any) => f.repo_id === p.repo.id).map((f: any) => f.id)
+  return (await hq.state()).tickets.filter((t: any) => t.repairs_main && fs0.includes(t.feature_id)) }
+
+test('Bug 416: on auto, an install of HQ\'s own rules that fails on main starts the test steps helper, not a repair; with its steps main is tested again and passes', async () => {
+  const p = await project('b416main', B416)
+  assert.equal((await hq.api('tickets', { featureId: p.f.id, title: 'Greeting', size: 'S', spec: 'Greeting.' })).status, 200) // queued: auto opens a run
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
+  const h = await helper(p, [], 90_000), first = await nextBatch(h.id)
+  assert.match(first, /\nHQ's own rules install this project's packages with `uv sync`, and that failed on main in HQ's sandbox \(network on\), so HQ can't test the project at all\. /)
+  assert.match(first, /What the install printed:\n```\n[^]+\n```\nWhat HQ runs now: `uv run pytest -q`\nTools HQ found installed/)
+  const bad = await notices(/^repo_teststeps:/)
+  assert.equal(bad.length, 1)
+  assert.match(bad[0].detail, /^b416main: HQ couldn't install its packages on main with its own rule \(`uv sync`\), so it can't test anything yet\. A repair ticket can't change/)
+  const toTpm = await waitFor('the TPM to hear', async () => (await hq.state()).messages.find((m: any) => m.to_id === p.tpm.id && /HQ's own install step \(`uv sync`\) fails there/.test(m.body)))
+  assert.match(toTpm.body, /Claude is working out how this project installs and runs its tests instead[^]*Don't open a ticket for this\.$/)
+  await waitFor('auto to say what it waits for', async () => /^Claude is working out how to test this project/.test((await repoNow(p)).auto_waiting ?? ''))
+  assert.deepEqual(await repairs(p), []); assert.equal((await repoNow(p)).auto_stopped_why, null)
+  assert.match((await events('teststeps.helper_started')).find((e: any) => e.agent_id === h.id).payload.install, /^uv sync$/)
+  await tried(h.id, 'node print.js')
+  assert.equal((await hq.mcp(h.id, 'save_test_steps', { parts: [{ dir: '.', test: 'node print.js' }] })).isError, false)
+  assert.match(await nextBatch(h.id), /HQ's check passed/)
+  // main is tested again, now with the steps: it passes, and no repair was opened
+  const passed = await waitFor('main tested again', async () => (await events('auto.main_checked')).find((e: any) => e.payload.repo === p.repo.id && e.payload.result === 'pass'), 60_000)
+  assert.equal(passed.payload.test, 'node print.js')
+  assert.deepEqual(await repairs(p), []); assert.equal((await helpers()).length, 1); await gone(p)
+})
+
+test('Bug 416: a ticket whose test fails at that install, as main alone does, gets the helper first; when it can\'t, HQ opens a repair as before and asks nobody twice', async () => {
+  const p = await project('b416tk', B416)
+  const { t } = await finished(p, 'Greeting', { 'tests/test_hi.py': 'def test_hi():\n    assert True\n' }, [{ criterion: 'A1', file: 'tests/test_hi.py', name: 'test_hi' }],
+    'uv run pytest -q')
+  await waitFor('T-01 finished', async () => (await tk(t))?.status === 'pr_ready')
+  assert.equal((await hq.api(`repos/${p.repo.id}/auto`, { on: true })).status, 200)
+  const h = await helper(p, [], 90_000); assert.match(await nextBatch(h.id), /with `uv sync`, and that failed on main/)
+  assert.deepEqual(await repairs(p), []); assert.equal((await tk(t)).status, 'pr_ready'); assert.equal((await tk(t)).auto_tries, 0) // not the ticket's fault
+  assert.equal((await hq.mcp(h.id, 'report_cant_test_steps', { reason: 'This project installs with Poetry, which isn\'t installed on this computer.' })).isError, false)
+  const s = await over(p); assert.equal(s.state, 'cant')
+  // the helper has looked at this install: the next failure opens the repair it would have opened before, and no second helper
+  const r = await waitFor('the repair', async () => (await repairs(p))[0], 60_000)
+  assert.match(r.spec, /HQ runs `uv sync` in its test sandbox/)
+  assert.equal((await helpers()).length, 1); assert.equal((await tk(t)).auto_tries, 0); await gone(p)
 })

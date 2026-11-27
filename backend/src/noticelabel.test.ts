@@ -10,7 +10,7 @@ register(`data:text/javascript,${encodeURIComponent(`export async function resol
   return next(s, c) }`)}`)
 ;(globalThis as any).document ??= { createElement: () => ({ getContext: () => null }) }
 const BOARD: string = '../../frontend/src/board.ts' // a plain string: the backend's typecheck stays out of the frontend's files
-const { kindLabel } = await import(BOARD) as { kindLabel: (k: string) => string }
+const { kindLabel, mergeActs } = await import(BOARD) as { kindLabel: (k: string) => string; mergeActs: (t: any, base: string, eng: any) => { kind: string }[] }
 
 test('Bug 251: project notices are named for what happened, never a bare "Repo"', () => {
   assert.equal(kindLabel('repo_cleared:r1'), 'Project cleared')
@@ -23,4 +23,14 @@ test('Bug 251: project notices are named for what happened, never a bare "Repo"'
   // what it must not change: kinds that aren't about a project, and auto mode's own
   assert.equal(kindLabel('merged'), 'Merged'); assert.equal(kindLabel('auto_finished:r1'), 'Auto mode finished')
   assert.equal(kindLabel('launch_failed'), 'Launch failed')
+  assert.equal(kindLabel('download_refused'), 'Download refused') // Bugs 412, 415
+})
+test('Bug 195: a model switch that paused a role is named for what HQ did about it (its own words say whose model switched)', () => {
+  assert.equal(kindLabel('model_fallback'), 'Paused by HQ'); assert.equal(kindLabel('model_mismatch'), 'Model mismatch') // the other model notice, as it was
+})
+test('Bug 195: a sent-back ticket whose engineer HQ stopped for a pause offers no "fix it again" button; one that went idle by itself still does', () => {
+  const t = { status: 'resolving', fixing: 'changes' }, kinds = (eng: unknown) => mergeActs(t, 'main', eng).map((a) => a.kind)
+  assert.deepEqual(kinds({ status: 'idle', interrupted_at: 5, pause_stopped_at: 5 }), [])
+  assert.deepEqual(kinds({ status: 'idle', interrupted_at: 5, pause_stopped_at: null }), ['fix']); assert.deepEqual(kinds(null), ['fix'])
+  assert.deepEqual(kinds({ status: 'working', pause_stopped_at: null }), [])
 })

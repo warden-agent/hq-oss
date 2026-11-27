@@ -234,6 +234,9 @@ UPDATE repos SET clear_tpm_was_on = 1 WHERE clearing_at IS NOT NULL AND EXISTS (
 // Migration 47 (Bug 389): when HQ began picking up the work of a project the user switched back to (freshstart.ts resumeNow), until every
 // parked agent is asked, so a restart in the middle finishes the resume (finishResumes). NULL: no resume under way.
 `ALTER TABLE repos ADD COLUMN resuming_at INTEGER;`,
+// Migration 48 (Bug 195): when HQ cut one of this agent's own turns short because its role is paused (pause.ts stopForPause). It is owed HQ's "carry on"
+// when the role is resumed, which clears it; an agent that was idle when the pause came is owed nothing. NULL: not stopped by a pause.
+`ALTER TABLE agents ADD COLUMN pause_stopped_at INTEGER;`,
 ]
 
 /** Applies the migrations not applied yet, up to `until` (all of them by default; tests replay one on its own). */

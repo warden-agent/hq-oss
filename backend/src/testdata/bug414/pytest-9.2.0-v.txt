@@ -1,0 +1,14 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.14, pytest-9.2.0, pluggy-1.7.0 -- /tmp/shelf/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /tmp/shelf
+configfile: pyproject.toml
+collecting ... collected 5 items
+
+tests/test_due.py::test_due_date_is_shown PASSED                         [ 20%]
+tests/test_due.py::test_due_soon_is_marked PASSED                        [ 40%]
+tests/test_shelf.py::test_shelf_lists_books PASSED                       [ 60%]
+tests/test_shelf.py::test_shelf_shows_covers SKIPPED (needs the cove...) [ 80%]
+tests/test_shelf.py::test_shelf_counts_books PASSED                      [100%]
+
+========================= 4 passed, 1 skipped in 0.01s =========================

@@ -29,9 +29,9 @@ http.createServer((q, s) => {
 }).listen(Number(process.env.PORT), '127.0.0.1')
 `
 /** The tools, connected: an app in a folder as a checkout would have it, the server started as tester.ts starts it. */
-async function tools(run = 'node server.js', more: Record<string, unknown> = {}) {
+async function tools(run = 'node server.js', more: Record<string, unknown> = {}, port: number | 'auto' = 'auto') {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-testermcp-app-'))); fs.writeFileSync(path.join(dir, 'server.js'), SERVER)
-  const recipe = { parts: [{ name: 'app', dir: '.', run, port: 'auto' as const }], show: 'app', worktree_files: [], notes: '' }
+  const recipe = { parts: [{ name: 'app', dir: '.', run, port }], show: 'app', worktree_files: [], notes: '' }
   const out = path.join(dir, '.hq-tester.json'), own = ownTmp(), cmd = serverCommand(dir, { recipe, repoPath: dir, how: lookHow(recipe) }, out, own.tmp, more)
   const client = new Client({ name: 'hq-test', version: '0.0.1' }); await client.connect(new StdioClientTransport({ ...cmd, stderr: 'pipe' }))
   const call = async (name: string, args: Record<string, unknown>) => { const r = await client.callTool({ name, arguments: args }) as { content: { text: string }[]; isError?: boolean }
@@ -82,4 +82,15 @@ test('map mode with an app that doesn\'t start: the tools say to stop without a 
   const r = await t.call('open', { path: '/' }); assert.equal(r.isError, true); assert.match(r.text, /There is nothing to look at: stop now, without a map\.$/)
   assert.doesNotMatch(r.text, /done/); assert.equal(t.read().started, false)
   await t.close()
+})
+
+test('Bug 433: an app hard-wired to a port browsers refuse (6000, 6665–6669) starts, and the tools open its page', opts, async () => {
+  const { BAD_PORTS } = await import('./badports.ts'), { portBusy } = await import('./apprun.ts')
+  let port = 0; for (const p of [6667, 5061]) if (BAD_PORTS.has(p) && !(await portBusy(p))) { port = p; break } // this file's own: test files run side by side
+  assert.ok(port, 'the ports this test may use are in use here')
+  const t = await tools('node server.js', {}, port)
+  try {
+    assert.match((await t.call('open', { path: '/' })).text, /^Page \/ "Library"\n- heading "Library" \[level=1\]/)
+    assert.equal(t.read().started, true)
+  } finally { await t.close() }
 })

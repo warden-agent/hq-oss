@@ -34,6 +34,8 @@ export function field(input: unknown, name: string): string {
   let v = raw; try { v = JSON.parse(`"${raw}"`) as string } catch { /* a broken escape: as written */ }
   return cut ? v + '…' : v
 }
+/** Bug 417: a helper the user stopped (its pane's Stop Claude, or its Agent tab's Stop), as its Events tab says it. */
+const YOU_STOPPED = 'you stopped Claude before it finished'
 const list = (v: unknown): string => Array.isArray(v) ? v.join(', ') : String(v ?? '')
 const file = (p: string): string => p.split('/').slice(-2).join('/')
 function toolLine(tool: string, input: unknown): string {
@@ -128,12 +130,12 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
       + 'another app. Its save was refused'
     case 'launch.helper_done': return p.why === 'app_stopped' ? 'Done with the launch steps: the app was stopped before it answered; the steps you OK\'d stay' // Bug 332
       : p.why === 'own_command' ? 'Done with the launch steps: you set your own start command, which runs now; the steps you OK\'d stay' // Bug 361
-        : 'Done with the launch steps'
+        : p.why === 'user_stopped' ? `Done with the launch steps: ${YOU_STOPPED}` : 'Done with the launch steps' // Bug 417
     case 'launch.run_answered': return `HQ's run of its steps answered${p.url ? ` at ${one(p.url)}` : ''}` // Bug 360: what launch_ok may confirm, kept
     case 'launch.run_restarted': return 'The app was started again during the first run of the steps you OK\'d: HQ tells it how the new run goes' // Bug 361
     case 'launch.run_resumed': return `HQ restarted during the first run of the steps you OK'd: ${p.again ? 'it runs them again' : 'it picks that run up again'}` // Bug 351
     case 'agent.launched': return `Started${p.model ? ` (${p.model})` : ''}`
-    case 'agent.stopped': return `Stopped${p.reason ? `: ${one(p.reason, 100)}` : ''}`
+    case 'agent.stopped': return p.reason === 'user' ? 'You stopped it' : `Stopped${p.reason ? `: ${one(p.reason, 100)}` : ''}` // Bug 417: the Agent tab's Stop
     case 'agent.lost': return 'Its terminal is gone'
     case 'agent.interrupted': return p.why === 'not_acked' ? "Interrupted: it didn't take HQ's messages" : 'Interrupted (Escape)'
     case 'agent.turn_over': return `Turn ended: Escape or No on a question on its screen${still(p.still)}` // Bug 289: no Stop hook came, so no "Turn ended" line
@@ -145,6 +147,9 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'agent.turn_ended_away': return `Its turn ended while HQ was down: shown as ${p.status === 'working' ? 'still working on what it left running' : 'idle'}`
     case 'agent.dialog_cleared': return 'A question on its screen was answered'
     case 'urgent.interrupt': return 'You interrupted it with a message'
+    case 'typed.enter_again': return "HQ pressed Enter again: its terminal had kept HQ's line unsent" // Bug 195
+    case 'agent.pause_stopped': return 'HQ stopped its turn: its role is paused until you press Resume' // Bug 195
+    case 'agent.pause_over': return 'The pause is over: HQ told it to carry on'
     case 'question.answered': return 'Its question was answered'
     case 'turns.waiting': { const b = behindWords(p.behind) // Bug 289: behind whom. Bug 309: HQ's own run, on its ticket's engineer's tab, by its name
       return `${p.hq ? `${one(p.who, 80)} waits its turn` : `Waiting its turn for ${one(p.what, 80) || 'a build or test run'}`}${b ? ` behind ${one(b, 120)}` : ''}` }
@@ -175,16 +180,20 @@ export function eventLine(kind: string, payload: Record<string, unknown>): strin
     case 'testsetup.helper_started': return 'Started working out how HQ tests the app'
     case 'testsetup.saved': return `Saved how HQ tests the app${Number(p.saves) > 1 ? ` (save ${p.saves})` : ''}: HQ is checking it`
     case 'testsetup.helper_done': return p.state === 'cant_test' ? `Done with the test setup: it says HQ can't test this app${p.note ? `: ${one(p.note, 100)}` : ''}`
-      : p.state === 'failed' ? `Done with the test setup, with no setup that works${p.note ? `: ${one(p.note, 100)}` : ''}` : 'Done with the test setup'
+      : p.by === 'user' ? `Done with the test setup: ${YOU_STOPPED}` // Bug 417
+        : p.state === 'failed' ? `Done with the test setup, with no setup that works${p.note ? `: ${one(p.note, 100)}` : ''}` : 'Done with the test setup'
     // Bug 411: the test steps helper
-    case 'teststeps.helper_started': return `Started working out how HQ tests the project${p.why === 'gap' ? ': its test steps left some tests out' : p.why === 'again' ? ' again' : ''}`
+    case 'teststeps.helper_started': return `Started working out how HQ tests the project${p.install ? `: HQ's own install step (${one(p.install, 80)}) failed` // Bug 416
+      : p.why === 'gap' ? ': its test steps left some tests out' : p.why === 'again' ? ' again' : ''}`
     case 'teststeps.saved': return `Saved test steps${Number(p.saves) > 1 ? ` (save ${p.saves})` : ''}: HQ is running them in its sandbox`
     case 'teststeps.checked': return `HQ's check of the test steps passed: ${one(p.cmd, 160)}`
     case 'teststeps.helper_done': return p.state === 'cant' ? `Done with the test steps: it says HQ can't run this project's tests${p.note ? `: ${one(p.note, 100)}` : ''}`
-      : p.state === 'failed' ? `Done with the test steps, with none that pass in HQ's sandbox${p.note ? `: ${one(p.note, 100)}` : ''}` : 'Done with the test steps'
+      : p.by === 'user' ? `Done with the test steps: ${YOU_STOPPED}` // Bug 417
+        : p.state === 'failed' ? `Done with the test steps, with none that pass in HQ's sandbox${p.note ? `: ${one(p.note, 100)}` : ''}` : 'Done with the test steps'
     case 'teststeps.not_started': return `HQ couldn't start Claude on the test steps${p.error ? `: ${one(p.error, 120)}` : ''}`
     case 'testsetup.change_proposed': return `Proposed a change to how HQ tests the app${p.ticket ? `, with ${p.ticket}` : ''}`
-    case 'ticket.launched': return `${p.fix ? 'Back on' : 'Started on'} ${keyOf(p.ticket, p.key)}`
+    // Bug 398 (and 389): `adopted`, a session the last backend started and went down before recording: HQ took it over after its restart
+    case 'ticket.launched': return `${p.fix ? 'Back on' : 'Started on'} ${keyOf(p.ticket, p.key)}${p.adopted ? ' (HQ restarted as it started; it took this session over)' : ''}`
     case 'ticket.resumed': return `Picked up ${keyOf(p.ticket, p.key)} again`
     case 'ticket.pr_open': return `Opened a pull request for ${keyOf(p.ticket, p.key)}`
     case 'ticket.pr_refused': return `HQ didn't take ${keyOf(p.ticket, p.key)} as finished (open pr): ${one(p.why, 600)}` // Bug 248

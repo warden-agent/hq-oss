@@ -173,7 +173,8 @@ export function placeBoard(boxes: Box[], sets: string[][], w: number, h: number,
 
 /** A side of the board's view. */
 export type Side = 'left' | 'right' | 'top' | 'bottom'
-/** Bug 284: boxes wholly past one edge of the view (a finished feature the view left out by fitSets' rule, or anything panned away).
+/** Bug 284: boxes wholly past one edge of the view (a finished feature the view left out by fitSets' rule, or anything panned away),
+ *  or mostly past it (Bug 408, SHOWN).
  *  `x`, `y`: the hint's top-left corner in the pane; `to`: the view that brings the nearest of them whole into view (at the left
  *  or right, with the boxes past that edge above and below it, as many as fit: Bug 306), moved on so no box is cut at an edge and
  *  zoomed out where that shows more (Bug 345: moveOn). Worked out when first read (a click), not on every pan. */
@@ -183,15 +184,27 @@ export const HINT_W = 72, HINT_H = 22, HINT_GAP = 4
 /** How far to move a pane-pixel span `lo`..`hi` so it sits whole inside a `pane` long side, EDGE from its ends (or its start at EDGE). */
 const into = (lo: number, hi: number, pane: number) =>
   hi - lo > pane - 2 * EDGE || lo < EDGE ? EDGE - lo : hi > pane - EDGE ? pane - EDGE - hi : 0
-/** The edge hints for a `w`×`h` pane showing `boxes` through view `v`: one per side that has boxes wholly past it. Each sits at its
- *  edge, level with the nearest of those boxes as far as it can, moved along the edge to keep clear of the boxes in view, of
- *  `avoid` (the zoom buttons) and of the hints already placed (where nothing is clear, covering the least of them). A box past a
- *  corner counts for the left or right side. */
+/** Bug 408: a box cut by an edge counts as past it when less than this share of it shows across that edge, and a pan toward it
+ *  shows more of it. A box that shows only a sliver (the TPM box after Read plan moved the view, grown back into view by its Start
+ *  section, which stayed under the top bar) gets the pill; one that mostly shows doesn't (Bug 284: you can see it). The owner's call:
+ *  1 gives every cut box a pill, 0 none (as before). */
+export const SHOWN = 0.5
+/** The edge hints for a `w`×`h` pane showing `boxes` through view `v`: one per side that has boxes wholly past it (or mostly, SHOWN).
+ *  Each sits at its edge, level with the nearest of those boxes as far as it can, moved along the edge to keep clear of the boxes
+ *  that show, of `avoid` (the zoom buttons) and of the hints already placed (where nothing is clear, covering the least of them).
+ *  A box past a corner counts for the left or right side. */
 export function edgeHints(boxes: Box[], v: View, w: number, h: number, avoid: Rect[] = []): EdgeHint[] {
   if (!(w > 0 && h > 0)) return []
   const z = v.zoom, on = boxes.map((b) => ({ id: b.id, l: v.x + b.x * z, t: v.y + b.y * z, r: v.x + (b.x + b.w) * z, u: v.y + (b.y + b.h) * z }))
-  const sideOf = (s: Rect): Side | null => s.r <= 0.5 ? 'left' : s.l >= w - 0.5 ? 'right' : s.u <= 0.5 ? 'top' : s.t >= h - 0.5 ? 'bottom' : null
-  const block: Rect[] = [...on.filter((s) => !sideOf(s)), ...avoid], hints: EdgeHint[] = []
+  const gone = (s: Rect): Side | null => s.r <= 0.5 ? 'left' : s.l >= w - 0.5 ? 'right' : s.u <= 0.5 ? 'top' : s.t >= h - 0.5 ? 'bottom' : null
+  // Bug 408: cut by an edge with less than SHOWN of it in view, on the side where more is hidden, if a pan that way shows more of it
+  const mostly = (lo: number, hi: number, pane: number, start: Side, end: Side): Side | null => {
+    if (Math.min(hi, pane) - Math.max(lo, 0) >= SHOWN * (hi - lo) - 0.01) return null
+    const side = lo < 0 && -lo >= hi - pane ? start : end, d = into(lo, hi, pane)
+    return (side === start ? d > 0.5 : d < -0.5) ? side : null
+  }
+  const sideOf = (s: Rect): Side | null => gone(s) ?? mostly(s.l, s.r, w, 'left', 'right') ?? mostly(s.t, s.u, h, 'top', 'bottom')
+  const block: Rect[] = [...on.filter((s) => !gone(s)), ...avoid], hints: EdgeHint[] = [] // a box cut at an edge too: its part in view
   const g = HINT_GAP, across = (s: Side) => s === 'left' || s === 'right'
   for (const side of ['left', 'right', 'top', 'bottom'] as const) {
     const off = on.filter((s) => sideOf(s) === side); if (!off.length) continue
@@ -280,8 +293,10 @@ export type PopPlace = { left: number; y: number; above: boolean; width: number;
  *  Bug 379: `spill` is the room in the window under the board (the app pane, when it shows below the board). A board short both
  *  ways (a short window with the app pane open) cut the popover to a strip a line tall; then it opens below its box and grows down
  *  over the app pane (`spill: true`: it must be drawn where the board doesn't clip it), when that is more room than above it. A box
- *  that fills the board (its bottom at or past the board's) gets it from the board's bottom edge. */
-export function placePop(box: { x: number; y: number; w: number; h: number }, want: number, w: number, h: number, spill = 0): PopPlace {
+ *  that fills the board (its bottom at or past the board's) gets it from the board's bottom edge.
+ *  Bug 432: `keep` (the TPM box, in pane pixels) and `need` (the popover's full height): the popover keeps off `keep` where it can
+ *  (clearOf). */
+export function placePop(box: Area, want: number, w: number, h: number, spill = 0, keep?: Area, need = 0): PopPlace {
   const width = Math.max(0, Math.min(want, w - 2 * POP_EDGE))
   const left = Math.max(POP_EDGE, Math.min(box.x + box.w / 2 - width / 2, w - POP_EDGE - width))
   const below = h - (box.y + box.h + POP_GAP) - POP_EDGE, over = box.y - POP_GAP - POP_EDGE
@@ -290,5 +305,25 @@ export function placePop(box: { x: number; y: number; w: number; h: number }, wa
     return { left, width, above: false, y: from, maxHeight: room, spill: true }
   }
   const above = below < POP_ROOM && over > below
-  return { left, width, above, y: above ? box.y - POP_GAP : top, maxHeight: Math.max(POP_FLOOR, above ? over : below) }
+  const p: PopPlace = { left, width, above, y: above ? box.y - POP_GAP : top, maxHeight: Math.max(POP_FLOOR, above ? over : below) }
+  return keep && need > 0 ? clearOf(p, box, keep, need, h) : p
+}
+/** Bug 432: popover `p` of `box` moved off box `keep` (the TPM box, with the project's Your turn and its write box), where it can.
+ *  `need`: the popover's full height. Unchanged when it doesn't cover `keep`, or `keep` isn't in its column or on the board. Else
+ *  the first that keeps clear of it: beside the box on the side it chose, then the other, with its full height; then either with
+ *  at least POP_ROOM (its body scrolls); then over its own box, from just past `keep` (a box's popover carries what its buttons do,
+ *  so covering its own box hides nothing you can't reach). Where none does (a board too short), it stays where it was. */
+function clearOf(p: PopPlace, box: Area, keep: Area, need: number, h: number): PopPlace {
+  const kt = keep.y, ku = keep.y + keep.h, hit = (t: number, u: number) => Math.min(u, ku) - Math.max(t, kt) > 0.5
+  const tall = Math.min(need, p.maxHeight), shown = p.above ? hit(p.y - tall, p.y) : hit(p.y, p.y + tall)
+  if (!shown || keep.x + keep.w <= p.left + 0.5 || keep.x >= p.left + p.width - 0.5 || ku <= 0.5 || kt >= h - 0.5) return p
+  const past = ku <= box.y // `keep` sits above the box (the TPM is on top of the board), else below it (beside it: nothing to do)
+  if (!past && kt < box.y + box.h) return p
+  const upTo = past ? Math.max(POP_EDGE, ku + POP_GAP) : POP_EDGE, downTo = past ? h - POP_EDGE : Math.min(h - POP_EDGE, kt - POP_GAP)
+  const up = { ...p, above: true, y: box.y - POP_GAP, maxHeight: box.y - POP_GAP - upTo }
+  const down = { ...p, above: false, y: box.y + box.h + POP_GAP, maxHeight: downTo - (box.y + box.h + POP_GAP) }
+  const sides = p.above ? [up, down] : [down, up]
+  const on = past ? { ...p, above: false, y: upTo, maxHeight: downTo - upTo } : { ...p, above: true, y: downTo, maxHeight: downTo - upTo }
+  return sides.find((s) => s.maxHeight >= need) ?? sides.find((s) => s.maxHeight >= POP_ROOM) ??
+    (on.maxHeight >= Math.min(need, POP_ROOM) ? on : p)
 }

@@ -85,3 +85,15 @@ test('recorder: a seed command that fails, or writes nothing, stops it before th
   const none = await startRecording({ ...spec(b.root, b.out), seed: 'true' })
   assert.equal(none.kind, 'no_seed'); assert.match(none.why, /wrote none of data/)
 })
+
+test('Bug 433: an app hard-wired to a port browsers refuse (6000, 6665–6669) starts under the recorder, and the browser is told its ports', async () => {
+  const { BAD_PORTS } = await import('./badports.ts'), { portBusy } = await import('./apprun.ts')
+  let port = 0; for (const p of [6679, 6566]) if (BAD_PORTS.has(p) && !(await portBusy(p))) { port = p; break } // this file's own: test files run side by side
+  assert.ok(port, 'the ports this test may use are in use here')
+  const { root, out } = project(), s = spec(root, out) // the app reads PORT, which HQ sets to the fixed port
+  const started = await startRecording({ ...s, parts: [{ ...s.parts[0]!, port }], startMs: 8000 }); assert.ok(started.rec, JSON.stringify(started)) // the wait was a fetch: refused
+  try {
+    assert.deepEqual(await (await fetch(`${started.rec.url}/list`)).json(), [{ id: 's1', name: 'rice' }])
+    assert.deepEqual(started.rec.ports(), [Number(new URL(started.rec.url).port), port]) // what scenariorun.mjs lets its Chromium open
+  } finally { await started.rec.stop() }
+})

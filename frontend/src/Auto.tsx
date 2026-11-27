@@ -77,7 +77,8 @@ function TestSteps({ ts, repo, own, busy, ask }: { ts: StepsView | undefined; re
 /** Turning auto mode on: what happens right now, and how HQ will test. */
 export function AutoDialog({ all }: { all: State }) {
   const [repoId, setRepoId] = useState<string | null>(null)
-  const [check, setCheck] = useState<{ custom: string | null; found: string | null; sandbox: string | null; not_run?: string[]; asks?: boolean } | null>(null)
+  const [check, setCheck] = useState<{ custom: string | null; found: string | null; sandbox: string | null; not_run?: string[]; asks?: boolean
+    stop?: string | null; no_tool?: string | null } | null>(null)
   const [cmd, setCmd] = useState(''), [busy, setBusy] = useState(false), [err, setErr] = useState(''), [away, setAway] = useState(false)
   const repo = all.repos.find((r) => r.id === repoId), [uiTest, setUiTest] = useState<boolean | null>(null) // null: as the project has it
   const testing = uiTest ?? repo?.ui_test !== 'off'
@@ -89,17 +90,15 @@ export function AutoDialog({ all }: { all: State }) {
   // Bug 64: HQ may be restarting as the box opens. Closing the box stops the asking, so a late answer can't land on the next open. What was typed meanwhile stays.
   useEffect(() => repoId ? askUntilAnswered(`repos/${repoId}/auto-check`, { away: setAway, answer: (c) => { setCheck(c); setCmd((t) => t || (c.custom ?? '')) },
     refused: (e) => setErr(errText(e)) }) : undefined, [repoId])
-  useEffect(() => {
-    if (!repoId) return
-    const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) close() }
-    document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
-  })
   if (!repo) return null
   const now = autoPreview(all, repo.id), noTests = !!check && !check.found && !cmd.trim(), refused = !repo.auto_mode ? check?.sandbox : null
   const bad = refusedCmd(repo), cantRun = !!cmd.trim() && bad?.cmd === cmd.trim() // while the box holds that command: typing another one takes the line away
   // Bug 411: the tests the command HQ found runs nothing of (a backend/ beside the frontend/ its rules stopped at). Only while the box is empty: HQ can't
   // tell what the user's own command runs. A found command too long for the box is shown whole under it
   const skipped = check && !cmd.trim() ? check.not_run ?? [] : [], long = !cmd.trim() && (check?.found?.length ?? 0) > 44
+  // Bug 403: the project's own tool (pnpm, Yarn, Bun) isn't installed, so HQ's first test would stop: said before auto goes on. A command of the user's own
+  // doesn't need it to run the tests, but the packages still install with it
+  const noTool = check ? (cmd.trim() ? check.stop : check.stop ?? check.no_tool) ?? null : null
   // The project's test steps (a helper worked them out, HQ checked them) and the helper at work on them, live from the page's state
   const ts: StepsView | undefined = (all.previews ?? []).find((x: any) => x.id === repo.id)?.test_steps, shown = !!ts?.steps && !cmd.trim()
   const askSteps = async (action?: 'dismiss') => {
@@ -133,6 +132,8 @@ export function AutoDialog({ all }: { all: State }) {
       <label className="flex flex-col gap-1">Test command
         <input className="input" value={cmd} onChange={(e) => setCmd(e.target.value)} placeholder={check ? check.found ?? 'No tests found' : 'Looking…'} aria-label="Test command" /></label>
       {long && !shown && <div className="break-words text-zinc-500">HQ runs: <span className="font-mono text-zinc-400">{check!.found}</span></div>}
+      {noTool && <div role="note" className="break-words rounded-md border border-amber-500/40 bg-amber-950/30 p-2 text-amber-200">
+        {repo.auto_mode ? 'Auto mode stops at its next test' : 'Auto mode would stop at its first test'}: {noTool}</div>}
       <TestSteps ts={ts} repo={repo} own={!!cmd.trim()} busy={busy} ask={askSteps} />
       {noTests && !skipped.length && !ts?.working && <div className="text-amber-300/80">HQ found no tests here, so it will build but not merge. The TPM can add tests, or write a command above.</div>}
       {skipped.length > 0 && !ts?.working && <div role="note" className="flex flex-wrap items-center gap-x-2 gap-y-1 break-words text-amber-300/80"><span className="min-w-0 grow">
@@ -163,15 +164,11 @@ export function AutoDialog({ all }: { all: State }) {
 
 function SummaryDialog({ run, name, onClose, all }: { run: any; name: string; onClose: () => void; all: State }) {
   const [busy, go] = useBusy(), [err, setErr] = useState('') // shown in this box: the page's error strip is behind it
-  const [asking, setAsking] = useState(false) // Undo's are-you-sure is up (Bug 341): Escape and a click outside leave the summary alone.
+  const [asking, setAsking] = useState(false) // Undo's are-you-sure is up (Bug 341): a click outside leaves the summary alone; Escape closes only the top layer anyway (Bug 407).
   // Undo itself reads "Undoing…" and dims only once the user says yes, like Merge and Try it (Bug 366); useBusy drops a second press meanwhile
   const base = all.repos.find((r) => r.id === run.repo_id)?.default_branch ?? 'main'
   const sure = async () => { setErr(''); setAsking(true); try { return await undoConfirm(name) } finally { setAsking(false) } }
   const undo = () => go(() => api(`auto-runs/${run.id}/undo`, {}).then(onClose, (e: Error) => setErr(errText(e))), sure)
-  useEffect(() => { // the are-you-sure's Escape is only for that; while the undo runs this box stays
-    const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy && !asking) onClose() }
-    document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
-  })
   return <Backdrop onClose={onClose} canClose={!busy && !asking} z="z-[80]">{/* under HQ's dialog: Undo's are-you-sure opens on top */}
     <div role="dialog" aria-modal="true" aria-label={`What auto mode did in ${name}`}
       className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-300 shadow-xl">

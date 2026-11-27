@@ -3,6 +3,7 @@
 // ends them with it; or, for a caller that stops and starts the app again itself (`group`), each in a group of its own that ends with the caller.
 // spec: { parts: [{ name, cwd, run, port: number | 'auto' }], show, startMs }
 import { spawn, spawnSync } from 'node:child_process'
+import http from 'node:http'
 import net from 'node:net'
 
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
@@ -19,8 +20,17 @@ const taken = (port) => Promise.all(['127.0.0.1', '::1'].map((host) => new Promi
   const s = net.connect({ host, port }), end = (b) => { s.destroy(); resolve(b) }
   s.once('connect', () => end(true)); s.once('error', () => end(false)); s.setTimeout(500, () => end(false))
 }))).then((a) => a.some(Boolean))
-const answers = async (port) => {
-  try { const r = await fetch(`http://localhost:${port}/`, { redirect: 'manual', signal: AbortSignal.timeout(2000) }); await r.body?.cancel(); return true } catch { return false }
+/** Does something answer HTTP at http://localhost:`port`/? node:http, as apprun.ts httpReply (which this plain-Node file can't import), not fetch: fetch
+ *  throws "bad port" without trying on the ports browsers refuse (6000, 6665–6669: badports.ts), and an app hard-wired there answers all the same (Bug 433). */
+const answers = (port) => new Promise((resolve) => {
+  const req = http.get({ host: 'localhost', port, path: '/', signal: AbortSignal.timeout(2000) }, (res) => { res.resume(); req.destroy(); resolve(true) })
+  req.on('error', () => resolve(false))
+})
+/** The flag HQ's own headless Chromium is started with so it opens the app's `ports` even when one is on the browsers' "bad port" list (6000, 6665–6669),
+ *  which it refuses otherwise (net::ERR_UNSAFE_PORT, Bug 433). Those ports only, and only in HQ's own runs: the user's browser still refuses them. */
+export const allowPorts = (ports) => {
+  const list = [...new Set(ports.map(Number))].filter((p) => Number.isInteger(p) && p > 0 && p < 65536)
+  return list.length ? [`--explicitly-allowed-ports=${list.join(',')}`] : []
 }
 
 /** Starts the parts and waits for the page's port to answer and every other part to listen on its own. `{ port, kids, ports }` when it's up. `o.ports`:

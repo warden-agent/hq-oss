@@ -10,6 +10,7 @@ import * as tmux from './tmux.ts'
 import { buildMcp, buildSettings, roleFlags, rolePromptPath, HOOK_HEADER_FILE, hookHeaderLine, type Role } from './roles.ts'
 import { ensureTrusted } from './trust.ts'
 import { resolveEndedAgent, resolveKind } from './attention.ts'
+import { settleEnded } from './allowhosts.ts'
 import { checkClaude } from './claudecheck.ts'
 import { agentChanged } from './wake.ts'
 
@@ -19,6 +20,8 @@ export type Agent = {
   status: string; in_plan_mode: number; last_event_at: number | null; takeover_locked_until: number | null; mod_seen_at: number | null; last_gate_allow_at: number | null
   paused_reason: string | null; started_at: number; ended_at: number | null; exit_code: number | null; launch_prompt: string | null; display_name: string | null
   fresh_start_at: number | null; fresh_start_then: string | null; fresh_start_msg: string | null; interrupted_at: number | null; ended_why: string | null
+  /** Bug 195: when HQ cut a turn of its own short because its role is paused (pause.ts). Cleared when the role is resumed and HQ's "carry on" is on its way. */
+  pause_stopped_at: number | null
   /** Why a `blocked` agent is blocked (Bug 72): 'dialog', or 'api_error' (its turn ended with an API error). Read only while the status is `blocked`; any other status clears it (update, Bug 218). */
   blocked_why: 'dialog' | 'api_error' | null
   /** The line its box shows ("Thinking", the tool it uses), as the last patch that carried one said it (keepLine, Bug 337). Read back at start-up only (ui.ts
@@ -56,6 +59,7 @@ export function update(agentId: string, fields: Partial<Omit<Agent, 'id'>>, show
   if (fields.status === 'exited') shown = { ...shown, activity: null } // Bug 122: an agent that has ended is doing nothing, however it ended
   if (keys.length || Object.keys(shown).length) patch('agent', agentId, { ...fields, ...shown })
   if (fields.status === 'exited') resolveEndedAgent(agentId) // Bugs 114, 153: every way an agent ends (Stop, lost, SessionEnd) passes here; its alerts end with it
+  if (fields.status === 'exited') settleEnded(agentId) // Bug 425: a refusal whose hosts the user has allowed since: the next session has them
   if (keys.length) agentChanged(agentId, fields) // Bug 99: a waiting `next` looks again if delivery reads what changed
 }
 
@@ -82,7 +86,7 @@ export async function launchAgent(spec: LaunchSpec): Promise<Agent> {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   fs.writeFileSync(path.join(dir, 'token'), token, { mode: 0o600 })
   fs.writeFileSync(path.join(dir, HOOK_HEADER_FILE), hookHeaderLine(token), { mode: 0o600 }) // what the SessionStart hook sends (Bug 87)
-  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(buildSettings(spec.role, token, { agentDir: dir, repoId: spec.repoId, repoAllowlist: spec.repoAllowlist, editOverrides: spec.editOverrides, localOnly: spec.localOnly }), null, 2), { mode: 0o600 })
+  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(buildSettings(spec.role, token, { agentDir: dir, repoId: spec.repoId, repoPath: spec.cwd, repoAllowlist: spec.repoAllowlist, editOverrides: spec.editOverrides, localOnly: spec.localOnly }), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(buildMcp(path.join(dir, 'token')), null, 2), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'prompt.md'), spec.launchPrompt)
   const sessionId = randomUUID(), tmp = agentTmp(agentId) // made in the same tick as the agent's row below: a sweep never sees one without the other

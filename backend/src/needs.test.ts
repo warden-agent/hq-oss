@@ -26,6 +26,12 @@ test('needsYou: plans waiting, finished tickets and alerting notices, in every r
   ])
 })
 
+test('Bug 195: a model switch that paused a role needs the user (its agents stand still until Resume); a model mismatch stays information', () => {
+  const s = { ...state(), reviews: [], attention: [{ id: 7, kind: 'model_fallback', agent_id: 'tpm-2', detail: 'TPM search switched models by itself' },
+    { id: 8, kind: 'model_mismatch', agent_id: 'tpm-2', detail: 'TPM search: main-loop request on x' }] }
+  assert.deepEqual(needsYou(s, () => null).map((n) => [n.key, n.text, n.repoId]), [['attention:7', 'api-server: TPM search switched models by itself', 'r2']])
+})
+
 test('Bug 210: a ticket to fix clashes with its project\'s own default branch', () => {
   const s = state(); s.repos[1] = { ...s.repos[1]!, default_branch: 'master' } as never
   assert.ok(needsYou(s, (t) => acts[t.id] ?? null).some((n) => n.key === 'fix:t3' && n.text === 'api-server: T3 clashes with master: press Fix conflicts'))
@@ -150,6 +156,21 @@ test("Bug 97: agents on a Claude Code HQ wasn't checked on alert in every projec
   assert.equal(forRepo({ ...s, messages: [] }, 'r1').attention.length, 2) // both are listed in the ⚠ menu, whichever project is open
   assert.equal(goodNews('claude_newer'), false); assert.equal(plainNews('claude_newer'), true) // neither green nor red
   assert.equal(plainNews('claude_unchecked'), false)
+})
+test('Bug 444: a refused download counts like the blocker beside it: ⚠, the menu and the tab title agree, and it goes from the count once closed', () => {
+  const eng = { id: 'eng-1', role: 'engineer', feature_id: 'f1', ticket_id: 't1' }
+  const att = [{ id: 30, kind: 'blocked', agent_id: 'eng-1', ticket_id: 't1', detail: 'eng T1: needs an API key' },
+    { id: 31, kind: 'download_refused', agent_id: 'eng-1', ticket_id: 't1', detail: "eng T1 couldn't download from files.example.org: it isn't allowed." }]
+  const s = { ...state(), reviews: [], messages: [], agents: [...state().agents, eng], attention: att }
+  const needs = needsYou(s, () => null), { here } = splitNeeds(needs, 'r1')
+  assert.deepEqual(here.map((n) => [n.key, n.text]), [['attention:30', 'demo: eng T1: needs an API key'],
+    ['attention:31', "demo: eng T1 couldn't download from files.example.org: it isn't allowed."]])
+  assert.equal(forRepo(s, 'r1').attention.length, here.length) // the ⚠ menu lists what ⚠ counts
+  assert.equal(titleFor(needs.length), '(2) HQ')
+  // Allowed and its agent ended: HQ closes it (allowhosts.ts settle), and the count drops with it
+  const closed = { ...s, attention: [att[0]!, { ...att[1]!, resolved_at: 50 }] }
+  assert.deepEqual(needsYou(closed, () => null).map((n) => n.key), ['attention:30']); assert.equal(titleFor(needsYou(closed, () => null).length), '(1) HQ')
+  assert.equal(goodNews('download_refused'), false); assert.equal(plainNews('download_refused'), false) // red, as its box shows it
 })
 test('Bug 97: the Agents menu says which Claude Code runs, and warns only when it is not the checked one', () => {
   assert.deepEqual(claudeLine({ checked: '2.1.322', runs: '2.1.322', installed: null }), { warn: false, text: 'Agents run Claude Code 2.1.322, the version HQ was checked on.' })

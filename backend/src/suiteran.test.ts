@@ -141,6 +141,46 @@ test('Bug 194: a repo with test files but no test script is checked against the 
   setRepo('test_cmd = NULL')
 })
 
+// Bug 429: worktreeState reads HEAD's files, then `git status`. A commit landing between the two (the engineer's `git commit -qam x` the
+// instant its test run is over) left the files it committed out of both, so open_pr said "You changed files after the last run". A stand-in
+// `git` first on PATH makes the commit land there every time: before each `status` it commits, once (`once`) or every time (`always`).
+const SHIM = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-suiteran-429-')), FLAG = path.join(SHIM, 'flag')
+const GIT = `${JSON.stringify(execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim())} -c user.email=t@hq -c user.name=t`
+fs.writeFileSync(path.join(SHIM, 'git'), `#!/bin/sh
+for a in "$@"; do if [ "$a" = status ] && [ -f '${FLAG}' ]; then
+  case "$(cat '${FLAG}')" in once) rm -f '${FLAG}'; ${GIT} commit -qam x ;;
+  always) ${GIT} commit -q --allow-empty -m y ;; esac
+fi; done
+exec ${GIT} "$@"
+`, { mode: 0o755 })
+/** Runs `f` with the stand-in `git` first on PATH (HQ's git calls look it up as they start) and `mode` in its flag file. */
+const committing = async <T,>(mode: 'once' | 'always', f: () => Promise<T>): Promise<T> => {
+  const was = process.env.PATH; fs.writeFileSync(FLAG, mode); process.env.PATH = `${SHIM}:${was}`
+  try { return await f() } finally { process.env.PATH = was; fs.rmSync(FLAG, { force: true }) }
+}
+const headOf = () => g(GWT, 'rev-parse', 'HEAD').trim()
+
+test('Bug 429: a commit landing while HQ looks at the worktree is not a change; a change still is, and so is a look HEAD never held still for', async () => {
+  reset(); setRepo('test_cmd = ?', 'npm test'); put('snap.txt', 'v0\n'); g(GWT, 'add', '.'); g(GWT, 'commit', '-qm', 'base 429')
+  put('snap.txt', 'v1\n') // what the test run wrote into a tracked file
+  let head = headOf(); const mid = await committing('once', () => worktreeState(GWT))
+  assert.notEqual(headOf(), head, 'the stand-in committed during the look'); assert.equal(g(GWT, 'status', '--porcelain'), '')
+  assert.equal(mid, await worktreeState(GWT), 'the look the commit landed in reads what the files hold')
+
+  put('snap.txt', 'v2\n'); head = headOf()
+  await committing('once', async () => { ranThenHandoff(); return suiteProblem(t2()) }) // the run's state is taken with the commit landing in it
+  assert.notEqual(headOf(), head); assert.equal(await suiteProblem(t2()), null, 'committing what the tests wrote, at once, is no change')
+  put('snap.txt', 'v3\n'); g(GWT, 'commit', '-qam', 'a real change'); assert.match(await suiteProblem(t2()) ?? '', CHANGED, 'a real change, committed')
+
+  await ranOk(); head = headOf()
+  assert.match(await committing('always', () => suiteProblem(t2())) ?? '', CHANGED, 'HEAD moved during every look: HQ can\'t vouch for the files')
+  assert.notEqual(headOf(), head); assert.equal(await suiteProblem(t2()), null, 'empty commits: once HEAD holds still the files are the run\'s')
+
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-suiteran-429n-')); g(fresh, 'init', '-q'); fs.writeFileSync(path.join(fresh, 'a.js'), 'a')
+  const s = await worktreeState(fresh); assert.ok(s && !s.startsWith('moving'), 'no commit yet: the files as they are'); assert.equal(await worktreeState(fresh), s)
+  setRepo('test_cmd = NULL')
+})
+
 test('Bug 213: which commands after the test command in its own line may change files', () => {
   for (const line of ['npm test', 'npm test 2>&1 | tail -5', `cd ${WT} && npm test`, 'npm test; echo "exit $?"', 'npm test | tee test.log',
     'npm test && git add -A && git commit -qm "totals > 0" && git push', 'npm test && git status && git diff --stat', "sed -i 's/a/b/' list.js && npm test",
@@ -205,4 +245,19 @@ test('Bug 411: an engineer\'s test command is the saved steps: the parts with te
   assert.equal(suiteCmd(repo(), later), '(cd "web" && npm test)') // nothing of the steps left for an engineer: what the rules find
   setRepo('test_cmd = ?', 'make check'); assert.equal(suiteCmd(repo(), later), 'make check'); setRepo('test_cmd = NULL') // the user's own command comes first
   assert.equal(suiteCmd(repo(), null), null); writeSteps('r1', { ...readSteps('r1'), steps: null })
+})
+
+// Bug 404: HQ's command for a project split into folders is `(cd "web" && npm test)`. Its `cd` alone counted as the command's hard part, so a line
+// with that `cd` and anything else in it was a run of the tests, and `pnpm test` in it was "after" the command.
+test('Bug 404: open_pr still asks for a split project\'s tests after `(cd "web" && echo hi)` or another tool\'s run, in true words', async () => {
+  const WEB = '(cd "web" && npm test)', NOT_SEEN = /HQ hasn't seen this project's test command run on SHOP-2\. .*own test files: \(cd "web" && npm test\)\./
+  reset(); setRepo('test_cmd = ?', WEB); put('web/snap.txt', 'v1'); g(GWT, 'add', '.'); g(GWT, 'commit', '-qm', 'base 404')
+  bash('(cd "web" && echo hi)', undefined, 'eng-3'); handoff('before_pr', 'eng-3'); assert.match(await suiteProblem(t2()) ?? '', NOT_SEEN)
+  const other = '(cd "web" && pnpm test)' // the tests write a file as they run: on main this read "…had `pnpm test` after it…, and the files changed"
+  assert.equal(await pre(other, 'eng-3', 'u1'), false); put('web/snap.txt', 'v2'); bash(other, undefined, 'eng-3', 'u1'); handoff('before_pr', 'eng-3')
+  assert.match(await suiteProblem(t2()) ?? '', NOT_SEEN)
+  const piped = '(cd "web" && npm test) 2>&1 | tail -40' // on main: "…had `2>&1` after it…"
+  assert.equal(await pre(piped, 'eng-3', 'u2'), false, 'only a tail after it'); put('web/snap.txt', 'v3'); bash(piped, undefined, 'eng-3', 'u2'); handoff('before_pr', 'eng-3')
+  assert.equal(await suiteProblem(t2()), null)
+  g(GWT, 'checkout', '-q', '--', 'web/snap.txt'); setRepo('test_cmd = NULL')
 })

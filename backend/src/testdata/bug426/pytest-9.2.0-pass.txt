@@ -1,0 +1,2 @@
+..sxX                                                                    [100%]
+2 passed, 1 skipped, 1 xfailed, 1 xpassed in 0.01s

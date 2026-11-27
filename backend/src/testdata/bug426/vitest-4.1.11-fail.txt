@@ -1,0 +1,33 @@
+
+ RUN  v4.1.11 /home/u/vitest
+
+ ❯ shelf.test.js (5 tests | 1 failed | 1 skipped | 1 todo) 4ms
+   × marks a book due soon 3ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  shelf.test.js > marks a book due soon
+AssertionError: expected 2 to be 3 // Object.is equality
+
+- Expected
++ Received
+
+- 3
++ 2
+
+ ❯ shelf.test.js:3:51
+      1| import { test, expect } from 'vitest'
+      2| test('adds a book', () => expect(1 + 1).toBe(2))
+      3| test('marks a book due soon', () => expect(1 + 1).toBe(3))
+       |                                                   ^
+      4| test.skip('later', () => {})
+      5| test.todo('someday')
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed | 1 expected fail | 1 skipped | 1 todo (5)
+   Start at  02:24:57
+   Duration  111ms (transform 7ms, setup 0ms, import 12ms, tests 4ms, environment 0ms)
+

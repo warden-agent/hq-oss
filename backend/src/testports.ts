@@ -22,9 +22,11 @@ import { PATHS } from './config.ts'
 import { q } from './db.ts'
 import { emit } from './events.ts'
 import { portBusy, type Recipe } from './apprun.ts'
+import { badPort } from './badports.ts'
 import { portHolders, whose } from './procs.ts'
 import { repos } from './records.ts'
 import type { MovedPort } from './smokerules.ts'
+import { claimCopy, copyPorts, handing, oneChoice, releaseCopy } from './copyports.ts'
 
 /** What HQ needs of a look's plan (smoke.ts LookPlan): the start steps, the user's checkout, and the ports already moved. */
 type Plan = { recipe: Recipe; repoPath: string; moved?: MovedPort[] }
@@ -198,12 +200,13 @@ function previewPorts(p: { id: string; port: number | null }): number[] {
 }
 /** The preview of this HQ's that was given `port`: one starting or running, whether or not its app listens there yet. A preview HQ restarts after a merge
  *  (preview.ts restartAfterMerge) reads "running" the whole time, and one starting may still be installing. */
-const previewWith = (port: number) => q<{ id: string; port: number | null }>("SELECT id, port FROM previews WHERE status IN ('starting', 'running')")
-  .find((p) => previewPorts(p).includes(port))
+const previewWith = (port: number): { id: string } | undefined => q<{ id: string; port: number | null }>("SELECT id, port FROM previews WHERE status IN ('starting', 'running')")
+  .find((p) => previewPorts(p).includes(port)) ?? [...handing].map(([id, ps]) => ({ id, ps })).find((h) => h.ps.includes(port)) // Bug 410: a start on its way
 /** Bug 381: is `port` taken, for HQ's test copy of an app? When something listens there, and when one of this HQ's previews was given it: the preview's app
  *  may not listen yet (it is restarting after a merge, or still installing), and a copy that took the port then would leave the preview's start refused
  *  ("Can't start …: port N is being used by …hq-test-…") or its part unable to listen. So the copy moves off it, as it does when the preview listens. */
-export const portTaken = async (port: number): Promise<boolean> => !!previewWith(port) || await portBusy(port)
+/** Bug 410: so is one another of HQ's own test copies was given (copyports.ts), which may not listen yet either. */
+export const portTaken = async (port: number): Promise<boolean> => !!previewWith(port) || copyPorts().has(port) || await portBusy(port)
 export type Holding = { who: string; fix: string }
 /** Who has `port`, in words for the user, and what they can do about it: this HQ's own preview (of this project or another), else whatever lsof names. */
 export async function heldBy(port: number, repoId: string | null): Promise<Holding> {
@@ -213,6 +216,8 @@ export async function heldBy(port: number, repoId: string | null): Promise<Holdi
     const name = all.find((r) => r.id === mine.id)?.name ?? 'another project'
     return { who: `HQ's preview of ${name}`, fix: mine.id === repoId ? 'Stop the app in the preview, then test again' : `Stop ${name}'s app, then test again` }
   }
+  const copies = copyPorts()
+  if (copies.has(port)) return { who: `HQ's own test of ${all.find((r) => r.id === copies.get(port))?.name ?? 'another project'}'s app`, fix: 'Test again once that test is over' }
   const h = (await portHolders(port))[0]; if (!h) return { who: 'another program', fix: 'Stop it, then test again' }
   const w = whose(h.cwd, all, repoId ?? '')
   return { who: w.kind === 'hq' ? `${w.name} (${h.cmd}, pid ${h.pid})` : `${h.cmd} in ${w.name} (pid ${h.pid})`, fix: 'Stop it, then test again' }
@@ -230,20 +235,24 @@ export async function placePorts<P extends Plan>(wt: string, plan: P, copied: st
   who?: (port: number) => Promise<Holding> } = {}): Promise<{ plan: P } | { skip: string }> {
   if ((o.platform ?? process.platform) !== 'darwin') return { plan } // a network of its own there: the port is free inside it
   const busy = o.busy ?? portTaken, held: { part: string; port: number; run: string; dir: string }[] = []
-  for (const p of plan.recipe.parts) if (p.port !== 'auto' && await busy(p.port)) held.push({ part: p.name, port: p.port, run: p.run, dir: p.dir })
+  const repo = repos().find((r) => r.path === plan.repoPath); releaseCopy(wt)
+  await oneChoice(async () => { // Bug 410: the check and the claim in one go, between previews' port choices (preview.ts choosePorts)
+    for (const p of plan.recipe.parts) if (p.port !== 'auto' && await busy(p.port)) held.push({ part: p.name, port: p.port, run: p.run, dir: p.dir })
+    claimCopy(wt, repo?.id ?? null, plan.recipe.parts.flatMap((p) => p.port === 'auto' || held.some((h) => h.part === p.name) ? [] : [p.port]))
+  })
   if (!held.length) return { plan }
-  const repo = repos().find((r) => r.path === plan.repoPath), root = fs.realpathSync(wt)
+  const root = fs.realpathSync(wt)
   const todo: { part: string; from: number; who: string; fix: string; files: string[] }[] = []
   for (const h of held) {
     const by = await (o.who ?? ((port) => heldBy(port, repo?.id ?? null)))(h.port), found = await find(root, h.port, copied)
     const cant = 'error' in found ? `it couldn't search the code (${found.error})` : found.unsure.length ? unsureWords(h.port, found.unsure) : await deaf(root, h, h.port)
-    if (cant) return { skip: `port ${h.port}, which its ${h.part} part always uses, is in use by ${by.who}. HQ couldn't run its own copy on another port: ${cant}. ${by.fix}` }
+    if (cant) { releaseCopy(wt); return { skip: `port ${h.port}, which its ${h.part} part always uses, is in use by ${by.who}. HQ couldn't run its own copy on another port: ${cant}. ${by.fix}` } }
     todo.push({ part: h.part, from: h.port, who: by.who, fix: by.fix, files: (found as Found).files })
   }
   const moved: MovedPort[] = [], taken = new Set<number>()
   for (const m of todo) {
-    let to = await freePort(); for (let i = 0; taken.has(to) && i < 20; i++) to = await freePort()
-    taken.add(to)
+    let to = await freePort(); for (let i = 0; (taken.has(to) || badPort(to)) && i < 20; i++) to = await freePort() // Bug 409: never one browsers refuse
+    taken.add(to); claimCopy(wt, repo?.id ?? null, [to])
     for (const f of m.files) { const at = path.join(root, f); fs.writeFileSync(at, moveAddresses(fs.readFileSync(at, 'utf8'), m.from, to)) }
     moved.push({ part: m.part, from: m.from, to, by: m.who, fix: m.fix })
     emit({ agentId: null, source: 'system', kind: 'testrun.port_moved', payload: { repo: repo?.name ?? null, part: m.part, from: m.from, to, by: m.who, files: m.files } })

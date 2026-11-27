@@ -61,3 +61,32 @@ test('Bug 387: what must not change: no plan words where the user does not answe
   assert.match(words()!, /R-5 waits for HQ's plan check$/) // list_tickets still shows them, in auto mode's words
   run("UPDATE repos SET auto_mode = 0 WHERE id = 'r1'")
 })
+
+// Bug 394 follow-up: a finished ticket the TPM changes is built with no new plan (changeFinished, `ticket.change`). The rounds alone read as if the last plan
+// covered the change, and the TPM told the user "the plan was approved". The real change path is in e2e/replan.test.ts; the edges are here.
+test('Bug 394 follow-up: changes after the last round are said; "Build the change" again, another ticket\'s change and a newer plan are not', () => {
+  run("INSERT INTO tickets(id, feature_id, key, slug, title, status, created_at, updated_at) VALUES ('t2', 'f1', 'B394-2', 'mul', 'Multiply', 'pr_ready', ?, ?)", now, now)
+  run("INSERT INTO agents(id, role, feature_id, ticket_id, model_alias, token_hash, status, started_at) VALUES ('e2', 'engineer', 'f1', 't2', 'haiku', 'h', 'exited', ?)", now)
+  run("INSERT INTO agents(id, role, feature_id, ticket_id, model_alias, token_hash, status, started_at) VALUES ('e3', 'engineer', 'f1', 't2', 'haiku', 'h', 'working', ?)", now)
+  const plan = (round: number, verdict: string | null, at: number) => run(`INSERT INTO plan_revisions(id, ticket_id, agent_id, round, plan_text, plan_hash, submitted_at,
+    verdict, verdict_by) VALUES (?, 't2', 'e2', ?, 'p', ?, ?, ?, 'user')`, `rev-b394-${round}`, round, `h${round}`, at, verdict)
+  const change = (agent: string, payload: Record<string, unknown>, at: number) => run(`INSERT INTO events(agent_id, source, kind, payload, created_at)
+    VALUES (?, 'mcp', 'ticket.change', ?, ?)`, agent, JSON.stringify({ key: 'B394-2', via: 'launch', ...payload }), at)
+  const w = () => planWords(one<any>("SELECT * FROM tickets WHERE id = 't2'")!, 'r1')
+  plan(1, 'approve', 1000)
+  change('e3', { ticket: 't1', round: 1 }, 2000) // another ticket's change (it can't really be: the engineer is t2's; the ticket field decides)
+  change('e2', { ticket: 't2', round: 1, again: true }, 2000) // "Build the change" again: the same change sent once more
+  assert.equal(w(), 'R-1 approved by the user')
+  change('e2', { ticket: 't2' }, 900) // recorded before HQ kept the round, and before R-1 was handed in: R-1 covers it
+  assert.equal(w(), 'R-1 approved by the user')
+  change('e2', { ticket: 't2' }, 3000) // recorded before HQ kept the round, after R-1: by time
+  assert.equal(w(), "R-1 approved by the user; then the ticket was changed after it was finished, with no new plan for the change: R-1 doesn't cover it")
+  change('e3', { ticket: 't2', round: 1 }, 4000) // a second change, by the fresh engineer that built it
+  assert.equal(w(), "R-1 approved by the user; then the ticket was changed 2 times after it was finished, with no new plan for the changes: R-1 doesn't cover them")
+  assert.match(finishWords(repo(), { ...one<any>("SELECT * FROM tickets WHERE id = 't2'")!, branch: 'hq/b/B394-2' }, { base: 'main', pushed: false, tests: false,
+    changed: true, fixed: false, plans: w() }).tpm, /^HQ: B394-2's engineer built the change to its spec .* Its plans: R-1 approved by the user; then the ticket was changed 2 times/)
+  plan(2, null, 5000) // its engineer planned the change after all: the new round is what the TPM reads now
+  assert.equal(w(), "R-1 approved by the user; R-2 waits for the user's review")
+  change('e3', { ticket: 't2', round: 2 }, 6000) // changed again after R-2
+  assert.match(w()!, /R-2 waits for the user's review; then the ticket was changed after it was finished, with no new plan for the change: R-2 doesn't cover it$/)
+})

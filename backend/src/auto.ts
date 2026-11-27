@@ -28,10 +28,10 @@ import { isRefusal, ranTestCmd, refusedTestCmd } from './refused.ts'
 import { readyTickets } from './readiness.ts'
 import { ensureFresh, ghOpts, git, syncRepo } from './repos.ts'
 import { canLaunch } from './scheduler.ts'
-import { autoGen, autoWork, detectTests, failedLine, failReport, lookAtBase, sandboxProblem, showing, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
+import { autoGen, autoWork, detectTests, exitedAnyway, failedLine, failReport, lookAtBase, sandboxProblem, showing, stopAutoTests, testBase, testCombined, type Failed } from './testrun.ts'
 import { notRunWords } from './testcensus.ts'
 import { readSteps, savedCmd, stepsOf } from './teststepsstore.ts'
-import { stepsGap, stepsHelperOf, stepsReady } from './teststeps.ts'
+import { stepsForInstall, stepsGap, stepsHelperOf, stepsReady } from './teststeps.ts'
 import { suiteCmd } from './suiteran.ts'
 import { combinedCommit } from './localmerge.ts'
 export { failedLine } // it lives with the runs now (testrun.ts): conflicts.ts words a send-back with it too (Bug 373)
@@ -124,6 +124,8 @@ export async function park(t: Ticket, why: string): Promise<void> {
 }
 /** Something that isn't one ticket's fault: no new starts or merges until the user presses Resume. Running engineers finish.
  *  HQ's own test run ends now, as with auto off: its result would be thrown away, and it holds the test turn engineers wait for. Resume tests afresh (Bug 115). */
+/** Bug 403: what the user does once what stopped auto is fixed, in the red bar's words (its button is Resume), for testrun.ts's "Install pnpm, then …". */
+const RESUME = 'press Resume'
 export function stopProject(repo: Repo, why: string): void {
   const cur = getRepo(repo.id); if (!cur?.auto_mode || cur.auto_stopped_why) return
   setRepo(cur, { auto_stopped_why: why }); clearGoAhead(repo.id); stopAutoTests(cur.path)
@@ -222,7 +224,7 @@ const moving = (repo: Repo, all: Ticket[]): Ticket[] => {
 
 /** Why the tests failed, for the user and the TPM. A run that froze has no failed line worth naming: whatever came first is misleading. */
 const whyFailed = (r: Failed): string => r.hung
-  ? `The tests froze and were stopped after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes.` : `Failed: ${failedLine(`${r.earlier}\n${r.output}`)}`
+  ? `The tests froze and were stopped after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes.` : `Failed: ${failedLine(`${r.earlier}\n${r.output}`)}${exitedAnyway(r)}`
 const mergingNow = new Set<string>() // repos with a test and merge under way: tests can take minutes, so ticks don't wait for them
 const ref = (repo: Repo): Promise<string> => git(repo.path, 'rev-parse', '--verify', '--quiet', `${mergeBase(repo).ref}^{commit}`).catch(() => '')
 const noTestsAt = new Map<string, string>() // ticket → the main and ticket that had no tests: looked at again only when one of them moves
@@ -271,6 +273,16 @@ ${failReport(r, 8000)}
 - When you call open_pr, ${LEFT_OUT_ASK}
 - Keep it small: this ticket is about the tests and nothing else.
 - If you can't fix it from here, call report_blocked and say why.`
+/** Bug 416: main failed at the install step of HQ's own rules, with no saved test steps. A repair can only change the test command, not that step, so it would
+ *  fail the same way until auto stops the project: the test steps helper works the install out first (once), and the TPM hears why no repair opened. True when
+ *  a helper is on it now; false and a repair as before when it can't help (another failure, or a helper already looked at this install). */
+async function installHelp(repo: Repo, tip: string, b: Failed): Promise<boolean> {
+  if (!b.rulesInstall || await stepsForInstall(repo, tip, b) !== 'working') return false
+  tellTpm(repo.id, `HQ: ${mergeBase(repo).name} can't be tested: HQ's own install step (\`${b.test}\`) fails there, even without any ticket. A repair ticket can't change `
+    + 'that step, so Claude is working out how this project installs and runs its tests instead (once, a few minutes). Nothing is tested or merged until then; '
+    + 'other work carries on. Don\'t open a ticket for this.')
+  return true
+}
 /** Main fails with no ticket on it. On auto HQ opens a ticket to repair it, and stops only when that can't help. */
 async function repairMain(repo: Repo, tip: string, b: Failed): Promise<void> {
   const base = mergeBase(repo).name, run0 = openRun(repo.id)
@@ -346,11 +358,13 @@ async function checkMain(repo0: Repo, r: AutoRun): Promise<void> {
     // Bug 411: test files HQ's command runs nothing of: a helper works the test steps out first (once), and its end brings auto back here (listeners.ts)
     if (await stepsReady(repo, tip) === 'working') return
     if (!still()) return
-    const test = () => testBase(repo.path, base.ref, `run-${r.id}`, repo.test_cmd, gen, { repoId: repo.id, ticketId: null, what: 'main' }, { steps: stepsOf(repo.id) })
+    const test = () => testBase(repo.path, base.ref, `run-${r.id}`, repo.test_cmd, gen, { repoId: repo.id, ticketId: null, what: 'main' },
+      { steps: stepsOf(repo.id), again: RESUME })
     let b = await test(); if (b.kind === 'fail' && !b.hung && still()) b = await test()
     if (b.kind === 'stopped') return // auto went off or stopped: no result, and a later run checks again (Bugs 89, 115)
     emit({ agentId: null, source: 'system', kind: 'auto.main_checked', payload: { repo: repo.id, run: r.id, result: b.kind, test: 'test' in b ? b.test : null } })
     const cur = still(); if (!cur) return
+    if (b.kind === 'fail' && await installHelp(cur, tip, b)) return // Bug 416: not checked: main is tested again with the steps, once the helper is done
     checked()
     if (b.kind === 'error') return stopProject(cur, `HQ couldn't test ${base.name}: ${b.why}`)
     if (b.kind === 'fail' && !openRepair(cur.id) && cur.test_cmd === repo.test_cmd && await ref(cur) === tip) await repairMain(cur, tip, b) // not if main or the command moved meanwhile
@@ -436,7 +450,7 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
     if (merged && 'sha' in merged && await stepsReady(repo, merged.sha, { ticketId: t.id }) === 'working') return
     if (!still()) return
     const r = await testCombined(repo.path, base.ref, head, t.key, repo.test_cmd, gen, { repoId: repo.id, ticketId: t.id, what: 'ticket' }, // on its box meanwhile (Bug 106)
-      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null, steps: stepsOf(repo.id) })
+      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null, steps: stepsOf(repo.id), again: RESUME })
     if (r.kind === 'stopped' || r.kind === 'looked') return // auto went off or stopped: nothing follows, not even with it back on by now (Bugs 89, 115)
     emit({ agentId: null, source: 'system', kind: 'auto.tested', payload: { ticket: t.id, key: t.key, result: r.kind, test: 'test' in r ? r.test : null } })
     if (!still()) return // turned off or removed during the test: a run that was killed reads as a failure, and nothing should follow from it
@@ -452,7 +466,9 @@ async function testAndMerge(repo0: Repo, t0: Ticket): Promise<void> {
       if (t.repairs_main) return fix() // main is broken: that's why this ticket exists, so testing main alone says nothing
       const b = await testBase(repo.path, base.ref, t.key, repo.test_cmd, gen, { repoId: repo.id, ticketId: t.id, what: 'main' }, { steps: stepsOf(repo.id) })
       if (b.kind === 'stopped') return
-      if (b.kind === 'fail') { if (still()) await repairMain(getRepo(repo.id)!, tip, b); return } // turned off during the test: nothing to repair for
+      // turned off during the test: nothing to repair for. Bug 416: an install of HQ's own rules that fails gets the test steps helper, not a repair
+      if (b.kind === 'fail') { if (still() && !await installHelp(getRepo(repo.id)!, tip, b) && still()) await repairMain(getRepo(repo.id)!, tip, b); return }
+      if (b.kind === 'pass' || b.kind === 'no_tests') r.basePassed = true // Bug 405: main is fine without it: its engineer isn't told another ticket may be to blame
       return fix()
     }
     const cur = still(); if (!cur) return // turned off, stopped or moved on during the test: not merged
@@ -930,15 +946,19 @@ export function autoRetry(ticketId: string): { ok: true } {
   setTicket(t.id, { auto_parked_why: null, auto_tries: 0 }); resolveForTicket(t.id); autoSoon(); return { ok: true }
 }
 /** What the Auto dialog shows: the user's test command, or the one HQ found in the checkout, and why this machine can't do it, if so. */
-export async function autoCheck(repoId: string): Promise<{ custom: string | null; found: string | null; sandbox: string | null; not_run: string[]; asks: boolean }> {
+export async function autoCheck(repoId: string): Promise<{ custom: string | null; found: string | null; sandbox: string | null; not_run: string[]; asks: boolean
+  stop: string | null; no_tool: string | null }> {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')
   // Bug 411: what HQ runs without a command of the user's own (the saved test steps, else what its rules find), and the tests that runs nothing of, for the
   // user to see before HQ tests with it. `asks`: a helper will be asked to work the steps out at the next test (nobody has looked at this gap yet)
   const base = await git(repo.path, 'rev-parse', '--verify', '--quiet', `${mergeBase(repo).ref}^{commit}`).catch(() => 'HEAD')
   const gap = await stepsGap(repo, base || 'HEAD', { own: false }), f = readSteps(repo.id)
+  // Bug 403: what would stop HQ's first test, said up front: the project's tool isn't installed. `stop` (its packages can't be installed) holds for a command
+  // of the user's own too; `no_tool` (HQ can't run the command it found) only without one. Not with saved test steps: they say how to install and test
+  const rules = f.steps ? null : detectTests(repo.path, 'HQ can test it')
   return { custom: repo.test_cmd, found: gap.runs, sandbox: await sandboxProblem(), not_run: [...gap.gaps.slice(0, 6).map(notRunWords),
     ...gap.shaky.map((d) => `${d === '.' ? 'the top folder' : `${d}/`} (a Python project whose setup HQ's rules can only guess)`)],
-    asks: !!gap.key && !f.job && !f.looked.some((l) => l.gap === gap.key) }
+    asks: !!gap.key && !f.job && !f.looked.some((l) => l.gap === gap.key), stop: rules?.stop ?? null, no_tool: rules?.noTool ?? null }
 }
 export function setTestCmd(repoId: string, cmd: string): { cmd: string | null } {
   const repo = getRepo(repoId); if (!repo) throw new Error('unknown repo')

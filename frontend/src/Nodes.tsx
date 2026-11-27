@@ -2,12 +2,12 @@
 // carries its own buttons; longer things (the plan, attention items, the conversation with the TPM) open in a popover pinned
 // under the box (BoardPop: it doesn't scale with zoom, stays inside the visible board and over the zoom buttons, Bug 120).
 // Opening one goes through focus(), which first pans the box near the top of the pane so the popover has room below it.
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Handle, Position, useStore, type Node, type NodeProps } from '@xyflow/react'
-import { alertFrom, answerAsk, api, beforeChange, type State } from './api'
+import { alertFrom, answerAsk, api, beforeChange, pausedBy, type State } from './api'
 import { askLabels, askText, cancelConfirm, featureCancelText, mergeConfirm, removeText, startLabel, startText, turnOn, waitingOn } from './board'
-import { actLabel, answerReview, fixWhy, kindLabel, freshBlocker, freshConfirm, freshOffered, localOnly, OPEN_PREVIEW, stopOthers, ticketLabel, useBoard, useBusy, useRevisionCap,
+import { actLabel, answerReview, fixWhy, kindLabel, freshBlocker, freshConfirm, freshOffered, localOnly, OPEN_PREVIEW, stopOthers, ticketLabel, ticketTone, useBoard, useBusy, useRevisionCap,
   type Act, type FeatureView, type FixWhy, type Line, type TicketView, type TpmView, type Tone } from './board'
 import { goodNews, plainNews, ticketBase, turnQuestionText, type Question, type Turn } from './needs.ts'
 import { MORE } from './reply.ts'
@@ -19,8 +19,9 @@ import { sendHere, sentHere, useAtEnd } from './atend.ts'
 import { placePop } from './fit'
 import { openDone } from './donefold'
 import { byKind, criteriaOf, KIND_HEADING } from '../../backend/src/criteria.ts'
-import { allSteps, canSend, changedWords, checkButton, checkFacts, checkHeadline, checkOf, checksOf, checkTone, outOfDate, STEP_NAME, unseenOnly, type HqCheck,
-  type Tone as CheckTone } from '../../backend/src/hqcheckrules.ts'
+import { hostProblem, ownHosts, refusedHosts } from '../../backend/src/downloads.ts'
+import { allSteps, canSend, changedWords, checkButton, checkFacts, checkHeadline, checkOf, checksOf, checkTone, fixBack, outOfDate, roundOf, STEP_NAME, unseenOnly,
+  type HqCheck, type Tone as CheckTone } from '../../backend/src/hqcheckrules.ts'
 
 const tone: Record<Tone, string> = { plain: 'text-zinc-200', muted: 'text-zinc-400', amber: 'text-amber-300', rose: 'text-rose-300', sky: 'text-sky-300', emerald: 'text-emerald-300', indigo: 'text-indigo-300' }
 const POP = 'nodrag nopan nowheel' // popovers: the wheel scrolls them and a drag in them doesn't pan the graph
@@ -33,17 +34,38 @@ const POP = 'nodrag nopan nowheel' // popovers: the wheel scrolls them and a dra
  *  (Graph.tsx) looks for. Rendered only while open: it follows every pan.
  *  Bug 379: on a board too short for it (a short window with the app pane open under the board) it was cut to a strip one line tall;
  *  there it grows down over the app pane (placePop `spill`), and its layer stops clipping. The same layer either way, so nothing in
- *  the popover (a half-written note) is lost when that changes. */
+ *  the popover (a half-written note) is lost when that changes.
+ *  Bug 432: a box's popover keeps off the TPM box (its Your turn, Start, its write box) where it can: it measures its full height and
+ *  placePop moves it beside its box clear of the TPM, else over its own box (the popover has what the box's buttons do). */
 function BoardPop({ id, want, children }: { id: string; want: number; children: React.ReactNode }) {
   const n = useStore((s) => s.nodeLookup.get(id)), [tx, ty, zoom] = useStore((s) => s.transform), root = useStore((s) => s.domNode)
-  const w = useStore((s) => s.width), h = useStore((s) => s.height)
+  const w = useStore((s) => s.width), h = useStore((s) => s.height), tpm = useStore((s) => id === 'tpm' ? undefined : s.nodeLookup.get('tpm'))
+  const ref = useRef<HTMLDivElement>(null), [need, setNeed] = useState(0)
+  useLayoutEffect(() => { // Bug 432: the popover's full height, for placePop to keep it off the TPM box; again when its content changes size
+    const el = ref.current; if (!el) return
+    const measure = () => setNeed((was) => { const now = fullHeight(el); return Math.abs(now - was) > 1 ? now : was }), seen = new ResizeObserver(measure)
+    measure(); for (const e of [el, ...el.querySelectorAll(':scope > * > *, :scope > * > * > *')]) seen.observe(e)
+    return () => seen.disconnect()
+  })
   if (!n || !root) return null
-  const { x, y } = n.internals.positionAbsolute, under = Math.max(0, window.innerHeight - root.getBoundingClientRect().bottom)
-  const p = placePop({ x: x * zoom + tx, y: y * zoom + ty, w: (n.measured.width ?? 0) * zoom, h: (n.measured.height ?? 0) * zoom }, want, w, h, under)
+  const at = (m: NonNullable<typeof n>) => ({ x: m.internals.positionAbsolute.x * zoom + tx, y: m.internals.positionAbsolute.y * zoom + ty,
+    w: (m.measured.width ?? 0) * zoom, h: (m.measured.height ?? 0) * zoom })
+  const under = Math.max(0, window.innerHeight - root.getBoundingClientRect().bottom)
+  const p = placePop(at(n), want, w, h, under, tpm && at(tpm), need)
   const style = { position: 'absolute', left: 0, top: 0, width: p.width, pointerEvents: 'auto', '--pop-h': `${p.maxHeight}px`,
     transform: `translate(${p.left}px, ${p.y}px)${p.above ? ' translateY(-100%)' : ''}` }
   return createPortal(<div className="pointer-events-none absolute inset-0 z-20" style={{ overflow: p.spill ? 'visible' : 'hidden' }}>
-    <div className={`react-flow__node-toolbar ${POP}`} style={style as React.CSSProperties}>{children}</div></div>, root.parentElement ?? root)
+    <div ref={ref} className={`react-flow__node-toolbar ${POP}`} style={style as React.CSSProperties}>{children}</div></div>, root.parentElement ?? root)
+}
+/** How tall popover `el` would be with no height limit (Bug 432): its height now plus what its panel and the panel's parts hide
+ *  and scroll (a part with a limit of its own, like Chat's list, only up to that limit). */
+function fullHeight(el: HTMLElement): number {
+  let more = 0
+  for (const e of [...el.children].flatMap((c) => [c, ...c.children]) as HTMLElement[]) {
+    const own = parseFloat(getComputedStyle(e).maxHeight), cap = e.parentElement === el || Number.isNaN(own) ? Infinity : own
+    more += Math.max(0, Math.min(e.scrollHeight, cap) - e.clientHeight)
+  }
+  return el.offsetHeight + more
 }
 /** Edge anchors. Every box has top in/out and bottom out/in (messages run both ways); tickets add left in / right out for
  *  dependencies. Always rendered (React Flow measures them once) and invisible; nothing can be connected by hand. */
@@ -146,13 +168,42 @@ const StopRunAct = ({ agentId }: { agentId: string }) => <ActBtn primary label="
 /** Attention items with ✓ (and Show, in the top-bar menu). A merge conflict also gets Fix conflicts, a frozen run Stop it. */
 /** A stop or a question that stays until it's answered: ticking it away would hide a project that's still stopped (Bug 63). Resume, Turn off or Use it clear it. */
 const answerOnly = (kind: string): boolean => /^(auto_stopped|test_cmd_proposed):/.test(kind)
+export const ResumeRoleAct = ({ role }: { role: string }) => <ActBtn primary label="Resume" busyLabel="Resuming…" run={() => api(`roles/${role}/resume`, {})}
+  title={`Lets every ${role === 'tpm' ? 'TPM' : role} work again: the ones HQ stopped carry on from where they were, on the model each is on now, `
+    + 'and get the messages that waited.'} />
 const FIX_KINDS = new Set(['merge_conflict', 'fix_stalled', 'look_stalled', 'review_stalled', 'change_stalled']) // notices with the ticket's fix button
-export function AttentionList({ items, show, s }: { items: any[]; show?: (a: any) => (() => void) | null; s: Pick<State, 'agents' | 'repos' | 'features' | 'tickets'> }) {
-  return <div className="flex flex-col gap-1">{items.map((a) => { const go = show?.(a); return <div key={a.id} className="rounded-md border border-zinc-800 bg-zinc-950/60 p-2 text-xs">
+export function AttentionList({ items, show, s }: { items: any[]; show?: (a: any) => (() => void) | null
+  s: Pick<State, 'agents' | 'repos' | 'features' | 'tickets' | 'settings'> }) {
+  return <div className="flex flex-col gap-1">{items.map((a) => { const go = show?.(a), paused = pausedBy(a, s)
+    return <div key={a.id} className="rounded-md border border-zinc-800 bg-zinc-950/60 p-2 text-xs">
     <div className="flex items-start justify-between gap-2"><span className={`min-w-0 break-words font-medium ${goodNews(a.kind) ? 'text-emerald-300' : plainNews(a.kind) ? 'text-sky-300' : 'text-rose-300'}`}>{kindLabel(a.kind)}</span><span className="flex shrink-0 gap-1">
-      {FIX_KINDS.has(a.kind) && a.ticket_id && <FixAct t={{ id: a.ticket_id }} base={ticketBase(s, a.ticket_id)} why={a.kind === 'fix_stalled' ? fixWhy(s.tickets.find((x) => x.id === a.ticket_id)) ?? 'tests' : a.kind === 'look_stalled' ? 'look' : a.kind === 'review_stalled' ? 'review' : a.kind === 'change_stalled' ? 'change' : undefined} />}{a.kind === 'bg_stalled' && a.agent_id && <StopRunAct agentId={a.agent_id} />}{go && <button className="btn-sm" onClick={go}>Show</button>}{!answerOnly(a.kind) && <ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} />}</span></div>
+      {FIX_KINDS.has(a.kind) && a.ticket_id && <FixAct t={{ id: a.ticket_id }} base={ticketBase(s, a.ticket_id)} why={a.kind === 'fix_stalled' ? fixWhy(s.tickets.find((x) => x.id === a.ticket_id)) ?? 'tests' : a.kind === 'look_stalled' ? 'look' : a.kind === 'review_stalled' ? 'review' : a.kind === 'change_stalled' ? 'change' : undefined} />}{a.kind === 'bg_stalled' && a.agent_id && <StopRunAct agentId={a.agent_id} />}{paused && <ResumeRoleAct role={paused} />}{go && <button className="btn-sm" onClick={go}>Show</button>}{!answerOnly(a.kind) && !paused && <ActBtn label="✓" title="Done: hide it" run={() => api(`attention/${a.id}/resolve`, {})} />}</span></div>
     <div className="mt-1 break-words text-zinc-400"><Linked text={a.detail} /></div>
+    {a.kind === 'download_refused' && <HostActs a={a} s={s} />}
     {(() => { const from = alertFrom(a, s); return from && <div className="mt-1 break-words text-zinc-500">{from.line}</div> })()}</div> })}</div>
+}
+/** Bug 425: a refused download's hosts, each with Allow for the project, or once allowed (here, in + Project → Downloads or another tab), what its agent
+ *  still needs: Claude Code reads the sandbox's list when a session starts, so a running engineer gets it at a Fresh start. */
+function HostActs({ a, s }: { a: any; s: Pick<State, 'agents' | 'repos' | 'features' | 'tickets'> }) {
+  const ag = s.agents.find((x) => x.id === a.agent_id), t = s.tickets.find((x) => x.id === a.ticket_id)
+  const repoId = ag?.repo_id ?? s.features.find((f) => f.id === (t?.feature_id ?? ag?.feature_id))?.repo_id, repo = s.repos.find((r) => r.id === repoId)
+  const hosts = refusedHosts(String(a.detail ?? '')); if (!repo || !hosts.length) return null
+  const own = ownHosts(repo.network_allowlist), up = !!ag && ag.status !== 'exited', name = ag?.display_name ?? ag?.id ?? 'The agent'
+  return <div className="mt-1.5 flex flex-col items-start gap-1">{hosts.map((h) => {
+    if (own.includes(h)) {
+      return <div key={h} className="flex flex-wrap items-center gap-1.5"><span className="min-w-0 break-words text-sky-300">{h} is allowed for {repo.name} now. {up
+        ? `${name} started before that, so it still can't download from there: ${ag!.role === 'engineer' ? 'a Fresh start gives it the new list.' : 'it gets it the next time it starts.'}`
+        : 'Agents started from now on can download from it.'}</span>{up && <FreshBtn a={ag!} label="Fresh start" />}</div>
+    }
+    const bad = hostProblem(h)
+    return bad ? <div key={h} className="break-words text-zinc-500">HQ can't allow {h}: {bad}</div> : <AllowBtn key={h} repo={repo} host={h} />
+  })}</div>
+}
+function AllowBtn({ repo, host }: { repo: any; host: string }) {
+  const [busy, go] = useBusy()
+  return <button className="btn-sm btn-primary nopan max-w-full whitespace-normal! break-all text-left" disabled={busy}
+    title={`${repo.name}'s agents may download from ${host} from their next start (a running engineer needs a Fresh start). See or remove it under + Project → Downloads.`}
+    onClick={() => go(() => api(`repos/${repo.id}/allowed-hosts`, { host }))}>{busy ? 'Allowing…' : `Allow ${host} for this project`}</button>
 }
 /** A box's notices, under it. Only while it has some: a reply can clear the last one, and an empty popover has no chip to close it. */
 function AttPop({ id, open, items }: { id: string; open: boolean; items: any[] }) {
@@ -300,7 +351,8 @@ export function TicketNode({ id, data }: NodeProps<Node<{ view: TicketView }>>) 
     <div className="flex h-4 items-center gap-1"><span className="min-w-0 truncate font-semibold" title={t.key}>{t.key}</span><span className="shrink-0 text-zinc-500">{t.size}</span><span className="grow" />
       <AttChip id={id} items={v.att} /><FreshBtn a={v.eng} />
       {t.status !== 'merged' && t.status !== 'cancelled' && !v.clearing && <CancelBtn tip={`Remove ${t.key}…`} title={`Remove ${t.key}?`} go="Remove" path={`tickets/${t.id}/cancel`}
-        body={removeText(t, v.eng, waitingOn(b.state, t))} />}<Pill s={t.status} label={ticketLabel(t, v.hqPlan, v.clearing)} className="py-0! text-[10px]! leading-4!" /></div>
+        body={removeText(t, v.eng, waitingOn(b.state, t))} />}<Pill s={ticketTone(t, v.eng)} label={ticketLabel(t, v.hqPlan, v.clearing, v.back, v.eng)}
+          className="py-0! text-[10px]! leading-4!" /></div>
     <div className={v.titleRows === 2 ? 'line-clamp-2 h-8 break-words' : 'h-4 truncate'} title={t.title}>{t.title}</div>
     {v.crit && <button className="nopan block h-4 max-w-full truncate text-left text-indigo-300 hover:underline" title={`${v.crit}. Click to read them: they say what "done" means for ${t.key}.`}
       onClick={() => pop === 'criteria' ? b.setPop(null) : b.focus(id, 'criteria')}>{v.crit} ›</button>}
@@ -345,10 +397,11 @@ function TicketAct({ a, v, id }: { a: Act; v: TicketView; id: string }) {
   if (a.kind === 'auto-retry') return <ActBtn primary label="Try again" busyLabel="Trying…" title="Auto mode gives this ticket another go" run={() => api(`tickets/${v.t.id}/auto-retry`, {})} />
   return <MergeAct a={a} t={v.t} />
 }
-/** The colour of "Have HQ test this" as its check stands: green all passed, red something failed, amber HQ couldn't finish, grey out of date. */
+/** The colour of "Have HQ test this" as its check stands: green all passed, red something failed, amber HQ couldn't finish, grey out of date, sky the
+ *  engineer's fix of what the user sent back is in, to test again (Bug 401). */
 const CHECK_TONE: Record<CheckTone, string> = { plain: '', green: 'border-emerald-500/60! bg-emerald-600/60! hover:bg-emerald-500/70! text-white!',
   red: 'border-rose-500/60! bg-rose-600/60! hover:bg-rose-500/70! text-white!', amber: 'border-amber-500/60! bg-amber-600/50! hover:bg-amber-500/60! text-white!',
-  grey: 'text-zinc-400!' }
+  grey: 'text-zinc-400!', sky: 'border-sky-400/70! bg-sky-600/60! hover:bg-sky-500/70! text-white!' }
 /** "Have HQ test this" (backend hqcheck.ts): starts HQ's check of this finished ticket; once there is one, it says how it's going or how it went, in its
  *  colour, and opens the results. */
 function CheckAct({ v, id }: { v: TicketView; id: string }) {
@@ -361,28 +414,51 @@ function CheckAct({ v, id }: { v: TicketView; id: string }) {
 const STEP_MARK = { pass: ['✓', 'text-emerald-400'], fail: ['✗', 'text-rose-400'], skipped: ['–', 'text-zinc-500'], running: ['●', 'text-emerald-300 animate-pulse'],
   waiting: ['·', 'text-zinc-600'], not_run: ['·', 'text-zinc-600'] } as const
 const LINE_TONE = { ok: 'text-emerald-300/90', bad: 'text-rose-300', plain: 'text-zinc-300' } as const
-const HEAD_TONE: Record<CheckTone, string> = { plain: 'text-zinc-200', green: 'text-emerald-300', red: 'text-rose-300', amber: 'text-amber-300', grey: 'text-zinc-400' }
+const HEAD_TONE: Record<CheckTone, string> = { plain: 'text-zinc-200', green: 'text-emerald-300', red: 'text-rose-300', amber: 'text-amber-300', grey: 'text-zinc-400',
+  sky: 'text-sky-300' }
 const hm = (ms: number): string => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 /** When a check began: the time, with the day when that isn't today. */
 const checkWhen = (c: HqCheck): string => new Date(c.started_at).toDateString() === new Date().toDateString() ? hm(c.started_at)
   : `${new Date(c.started_at).toLocaleDateString([], { month: 'short', day: 'numeric' })} ${hm(c.started_at)}`
-/** One check in a line, for a list of them: when, how it ended in its colour, and whether it went to the engineer. */
-export function CheckLine({ c }: { c: HqCheck }) {
-  return <><span className="text-zinc-400">{checkWhen(c)} · </span><span className={HEAD_TONE[checkTone(c)]}>{checkHeadline(c)}</span>
-    {c.sent_at ? <span className="text-sky-300"> · sent to its engineer</span> : null}</>
+/** One check in a line, for a list of them: its round (Bug 401), when, how it ended in its colour, and the rest of the round: when it was sent to the
+ *  engineer, and when the engineer came back with its fix (HQ keeps that for a send of its tests). `n`: its round (roundOf). */
+export function CheckLine({ c, n }: { c: HqCheck; n: number }) {
+  return <><span className="font-semibold text-zinc-300">Round {n}</span><span className="text-zinc-400"> · {checkWhen(c)} · </span>
+    <span className={HEAD_TONE[checkTone(c)]}>{checkHeadline(c)}</span>
+    {c.sent_at ? <span className="text-sky-300"> → sent to its engineer {hm(c.sent_at)}{c.back ? <> → its engineer back {hm(c.back.at)}</> : null}</span> : null}</>
+}
+/** Bug 401: what came back from a round the user sent to its engineer, first in its results once the ticket is finished again: when it went, when the engineer
+ *  finished, the files it changed and what it wrote (none of that for a send of its conflicts: HQ keeps it for its tests only). */
+function BackFrom({ t, c, n }: { t: any; c: HqCheck; n: number }) {
+  return <div className="rounded-md border border-sky-500/50 bg-sky-950/40 p-2 text-xs">
+    <div className="break-words text-[13px] font-medium text-sky-200">Round {n}: its engineer is back with a fix</div>
+    <div className="mt-0.5 break-words text-zinc-300">You sent it what HQ found{c.sent_at ? ` at ${hm(c.sent_at)}` : ''}.{' '}
+      {c.back ? <>It finished {t.key} again at {hm(c.back.at)} and {changedWords(c.back.files, c.back.more)}.{c.back.note ? ' What it wrote about it:' : ' It wrote no note about it.'}</>
+        : <>It has finished {t.key} again.</>}</div>
+    {c.back?.note && <div className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950/70 p-1.5 text-zinc-300">{c.back.note}</div>}
+    <div className="mt-1 break-words text-sky-300">Test again to check what it has now: round {n + 1}.</div></div>
 }
 /** One check's results: how it went, what it tested, what became of it once it was sent to the engineer (Bug 373: when that engineer finished again, the
  *  files it changed and what it wrote, which used to stay in its terminal), then each check in order with what it saw. `old`: the ticket was finished again
  *  since this, its latest check. `head`: its heading line too (not under a line that says it already). Tests that passed with named ones unseen are amber
  *  with a "?", never the red ✗ of a failed test. */
 export function CheckResults({ t, c, old = false, head = true }: { t: any; c: HqCheck; old?: boolean; head?: boolean }) {
-  const going = c.state === 'running', soft = unseenOnly(c)
-  return <><div>{head && <div className={`break-words font-medium ${old ? 'text-amber-300' : HEAD_TONE[checkTone(c)]}`}>{checkHeadline(c)}</div>}
+  const going = c.state === 'running', soft = unseenOnly(c), n = roundOf(t, c)
+  // Bug 401: the engineer's fix of this round is back: that leads, and what this round found (about older code now) folds away under it
+  if (old && fixBack(t, c)) return <><BackFrom t={t} c={c} n={n} />
+    <details className="text-xs"><summary className="cursor-pointer break-words text-indigo-300">What round {n} found, on the older code ›</summary>
+      <div className="mt-1 flex flex-col gap-2"><Found t={t} c={c} n={n} going={going} soft={soft} old={false} head sent={false} /></div></details></>
+  return <Found t={t} c={c} n={n} going={going} soft={soft} old={old} head={head} sent />
+}
+/** One round's own results (CheckResults): its heading, what it tested, whether it went to the engineer (`sent`) and came back, and each check's lines. */
+function Found({ t, c, n, going, soft, old, head, sent }: { t: any; c: HqCheck; n: number; going: boolean; soft: boolean; old: boolean; head: boolean; sent: boolean }) {
+  return <><div>{head && <div className={`break-words font-medium ${old ? 'text-amber-300' : HEAD_TONE[checkTone(c)]}`}>
+    <span className="text-zinc-400">Round {n} · </span>{checkHeadline(c)}</div>}
     <div className="break-words text-xs text-zinc-400">{checkFacts(c)}{going && <> · going for <Elapsed since={c.started_at} /></>}</div>
     {old && <div className="mt-1 break-words text-xs text-amber-300">
       {t.key}'s engineer finished it again after this test, so these results are about older code. Test again to check what it has now.</div>}
-    {c.sent_at && <div className="mt-1 text-xs text-sky-300">Sent to its engineer at {hm(c.sent_at)}.</div>}
-    {c.back && <div className="mt-1 break-words text-xs text-zinc-300"><span className="text-sky-300">Its engineer finished it again at {hm(c.back.at)}</span> and{' '}
+    {sent && c.sent_at && <div className="mt-1 text-xs text-sky-300">Sent to its engineer at {hm(c.sent_at)}.</div>}
+    {sent && c.back && <div className="mt-1 break-words text-xs text-zinc-300"><span className="text-sky-300">Its engineer finished it again at {hm(c.back.at)}</span> and{' '}
       {changedWords(c.back.files, c.back.more)}.{c.back.note ? ' What it wrote about it:' : ' It wrote no note about it.'}
       {c.back.note && <div className="mt-0.5 max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded bg-zinc-950/70 p-1.5 text-zinc-300">{c.back.note}</div>}</div>}</div>
     <ol className="space-y-1.5 text-xs leading-5">{allSteps(c).map((s) => {
@@ -403,18 +479,20 @@ function CheckPanel({ v, onDone }: { v: TicketView; onDone: () => void }) {
   const t = v.t, all = checksOf(t), [pick, setPick] = useState<string | null>(null)
   const c = all.find((x) => x.id === pick) ?? all[0]!, latest = c === all[0], going = latest && c.state === 'running'
   const finished = t.status === 'pr_ready' || t.status === 'pr_open', merge = v.acts.find((a) => a.kind === 'merge')
+  // Bug 401: once the ticket is finished again since its latest round (the engineer's fix is back, or any new open_pr), Test again is the next step, not Merge
+  const again = finished && outOfDate(t, all[0]!), n = roundOf(t, all[0]!)
   return <div className="hq-pop flex max-h-[var(--pop-h,70vh)] w-full flex-col gap-2">
-    <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium text-zinc-200" title={`${t.key}: ${t.title}`}>{t.key}: HQ's test</span>
+    <div className="flex items-center gap-2"><span className="min-w-0 grow truncate font-medium text-zinc-200" title={`${t.key}: ${t.title}`}>{t.key}: HQ's test · round {roundOf(t, c)}</span>
       <button className="btn" title="Close (Esc)" onClick={onDone}>×</button></div>
     <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
-      {!latest && <div className="break-words text-xs text-sky-300">An earlier test, from {checkWhen(c)}.{' '}
+      {!latest && <div className="break-words text-xs text-sky-300">An earlier round, from {checkWhen(c)}.{' '}
         <button className="nopan text-indigo-300 hover:underline" onClick={() => setPick(null)}>Back to the latest ›</button></div>}
       <CheckResults t={t} c={c} old={latest && outOfDate(t, c)} />
-      {all.length > 1 && <div className="text-xs"><div className="font-semibold text-zinc-400">Every test of {t.key}, newest first</div>
+      {all.length > 1 && <div className="text-xs"><div className="font-semibold text-zinc-400">Every round of {t.key}, newest first</div>
         <ul className="mt-0.5 space-y-0.5">{all.map((x, i) => <li key={x.id} className="break-words">
           <button className={`nopan text-left hover:underline ${x.id === c.id ? 'font-semibold' : ''}`} aria-current={x.id === c.id}
             title={x.id === c.id ? 'Shown above' : 'Show this test’s results'} onClick={() => setPick(i === 0 ? null : x.id)}>
-            <span className="text-zinc-500">{x.id === c.id ? '▸ ' : ''}</span><CheckLine c={x} /></button></li>)}</ul></div>}
+            <span className="text-zinc-500">{x.id === c.id ? '▸ ' : ''}</span><CheckLine c={x} n={roundOf(t, x)} /></button></li>)}</ul></div>}
     </div>
     {latest && <div className="flex flex-wrap gap-1">
       {going ? <ActBtn label="Stop" busyLabel="Stopping…" title="Stop HQ's test now. Nothing is kept from it but what it has already said." run={() => api(`tickets/${t.id}/check-stop`, {})} />
@@ -424,9 +502,9 @@ function CheckPanel({ v, onDone }: { v: TicketView; onDone: () => void }) {
               : unseenOnly(c) ? "The list of tests HQ didn't see goes to its engineer (a fresh one starts if it has stopped): it makes them show up in HQ's run, or says why they"
                 + ' already do. It calls open_pr again when done; then test it again.'
               : 'What failed goes to its engineer to fix (a fresh one starts if it has stopped). It calls open_pr again when done; then test it again.'} />}
-          {finished && <ActBtn label="Test again" busyLabel="Starting…" title="HQ tests the ticket as it is now, from the start. These results are kept: they stay in the list here."
-            run={() => api(`tickets/${t.id}/check`, {}).then(() => setPick(null))} />}
-          {merge && <MergeAct a={merge} t={t} />}</>}
+          {finished && <ActBtn primary={again} label="Test again" busyLabel="Starting…" run={() => api(`tickets/${t.id}/check`, {}).then(() => setPick(null))}
+            title={`HQ tests the ticket as it is now, from the start: round ${n + 1}. These results are kept: they stay in the list here.`} />}
+          {merge && <MergeAct a={again && merge.kind === 'merge' ? { ...merge, soft: true } : merge} t={t} />}</>}
     </div>}
   </div>
 }
@@ -465,7 +543,7 @@ export function MergeAct({ a, t }: { a: Act; t: any }) {
   const { state } = useBoard()
   if (a.kind === 'fix') return <FixAct t={t} why={a.why} base={ticketBase(state, t.id)} />
   if (a.kind === 'merge') {
-    return <ActBtn primary label={`Merge into ${a.into}`} busyLabel="Merging…" run={() => api(`tickets/${t.id}/merge`, {})}
+    return <ActBtn primary={!a.soft} label={`Merge into ${a.into}`} busyLabel="Merging…" run={() => api(`tickets/${t.id}/merge`, {})}
       ask={() => mergeConfirm(t, a, state.defaults.github_account ?? 'the HQ account')} title={a.github
       ? `HQ ${a.pr ? `merges PR #${a.pr}` : 'opens a PR and merges it'} on GitHub. If GitHub won't, or ${t.key} conflicts with ${a.into}, nothing changes and HQ tells you why.`
       : `HQ merges ${t.branch} into ${a.into} in your checkout. If that isn't safe it changes nothing and tells you why.`} />

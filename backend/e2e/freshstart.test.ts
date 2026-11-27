@@ -328,15 +328,20 @@ test('Bug 350: auto turned on while the switch\'s notes are still being written:
 /** Bug 369: the switch away from `repo` is asked for, and the backend goes down while the park is still asking (one agent after the other,
  *  typing into each terminal: a few seconds each): once one of `ids` has its request, and before all of them have. Then it comes back.
  *  The ones not asked yet, as the database said while it was down. */
-async function downMidPark(repo: any, ids: string[]): Promise<string[]> {
+async function downMidPark(repo: any, ids: string[], meanwhile = async (): Promise<unknown> => null): Promise<string[]> {
   const away = hq.api(`repos/${repo.id}/park`, {}).catch(() => null) // goes with the backend
   await waitFor('the first request', async () => { const s = await hq.state(); return ids.some((id) => s.agents.find((a: any) => a.id === id)?.fresh_start_at) })
+  await meanwhile() // Bug 402: what the user does while the park still asks (a switch straight back)
   await hq.down(); await away
-  const db = hq.db({ readOnly: true }); let unasked: string[]
-  try { unasked = ids.filter((id) => !(db.prepare('SELECT fresh_start_at FROM agents WHERE id = ?').get(id) as any).fresh_start_at) } finally { db.close() }
-  assert.ok(unasked.length, 'the park was over before the backend went down: this test checked nothing')
-  await hq.up(); return unasked
+  return whileDown(() => {
+    const db = hq.db({ readOnly: true }); let unasked: string[]
+    try { unasked = ids.filter((id) => !(db.prepare('SELECT fresh_start_at FROM agents WHERE id = ?').get(id) as any).fresh_start_at) } finally { db.close() }
+    assert.ok(unasked.length, 'the park was over before the backend went down: this test checked nothing'); return unasked
+  })
 }
+/** `check` with the backend down, then it comes back, also when a check fails: the tests after it need it (a failed Bug 402 check left it down,
+ *  and the next four tests failed with it). */
+async function whileDown<T>(check: () => T): Promise<T> { try { return check() } finally { await hq.up() } }
 /** The note of each of `ids` still writing one (a note that came in already ended its session). */
 async function notes(ids: string[], text: string): Promise<void> {
   for (const id of ids) {
@@ -347,6 +352,12 @@ const switchAsked = async (id: string) => (await asksTo(id)).some((m: any) => /T
 /** Whether the agent's Events say HQ asked it for the switch's note ("Asked for its handoff note: you switched projects"). */
 const switchLine = async (id: string) => (await hq.api(`events?agent=${id}`)).json
   .some((e: any) => e.kind === 'fresh_start.requested' && JSON.parse(e.payload).then === 'switch')
+/** The payloads of `repo`'s "parked" lines (repo.parked), each written once a park is over. */
+const parkedLines = (repo: any): any[] => {
+  const db = hq.db({ readOnly: true })
+  try { return (db.prepare("SELECT payload FROM events WHERE kind = 'repo.parked'").all() as any[]).map((e) => JSON.parse(e.payload)).filter((p) => p.repo === repo.id) }
+  finally { db.close() }
+}
 test('Bug 369: a restart in the middle of a switch away finishes the park: the agents it hadn\'t asked yet are asked, none keeps working', async () => {
   await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
   const { repo, f, tpm } = await setup('b369x')
@@ -357,7 +368,11 @@ test('Bug 369: a restart in the middle of a switch away finishes the park: the a
   for (const id of unasked) await waitFor(`${id}'s Events line`, () => switchLine(id)) // written once the request is typed
   await notes(ids, 'B369X')
   await waitFor('all parked', async () => (await tk(t1)).parked_at && (await tk(t2)).parked_at && (await repoRow(repo.id)).tpm_parked_at, 20_000)
-  assert.equal(await live(t1), undefined); assert.equal(await live(t2), undefined); assert.equal((await repoRow(repo.id)).parking_at, null)
+  assert.equal(await live(t1), undefined); assert.equal(await live(t2), undefined)
+  // Bug 438: the park is over once it has typed its last request, which can be after the notes are in and the work parked: waited for, not
+  // asserted at once. Its mark goes before its line is written (parkNow).
+  await waitFor("the restart's park recorded", () => parkedLines(repo).some((p) => p.again))
+  assert.equal((await repoRow(repo.id)).parking_at, null)
   const back = await hq.api(`repos/${repo.id}/resume`, {}); assert.equal(back.json.resumed.length, 3, JSON.stringify(back.json))
   await waitFor('the engineers back', async () => (await live(t1)) && (await live(t2)))
 })
@@ -416,6 +431,89 @@ async function stopAll(repoId: string): Promise<void> {
   for (const a of (await hq.state()).agents.filter((x: any) => x.repo_id === repoId && x.status !== 'exited')) await hq.api(`agents/${a.id}/stop`, {})
   await waitFor('its sessions ended', async () => !(await hq.state()).agents.some((x: any) => x.repo_id === repoId && x.status !== 'exited'))
 }
+test('Bug 397: an agent whose terminal goes while the switch away asks for notes is skipped; the park asks the rest and is recorded', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, f, tpm } = await setup('b397x')
+  const t1 = await ticket(f, 'One'); const e1 = await building(t1)
+  const t2 = await ticket(f, 'Two'); const e2 = await building(t2) // asked after e1: the park goes through them in the order they started
+  hq.tmux('kill-session', '-t', (await agent(e1.id)).tmux_session) // its process dies without a SessionEnd: to HQ it still works
+  assert.equal((await agent(e1.id)).status, 'working')
+  const r = await hq.api(`repos/${repo.id}/park`, {})
+  assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.parked.length, 3, JSON.stringify(r.json)); assert.deepEqual(r.json.left, [])
+  assert.ok(await switchAsked(e2.id)); assert.ok(await switchLine(e2.id)) // the one after it was asked too
+  assert.equal((await repoRow(repo.id)).parking_at, null)
+  const parkedLine = (await hq.api('events?limit=50')).json.find((e: any) => e.kind === 'repo.parked' && JSON.parse(e.payload).repo === repo.id)
+  assert.equal(JSON.parse(parkedLine.payload).parked.length, 3)
+  assert.ok((await hq.api(`events?agent=${e1.id}`)).json.some((e: any) => e.kind === 'backend.error' && JSON.parse(e.payload).server === 'typing'))
+  // its session ends (the terminal check would find it gone; here Stop, so the test needn't wait a minute): HQ writes its note and parks its work
+  assert.equal((await hq.api(`agents/${e1.id}/stop`, {})).status, 200)
+  await notes([tpm.id, e2.id], 'B397X')
+  await waitFor('all parked', async () => (await tk(t1)).parked_at && (await tk(t2)).parked_at && (await repoRow(repo.id)).tpm_parked_at, 30_000)
+  const db = hq.db({ readOnly: true })
+  try { assert.match((db.prepare("SELECT text FROM docs WHERE scope = ? AND key = 'note'").get(`resume:ticket:${t1.id}`) as any).text, /didn't leave a note/) }
+  finally { db.close() }
+  assert.equal(await live(t1), undefined); assert.equal(await live(t2), undefined)
+})
+
+/** Bug 402: the backend is down; the marks of the switches away and back it had asked for, as the database says. */
+const marks = (repo: any): { parking_at: number | null; resuming_at: number | null } => {
+  const db = hq.db({ readOnly: true }); try { return db.prepare('SELECT parking_at, resuming_at FROM repos WHERE id = ?').get(repo.id) as any } finally { db.close() }
+}
+test('Bug 402: switching straight back while the park still asks, then a restart: the park finishes, then the resume; nothing stays parked', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, f, tpm } = await setup('b402x')
+  const t1 = await ticket(f, 'One'); const e1 = await building(t1)
+  const t2 = await ticket(f, 'Two'); const e2 = await building(t2)
+  const ids = [tpm.id, e1.id, e2.id]
+  let back: Promise<unknown> = Promise.resolve()
+  const unasked = await downMidPark(repo, ids, async () => {
+    back = hq.api(`repos/${repo.id}/resume`, {}).catch(() => null) // the page's switch back: waits behind the park (inTurn), goes with the backend
+    await waitFor('the switch back recorded', async () => (await repoRow(repo.id)).resuming_at, 10_000) // asked for, not begun
+    assert.ok((await repoRow(repo.id)).parking_at, 'the switch back was recorded only once the park was over')
+  })
+  await back
+  const m = marks(repo); assert.ok(m.parking_at && m.resuming_at && m.parking_at < m.resuming_at, JSON.stringify(m))
+  for (const id of unasked) await waitFor(`${id}'s Events line`, () => switchLine(id)) // the park finished first
+  // the park types to the ones it hadn't asked, then the resume to all three: a few seconds each (Bug 438), as long as in the mirror below
+  await waitFor('the resume over', async () => { const r = await repoRow(repo.id); return r.parking_at === null && r.resuming_at === null }, 30_000)
+  for (const id of ids) assert.equal((await agent(id)).fresh_start_then, 'continue', id) // then the resume told each a new session takes over
+  await notes(ids, 'B402X')
+  const fresh = async (t: any, old: string) => { const a = await live(t); return a && a.id !== old && (await tk(t)).assignee_agent_id === a.id }
+  await waitFor('everyone back', async () => (await fresh(t1, e1.id)) && (await fresh(t2, e2.id)) && (await repoRow(repo.id)).tpm_agent_id !== tpm.id, 20_000)
+  assert.equal((await tk(t1)).parked_at, null); assert.equal((await tk(t2)).parked_at, null); assert.equal((await repoRow(repo.id)).tpm_parked_at, null)
+  await stopAll(repo.id)
+})
+
+// The resume must still be under way when the switch away comes, and when the backend goes down. Starting parked agents is too quick for that
+// (on Linux the TPM and four engineers were all back before the test's park request landed), so here the resume tells agents still writing the
+// switch's notes that a new session takes over (Bug 350): it types into each terminal in turn (Escape, then a second and a half), seconds in all.
+test('Bug 402, the mirror: switching away while coming back is still under way, then a restart: the resume finishes, then the park', async () => {
+  await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
+  const { repo, f, tpm } = await setup('b402y'), ts: any[] = [], engs: any[] = []
+  for (const n of ['One', 'Two', 'Three']) { const t = await ticket(f, n); ts.push(t); engs.push(await building(t)) }
+  const ids = [tpm.id, ...engs.map((e) => e.id)]
+  try {
+    assert.equal((await hq.api(`repos/${repo.id}/park`, {})).json.parked.length, 4) // each asked for the switch's note; none written yet
+    const back = hq.api(`repos/${repo.id}/resume`, {}).catch(() => null) // goes with the backend
+    await waitFor('the resume telling the first', async () => (await Promise.all(ids.map(agent))).some((a) => a.fresh_start_then === 'continue'))
+    const away = hq.api(`repos/${repo.id}/park`, {}).catch(() => null) // waits behind the resume
+    await waitFor('the switch away recorded', async () => (await repoRow(repo.id)).parking_at)
+    await hq.down(); await back; await away
+    await whileDown(() => {
+      const m = marks(repo); assert.ok(m.parking_at && m.resuming_at && m.resuming_at < m.parking_at, JSON.stringify(m))
+      const db = hq.db({ readOnly: true }); let told: number
+      try { told = ids.filter((id) => (db.prepare('SELECT fresh_start_then FROM agents WHERE id = ?').get(id) as any).fresh_start_then === 'switch').length }
+      finally { db.close() }
+      assert.ok(told, 'the resume was over before the backend went down: this test checked nothing')
+    })
+    await waitFor('both over', async () => { const r = await repoRow(repo.id); return r.parking_at === null && r.resuming_at === null }, 30_000)
+    for (const id of ids) assert.equal((await agent(id)).fresh_start_then, 'switch', id) // the resume told each to carry on, then the park parked each again
+    await notes(ids, 'B402Y')
+    await waitFor('all parked', async () => (await repoRow(repo.id)).tpm_parked_at && (await Promise.all(ts.map(tk))).every((t) => t.parked_at), 20_000)
+    assert.deepEqual(await running(repo.id, ts), { tpms: 0, engineers: ts.map(() => 0) })
+  } finally { await stopAll(repo.id) } // a failed check leaves no engineer taking a slot from the tests after it
+})
+
 test('Bug 389: a restart in the middle of coming back to a project finishes the resume: the agents it hadn\'t started yet start, none twice', async () => {
   await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
   const { repo, tpm, ts } = await parkedAll('b389x', 4)
@@ -423,14 +521,15 @@ test('Bug 389: a restart in the middle of coming back to a project finishes the 
   // the resume starts the TPM first, then one engineer after the other: down once the TPM is back, while engineers are still parked
   await waitFor('the TPM back', async () => !(await repoRow(repo.id)).tpm_parked_at, 20_000)
   await hq.down(); await back
-  const db = hq.db({ readOnly: true }); let still: number, mark: unknown
-  try {
-    still = ts.filter((t) => (db.prepare('SELECT parked_at FROM tickets WHERE id = ?').get(t.id) as any).parked_at).length
-    mark = (db.prepare('SELECT resuming_at FROM repos WHERE id = ?').get(repo.id) as any).resuming_at
-  } finally { db.close() }
-  assert.ok(still, 'the resume was over before the backend went down: this test checked nothing')
-  assert.ok(mark, 'the resume under way is recorded')
-  await hq.up()
+  await whileDown(() => {
+    const db = hq.db({ readOnly: true }); let still: number, mark: unknown
+    try {
+      still = ts.filter((t) => (db.prepare('SELECT parked_at FROM tickets WHERE id = ?').get(t.id) as any).parked_at).length
+      mark = (db.prepare('SELECT resuming_at FROM repos WHERE id = ?').get(repo.id) as any).resuming_at
+    } finally { db.close() }
+    assert.ok(still, 'the resume was over before the backend went down: this test checked nothing')
+    assert.ok(mark, 'the resume under way is recorded')
+  })
   await allBack(repo, tpm, ts)
   await stopAll(repo.id)
 })
@@ -438,8 +537,7 @@ test('Bug 389: a restart in the middle of coming back to a project finishes the 
 /** Bug 389: the last backend went down right after it marked a coming back to `repo` under way (repos.resuming_at), before it started anyone. */
 async function downAfterMark(repo: any): Promise<void> {
   await hq.down()
-  const db = hq.db(); try { db.prepare('UPDATE repos SET resuming_at = ? WHERE id = ?').run(Date.now(), repo.id) } finally { db.close() }
-  await hq.up()
+  await whileDown(() => { const db = hq.db(); try { db.prepare('UPDATE repos SET resuming_at = ? WHERE id = ?').run(Date.now(), repo.id) } finally { db.close() } })
 }
 test('Bug 389: a coming back recorded but not begun when HQ went down is done at start-up', async () => {
   await hq.api('settings', { key: 'after_fresh_start', value: 'continue' })
@@ -458,13 +556,14 @@ test('Bug 389: a session the last backend started for the resume but never recor
   await allBack(repo, tpm, ts)
   const t = await tk(ts[0]), eng = await agent(t.assignee_agent_id), next = await agent((await repoRow(repo.id)).tpm_agent_id)
   await hq.down() // as the last backend left it had it gone down just after starting those two: ticket and repo still say parked, the slot is the launch's
-  const db = hq.db()
-  try {
-    db.prepare('UPDATE tickets SET assignee_agent_id = ?, parked_at = ? WHERE id = ?').run(engs[0].id, eng.started_at - 1000, t.id)
-    db.prepare('UPDATE worker_slots SET agent_id = ? WHERE agent_id = ?').run(`pending-${t.id}`, eng.id)
-    db.prepare('UPDATE repos SET tpm_agent_id = ?, tpm_parked_at = ?, resuming_at = ? WHERE id = ?').run(tpm.id, next.started_at - 1000, Date.now(), repo.id)
-  } finally { db.close() }
-  await hq.up()
+  await whileDown(() => {
+    const db = hq.db()
+    try {
+      db.prepare('UPDATE tickets SET assignee_agent_id = ?, parked_at = ? WHERE id = ?').run(engs[0].id, eng.started_at - 1000, t.id)
+      db.prepare('UPDATE worker_slots SET agent_id = ? WHERE agent_id = ?').run(`pending-${t.id}`, eng.id)
+      db.prepare('UPDATE repos SET tpm_agent_id = ?, tpm_parked_at = ?, resuming_at = ? WHERE id = ?').run(tpm.id, next.started_at - 1000, Date.now(), repo.id)
+    } finally { db.close() }
+  })
   await waitFor('the resume over', async () => { const r = await repoRow(repo.id); return r.resuming_at === null && !r.tpm_parked_at && !(await tk(t)).parked_at })
   assert.equal((await tk(t)).assignee_agent_id, eng.id); assert.equal((await repoRow(repo.id)).tpm_agent_id, next.id)
   assert.deepEqual(await running(repo.id, ts), { tpms: 1, engineers: [1] })

@@ -67,6 +67,7 @@ test('what the tab leaves out: the other half of a tool call, HQ\'s plumbing, a 
   assert.equal(eventLine('gate.verdict', { verdict: 'approve', by: 'auto' }), 'Plan approved by HQ')
   assert.equal(eventLine('attention.context_high', { detail: 'eng A-1 is at 114k of context' }), 'Alert: eng A-1 is at 114k of context')
   assert.equal(eventLine('agent.recovered', {}), 'Its terminal is back')
+  assert.equal(eventLine('ticket.launched', { ticket: 'tkt-x', key: 'A-1', fix: true, adopted: true }), 'Back on A-1 (HQ restarted as it started; it took this session over)') // Bug 398
 })
 
 test('an agent\'s history: newest first, its own lines only, named as on the board, chatter dropped before the limit', () => {
@@ -309,4 +310,17 @@ test('Bug 373: the Events tab says what the engineer changed when a sent-back ti
   assert.equal(eventLine('check.ended', { key: 'PAY-1', state: 'fail', unseen: 8 }),
     "HQ's test of PAY-1: the tests passed, but 8 tests named for its criteria weren't seen running (View results on its box)")
   assert.equal(eventLine('check.ended', { key: 'PAY-1', state: 'fail' }), "HQ's test of PAY-1 found a problem (View results on its box)")
+})
+
+test('Bug 417: a helper the user stopped says so in plain words, each kind of helper; one that ended by itself, or finished, still says that', () => {
+  assert.equal(eventLine('agent.stopped', { reason: 'user' }), 'You stopped it')
+  assert.equal(eventLine('agent.stopped', { reason: 'launch helper done' }), 'Stopped: launch helper done')
+  assert.equal(eventLine('launch.helper_done', { repo: 'a', state: null, note: null, why: 'user_stopped' }), 'Done with the launch steps: you stopped Claude before it finished')
+  assert.equal(eventLine('launch.helper_done', { repo: 'a', state: null, note: null }), 'Done with the launch steps')
+  assert.equal(eventLine('testsetup.helper_done', { repo: 'a', state: 'stopped', note: null, by: 'user' }), 'Done with the test setup: you stopped Claude before it finished')
+  assert.equal(eventLine('testsetup.helper_done', { repo: 'a', state: 'failed', note: 'Claude stopped before it finished.' }),
+    'Done with the test setup, with no setup that works: Claude stopped before it finished.')
+  assert.equal(eventLine('teststeps.helper_done', { repo: 'a', state: 'failed', note: 'You stopped Claude before it finished.', by: 'user' }),
+    'Done with the test steps: you stopped Claude before it finished')
+  assert.equal(eventLine('teststeps.helper_done', { repo: 'a', state: 'saved', note: null }), 'Done with the test steps')
 })

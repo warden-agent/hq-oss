@@ -1,0 +1,30 @@
+(node:58664) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+FAIL ./shelf.test.js
+  ✓ adds a book (1 ms)
+  ✕ marks a book due soon (1 ms)
+  ✓ known bug (1 ms)
+  ○ skipped later
+  ✎ todo someday
+
+  ● marks a book due soon
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 3
+    Received: 2
+
+    [0m [90m 1 |[39m test([32m'adds a book'[39m[33m,[39m () [33m=>[39m expect([35m1[39m [33m+[39m [35m1[39m)[33m.[39mtoBe([35m2[39m))
+    [31m[1m>[22m[39m[90m 2 |[39m test([32m'marks a book due soon'[39m[33m,[39m () [33m=>[39m expect([35m1[39m [33m+[39m [35m1[39m)[33m.[39mtoBe([35m3[39m))
+     [90m   |[39m                                                   [31m[1m^[22m[39m
+     [90m 3 |[39m test[33m.[39mskip([32m'later'[39m[33m,[39m () [33m=>[39m {})
+     [90m 4 |[39m test[33m.[39mtodo([32m'someday'[39m)
+     [90m 5 |[39m test[33m.[39mfailing([32m'known bug'[39m[33m,[39m () [33m=>[39m expect([35m1[39m)[33m.[39mtoBe([35m2[39m))[0m
+
+      at Object.toBe (shelf.test.js:2:51)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 1 skipped, 1 todo, 2 passed, 5 total
+Snapshots:   0 total
+Time:        0.116 s
+Ran all test suites.

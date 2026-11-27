@@ -109,6 +109,23 @@ test('fixTestsText (Bug 82): what failed early is kept with the end of the outpu
   assert.match(hung, /find what never finishes and fix it/); assert.match(hung, /ℹ fail 1\n\nFix it now/)
 })
 
+test('Bug 405: the engineer hears the failure is its ticket\'s only when HQ saw main pass without it; otherwise another ticket may be to blame', () => {
+  const t = getTicket('shop')!, failed = { kind: 'fail' as const, test: 'npm test', output: 'ℹ fail 1', earlier: '' }
+  const mine = fixTestsText({ t, base: 'main', failed: { ...failed, basePassed: true } })
+  assert.match(mine, /fails its tests, so HQ didn't merge it\. main passes them without your ticket, so the failure is your ticket's: its work alone, or next to what is/)
+  assert.doesNotMatch(mine, /may have merged first/)
+  // main not run alone (a ticket that repairs main, main's run couldn't be done, a send-back kept from before): HQ can't say, so the hedge stays
+  assert.match(fixTestsText({ t, base: 'main', failed }), /fails its tests, so HQ didn't merge it\. Another ticket may have merged first\. `npm test` said:/)
+  const hung = fixTestsText({ t, base: 'origin/main', failed: { ...failed, hung: true, basePassed: true, asked: true } })
+  assert.match(hung, /so the user sent it back to you\. origin\/main finishes them without your ticket, so something your ticket brings waits forever .* What it printed:/)
+  assert.doesNotMatch(hung, /another ticket/)
+  assert.match(fixTestsText({ t, base: 'main', failed: { ...failed, hung: true } }), /maybe only next to what another ticket merged first\. What it printed:/)
+  keepTestsFailed(t, { ...failed, basePassed: true }) // an engineer that takes over hears the same
+  assert.equal(testsFailed(t, null).basePassed, true); assert.match(fixTestsText({ t, base: 'main', failed: testsFailed(t, null) }), /the failure is your ticket's/)
+  keepTestsFailed(t, failed); assert.equal(testsFailed(t, null).basePassed, undefined)
+  run("DELETE FROM docs WHERE scope = ? AND key = 'tests_failed'", `ticket:${t.id}`)
+})
+
 test('"Have HQ test this": a failure the user sent back says so, never that HQ didn\'t merge it, and the UI tester\'s findings say whose they are', () => {
   const t = getTicket('shop')!, failed = { kind: 'fail' as const, test: 'npm test', output: 'ℹ fail 1', earlier: '', asked: true }
   const kinds = [failed, { ...failed, hung: true }, { ...failed, unproven: true }, { ...failed, look: true }, { ...failed, review: true }, { ...failed, look: true, tester: true }]
@@ -131,6 +148,20 @@ test('Bug 84: what the tests printed is kept for an engineer that takes over, an
   assert.equal(fixWords('tests', 'origin/main').ing, 'fixing its tests on origin/main')
 })
 
+// Bug 426: a test command that exits 0 though a test failed: the engineer is told not to go by its exit code (it would see `npm test` "pass"), the TPM
+// hears why HQ calls it failed, and an engineer that takes over gets the same
+test('Bug 426: a failure whose command exited 0 says so, to the engineer, to the TPM and to an engineer that takes over', () => {
+  const t = getTicket('shop')!, failed = { kind: 'fail' as const, test: 'npm test', output: '  1 passing (2ms)\n  1 failing\n\n  1) shelf\n       marks a book due soon:\n', earlier: '',
+    exit0: { passed: 1, failed: 1, skipped: 0 } }
+  const text = fixTestsText({ t, base: 'main', failed })
+  assert.ok(text.includes("fails its tests, so HQ didn't merge it. Another ticket may have merged first. `npm test` exits 0 even when a test fails, so don't go by its "
+    + 'exit code: read what it prints. HQ went by its counts, 1 passed, 1 failed. `npm test` said:'), text)
+  assert.equal(backWords(failed, 'main'), 'its tests failed with it merged into main: 1) shelf marks a book due soon (`npm test` exited 0 all the same, but its output says 1 passed, 1 failed)')
+  const { exit0: _, ...plain } = failed
+  assert.doesNotMatch(fixTestsText({ t, base: 'main', failed: plain }), /exit/); assert.doesNotMatch(backWords(plain, 'main'), /exit/)
+  keepTestsFailed(t, failed); assert.deepEqual(testsFailed(t, null), { ...failed, hung: false })
+  run("DELETE FROM docs WHERE scope = ? AND key = 'tests_failed'", `ticket:${t.id}`)
+})
 test('a finished ticket whose spec changed: its own words, notice and instructions, apart from tests and conflicts', () => {
   assert.deepEqual(fixWords('changes', 'main'), { to: 'build the change to its spec', ing: 'building the change to its spec' })
   assert.deepEqual(['changes', 'tests', 'tests_hung', null].map((f) => forTests(f as never)), [false, true, true, false])

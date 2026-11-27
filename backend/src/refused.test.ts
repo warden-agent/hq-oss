@@ -1,7 +1,7 @@
 // Bug 107: telling "Claude Code refused the project's test command" from everything that looks like it.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { commands, isRefusal, ranTestCmd, refusedTestCmd, testCmdParts } from './refused.ts'
+import { afterTestCmd, commands, isRefusal, ranTestCmd, refusedTestCmd, testCmdParts } from './refused.ts'
 
 const WT = '/Users/me/my app/.claude/worktrees/T-01'
 // The hook's `error` for `node --test $(git ls-files test)` on Claude Code 2.1.322, and for `node --test $(ls test/*.test.js)` on 2.1.300
@@ -43,10 +43,11 @@ test('the ways real engineers ran a two-part command all count: output cut down,
     `npm run build 2>&1 | tail -5 && ${SECOND.replace(' node ', ' timeout 540 node ')}`, `cd "${WT}" && (npm run build && ${SECOND.replace(' node ', ' timeout 540 node ')})`]) {
     assert.equal(refusedTestCmd(c, TWO_PART, WT), true, c); assert.equal(ranTestCmd(c, TWO_PART, WT), true, c)
   }
-  assert.deepEqual(testCmdParts(TWO_PART, TWO_PART, WT), { whole: true, hard: 1, hardInCmd: 1 }); assert.deepEqual(testCmdParts(SECOND, TWO_PART, WT), { whole: false, hard: 1, hardInCmd: 1 })
+  assert.deepEqual(testCmdParts(TWO_PART, TWO_PART, WT), { whole: true, hard: 1, hardInCmd: 1, need: 1, needInCmd: 1 })
+  assert.deepEqual(testCmdParts(SECOND, TWO_PART, WT), { whole: false, hard: 1, hardInCmd: 1, need: 1, needInCmd: 1 })
 })
 test('the plain half of a command says nothing either way: Claude Code never refuses it, and it running doesn\'t show the other half can', () => {
-  assert.deepEqual(testCmdParts('npm run build 2>&1 | tail -5', TWO_PART, WT), { whole: false, hard: 0, hardInCmd: 1 })
+  assert.deepEqual(testCmdParts('npm run build 2>&1 | tail -5', TWO_PART, WT), { whole: false, hard: 0, hardInCmd: 1, need: 0, needInCmd: 1 })
   assert.equal(refusedTestCmd('npm run build', TWO_PART, WT), false); assert.equal(ranTestCmd('npm run build', TWO_PART, WT), false)
 })
 test('anything else in the line could be what was refused, and a narrowed run is another command: neither counts', () => {
@@ -76,4 +77,30 @@ test('Bug 411, what the quotes rule must not catch: another folder, a folder wor
     '(cd backend/ && uv run pytest -v) && (cd "web app" && npm test)', '(cd "back""end" && uv run pytest -v) && (cd "web app" && npm test)']) assert.equal(ranTestCmd(c, SPLIT, WT), false, c)
   assert.equal(ranTestCmd('(cd backend && uv run pytest -v)', SPLIT, WT), false) // one part only: the other suite never ran
   assert.equal(testCmdParts("cd 'web app' && npm test", SPLIT, WT)?.whole, false)
+})
+
+// Bug 404: the `cd "web"` of HQ's command for a split project counted as the command's hard part by itself, so `(cd "web" && echo hi)` was "the
+// project's test command ran" for open_pr (Bug 162), and `(cd "web" && pnpm test)` read as the command with `pnpm test` after it.
+const WEB = '(cd "web" && npm test)'
+test('Bug 404: a `cd` runs no tests: the folder of the test command with something else in it is none of the command', () => {
+  for (const c of ['(cd "web" && echo hi)', '(cd "web" && pnpm test)', '(cd web && npm run lint)', 'cd web && echo hi', '(cd "web") && npm test',
+    '(cd "web" && echo hi) && npm test', '(cd web && cd "' + WT + '" && npm test)', 'cd "' + WT + '" && npm test']) { // npm test, but not in web/
+    assert.equal(ranTestCmd(c, WEB, WT), false, c); assert.equal(refusedTestCmd(c, WEB, WT), false, c)
+  }
+  assert.deepEqual(afterTestCmd('(cd "web" && pnpm test)', WEB), [], 'no part of the command, so nothing comes after it')
+  assert.deepEqual(afterTestCmd('(cd "web" && echo hi) && npm test && git commit -qam x', WEB), [], 'npm test in the wrong folder is no part either')
+})
+test('Bug 404, what it must not catch: the command in its folder, however engineers type it', () => {
+  for (const c of [WEB, 'cd web && npm test', '(cd web && npm test --silent) 2>&1 | tail -40', `cd "${WT}" && cd web && npm test; echo exit=$?`,
+    `cd '${WT}' && (cd "web" && CI=1 npm test)`]) { assert.equal(ranTestCmd(c, WEB, WT), true, c); assert.equal(refusedTestCmd(c, WEB, WT), true, c) }
+  assert.deepEqual(afterTestCmd('(cd "web" && npm test) 2>&1 | tail -40', WEB), ['tail -40'], 'the 2>&1 after the bracket is no command')
+  assert.deepEqual(afterTestCmd("(cd web && npm test) && sed -i 's/a/b/' web/x.js", WEB), ["sed -i 's/a/b/' web/x.js"])
+  assert.deepEqual(afterTestCmd(`cd "${WT}" && (cd web && npm test) && npm test && git merge main`, WEB), ['npm test', 'git merge main'], 'npm test at the top is not the command')
+})
+test('Bug 404: a split command needs each folder\'s tests, a plain one too; a build before the tests may still be left out', () => {
+  assert.equal(ranTestCmd('(cd "web app" && npm test)', SPLIT, WT), false) // npm test is plain, but backend's tests never ran
+  assert.deepEqual(testCmdParts('(cd "web app" && npm test)', SPLIT, WT), { whole: false, hard: 0, hardInCmd: 1, need: 1, needInCmd: 2 })
+  assert.equal(ranTestCmd('(cd web && npm run build && npm test)', '(cd web && npm run build && npm test)', WT), true)
+  assert.equal(ranTestCmd('(cd web && npm test)', '(cd web && npm run build && npm test)', WT), false, 'in a folder: each part counts')
+  assert.equal(ranTestCmd(SECOND, TWO_PART, WT), true, 'at the top: the build may be left out, as before')
 })

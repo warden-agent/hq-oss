@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { CORNERS, CROWDED_GIVE, edgeHints, fitSets, floorAt, HINT_H, HINT_W, LOWEST, NARROW, placeBoard, placePop, placeView, POP_EDGE, POP_GAP,
-  POP_FLOOR, READABLE, wholeIn, type Box, type Corner } from '../../frontend/src/fit.ts'
+  POP_FLOOR, POP_ROOM, READABLE, wholeIn, type Box, type Corner } from '../../frontend/src/fit.ts'
 
 /** Which boxes a view shows whole in a w×h pane. */
 const whole = (boxes: Box[], v: { x: number; y: number; zoom: number }, w: number, h: number) => boxes.filter((b) =>
@@ -230,6 +230,41 @@ test('what the app pane must not change: room enough on the board, a box low wit
   assert.equal(placePop({ x: 100, y: 200, w: 200, h: 20 }, 520, 900, 300, 2).above, true) // 2 px under the board: more room above (182 to 64)
 })
 
+// Bug 432: bug408demo at 820×700 with the side panel open (board 414×601), after the ↑ pill brought the grown TPM in: T-01's plan
+// (246 px) opened above T-01 and covered the TPM's Start T-02, Do the rest automatically, Send and Chat. Rects as the page measured them.
+const t01 = { x: 81, y: 395, w: 252, h: 108 }, tpmBox = { x: 62, y: 16, w: 290, h: 241 }
+/** Where a placed popover `need` px tall at most sits, top to bottom, in pane pixels. */
+const span = (p: ReturnType<typeof placePop>, need: number) => { const tall = Math.min(need, p.maxHeight); return p.above ? [p.y - tall, p.y] : [p.y, p.y + tall] }
+const covers = (p: ReturnType<typeof placePop>, need: number, k: { y: number; h: number }) => { const [t, u] = span(p, need); return Math.min(u, k.y + k.h) - Math.max(t, k.y) > 0.5 }
+test('Bug 432: with no room beside its box clear of the TPM, the plan goes over its own box, from just under the TPM, whole', () => {
+  const was = placePop(t01, 520, 414, 601)
+  assert.equal(was.above, true); assert.ok(covers(was, 246, tpmBox)) // the bug: above T-01, over the TPM's buttons
+  const p = placePop(t01, 520, 414, 601, 0, tpmBox, 246)
+  assert.deepEqual({ above: p.above, y: p.y, left: p.left, width: p.width }, { above: false, y: 16 + 241 + POP_GAP, left: was.left, width: was.width })
+  assert.ok(!covers(p, 246, tpmBox)); assert.ok(p.maxHeight >= 246); assert.ok(p.y + p.maxHeight <= 601 - POP_EDGE) // all of it shows: Approve too
+  assert.ok(p.y < t01.y + t01.h && p.y + 246 > t01.y) // still on its own box, not off somewhere else
+})
+test('Bug 432: off the TPM beside its box first: the other side when it has the full height, then a side with POP_ROOM', () => {
+  const box = { x: 100, y: 500, w: 200, h: 100 } // 202 px below it, 482 above: it opens above
+  const down = placePop(box, 380, 900, 820, 0, { x: 50, y: 0, w: 300, h: 400 }, 200)
+  assert.deepEqual({ above: down.above, y: down.y }, { above: false, y: 610 }) // 200 px fit below
+  const up = placePop(box, 380, 900, 820, 0, { x: 50, y: 0, w: 300, h: 150 }, 400) // 400 px fit nowhere; 330 above, under the TPM
+  assert.deepEqual({ above: up.above, y: up.y, maxHeight: up.maxHeight }, { above: true, y: 490, maxHeight: 490 - 150 - POP_GAP })
+  assert.ok(up.maxHeight >= POP_ROOM && !covers(up, 400, { y: 0, h: 150 })) // its body scrolls; the TPM shows
+})
+test('Bug 432, what it must not change: a popover clear of the TPM, a TPM off the board or to the side, an unmeasured popover, no room anywhere', () => {
+  const box = { x: 100, y: 500, w: 200, h: 100 }, alone = placePop(box, 380, 900, 820)
+  assert.deepEqual(placePop(box, 380, 900, 820, 0, { x: 50, y: 0, w: 300, h: 150 }, 200), alone) // 200 px above it end well under the TPM
+  assert.deepEqual(placePop(box, 380, 900, 820, 0, { x: 50, y: -400, w: 300, h: 390 }, 400), alone) // the TPM panned off the top
+  assert.deepEqual(placePop(box, 380, 900, 820, 0, { x: 600, y: 0, w: 290, h: 400 }, 400), alone) // beside the popover's column
+  assert.deepEqual(placePop(box, 380, 900, 820, 0, { x: 50, y: 0, w: 300, h: 400 }), alone) // its height not measured yet
+  assert.deepEqual(placePop(box, 380, 900, 820, 0, { x: 320, y: 300, w: 300, h: 400 }, 400), alone) // level with the box: no side to keep off
+  assert.deepEqual(placePop(t01, 520, 414, 601, 0, { ...tpmBox, h: 400 }, 246), placePop(t01, 520, 414, 601)) // the TPM fills it: as before
+  assert.deepEqual(placePop(t01, 520, 414, 601, 0, tpmBox, 600), placePop(t01, 520, 414, 601, 0, tpmBox, 246)) // taller than the room: scrolls there
+  const short = { x: 87, y: 26, w: 240, h: 100 } // Bug 379's short board with the app pane under it opens below, never over the TPM above
+  assert.deepEqual(placePop(short, 480, 414, 166, 465, { x: 50, y: -300, w: 300, h: 316 }, 300), placePop(short, 480, 414, 166, 465))
+})
+
 // Bug 284: boxes the view leaves wholly past an edge get a hint there ("‹ 1 more") that pans to the nearest of them.
 /** bug250demo's board as the page lays it out: the TPM, finished F-1 (folded), F-2 and F-3 with two tickets each. */
 const garden = (): Box[] => [
@@ -265,6 +300,43 @@ test('Bug 284, what it must not show: no hint when every box is in view, or only
     assert.deepEqual(edgeHints(bs, v, w, 831), []) }
   assert.deepEqual(edgeHints(bs, { x: -100, y: 0, zoom: 1 }, 820, 831), []) // f1 cut at the left edge (it shows): no hint
   assert.deepEqual(edgeHints(bs, { x: 0, y: 0, zoom: 1 }, 0, 831), []) // no size yet
+})
+
+/** bug408demo's board at 1100 px (574 px with the panel open): the TPM over F-1 with T-01 (its plan open) and T-02. `grown`: the TPM's
+ *  Your turn has "T-02 is ready to start" + Start T-02, 108 px more, and everything under it is 108 px lower. */
+const notes = (grown: boolean): Box[] => { const g = grown ? 108 : 0
+  return [{ id: 'tpm', x: 0, y: 0, w: 340, h: 174 + g }, { id: 'f1', x: 50, y: 230 + g, w: 240, h: 50 }, { id: 't1', x: 60, y: 336 + g, w: 220, h: 98 },
+    { id: 't2', x: 60, y: 450 + g, w: 220, h: 82 }] }
+test('Bug 408: the TPM box grown back into view by a sliver, its Start under the top bar, keeps its ↑ pill, which brings it in', () => {
+  const v = { x: 117, y: -211, zoom: 1 }, [w, h] = [574, 831] // where Read plan put the view: T-01 near the top, the TPM above it
+  assert.deepEqual(edgeHints(notes(false), v, w, h).map((o) => [o.side, o.ids]), [['top', ['tpm']]]) // wholly above: as before
+  const bs = notes(true), hs = edgeHints(bs, v, w, h, [{ l: 0, t: h - 112, r: 52, u: h }]) // grown: 71 of its 282 px show
+  assert.deepEqual(hs.map((o) => [o.side, o.ids]), [['top', ['tpm']]])
+  const r = rectOf(hs[0]!)
+  assert.ok(r.l >= 0 && r.r <= w && r.t >= 0 && r.u <= h, 'inside the board')
+  for (const b of bs) assert.equal(overlaps(r, onScreen(b, v)), false, `clear of ${b.id}, the TPM's sliver too`)
+  assert.ok(whole(bs, hs[0]!.to, w, h).includes('tpm'), 'brings the TPM whole into view'); assert.deepEqual(cut(bs, hs[0]!.to, w, h), [])
+  assert.deepEqual(edgeHints(bs, hs[0]!.to, w, h), [])
+})
+test('Bug 408: a sliver of a box at the bottom, left or right edge gets that edge\'s pill; the pill brings it whole, cutting nothing', () => {
+  const bs = notes(true), [w, h] = [574, 831]
+  for (const [v, side, id] of [[{ x: 117, y: 356, zoom: 1 }, 'bottom', 't1'], [{ x: -260, y: 0, zoom: 1 }, 'left', 'tpm'],
+    [{ x: 500, y: 0, zoom: 1 }, 'right', 'tpm']] as const) {
+    const hs = edgeHints(bs, v, w, h), p = hs.find((o) => o.side === side)!
+    assert.ok(p && p.ids.includes(id), `${side}: ${JSON.stringify(hs.map((o) => [o.side, o.ids]))}`)
+    assert.ok(whole(bs, p.to, w, h).includes(id), `${side} brings ${id} in`); assert.deepEqual(cut(bs, p.to, w, h), [], `${side} cuts nothing`)
+  }
+})
+test('Bug 408, what it must not show: a box with half or more in view, or one bigger than the board shown from its start, gets no pill', () => {
+  const bs = notes(true)
+  assert.deepEqual(edgeHints(bs, { x: 117, y: -132, zoom: 1 }, 574, 831), []) // the TPM shows 150 of its 282 px: you can see it (Bug 284)
+  assert.deepEqual(edgeHints(bs, { x: 117, y: -141, zoom: 1 }, 574, 831), []) // exactly half
+  // Taller than the board (a short window), shown from its top: a pan down shows nothing more of it
+  const tall: Box[] = [{ id: 'big', x: 0, y: 0, w: 300, h: 900 }]
+  assert.deepEqual(edgeHints(tall, { x: 8, y: 8, zoom: 1 }, 574, 280), [])
+  // ...but shown from below its top, with most of it under the bottom edge: ↓ moves it up, as far as its top (EDGE from the board's)
+  const [down] = edgeHints(tall, { x: 8, y: 200, zoom: 1 }, 574, 280)
+  assert.equal(down?.side, 'bottom')
 })
 
 test('Bug 284: a hint for each side with boxes past it, a corner box counted left or right, hints clear of each other and the zoom buttons', () => {
@@ -325,8 +397,9 @@ test('Bug 284 (seen with Bug 282): running features off both sides at 820 px wit
 test('Bug 284: with no room clear of everything along an edge the hint covers as little as it can', () => {
   // Two boxes cut at the bottom edge with a 64 px gap between them (less than a hint), and the zoom buttons in the corner
   const bs: Box[] = [{ id: 'a', x: 8, y: 800, w: 240, h: 50 }, { id: 'b', x: 320, y: 800, w: 240, h: 50 }, { id: 'gone', x: 100, y: 1200, w: 100, h: 50 }]
-  const buttons = { l: 0, t: 831 - 112, r: 52, u: 831 }, [h] = edgeHints(bs, { x: 0, y: 0, zoom: 1 }, 414, 831, [buttons])
-  assert.equal(h!.side, 'bottom')
+  const buttons = { l: 0, t: 831 - 112, r: 52, u: 831 }, hs = edgeHints(bs, { x: 0, y: 0, zoom: 1 }, 414, 831, [buttons])
+  const h = hs.find((o) => o.side === 'bottom') // (b shows 94 of its 240 px at the right edge: since Bug 408 that side has a pill too)
+  assert.deepEqual(hs.map((o) => [o.side, o.ids]), [['right', ['b']], ['bottom', ['gone']]])
   const r = rectOf(h!), area = (b: { l: number; t: number; r: number; u: number }) =>
     Math.max(0, Math.min(r.r, b.r) - Math.max(r.l, b.l)) * Math.max(0, Math.min(r.u, b.u) - Math.max(r.t, b.t))
   assert.equal(area(buttons), 0)
@@ -388,8 +461,9 @@ test('Bug 306 (c): a view panned so that no box is whole in it is told apart fro
   assert.deepEqual(wholeIn(four(), fourAt(true, 414).v, 414, 831), MIDDLE)
 })
 test('Bug 306 (d): a side hint brings its feature in with the tickets under it, not just sideways to the bottom edge', () => {
-  // F-4 past the right edge with its feature box at the bottom edge's height and its tickets below the board (the old view's look)
-  const bs = four(), v = { x: -240, y: 831 - 380, zoom: 1 }, h = edgeHints(bs, v, 414, 831).find((o) => o.side === 'right')!
+  // F-4 past the right edge with its feature box at the bottom edge's height and its tickets below the board (the old view's look;
+  // F-3 cut at the right edge with 150 of its 240 px in view: a 30 px sliver of it would get the pill since Bug 408)
+  const bs = four(), v = { x: -340, y: 831 - 380, zoom: 1 }, h = edgeHints(bs, v, 414, 831).find((o) => o.side === 'right')!
   assert.deepEqual(h.ids, ['f4', 't6'])
   assert.deepEqual(whole(bs, h.to, 414, 831).filter((id) => h.ids.includes(id)), ['f4', 't6']) // the old pan: f4 at the bottom, t6 below
   assert.ok(h.to.zoom <= 1 && h.to.zoom >= READABLE) // (zoomed out a little where that shows more: Bug 345)

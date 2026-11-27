@@ -1,0 +1,10 @@
+test_lists_books (test_ut.ShelfTest.test_lists_books) ... ok
+test_shows_covers (test_ut.ShelfTest.test_shows_covers) ... expected failure
+test_sorts_books (test_ut.ShelfTest.test_sorts_books) ... unexpected success
+
+======================================================================
+UNEXPECTED SUCCESS: test_sorts_books (test_ut.ShelfTest.test_sorts_books)
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+FAILED (expected failures=1, unexpected successes=1)

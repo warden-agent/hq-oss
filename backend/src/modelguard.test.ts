@@ -8,10 +8,12 @@ import path from 'node:path'
 import type { ServerResponse } from 'node:http'
 
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-modelguard-'))
+// Bug 195: a switch nobody asked for pauses the role, and the pause looks at its agents' terminals (pause.ts). These have none: no tmux of anyone's is asked
+process.env.TMUX_TMPDIR = process.env.HQ_HOME; delete process.env.TMUX
 const { migrate, run, one, q, getSetting, setSetting } = await import('./db.ts')
 migrate()
 const { onExitPlanMode, answerReview } = await import('./gate.ts')
-const { onTurnStep, onPostModelSwitch } = await import('./modelguard.ts')
+const { onTurnStep, onPostModelSwitch, fallbackWords } = await import('./modelguard.ts')
 
 const OPUS = 'claude-opus-5-5', SONNET = 'claude-sonnet-5-5'
 const t0 = Date.now()
@@ -93,7 +95,7 @@ test('while it plans, a request on the build model is a mismatch; a helper\'s re
 // plans on Haiku and never switches.
 const HAIKU = 'claude-haiku-5-5'
 const toHaiku = (id: string) => onPostModelSwitch(agent(id), { from_model: SONNET, to_model: HAIKU, source: 'auto', requested_model: null })
-const fallback = (id: string, from: string, to: string) => [['model_fallback', `engineer ${id}: model switched ${from} → ${to} (source auto); role paused`]]
+const fallback = (id: string, from: string, to: string) => [['model_fallback', fallbackWords({ id, role: 'engineer', display_name: null }, from, to)]]
 const unpause = () => setSetting('paused_roles', [])
 
 test('Bug 141: an engineer on haiku plans on Sonnet, switches to Haiku at the approval, and nothing is raised or paused', async () => {

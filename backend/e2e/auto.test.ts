@@ -298,7 +298,7 @@ test('Bug 141: an engineer set to haiku plans on Sonnet and builds on Haiku, wit
   assert.equal(e2.model_alias, 'haiku')
   // Any other switch Claude Code makes by itself still pauses the role: here the first engineer goes back to Sonnet while it builds
   await hq.hook(e.id, { hook_event_name: 'PostModelSwitch', from_model: HAIKU, to_model: SONNET, source: 'auto', requested_model: null })
-  assert.deepEqual(await alarms(), [`engineer ${e.id}: model switched ${HAIKU} → ${SONNET} (source auto); role paused`])
+  assert.equal((await alarms()).length, 1); assert.match((await alarms())[0], new RegExp(`switched models by itself: ${HAIKU} → ${SONNET}\\. .*HQ stopped every engineer at work`))
   assert.deepEqual((await hq.state()).settings.paused_roles, ['engineer'])
 })
 test('Bug 385: an approved engineer on haiku goes back into plan mode by itself, with no model alarm and the role not paused', async () => {
@@ -328,7 +328,7 @@ test('Bug 385: an approved engineer on haiku goes back into plan mode by itself,
   await tool('PostToolUse', 'ExitPlanMode', 'acceptEdits'); await tool('PreToolUse', 'Edit', 'acceptEdits')
   assert.deepEqual(await alarms(), [])
   await hq.hook(e.id, { hook_event_name: 'PostModelSwitch', from_model: HAIKU, to_model: SONNET, source: 'auto', requested_model: null })
-  assert.deepEqual(await alarms(), [`engineer ${e.id}: model switched ${HAIKU} → ${SONNET} (source auto); role paused`])
+  assert.equal((await alarms()).length, 1); assert.match((await alarms())[0], new RegExp(`switched models by itself: ${HAIKU} → ${SONNET}\\. .*HQ stopped every engineer at work`))
   assert.deepEqual((await hq.state()).settings.paused_roles, ['engineer'])
   assert.equal((await hq.api('roles/engineer/resume', {})).status, 200)
 })
@@ -345,6 +345,7 @@ test('tickets that pass alone but fail together go back to their engineer, and t
   await until(t1, 'resolving')
   const told = await waitFor('HQ to tell the engineer', async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === e1.id && /fails its tests/.test(m.body)))
   assert.match(told.body, /join/); assert.equal(fs.readFileSync(path.join(p.dir, 'version.txt'), 'utf8'), 'v1\n')
+  assert.match(told.body, /main passes them without your ticket, so the failure is your ticket's/) // Bug 405: HQ ran main alone, and it passed
   sh(wt(p, t1), 'merge', '--no-edit', 'main'); fs.writeFileSync(path.join(wt(p, t1), 'items.js'), "exports.item=()=>({expiresOn:'2027'})\n"); sh(wt(p, t1), 'add', '.');
     sh(wt(p, t1), 'commit', '-qm', 'same name'); await openPr(e1)
   await until(t1, 'merged')
@@ -365,6 +366,7 @@ test('Bug 84: a ticket sent back for its tests says so, and an engineer that tak
   const e3 = await engineer(t1, e1.id)
   assert.match(prompt(e3.id), /It was fixing its tests on main; HQ's instructions for that are below\.[\s\S]*fails its tests[\s\S]*join/)
   assert.doesNotMatch(prompt(e3.id), /conflict/i); assert.equal((await tk(t1)).fixing, 'tests')
+  assert.match(prompt(e3.id), /main passes them without your ticket, so the failure is your ticket's/) // Bug 405: kept for the engineer that takes over
   assert.deepEqual(await cameBack(e1.id), [`${t1.key} came back: its tests fail`]) // Bug 206
   sh(wt(p, t1), 'merge', '--no-edit', 'main'); fs.writeFileSync(path.join(wt(p, t1), 'items.js'), "exports.item=()=>({expiresOn:'2027'})\n"); sh(wt(p, t1), 'add', '.')
   sh(wt(p, t1), 'commit', '-qm', 'same name'); await openPr(e3)
@@ -443,7 +445,8 @@ test('Bug 108: what the TPM writes for HQ\'s repair ticket goes under HQ\'s spec
   await turnEnds(p); const er = await engineer(r)
   assert.match(prompt(er.id), /Don't delete or weaken a test/); assert.match(prompt(er.id), /## From the TPM\n.+\n\n## What\nOnly the offline tests/)
   // A second text takes the place of the first, and only of that; the engineer on the ticket is told where to look
-  const second = await spec(r, { spec: 'Leave the date tests alone.' }); assert.match(second.text, under); assert.match(second.text, /added before\.$/)
+  const second = await spec(r, { spec: 'Leave the date tests alone.' }); assert.match(second.text, under)
+  assert.match(second.text, new RegExp(`added before\\. HQ has told ${r.key}'s engineer \\(${er.id}\\)\\. Don't message the engineer about this change yourself`)) // Bug 406
   const part = await tpmPart(); assert.ok(part.endsWith('\n\nLeave the date tests alone.')); assert.ok(!part.includes('offline')); assert.equal(part.split('## From the TPM').length, 2)
   await waitFor('the engineer to be told', async () => (await hq.state()).messages.find((m: any) => m.to_id === er.id && /^HQ: the TPM added to .+ spec, under "From the TPM"/.test(m.body)))
   // Bug 168: the same text again changes nothing, and the engineer isn't told twice

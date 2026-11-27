@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
-import { boundTo, listenersUnder, listenPorts, lstartMs, pgidOf, pidsUnder, portHolder, portHolders, psEnv, whoAnswers, whose } from './procs.ts'
+import { boundTo, inTestCopy, listenersUnder, listenPorts, lstartMs, pgidOf, pidsUnder, portHolder, portHolders, psEnv, whoAnswers, whose } from './procs.ts'
 
 test('lstartMs (Bug 319): ps\'s date for a process, in UTC; anything else is no date', () => {
   const f = (s: string) => lstartMs(s.trim().split(/\s+/))
@@ -45,11 +45,25 @@ test('whose (Bug 42): a launch-* leftover is HQ\'s, the rest of the repo is the 
 test('whoAnswers (Bug 44): the app alone is shown; another listener beside it is a clash; another one alone is waited for, then shown', () => {
   const h = (pid: number, pgid: number | null) => ({ pid, pgid, cmd: 'node', cwd: null })
   assert.deepEqual(whoAnswers([h(5, 4), h(6, 4)], 4, 0), { kind: 'show' }) // a --reload server: watcher and worker
-  assert.deepEqual(whoAnswers([], 4, 0), { kind: 'show' }) // lsof sees nobody
+  assert.deepEqual(whoAnswers([], 4, 0), { kind: 'wait' }) // lsof sees nobody: Bug 410, the reply may have come from a program that has just gone
+  assert.deepEqual(whoAnswers([], 4, 16_000), { kind: 'show' }) // a machine whose lsof can't see the app at all
   assert.deepEqual(whoAnswers([h(5, 4), h(9, 9)], 4, 0), { kind: 'clash', others: [h(9, 9)] })
   assert.deepEqual(whoAnswers([h(9, 9)], 4, 1000), { kind: 'wait' }) // the app may still be starting
   assert.deepEqual(whoAnswers([h(9, 9)], 4, 16_000), { kind: 'show' }) // a port Docker forwards
   assert.deepEqual(whoAnswers([h(9, null)], null, 0), { kind: 'wait' })
+})
+
+test('whoAnswers (Bug 410): HQ\'s own test copy of an app is never shown as the preview\'s page, however long it waits; beside the app it is a clash', () => {
+  const copy = { pid: 9, pgid: 9, cmd: 'node', cwd: '/u/me/shop/.claude/worktrees/hq-test-T-02/backend' }, app = { pid: 5, pgid: 4, cmd: 'node', cwd: '/u/me/garden' }
+  assert.deepEqual(whoAnswers([copy], 4, 0), { kind: 'wait' })
+  assert.deepEqual(whoAnswers([copy], 4, 10 * 60_000), { kind: 'wait' })
+  assert.deepEqual(whoAnswers([app, copy], 4, 0), { kind: 'clash', others: [copy] })
+  assert.deepEqual(whoAnswers([app], 4, 0), { kind: 'show' })
+  // what it must not catch: an engineer's worktree, the user's own folder named like one, a Launch helper's run
+  for (const cwd of ['/u/me/shop/.claude/worktrees/T-02', '/u/me/hq-test-shop', '/u/me/shop/.claude/worktrees/launch-1/x', null]) {
+    assert.equal(inTestCopy(cwd), false, String(cwd)); assert.deepEqual(whoAnswers([{ ...copy, cwd }], 4, 16_000), { kind: 'show' }, String(cwd))
+  }
+  assert.equal(inTestCopy('/u/me/shop/.claude/worktrees/hq-test-main'), true)
 })
 
 test('listenPorts (Bug 226): each process\'s listening ports, once each, on any address', () => {

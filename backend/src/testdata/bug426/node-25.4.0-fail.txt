@@ -1,0 +1,32 @@
+✔ adds a book (0.542625ms)
+✖ marks a book due soon (0.446ms)
+﹣ later (0.036959ms) # SKIP
+✔ someday (0.037875ms) # TODO
+ℹ tests 4
+ℹ suites 0
+ℹ pass 1
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 1
+ℹ todo 1
+ℹ duration_ms 67.110209
+
+✖ failing tests:
+
+test at test/shelf.test.mjs:4:1
+✖ marks a book due soon (0.446ms)
+  AssertionError [ERR_ASSERTION]: 2 == 3
+      at TestContext.<anonymous> (file:///home/u/node/test/shelf.test.mjs:4:44)
+      at Test.runInAsyncScope (node:async_hooks:213:14)
+      at Test.run (node:internal/test_runner/test:1095:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:777:18)
+      at Test.postRun (node:internal/test_runner/test:1224:19)
+      at Test.run (node:internal/test_runner/test:1152:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 2,
+    expected: 3,
+    operator: '==',
+    diff: 'simple'
+  }

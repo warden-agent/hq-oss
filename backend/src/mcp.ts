@@ -40,6 +40,17 @@ const text = (s: string): ToolResult => ({ content: [{ type: 'text', text: s }] 
 const fail = (s: string): ToolResult => ({ content: [{ type: 'text', text: s }], isError: true })
 
 const GO_AHEAD = 'started: HQ starts an engineer on it as soon as a slot is free, nothing for the user to click'
+// Bug 406: HQ's notice already tells the engineer about a spec change. The TPM's own fyi on top of it ("…rebase your work on them") came after the
+// engineer's turn and cost it two turns finding nothing to do. A question it asked still needs the TPM's answer, which a notice doesn't give.
+const NO_REPEAT = ' Don\'t message the engineer about this change yourself: HQ\'s notice tells it what changed and what to do.'
+function noRepeat(t: Ticket, tpm: string): string {
+  const q = one<{ id: string; body: string }>(`SELECT m.id, m.body FROM questions q JOIN messages m ON m.id = q.message_id
+    WHERE q.ticket_id = ? AND q.to_target = ? AND q.answered_at IS NULL ORDER BY q.asked_at LIMIT 1`, t.id, tpm)
+  if (!q) return NO_REPEAT
+  const words = q.body.replace(/\s+/g, ' ').trim(), cut = words.length > 120 ? `${words.slice(0, 120)}…` : words // which one, so it isn't taken for another
+  return ` HQ's notice tells the engineer what changed. Its question to you ("${cut}", ${q.id}) still waits for your answer: send that with send_message`
+    + ` (reason "answer", in_reply_to ${q.id}).`
+}
 // `kind` and `id` are plain strings here so a wrong one gets HQ's own words (criteria.ts readCriteria), not a schema error. `type` is the same as `kind`.
 const CRITERIA = z.array(z.object({ id: z.string().optional(), kind: z.string().optional(), type: z.string().optional(), text: z.string() }))
 const CRITERIA_ABOUT = 'a list of { kind, text }, at least one, one per thing that must be true when the ticket is done, checkable from outside the code:'
@@ -178,7 +189,7 @@ function registerTools(s: McpServer, agent: Agent): void {
         try {
           const r = await changeFinished(t.id, { ...(spec ? { spec } : {}), ...(title ? { title } : {}), ...(criteria ? { criteria } : {}) })
           const who = r.via === 'launch' ? `HQ started an engineer (${r.engineer})` : `HQ told its engineer (${r.engineer})`
-          return text(`${ok} ${t.key} was already finished, so ${who} to build the change. It can't be merged until that's done; HQ tells you when it is.`)
+          return text(`${ok} ${t.key} was already finished, so ${who} to build the change. It can't be merged until that's done; HQ tells you when it is.${NO_REPEAT}`)
         } catch (e) {
           return fail(`${t.key} is already finished, and HQ couldn't send it back to an engineer for this change: ${(e as Error).message.replace(/\.$/, '')}.`
             + ' Nothing was changed. Try again in a minute, or create a new ticket for the change.')
@@ -199,8 +210,8 @@ function registerTools(s: McpServer, agent: Agent): void {
       // Bug 370: an engineer at work reads it at its next tool step, not once the turn it builds the old version in has ended (delivery.ts MID_TURN_REASONS)
       if (to) sendMessage({ repoId, featureId: t.feature_id, channel: 'dm', from: 'hq', to, reason: 'spec_change', body })
       const plan = replan ? ` Auto mode is off, so ${t.key}'s engineer shows the user a new plan for the change before it builds on; they approve it like the first.` : ''
-      if (eng) return text(ok + plan)
-      return text(to ? `${ok} ${t.key}'s engineer (${to}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.${plan}`
+      if (eng) return text(`${ok} HQ has told ${t.key}'s engineer (${eng}).${plan}${noRepeat(t, agent.id)}`)
+      return text(to ? `${ok} ${t.key}'s engineer (${to}) has stopped, so nobody has read this yet: HQ tells the next engineer that starts on ${t.key}.${plan}${NO_REPEAT}`
         : `${ok} Nobody has started on ${t.key} yet; its engineer gets ${hq ? 'it' : `the new ${news}`} when it starts.`)
     })
     s.registerTool('set_merge_order', {

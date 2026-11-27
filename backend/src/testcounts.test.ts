@@ -87,3 +87,23 @@ test('Bug 384: todo alone, and what todo must NOT catch', () => {
   assert.equal(read('TODO: 3 tests\nwe have 1 todo left\n'), null, 'the word in other lines')
   assert.equal(read('  3 passing (2ms)\n  1 todo\n')?.todo, undefined, 'a line that only looks like mocha\'s')
 })
+
+// Bug 426: HQ goes by these counts when a test command exits 0 though a test failed (`mocha || true`: testrun.ts failedAnyway), so a failed count must be a
+// real failure and nothing else. Real output (testdata/bug426, captured 2026-11-26 with CI=1, paths cut out) from one file of a passing test, a failing one
+// (fixed in the -pass captures), a skipped one, and where the runner has them a todo and a test expected to fail: vitest's `1 expected fail`, jest's
+// test.failing, pytest's xfail and xpass, unittest's expectedFailure, mocha's pending.
+const cap426 = (name: string): string => readFileSync(new URL(`./testdata/bug426/${name}.txt`, import.meta.url), 'utf8')
+const COUNTS_426: [string, { passed: number; failed: number; skipped: number; todo?: number }][] = [
+  ['mocha-11.8.0-fail', { passed: 1, failed: 1, skipped: 1 }], ['mocha-11.8.0-pass', { passed: 2, failed: 0, skipped: 1 }],
+  ['jest-30.1.2-fail', { passed: 2, failed: 1, skipped: 1, todo: 1 }], ['jest-30.1.2-pass', { passed: 3, failed: 0, skipped: 1, todo: 1 }],
+  ['vitest-4.1.11-fail', { passed: 1, failed: 1, skipped: 1, todo: 1 }], ['vitest-4.1.11-pass', { passed: 2, failed: 0, skipped: 1, todo: 1 }],
+  ['pytest-9.2.0-fail', { passed: 1, failed: 1, skipped: 1 }], ['pytest-9.2.0-pass', { passed: 2, failed: 0, skipped: 1 }],
+  ['node-25.4.0-fail', { passed: 1, failed: 1, skipped: 1, todo: 1 }], ['node-25.4.0-pass', { passed: 2, failed: 0, skipped: 1, todo: 1 }],
+  ['unittest-3.14-fail', { passed: 1, failed: 1, skipped: 1 }], ['unittest-3.14-pass', { passed: 2, failed: 0, skipped: 1 }],
+]
+for (const [name, want] of COUNTS_426) test(`Bug 426: ${name} has ${want.failed ? 'its failed test' : 'no failed test'} in its counts`, () => assert.deepEqual(read(cap426(name)), want))
+test('Bug 426: vitest\'s two-word count (`1 expected fail`) no longer loses the whole line, and is neither a pass nor a failure', () => {
+  assert.deepEqual(read(' Tests  2 passed | 1 expected fail | 1 skipped (4)\n'), { passed: 2, failed: 0, skipped: 1 })
+  assert.deepEqual(read(' Tests  1 failed | 1 expected fail (2)\n'), { passed: 0, failed: 1, skipped: 0 })
+  assert.equal(read(' Test Files  1 failed (1)\n'), null, 'the files line is not the tests line')
+})

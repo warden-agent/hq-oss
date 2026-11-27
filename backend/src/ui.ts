@@ -18,6 +18,7 @@ import { readCriteria } from './criteria.ts'
 import { messageTpm, restartTpm } from './tpm.ts'
 import { freshStart, freshStartAll, parkRepo, resumeRepo } from './freshstart.ts'
 import { clearRepo } from './clear.ts'
+import { HostRefused, setAllowedHost } from './allowhosts.ts'
 import { removeRepo } from './remove.ts'
 import { repos, features, tickets, getTicket, getRepo, closedWhy, repoOfAgent } from './records.ts'
 import { messageRoute } from './msgroute.ts'
@@ -27,10 +28,10 @@ import { createProject, githubReady, RepoHere } from './newproject.ts'
 import { makePr, mergeTicket } from './mergewatch.ts'
 import { sendCheck, startCheck, stopCheck } from './hqcheck.ts'
 import { answerReview, openReviews, pageReviews, getReview, getRevision, heldCount, isVerdict, VERDICTS } from './gate.ts'
-import { interruptAndType, sendMessage, messagesForFeature, openQuestions } from './delivery.ts'
+import { interruptAndType, sendMessage, messagesForFeature, openQuestions, pausedRoles } from './delivery.ts'
 import { wakeAll } from './wake.ts'
 import { openAttention, resolveAttention } from './attention.ts'
-import { resumeRole } from './modelguard.ts'
+import { heldByPause, pauseRole, resumeRole } from './pause.ts'
 import * as tmux from './tmux.ts'
 import { answerAsk, answerOpenAsks, openAsks } from './asks.ts'
 import { freePort, NeedsSetup, previews, setPreviewCommand, startPreview, StepsOutdated, stopPreview } from './preview.ts'
@@ -143,6 +144,10 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     if (r0 === 'repos' && r1 && r2 === 'test-cmd-answer' && req.method === 'POST') {
       try { return json(res, 200, await answerTestCommand(r1, !!body.use)) } catch (e) { return json(res, 409, { error: (e as Error).message }) }
     }
+    if (r0 === 'repos' && r1 && r2 === 'allowed-hosts' && req.method === 'POST') { // Bug 425: the user allows a download host for the project, or takes it off
+      try { return json(res, 200, setAllowedHost(r1, String(body.host ?? ''), body.allow !== false)) }
+      catch (e) { if (e instanceof HostRefused) return json(res, 400, { error: e.message }); throw e }
+    }
     if (r0 === 'repos' && r1 && r2 === 'test-cmd' && req.method === 'POST') { try { return json(res, 200, setTestCmd(r1, String(body.cmd ?? ''))) } catch (e) { return json(res,
       400, { error: (e as Error).message }) } }
     if (r0 === 'repos' && r1 && r2 === 'first-map' && req.method === 'POST') { try { return json(res, 200, startFirstMap(r1)) } catch (e) { return json(res, 409, { error: (e as Error).message }) } }
@@ -185,7 +190,8 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
       if (a.role === 'tpm' && a.repo_id) answerOpenAsks(a.repo_id, m.body) // what the user tells the TPM answers what it asked (Bug 43)
       // Typed after Escape (a mod prompt is dropped after an interrupt), but never into a dialog or menu, where Enter picks an option:
       // then the mod delivers it as usual, once the agent is free.
-      const typeable = !onDialog(a) && !['plan_review', 'exited'].includes(a.status) // after an API error it sits at its prompt (Bug 72)
+      // Bug 195: nor into an agent whose role is paused: Urgent would start the turn the pause is there to prevent. It waits for Resume with the rest
+      const typeable = !onDialog(a) && !['plan_review', 'exited'].includes(a.status) && !heldByPause(a) // after an API error it sits at its prompt (Bug 72)
       if (body.urgent && typeable) { emit({ agentId: a.id, source: 'ui', kind: 'urgent.interrupt', payload: {} }); await interruptAndType(a, m) }
       return json(res, 200, m)
     }
@@ -242,7 +248,11 @@ async function api(req: http.IncomingMessage, url: URL, res: http.ServerResponse
     }
     if (r0 === 'settings' && req.method === 'POST') {
       const bad = validSetting(String(body.key), body.value); if (bad) return json(res, 400, { error: bad })
+      // Bug 195: a role paused or resumed through the setting is paused or resumed like any other (its agents stopped, or told to carry on)
+      const was = body.key === 'paused_roles' ? pausedRoles() : [], next = body.key === 'paused_roles' ? body.value as string[] : []
       setSetting(String(body.key), body.value); patch('setting', String(body.key), { value: body.value }); emit({ agentId: null, source: 'ui', kind: 'settings.changed', payload: { key: body.key } })
+      for (const r of next.filter((x) => !was.includes(x))) pauseRole(r, 'paused in the settings')
+      for (const r of was.filter((x) => !next.includes(x))) resumeRole(r)
       if (body.key === 'concurrency_cap') void fillSlots().catch(() => {})
       if (body.key === 'heavy_at_once') pump() // raised: whoever waits for a turn may go
       if (body.key === 'paused_roles' || body.key === 'batch_receive_s') wakeAll() // Bug 99: who may get a batch, or when one falls due

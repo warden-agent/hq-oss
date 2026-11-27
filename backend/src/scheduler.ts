@@ -12,7 +12,8 @@ export function canLaunch(o: { ignoreCap?: boolean } = {}): { ok: boolean; why?:
   const running = one<{ c: number }>(`SELECT COUNT(*) AS c FROM agents a LEFT JOIN tickets t ON t.id = a.ticket_id WHERE a.role = 'engineer' AND a.status != 'exited' AND (t.status IS NULL OR t.status NOT IN (${FINISHED.map(() => '?').join(',')}))`, ...FINISHED)!.c + starting.size
   const free = Math.max(0, cap - running)
   if (!free && !o.ignoreCap) return { ok: false, why: `${LIMIT_REACHED} (${running}/${cap})`, free }
-  const paused = getSetting<string[]>('paused_roles', []); if (paused.includes('engineer')) return { ok: false, why: 'Engineer role is paused (model fallback or usage limit)', free: 0 }
+  const paused = getSetting<string[]>('paused_roles', [])
+  if (paused.includes('engineer')) return { ok: false, why: 'Engineers are paused (one switched models by itself): press Resume on that notice in the ⚠ menu first', free: 0 }
   const u = one<{ fh: number | null; sd: number | null }>('SELECT MAX(five_hour_pct) fh, MAX(seven_day_pct) sd FROM usage_samples WHERE at > ?', Date.now() - 600_000)
   const why = overPause(u?.fh, u?.sd, pauseLevels()); if (why) return { ok: false, why, free: 0 }
   return { ok: true, free }

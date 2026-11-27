@@ -1,14 +1,15 @@
 // Worker slots (each running engineer's ports and DB name) and engineers' worktrees once they're gone.
 import fs from 'node:fs'
+import path from 'node:path'
 import { q, run } from './db.ts'
 import { portBusy } from './apprun.ts'
 import { freeBase, SLOT_SIZE } from './slotports.ts'
 import { heldBases, slotBasesNow, takenSlots } from './runports.ts'
 import { emit } from './events.ts'
-import { sleep } from './util.ts'
+import { j, sleep } from './util.ts'
 import { sweepNow } from './leftovers.ts'
 import { claudeLockPid, listWorktrees, removeMerged, unlockStale } from './worktrees.ts'
-import { getAgent } from './agents.ts'
+import { agentDir, getAgent, type Agent } from './agents.ts'
 import { getFeature, getRepo, getTicket, repos, type Ticket, removing } from './records.ts'
 
 /** A worker slot's env: the engineer owns ports `base` … `base`+9 (PORT is the first) and a database name no other HQ's engineer has. */
@@ -31,6 +32,24 @@ export async function nextWorkerSlot(agentId: string, busy: (port: number) => Pr
   return got
 }
 export function releaseSlot(agentId: string): void { run('UPDATE worker_slots SET agent_id = NULL WHERE agent_id = ?', agentId) }
+/** The first port an agent's launch script gave it (HQ_PORT_BASE), or null. */
+function launchBase(agentId: string): string | null {
+  try { return /^export HQ_PORT_BASE='(\d+)'$/m.exec(fs.readFileSync(path.join(agentDir(agentId), 'launch.sh'), 'utf8'))?.[1] ?? null } catch { return null }
+}
+/** Bug 422: on backend start, before anything can start an engineer (no start of this backend is under way, so every `pending-<ticket>` row is the last
+ *  backend's). startEngineer holds a block under that name until launchAgent returns; a backend that went down in between left it there, counted as taken
+ *  for good. It goes to the engineer that start launched if that one still runs (its launch script has those ports; a take-over finds it there), so it is
+ *  freed when that engineer ends, like any engineer's; with no such engineer it is free now. Returns what it did, for the event. */
+export function settlePendingSlots(): { idx: number; ticket: string; to: string | null }[] {
+  const out: { idx: number; ticket: string; to: string | null }[] = []
+  for (const r of q<{ idx: number; agent_id: string; env: string }>("SELECT idx, agent_id, env FROM worker_slots WHERE agent_id LIKE 'pending-%'")) {
+    const ticket = r.agent_id.slice('pending-'.length), base = j<Record<string, string>>(r.env, {}).HQ_PORT_BASE
+    const a = q<Agent>(`SELECT * FROM agents WHERE role = 'engineer' AND ticket_id = ? AND status != 'exited'
+      AND id NOT IN (SELECT agent_id FROM worker_slots WHERE agent_id IS NOT NULL) ORDER BY started_at DESC`, ticket).find((x) => !!base && launchBase(x.id) === base)
+    run('UPDATE worker_slots SET agent_id = ? WHERE idx = ?', a?.id ?? null, r.idx); out.push({ idx: r.idx, ticket, to: a?.id ?? null })
+  }
+  return out
+}
 
 /** Once an engineer is gone, its worktree's stale lock is cleared, and a merged ticket's worktree is removed if nothing in it
  *  would be lost (see worktrees.ts). A session HQ just stopped can take a moment to exit, so the lock is checked a few times. */

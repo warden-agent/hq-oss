@@ -17,6 +17,7 @@ const { migrate, run } = await import('./db.ts'); migrate()
 const { PATHS } = await import('./config.ts')
 const { bus } = await import('./events.ts')
 const { blocked, dotenv, heldBy, mentions, moveAddresses, moveLine, ownPort, placePorts, portTaken, scanned, scriptsOf, unsureWords } = await import('./testports.ts')
+const { copyPorts, handing, releaseCopy } = await import('./copyports.ts')
 
 const sh = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.hooksPath=/dev/null', ...args], { cwd,
   encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
@@ -291,7 +292,41 @@ test('Bug 381: a port HQ\'s preview was given is taken while its app isn\'t list
     assert.equal(await portTaken(api), false, status)
     sh(wt, 'checkout', '-q', '--', '.')
     const got = await placePorts(wt, plan, [], darwin); assert.ok('plan' in got && !got.plan.moved, `${status}: ${JSON.stringify(got)}`)
+    releaseCopy(wt) // that copy's run is over (testrun.ts dropWorktree): its port is free again (Bug 410)
   }
+})
+
+// Bug 410: a test copy that runs on the project's own fixed port may not listen there yet (installing, starting), and another project's preview with the
+// same fixed port was started on it, then read "running" off the copy's page. What a copy was given is HQ's own record now, from the moment its ports are
+// settled until its checkout goes: taken for the previews (preview.ts choosePorts, e2e/test-copy-ports.test.ts) and for another copy, which moves off it.
+test('Bug 410: a test copy\'s fixed port is taken, and named as HQ\'s test, from its settling until its checkout is gone; a preview start on its way too', async () => {
+  const free = (): Promise<number> => new Promise((ok) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = (s.address() as net.AddressInfo).port; s.close(() => ok(p)) }) })
+  const api = await free(), darwin = { platform: 'darwin' }
+  run("INSERT INTO repos(id, name, path, kind, created_at) VALUES ('b410', 'b410shop', '/tmp/hq-testports-b410', 'local', 1)")
+  const copy = () => {
+    const { wt, plan: p0 } = checkout({ 'frontend/vite.config.ts': VITE.replace('8000', String(api)) })
+    const parts = p0.recipe.parts.map((p) => p.name === 'api' ? { ...p, run: `node api.js --port ${api}`, port: api } : p)
+    return { wt, plan: { ...p0, repoPath: '/tmp/hq-testports-b410', recipe: { ...p0.recipe, parts } } }
+  }
+  const a = copy(), b = copy()
+  assert.equal(await portTaken(api), false)
+  const got = await placePorts(a.wt, a.plan, [], darwin); assert.ok('plan' in got && !got.plan.moved, JSON.stringify(got)) // nobody had it: the copy keeps it
+  assert.equal(await portTaken(api), true); assert.equal(copyPorts().get(api), 'b410') // nothing listens there, and it is taken all the same
+  assert.deepEqual(await heldBy(api, null), { who: "HQ's own test of b410shop's app", fix: 'Test again once that test is over' })
+  // a second copy (another test of the project, or of another one with the same fixed port) moves off it, saying whose test has it
+  const second = await placePorts(b.wt, b.plan, [], darwin); assert.ok('plan' in second && second.plan.moved?.length === 1, JSON.stringify(second))
+  const to = second.plan.moved[0]!.to
+  assert.deepEqual(second.plan.moved, [{ part: 'api', from: api, to, by: "HQ's own test of b410shop's app", fix: 'Test again once that test is over' }])
+  assert.equal(copyPorts().get(to), 'b410') // and what it moved to is its own while it runs
+  // what it must not catch: a copy that is over (its checkout removed, released or not) holds nothing
+  releaseCopy(a.wt); assert.equal(await portTaken(api), false)
+  assert.ok('plan' in await placePorts(a.wt, a.plan, [], darwin)); assert.equal(await portTaken(api), true)
+  fs.rmSync(a.wt, { recursive: true, force: true }); assert.equal(await portTaken(api), false); assert.equal(copyPorts().has(api), false)
+  releaseCopy(b.wt); assert.equal(copyPorts().has(to), false)
+  // Bug 354's claim of a preview start on its way (its row not yet "starting") counts for a copy too, named as that project's preview
+  handing.set('b410', [api]); assert.equal(await portTaken(api), true)
+  assert.deepEqual(await heldBy(api, 'b410'), { who: "HQ's preview of b410shop", fix: 'Stop the app in the preview, then test again' })
+  handing.delete('b410'); assert.equal(await portTaken(api), false)
 })
 
 // A rule with no check gets broken: a run that starts a moved app without `block` could reach the preview's server and the user's data on the old port.

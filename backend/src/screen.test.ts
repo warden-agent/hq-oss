@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { draftText, ownHalfLine, paneHasDraft, paneLooksIdle, plainScreen } from './screen.ts'
+import { draftText, ownHalfLine, paneAtWork, paneHasDraft, paneLooksIdle, plainScreen } from './screen.ts'
 
 const RULE = '─'.repeat(120)
 const box = (prompt: string, footer: string, above = '') => `${above}\n${RULE} TPM demo ─\n${prompt}\n${RULE}\n${footer}\n`
@@ -218,6 +218,21 @@ test('Bug 189: paneLooksIdle on a plain capture: the working line above the box 
     assert.equal(paneLooksIdle(box('❯ ', '  ⏸ manual mode on', done)), true, done)
   }
   assert.equal(paneLooksIdle(box('❯ ', '  ⏸ manual mode on', '✽ Doodling… (3s · ↓ 16 tokens)\n  ⎿  Tip: Create skills')), false) // a tip line under it
+})
+
+// ---- Bug 195: a paused role's agents get Escape, but only into a screen where a turn is at work (pause.ts stopForPause) ----
+test('Bug 195: paneAtWork: a turn at work, with "esc to interrupt" in the footer or (a draft in the box) without it', () => {
+  for (const [name, s] of Object.entries({ THINKING, RUNNING, BUSY_DRAFT, BUSY_EMPTY, BUSY_QUEUED_HINT })) assert.equal(paneAtWork(s), true, name)
+  for (const s of BUSY_322) assert.equal(paneAtWork(s), true, s)
+  for (const n of WORKING_189) assert.equal(paneAtWork(screen189(n)), true, n)
+})
+test('Bug 195: paneAtWork: what it must not catch: an ended turn (a draft, a helper or a background shell still there), a menu, a dialog, no prompt box', () => {
+  for (const n of IDLE_189) assert.equal(paneAtWork(screen189(n)), false, n) // Escape there stops nothing, and twice it clears somebody's draft
+  for (const s of [IDLE_TPM, IDLE_ENG, ...IDLE_322]) assert.equal(paneAtWork(s), false, s)
+  for (const [name, s] of Object.entries({ EMPTY_PLACEHOLDER, DRAFT, SUGGESTION, AFTER_ESCAPE_DRAFT, REWIND })) assert.equal(paneAtWork(s), false, name)
+  for (const [name, s] of Object.entries({ PLAN_MENU, PERMISSION, PLAN_MENU_322 })) assert.equal(paneAtWork(s), false, name) // Escape would answer it
+  // Claude Code still starting, a shell, nothing: no box to tell by, so nothing HQ knows how to stop
+  for (const s of ['', 'zsh: command not found: claude\n$ ', '❯ \n  ? for shortcuts\n']) assert.equal(paneAtWork(s), false, JSON.stringify(s))
 })
 
 // ---- Bug 331: a restart in the middle of HQ typing a line leaves its first pieces (250 characters each) in the box. Captured from real

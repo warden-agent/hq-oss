@@ -154,6 +154,8 @@ export async function startRecording(spec) {
   const rec = {
     url: `http://127.0.0.1:${proxyPort}`,
     seedDir,
+    /** The ports a browser on this app may open: the proxy's and the app's parts' (a reset starts them on the same ones). */
+    ports: () => [proxyPort, ...Object.values(app.ports ?? {})],
     /** Stamps the start or end of an action. A start makes it the action later requests belong to. */
     mark(label, phase, extra = {}) {
       if (phase === 'start') action = ++marks

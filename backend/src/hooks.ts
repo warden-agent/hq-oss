@@ -10,10 +10,11 @@ import { paneShowsDialog } from './screen.ts'
 import { onExitPlanMode, onPostExitPlanMode, openReviews } from './gate.ts'
 import { ackBatchFromPrompt, deliveredByStopHook, recordReply, nextBatchFor, markSubmitted, markReceived, requeue, unreadCount, pendingFor, tellIfHqWasAway, modLook } from './delivery.ts'
 import { stepNotes } from './delivery.ts'
-import { turnEnded } from './delivery.ts'
+import { turnEnded, typeWaitsOver } from './delivery.ts'
 import { lateReportFits, submittedWhileAway } from './delivery.ts'
 import { listen, wake, type Waiter } from './wake.ts'
 import { onPostModelSwitch, onTurnStep } from './modelguard.ts'
+import { heldByPause, pauseRefused, PAUSE_NOTE, stopForPause } from './pause.ts'
 import { attention, resolveKind } from './attention.ts'
 import { getRepo, getTicket, repoOfAgent } from './records.ts'
 import { gateBash, laneMoved } from './heavy.ts'
@@ -21,7 +22,9 @@ import { addRun, endRuns, turnHadEnded, waitingText, watchedTask } from './bgrun
 import { isBridgePid } from './terminal.ts'
 import * as tmux from './tmux.ts'
 import { readJson, asObject, TooLarge } from './util.ts'
-import { TOKEN_HEADER } from './roles.ts'
+import { TOKEN_HEADER, REGISTRY_WORDS, systemCerts } from './roles.ts'
+import { hookText, stoppedDownloads, stoppedWords } from './downloads.ts'
+import { projectHosts } from './allowhosts.ts'
 import { sawTestCmd } from './auto.ts'
 import { overPause, pauseLevels } from './scheduler.ts'
 import { keepBefore, keepState, suiteRan } from './suiteran.ts'
@@ -287,6 +290,7 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
     case 'UserPromptSubmit': { turn.prompt = ++turnSeq; payload.prompt = trim(body.prompt, 200); fields.status = 'working'; live.activity = 'Thinking'
       const done = [...String(body.prompt ?? '').matchAll(/<task-id>([\w-]+)<\/task-id>/g)].map((m) => m[1]!) // a helper's or a background run's "done" notice
       const ended = done.filter((task) => bg.delete(task)); if (ended.length) payload.helpersDone = ended // Bug 232: logged, for rebuildHelpers
+      typeWaitsOver(agent.id) // Bug 436: a prompt got in, so what held a typed message back (a draft, a menu) is gone
       endRuns(agent.id, done, 'done') // Bugs 94, 95
       payload.acked = ackBatchFromPrompt(agent, String(body.prompt ?? '')); break }
     case 'PreToolUse': payload.input = trim(input, 300); if (!sub) fields.status = 'working'
@@ -337,6 +341,7 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (!sub && DIALOG_MAY_BE_OVER.has(ev) && agent.status !== 'exited') dialogMayBeOver(agent.id, `hook:${ev}`) // Bug 188: after the update, which the look reads
   // Bug 107: a Bash command of an engineer's (or of a helper of its: same session, same worktree) is over. Was it the project's test command, refused by Claude Code?
   if (tool === 'Bash' && (ev === 'PostToolUse' || ev === 'PostToolUseFailure')) sawTestCmd(agent, String(input.command ?? ''), ev === 'PostToolUse' ? undefined : String(body.error ?? ''))
+  if (tool === 'Bash' && (ev === 'PostToolUse' || ev === 'PostToolUseFailure')) sawDownloads(agent, body)
 
   // ---- decisions ----
   if (ev === 'PermissionRequest') {
@@ -352,6 +357,11 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   // at a time, so the next tool starting (or a helper finishing) means the turn its last command held is free
   const lane = sub ? String(body.agent_id) : 'main'
   if (ev === 'PreToolUse' || ev === 'SubagentStop') laneMoved(agent.id, lane, ev === 'PreToolUse' && tool === 'Bash' ? String(body.tool_use_id ?? '') : '') // Bug 145: asked again
+  // Bug 195: its role is paused, so no step runs, its own or a helper's, and its own turn is stopped (pause.ts). Before the turn gate: nothing waits in line
+  if (ev === 'PreToolUse' && heldByPause(agent)) {
+    if (!sub) pauseRefused(agent)
+    return json(res, 200, { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: PAUSE_NOTE } })
+  }
   // Bug 213: a test run with a command after it that may change files starts once HQ has what the worktree holds before it (suiteran.ts)
   const goAhead = (): void => { const p = row.id ? keepBefore(agent, String(input.command ?? ''), row.id, input.run_in_background === true) : null
     if (!p) return json(res, 200, {}); void p.then(() => { if (!res.writableEnded && !res.destroyed) json(res, 200, {}) }) }
@@ -366,6 +376,8 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
   if (ev === 'PostToolUse' && (tool === 'TaskCreate' || tool === 'TaskUpdate')) { recordTask(agent, tool, input, body.tool_response as Record<string, unknown> | undefined) }
   if (ev === 'UserPromptSubmit' || ev === 'Stop') {
     if (ev === 'Stop' && !sub) wake(agent.id) // Bug 370: what waited for its next step goes to the mod now, though a helper may keep it 'working'
+    // Bug 195: a turn that starts while its role is paused (a helper or a run in the background ended, somebody typed in its terminal) is stopped
+    if (ev === 'UserPromptSubmit' && heldByPause(agent)) stopForPause(agent.id, 'prompt')
     const ctx: string[] = []
     // Only as a turn starts (Bug 139): on Stop the note made the agent answer it, again and again, and never go idle for the message to come in
     const unread = ev === 'UserPromptSubmit' ? unreadCount(agent) : 0
@@ -403,6 +415,14 @@ function handleHook(agent: Agent, body: Record<string, unknown>, res: http.Serve
 /** Bug 370: the answer to the agent's own tool step (not a helper's): what can't wait for its turn to end goes in with it (stepNotes). */
 function atStep(agent: Agent, ev: string, sub: boolean, body: Record<string, unknown>): Record<string, unknown> {
   const notes = sub ? null : stepNotes(agent.id, now(), String(body.tool_use_id ?? '')); return notes ? { hookSpecificOutput: { hookEventName: ev, additionalContext: notes } } : {}
+}
+/** Bugs 412, 415: one of a sandboxed agent's commands was refused a download (a host not on the list, or the Mac's certificate check): the user hears
+ *  which host, in one notice per agent that newer words replace. Only the agent sees the command's output, and it may just give up on the download. */
+function sawDownloads(agent: Agent, body: Record<string, unknown>): void {
+  if (agent.role !== 'engineer' && agent.role !== 'launcher') return // the only ones with a sandbox
+  const s = stoppedDownloads(hookText(body), process.platform === 'darwin' && !systemCerts()); if (!s) return
+  const own = projectHosts(getRepo(repoOfAgent(agent) ?? ''))
+  attention('download_refused', stoppedWords(agent.display_name ?? agent.id, s, REGISTRY_WORDS, own), { agentId: agent.id, ticketId: agent.ticket_id })
 }
 function recordTask(agent: Agent, tool: string, input: Record<string, unknown>, resp: Record<string, unknown> | undefined): void {
   const taskId = String(input.taskId ?? input.id ?? resp?.id ?? resp?.taskId ?? '')

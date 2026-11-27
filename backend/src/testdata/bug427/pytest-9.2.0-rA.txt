@@ -1,0 +1,24 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.14, pytest-9.2.0, pluggy-1.7.0
+rootdir: /private/tmp/shelf427
+configfile: pyproject.toml
+testpaths: tests
+collected 7 items
+
+tests/test_notrun.py xx                                                  [ 28%]
+tests/test_shelf.py .xXF.                                                [100%]
+
+=================================== FAILURES ===================================
+___________________________ test_shelf_strict_xpass ____________________________
+[XPASS(strict)] strict: must fail
+==================================== PASSES ====================================
+=================================== XPASSES ====================================
+=========================== short test summary info ============================
+PASSED tests/test_shelf.py::test_shelf_lists_books
+PASSED tests/test_shelf.py::test_shelf_counts_books
+XFAIL at setup of tests/test_notrun.py::test_shelf_never_run - [NOTRUN] hangs the shelf
+XFAIL tests/test_notrun.py::test_shelf_imperative_xfail - cover service down
+XFAIL tests/test_shelf.py::test_shelf_shows_covers - covers not built yet
+XPASS tests/test_shelf.py::test_shelf_sorts_books - sorting may already work
+FAILED tests/test_shelf.py::test_shelf_strict_xpass - [XPASS(strict)] strict:...
+============== 1 failed, 2 passed, 3 xfailed, 1 xpassed in 0.02s ===============

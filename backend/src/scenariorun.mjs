@@ -6,6 +6,7 @@
 // A step: { action: 'navigate'|'click'|'fill'|'press'|'select'|'check'|'back'|'reset', role?, name?, text?, value?, url?, label? }
 import fs from 'node:fs'
 import path from 'node:path'
+import { allowPorts } from './appstart.mjs'
 import { startRecording } from './recorder.mjs'
 import { holds, runStep, stepLabel } from './steps.mjs'
 
@@ -27,7 +28,10 @@ try {
   if (!started.rec) { result.started = false; result.why = started.why; result.output = started.output ?? null; await finish() }
   rec = started.rec
   const { chromium } = await import(path.join(spec.pwCore, 'index.mjs'))
-  try { browser = await chromium.launch({ headless: true }) } catch (e) { result.started = false; result.why = `HQ's browser didn't start (${cut(e.message, 200)})`; await finish() }
+  // The recorder's port and the app's own, even one browsers refuse (Bug 433): a page may call another part of the app straight
+  try { browser = await chromium.launch({ headless: true, args: allowPorts(rec.ports()) }) } catch (e) {
+    result.started = false; result.why = `HQ's browser didn't start (${cut(e.message, 200)})`; await finish()
+  }
   const page = await (await browser.newContext()).newPage()
   rec.attach(page); result.started = true; write()
   // The page is opened first when the steps don't open it themselves; that step is HQ's, and has no result: results line up with the steps given

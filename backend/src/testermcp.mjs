@@ -8,7 +8,7 @@
 // imported by path from `rules`), so a refused one goes back to the agent while the app is still open, for it to fix and send again.
 import fs from 'node:fs'
 import path from 'node:path'
-import { startApp } from './appstart.mjs'
+import { allowPorts, startApp } from './appstart.mjs'
 
 const spec = JSON.parse(process.argv[2])
 const { McpServer } = await import(path.join(spec.sdk, 'dist/esm/server/mcp.js'))
@@ -25,7 +25,8 @@ const ready = (async () => {
   if (!app.port) { state.started = false; state.why = app.kind === 'skipped' ? app.why : `the app didn't start: ${app.why}`; state.output = app.output ?? null; save(); return state.why }
   try {
     const { chromium } = await import(path.join(spec.pwCore, 'index.mjs'))
-    browser = await chromium.launch({ headless: true }); page = await browser.newPage(); origin = `http://localhost:${app.port}`
+    browser = await chromium.launch({ headless: true, args: allowPorts([app.port, ...Object.values(app.ports)]) }) // even a port browsers refuse (Bug 433)
+    page = await browser.newPage(); origin = `http://localhost:${app.port}`
     page.on('console', (m) => { if (m.type() === 'error' && !/^Failed to load resource/.test(m.text())) logged.push(m.text().slice(0, 300)) })
     page.on('pageerror', (e) => logged.push(e.message.slice(0, 300)))
   } catch (e) { state.started = false; state.why = `HQ's browser didn't start (${String(e.message).split('\n')[0].slice(0, 200)})`; save(); return state.why }

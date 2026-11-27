@@ -187,7 +187,7 @@ test('Bug 383, what a carriage return must not change: only what a terminal show
   assert.deepEqual(seen(' 40% [====    ]\r100% [========]\r\n  ✔ shows each due date\n', ['shows each due date']).passed, ['shows each due date'])
   const names = ['adds_item', 'shows each due date', 'sorts books by due date', 'has due_on'], files = ['test/list.test.js', 'web/src/sort.test.ts']
   for (const [k, c] of Object.entries({ VITEST, JEST, PYTEST_RA, GO_V, CARGO })) assert.deepEqual(seen(c.replace(/\n/g, '\r\n'), names, files), seen(c, names, files), k)
-  for (const d of ['bug372', 'bug375', 'bug377']) { // every real test run captured reads the same with Windows line ends
+  for (const d of ['bug372', 'bug375', 'bug377', 'bug414', 'bug427']) { // every real test run captured reads the same with Windows line ends
     for (const f of readdirSync(new URL(`./testdata/${d}/`, import.meta.url))) {
       const c = readFileSync(new URL(`./testdata/${d}/${f}`, import.meta.url), 'utf8')
       assert.deepEqual(seen(c.replace(/\n/g, '\r\n'), names, files, 64), seen(c, names, files, 64), `${d}/${f}`)
@@ -392,4 +392,74 @@ test('Bug 411: a named test in something the project\'s test steps leave out say
   assert.deepEqual([A1, A2, A3].map((e) => outsideParts(e, parts, left)), [false, false, true]) // what is left out on purpose is the engineer's to answer for, not the command's
   assert.equal(leftOutOf('mobile', left)?.path, 'mobile'); assert.equal(leftOutOf('mobiles/a.test.ts', left), undefined); assert.equal(leftOutOf(undefined, left), undefined)
   assert.equal(leftOutOf('anything/at/all.py', [{ path: '.', why: 'w' }])?.why, 'w'); assert.equal(unproven([A1], 'cmd', parts).length, 1) // no list given: today's words
+})
+
+// Bug 414: pytest -v names every test on a line of its own that also names its file (`tests/test_shelf.py::test_x PASSED`). Such a line was read as one for
+// its whole file: a file with one test skipped made its other named tests "couldn't see it by name", and a file with none skipped made a named test pytest
+// never ran (one it doesn't collect) read "passed". Real pytest 9.2.0 through HQ's sandbox, 2026-11-26: tests/test_due.py has two passing tests,
+// tests/test_shelf.py two passing and one skipped. In testdata/bug414.
+const cap414 = (name: string): string => readFileSync(new URL(`./testdata/bug414/${name}.txt`, import.meta.url), 'utf8')
+const MAP414 = [
+  { criterion: 'A1', file: 'tests/test_shelf.py', name: 'test_shelf_lists_books' }, { criterion: 'A2', file: 'tests/test_shelf.py', name: 'test_shelf_shows_covers' },
+  { criterion: 'A3', file: 'tests/test_shelf.py', name: 'check_shelf_is_sorted' }, { criterion: 'A4', file: 'tests/test_due.py', name: 'test_due_date_is_shown' },
+  { criterion: 'A5', file: 'tests/test_due.py', name: 'check_due_soon_is_marked' },
+]
+test('Bug 414: a test pytest -v never ran reads "never ran", whether or not its file had a test skipped or passing', () => {
+  const v = cap414('pytest-9.2.0-v'); assert.match(v, /test_shelf\.py::test_shelf_shows_covers SKIPPED/)
+  // A3 and A5 are written in their files but pytest doesn't collect them (no test_ in front). Before: A3 unconfirmed (the skip), A5 passed (the file's others)
+  assert.deepEqual(states372(v, MAP414), ['passed', 'skipped', 'not_run', 'passed', 'not_run'])
+  assert.deepEqual(seen(v, [], ['tests/test_shelf.py', 'tests/test_due.py']), { prints: true, passed: [], skipped: [], unsure: [] }) // one test's line is no file's
+  const told = unproven(MAP414.map((e, i) => ({ ...e, state: states372(v, MAP414)[i] })), 'pytest -v')
+  assert.equal(told.length, 3); assert.match(told[1]!, /^A3: "check_shelf_is_sorted" in tests\/test_shelf\.py never ran\. `pytest -v` listed other tests and not this one/)
+  // also in a folder, run part by part (Bug 411), and with the folder it runs in
+  assert.equal(st411(v, 'check_shelf_is_sorted', 'api/tests/test_shelf.py', ['api']), 'not_run')
+  // vitest's verbose reporter is shaped the same (file > name on every line): its files' unprinted tests never ran either. Before: unconfirmed, and passed
+  const map = [{ criterion: 'A1', file: 'web/src/list.test.ts', name: 'not in the list' }, { criterion: 'A2', file: 'web/src/api.test.ts', name: 'not in the api' }]
+  assert.deepEqual(states372(cap372('vitest-4.1.11-verbose'), map), ['not_run', 'not_run'])
+})
+test('Bug 414, what must not change: a skip line that names no test, and lines for a whole file (Bug 375)', () => {
+  // pytest -rA's skip summary names the file and a line, not the test: an unprinted test of that file may be the skipped one. A5 never ran
+  // (before: passed, through its file's other PASSED lines: the one thing here that changes)
+  const rA = cap414('pytest-9.2.0-rA'); assert.match(rA, /^SKIPPED \[1\] tests\/test_shelf\.py:8: /m)
+  assert.deepEqual(states372(rA, MAP414), ['passed', 'unconfirmed', 'unconfirmed', 'passed', 'not_run'])
+  assert.equal(state('PASSED test_a.py::test_x\nSKIPPED [1] test_a.py:9: needs std::vector > 2\n', 'test_y', 'test_a.py'), 'unconfirmed') // `::` in the reason
+  // vitest's line for a file it skipped whole, and its usual and tree reporters' file lines with a count, and jest's PASS lines in a run with skips: as before
+  assert.equal(state(' ✓ src/b.test.ts (1 test) 1ms\n ↓ src/a.test.ts (4 tests | 4 skipped)\n', 'x', 'web/src/a.test.ts'), 'unconfirmed')
+  assert.deepEqual(states372(cap372('vitest-4.1.11'), MAP372), ['unconfirmed', 'unconfirmed', 'passed', 'passed', 'unconfirmed'])
+  assert.deepEqual(states372(cap372('vitest-4.1.11-tree'), MAP372), ['passed', 'passed', 'passed', 'passed', 'not_run'])
+  assert.deepEqual(states372(cap375('vitest-4.1.11-skip-todo'), MAP375('src', 'ts')), ['unconfirmed', 'unconfirmed', 'unconfirmed', 'passed'])
+  assert.deepEqual(states372(cap375('jest-30.1.3-skip-todo'), MAP375('test', 'js')), ['unconfirmed', 'unconfirmed', 'unconfirmed', 'unconfirmed'])
+  assert.equal(state(JEST, 'shows each due date', 'test/list.test.js'), 'passed') // a PASS line passes its file when nothing was skipped
+})
+
+// Bug 427: pytest's XFAIL / XPASS lines were neither a pass nor a skip, so a named test marked xfail read "never ran" with pytest -v or -rA. Real pytest
+// 9.2.0 and Python 3.14's unittest, 2026-11-26: tests/test_shelf.py has two passing tests, one xfail that fails (XFAIL), one that passes (XPASS), one strict
+// one that passes (FAILED, `[XPASS(strict)]`); tests/test_notrun.py one `run=False` xfail and one `pytest.xfail()`. In testdata/bug427.
+const cap427 = (name: string): string => readFileSync(new URL(`./testdata/bug427/${name}.txt`, import.meta.url), 'utf8')
+const MAP427 = [
+  { criterion: 'A1', file: 'tests/test_shelf.py', name: 'test_shelf_lists_books' }, { criterion: 'A2', file: 'tests/test_shelf.py', name: 'test_shelf_shows_covers' },
+  { criterion: 'A3', file: 'tests/test_shelf.py', name: 'test_shelf_sorts_books' }, { criterion: 'A4', file: 'tests/test_notrun.py', name: 'test_shelf_never_run' },
+  { criterion: 'A5', file: 'tests/test_notrun.py', name: 'test_shelf_imperative_xfail' }, { criterion: 'A6', file: 'tests/test_shelf.py', name: 'check_shelf_is_sorted' },
+]
+test('Bug 427: a named test pytest marks xfail reads "skipped" (it proves nothing), one that passed although marked (XPASS) "passed"', () => {
+  const v = cap427('pytest-9.2.0-v'), rA = cap427('pytest-9.2.0-rA')
+  assert.match(v, /::test_shelf_shows_covers XFAIL \(/); assert.match(v, /::test_shelf_sorts_books XPASS \(/); assert.match(rA, /^XFAIL at setup of tests\/test_notrun\.py::/m)
+  // before: ['passed', 'not_run', 'not_run', 'not_run', 'not_run', 'not_run'] from both
+  for (const out of [v, rA]) assert.deepEqual(states372(out, MAP427), ['passed', 'skipped', 'passed', 'skipped', 'skipped', 'not_run'])
+  const told = unproven(MAP427.map((e, i) => ({ ...e, state: states372(v, MAP427)[i] })), 'pytest -v')
+  assert.equal(told.length, 4); assert.match(told[0]!, /^A2: "test_shelf_shows_covers" in tests\/test_shelf\.py was skipped, so nothing proved A2\./)
+  // a strict xpass fails the run, and its FAILED line (`[XPASS(strict)]` in the reason) is no pass; nor is unittest's unexpected success, which fails its run
+  for (const out of [v, rA]) assert.equal(state(out, 'test_shelf_strict_xpass', 'tests/test_shelf.py'), 'not_run')
+  const ut = cap427('unittest-3.14-v'); assert.match(ut, /\.\.\. expected failure$/m)
+  assert.deepEqual(['test_lists_books', 'test_shows_covers', 'test_sorts_books'].map((n) => state(ut, n, 'test_ut.py')), ['passed', 'skipped', 'not_run'])
+})
+test('Bug 427, what the xfail words must not catch: in a test\'s name or in a reason, and a file\'s other tests', () => {
+  assert.equal(state('tests/a.py::test_XFAIL_badge PASSED [ 50%]\n', 'test_XFAIL_badge', 'tests/a.py'), 'passed')
+  const ok = 'tests/a.py::test_ok PASSED [ 50%]\n' // the run lists its tests by name
+  assert.equal(state(`${ok}tests/a.py::test_badge_XPASS_x FAILED [ 50%]\n`, 'test_badge_XPASS_x', 'tests/a.py'), 'not_run')
+  assert.equal(state(`${ok}FAILED tests/a.py::test_badge - [XPASS(strict)] why\n`, 'test_badge', 'tests/a.py'), 'not_run')
+  assert.equal(state('test_x (a.T.test_x) ... ok\nprinted: an expected failure\n', 'test_x', 'a.py'), 'passed')
+  // an xfail line names its test, so (as Bug 414's skip lines) it says nothing of the file's other tests: never ran, not "couldn't see it"
+  assert.equal(state(cap427('pytest-9.2.0-rA'), 'check_shelf_is_sorted', 'tests/test_shelf.py'), 'not_run')
+  assert.equal(state('tests/a.py::test_x XFAIL (why)\ntests/a.py::test_y PASSED\n', 'test_x', 'tests/a.py'), 'skipped')
 })

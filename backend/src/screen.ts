@@ -19,11 +19,24 @@ export function paneLooksIdle(screen: string): boolean {
   const styled = /\x1b\[[0-9;:]*m/.test(screen), lines = plainScreen(screen).split('\n').map((l) => l.replace(/\s+$/, ''))
   if (lines.some((l) => /esc to interrupt/.test(l))) return false
   if (paneShowsDialog(lines.join('\n'))) return false
-  const prompt = lines.map((l) => /^❯(\s|$)/.test(l)).lastIndexOf(true), rule = (l: string): boolean => /^─{10,}/.test(l.trim())
-  if (!(prompt > 0 && rule(lines[prompt - 1]) && lines.slice(prompt + 1).some((l) => FOOTER.test(l)))) return false
+  const prompt = promptRow(lines); if (prompt < 0) return false
   if (styled && !typedOnly(screen)[prompt]?.startsWith('❯')) return false // the `❯` is drawn in a colour: a turn runs
   const above = lines.slice(0, prompt - 1).reverse().find((l) => /^\S/.test(l)) // the last line above the box that isn't indented
   return !(above && SPINNER.test(above))
+}
+/** The row of Claude Code's input box (its `❯` line, under a rule, with the footer somewhere below), -1 when the screen shows none. */
+function promptRow(lines: string[]): number {
+  const prompt = lines.map((l) => /^❯(\s|$)/.test(l)).lastIndexOf(true), rule = (l: string): boolean => /^─{10,}/.test(l.trim())
+  return prompt > 0 && rule(lines[prompt - 1]!) && lines.slice(prompt + 1).some((l) => FOOTER.test(l)) ? prompt : -1
+}
+/** Bug 195: a turn is at work on the screen, so Escape would stop it (pause.ts). No menu or dialog (Escape would answer it), and either the footer's
+ *  "esc to interrupt", or Claude Code's input box on a screen that isn't waiting at its prompt: with a draft typed in the box the footer drops those
+ *  words while it works (Bug 189; paneLooksIdle tells the two apart by the box's colour and the working line, so pass a capture with `-e`). A screen
+ *  with neither (Claude Code still starting, a shell) is not at work. */
+export function paneAtWork(styled: string): boolean {
+  const plain = plainScreen(styled); if (paneShowsDialog(plain)) return false
+  if (/esc to interrupt/.test(plain)) return true
+  return promptRow(plain.split('\n').map((l) => l.replace(/\s+$/, ''))) >= 0 && !paneLooksIdle(styled)
 }
 /** A menu or dialog on the screen (a plan approval, a permission prompt): numbered options, or the question itself. */
 export const paneShowsDialog = (screen: string): boolean => screen.split('\n').some((l) => /^\s*❯\s*\d+\.\s/.test(l) || /Do you want to|Would you like to proceed/.test(l))

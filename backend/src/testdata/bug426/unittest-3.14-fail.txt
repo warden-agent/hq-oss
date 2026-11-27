@@ -1,0 +1,14 @@
+.Fxs
+======================================================================
+FAIL: test_due (test_shelf.Shelf.test_due)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/u/unit/test_shelf.py", line 4, in test_due
+    def test_due(self): self.assertEqual(1 + 1, 2 if os.environ.get("B426_PASS") else 3)
+                        ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 2 != 3
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.000s
+
+FAILED (failures=1, skipped=1, expected failures=1)

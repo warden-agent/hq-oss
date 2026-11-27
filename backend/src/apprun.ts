@@ -2,20 +2,25 @@
 // part needs installing, which ports, where it answers and whether it may be shown inside HQ. Fixed rules, no agent turns. No
 // DB access here. The recipe itself is worked out once by the Launch helper (launchhelper.ts) or is the user's own ⚙ command.
 import fs from 'node:fs'
+import http from 'node:http'
 import net from 'node:net'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { shq } from './util.ts'
 import { cantListen } from './ports.ts'
+import { badPort } from './badports.ts'
 import { lockedInstalls, npmInstalls, uvVenvs, type LockedInstall, type NpmInstall } from './npminstalls.ts'
 
 /** The ports HQ hands out to previews, from HQ_PREVIEW_PORTS ("3090-3099", the default; engineers get ports of their own, slotports.ts).
- *  A test HQ gets a range of its own (Bug 44): two HQs that share one can both pick the same free port before either app is up. */
+ *  A test HQ gets a range of its own (Bug 44): two HQs that share one can both pick the same free port before either app is up. Ports browsers and
+ *  Node's fetch refuse (6665–6669, Bug 409) are left out; a range of only those is refused. */
 export function portRange(spec: string | undefined): number[] {
   const m = /^\s*(\d+)\s*-\s*(\d+)\s*$/.exec(spec ?? '3090-3099'), lo = Number(m?.[1]), hi = Number(m?.[2])
   if (!m || lo < 1024 || hi > 65535 || hi < lo || hi - lo > 99) throw new Error(`HQ_PREVIEW_PORTS must look like 3090-3099 (at most 100 ports above 1023), not "${spec}"`)
-  return Array.from({ length: hi - lo + 1 }, (_, i) => lo + i)
+  const out = Array.from({ length: hi - lo + 1 }, (_, i) => lo + i).filter((p) => !badPort(p))
+  if (!out.length) throw new Error(`HQ_PREVIEW_PORTS "${spec}" holds only ports web browsers refuse to open (such as 6000 and 6665–6669); pick another range`)
+  return out
 }
 export const PREVIEW_PORTS = portRange(process.env.HQ_PREVIEW_PORTS)
 
@@ -28,11 +33,13 @@ export function detectCommand(repoPath: string): string | null {
 }
 
 /** Does this package.json give npm anything to install? A package with none still gets a package-lock.json written by
- *  `npm install` and no node_modules, so every later start would run `npm ci` again (Bug 90). Unreadable: assume it does. */
+ *  `npm install` and no node_modules, so every later start would run `npm ci` again (Bug 90). Unreadable: assume it does.
+ *  A workspace root does, whatever it lists itself: npm's, Yarn's and Bun's (its `workspaces`) and pnpm's (a pnpm-workspace.yaml
+ *  with `packages`, Bug 399; one with only settings in it makes no workspace). */
 export function listsPackages(pkgPath: string): boolean {
   let pkg: Record<string, unknown>
   try { pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) } catch { return true }
-  if (!pkg || typeof pkg !== 'object' || pkg.workspaces) return true // a workspace root: its packages list their own
+  if (!pkg || typeof pkg !== 'object' || pkg.workspaces || pnpmPackages(path.dirname(pkgPath))) return true // its packages list their own
   return ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'].some((k) => {
     const v = pkg[k]; return !!v && typeof v === 'object' && Object.keys(v).length > 0
   })
@@ -45,11 +52,12 @@ export const NO_LOCK_INSTALL = 'npm install --no-package-lock'
  *  older than package.json (npm rewrites it on every install, even one with nothing to do), and never a lockfile written
  *  (Bug 116). A node_modules with no npm record (yarn's, pnpm's) is left alone. Never for a package.json that lists no
  *  packages, so Launch adds no file to the user's project (Bug 90). */
-export function installStep(repoPath: string): 'npm ci' | typeof NO_LOCK_INSTALL | null {
-  const at = (f: string) => { try { return fs.statSync(path.join(repoPath, f)).mtimeMs } catch { return null } }
+export function installStep(repoPath: string, root: string = checkoutOf(repoPath)): 'npm ci' | typeof NO_LOCK_INSTALL | null {
+  const at = (f: string) => { try { return fs.statSync(path.resolve(repoPath, f)).mtimeMs } catch { return null } }
   const pkg = at('package.json')
   if (pkg === null || !listsPackages(path.join(repoPath, 'package.json'))) return null
-  const lock = at('package-lock.json') ?? at('npm-shrinkwrap.json'), record = at('node_modules/.package-lock.json') // npm ci follows either (Bug 343)
+  // npm ci follows either lockfile (Bug 343), its own or its npm workspace root's (Bug 400), where npm keeps its record too
+  const file = npmLock(repoPath, root), lock = file ? at(file) : null, record = at(path.join(file ? path.dirname(file) : repoPath, 'node_modules/.package-lock.json'))
   if (lock === null) return at('node_modules') === null || (record !== null && record < pkg) ? NO_LOCK_INSTALL : null
   return record === null || record < lock ? 'npm ci' : null
 }
@@ -63,18 +71,40 @@ export function onPath(tool: string, PATH: string = process.env.PATH ?? ''): boo
 type NodeTool = 'npm' | 'yarn' | 'pnpm' | 'bun'
 /** Bug 343: the package manager a Node project uses: the one its package.json's `packageManager` names (what Corepack follows), else the
  *  one whose lockfile it has (npm's first, as before; then yarn.lock, pnpm-lock.yaml, bun.lock or bun.lockb: Bug 358), else npm. `lock`: that tool's lockfile, if there is
- *  one; `why`: how HQ can tell, in the user's words; `major`: the version `packageManager` names. */
-export function packageManager(repoPath: string): { tool: NodeTool; lock: string | null; why: string; major: number | null } {
-  const lockOf = (t: NodeTool) => LOCKS[t].files.find((f) => fs.existsSync(path.join(repoPath, f))) ?? null
-  let named: unknown; try { named = JSON.parse(fs.readFileSync(path.join(repoPath, 'package.json'), 'utf8'))?.packageManager } catch { /* none */ }
+ *  one; `why`: how HQ can tell, in the user's words; `major`: the version `packageManager` names. Bug 400: a workspace member with none of
+ *  these of its own (`web/` of a pnpm workspace) goes by its workspace root's (the root's lockfile, which the member's install follows),
+ *  up to the checkout `root`. A pnpm-workspace.yaml says pnpm too, after the lockfiles. `at`: the folder of that lockfile (else the one
+ *  that told), where Yarn keeps its settings. */
+export function packageManager(dirPath: string, root: string = checkoutOf(dirPath)): NodeManager {
+  const own = managerIn(dirPath, root, ['it has', 'its package.json']); if (own) return own
+  const ws = upTo(dirPath, root).slice(1).find((d) => fs.existsSync(path.join(d, 'pnpm-workspace.yaml')) || lists(d, dirPath))
+  return (ws && managerIn(ws, root, ['its workspace root has', 'its workspace root\'s package.json']))
+    || { tool: 'npm', lock: null, why: 'it has no lockfile', major: null, at: dirPath }
+}
+type NodeManager = { tool: NodeTool; lock: string | null; why: string; major: number | null; at: string }
+/** What the folder `dir` itself says about its package manager (packageManager), or null when it says nothing. */
+function managerIn(dir: string, root: string, [has, pkg]: [string, string]): NodeManager | null {
+  let named: unknown; try { named = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))?.packageManager } catch { /* none */ }
   const m = typeof named === 'string' ? /^(npm|yarn|pnpm|bun)@(\d+)/.exec(named) : null
   if (m) {
-    const tool = m[1] as NodeTool
-    return { tool, lock: lockOf(tool), why: `its package.json names ${String(named).split('+')[0]} as its packageManager`, major: Number(m[2]) }
+    const tool = m[1] as NodeTool, lock = lockOf(tool, dir, root).lock // its own, or its workspace root's
+    return { tool, lock: lock && path.basename(lock), why: `${pkg} names ${String(named).split('+')[0]} as its packageManager`, major: Number(m[2]),
+      at: lock ? path.dirname(lock) : dir }
   }
-  for (const tool of ['npm', 'yarn', 'pnpm', 'bun'] as const) { const lock = lockOf(tool); if (lock) return { tool, lock, why: `it has a ${lock}`, major: null } }
-  return { tool: 'npm', lock: null, why: 'it has no lockfile', major: null }
+  for (const tool of ['npm', 'yarn', 'pnpm', 'bun'] as const) {
+    const lock = LOCKS[tool].files.find((f) => fs.existsSync(path.join(dir, f))); if (lock) return { tool, lock, why: `${has} a ${lock}`, major: null, at: dir }
+  }
+  return fs.existsSync(path.join(dir, 'pnpm-workspace.yaml')) ? { tool: 'pnpm', lock: null, why: `${has} a pnpm-workspace.yaml`, major: null, at: dir } : null
 }
+/** The checkout `dirPath` is in: the nearest folder up from it with a .git (a clone, or a worktree's .git file); `dirPath` itself when none has. */
+function checkoutOf(dirPath: string): string {
+  for (let d = path.resolve(dirPath); ; d = path.dirname(d)) {
+    if (fs.existsSync(path.join(d, '.git'))) return d
+    if (path.dirname(d) === d) return dirPath
+  }
+}
+/** A pnpm-workspace.yaml in `dir` that lists packages (pnpm 10 also keeps settings in one, with no packages). */
+const pnpmPackages = (dir: string): boolean => /^packages\s*:/m.test(readIn(dir, 'pnpm-workspace.yaml') ?? '')
 /** Bug 343: what HQ does about the packages before the user's own ⚙ command: an install by the project's own package manager (npm's as
  *  installStep says; Yarn's, pnpm's and Bun's (Bug 358) follow their lockfile, or write none when there is none, and run again when it changes or what they
  *  made is gone, as Claude's steps do), nothing, or `stop`: why HQ can't install them (the tool isn't installed; Yarn 2+ with no yarn.lock
@@ -85,14 +115,14 @@ export function packageManager(repoPath: string): { tool: NodeTool; lock: string
 export function ownInstall(repoPath: string, has: (tool: string) => boolean = onPath, again = 'press Start again'): { install?: string; install_when?: string
   stop?: string } {
   const pkg = path.join(repoPath, 'package.json'); if (!fs.existsSync(pkg) || !listsPackages(pkg)) return {}
-  const pm = packageManager(repoPath)
-  if (pm.tool === 'npm') { const install = installStep(repoPath); return install ? { install } : {} }
-  const berry = pm.tool === 'yarn' && (pm.major !== null ? pm.major >= 2 : yarnBerry(repoPath))
+  const root = checkoutOf(repoPath), pm = packageManager(repoPath, root) // a workspace member's: its root's lockfile (Bug 400)
+  if (pm.tool === 'npm') { const install = installStep(repoPath, root); return install ? { install } : {} }
+  const berry = pm.tool === 'yarn' && (pm.major !== null ? pm.major >= 2 : yarnBerry(pm.at))
   const install = pm.tool === 'pnpm' ? `pnpm install ${pm.lock ? '--frozen-lockfile' : '--no-lockfile'}`
     : pm.tool === 'bun' ? `bun install ${pm.lock ? '--frozen-lockfile' : '--no-save'}` // Bug 358: --no-save writes no bun.lock (bun 1.4.5)
     : pm.lock ? `yarn install ${berry ? '--immutable' : '--frozen-lockfile'}` : berry ? null : 'yarn install --pure-lockfile'
   if (install && has(pm.tool)) return { install, install_when: pm.lock ?? 'package.json' }
-  const made = install ? installOutputs(install, repoPath) : ['node_modules', '.pnp.cjs'].filter((f) => fs.existsSync(path.join(repoPath, f)))
+  const made = install ? installOutputs(install, repoPath, root) : ['node_modules', '.pnp.cjs'].map((f) => path.join(pm.at, f)).filter((f) => fs.existsSync(f))
   if (made.length && made.every((f) => fs.existsSync(path.resolve(repoPath, f)))) return {}
   const name = ({ yarn: 'Yarn', pnpm: 'pnpm', bun: 'Bun' } as const)[pm.tool]
   if (!install) {
@@ -441,6 +471,19 @@ export function runScript(o: { cwd: string; node: string; supervisor: string; sp
 export function printedPorts(text: string): number[] {
   const ports = [...text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):(\d{2,5})/g)].map((m) => Number(m[1]))
   return [...new Set(ports)].filter((p) => p > 0 && p < 65536)
+}
+
+/** The reply's headers (a getter, names in lower case) when something answers HTTP at http://localhost:`port`/ within `ms`, else null. node:http, not
+ *  fetch: fetch throws "bad port" on the ports browsers refuse (6000, 6665–6669, badports.ts), and an app the user hard-wired there answers all the same
+ *  (Bug 409). Redirects aren't followed: a redirect is an answer. */
+export function httpReply(port: number, ms: number): Promise<((name: string) => string | null) | null> {
+  return new Promise((resolve) => {
+    const req = http.get({ host: 'localhost', port, path: '/', signal: AbortSignal.timeout(ms) }, (res) => {
+      res.resume(); req.destroy() // the body isn't wanted
+      resolve((n) => { const v = res.headers[n.toLowerCase()]; return v === undefined ? null : Array.isArray(v) ? v.join(', ') : String(v) })
+    })
+    req.on('error', () => resolve(null))
+  })
 }
 
 /** True when the app's reply forbids being shown inside HQ's page (another origin): X-Frame-Options DENY/SAMEORIGIN, or a

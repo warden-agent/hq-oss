@@ -243,6 +243,23 @@ test('the browser: Playwright MCP in its own sandbox reaches the app and nothing
     } finally { await client.close(); app.close(); other.close(); fs.rmSync(b, { recursive: true, force: true }); fs.rmSync(project, { recursive: true, force: true }) }
   })
 
+test('Bug 433: the browser opens an app on a port browsers refuse (6000, 6665–6669) when it is the app\'s, and no other such port', { skip: noBrowser ?? false, timeout: 120_000 }, async () => {
+  const { BAD_PORTS } = await import('./badports.ts'), { portBusy } = await import('./apprun.ts'), free: number[] = []
+  for (const p of [6668, 6669, 4190]) if (free.length < 2 && BAD_PORTS.has(p) && !(await portBusy(p))) free.push(p) // this file's own: test files run side by side
+  assert.equal(free.length, 2, 'too few of the ports browsers refuse are free here'); const [port, otherPort] = free as [number, number]
+  const app = http.createServer((_q, s) => s.end('<!doctype html><title>Library</title><h1>Library</h1>')); await new Promise<void>((r) => app.listen(port, '127.0.0.1', r))
+  const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-uitester-project-')))
+  const b = fs.mkdtempSync('/private/tmp/hq-ut-test-'); for (const d of ['empty', 'home', 'out']) fs.mkdirSync(path.join(b, d))
+  const cmd = _forTests.browserServer(b, port, project, headlessShell()!), client = new Client({ name: 'hq-test', version: '0.0.1' })
+  await client.connect(new StdioClientTransport({ command: cmd.command, args: cmd.args, stderr: 'pipe' }))
+  const go = async (url: string) => ((await client.callTool({ name: 'browser_navigate', arguments: { url } })) as { content: { text?: string }[] }).content.map((c) => c.text).join('\n')
+  try {
+    assert.match(await go(`http://localhost:${port}/`), /Page Title: Library/)
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(b, 'browser.json'), 'utf8')).browser.launchOptions.args, [`--explicitly-allowed-ports=${port}`]) // the app's port only
+    assert.doesNotMatch(await go(`http://localhost:${otherPort}/`), /Page Title/)
+  } finally { await client.close(); app.close(); fs.rmSync(b, { recursive: true, force: true }); fs.rmSync(project, { recursive: true, force: true }) }
+})
+
 test('the lockdown Claude Code adds: no built-in tools, only HQ\'s MCP servers, of the browser\'s tools only what a person does, and HQ\'s hooks on each step', () => {
   const f = testerFlags({ model: 'sonnet', mcp: { browser: {}, uitest: {} }, ctrl: 4321 }), at = (k: string) => f[f.indexOf(k) + 1]
   assert.equal(at('--tools'), ''); assert.ok(f.includes('--strict-mcp-config')); assert.equal(at('--model'), 'sonnet')

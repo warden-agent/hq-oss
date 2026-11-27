@@ -6,7 +6,7 @@ import os from 'node:os'
 import net from 'node:net'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { commandWarning, EPHEMERAL_FROM, onPath, ownInstall, packageManager, installLeftovers, installOutputs, portBusy, portBusyWith, strayPorts, testPorts } from './apprun.ts'
+import { commandWarning, EPHEMERAL_FROM, listsPackages, onPath, ownInstall, packageManager, installLeftovers, installOutputs, portBusy, portBusyWith, strayPorts, testPorts } from './apprun.ts'
 import { assignPorts, portRange, checkRecipe, commandRecipe, detectCommand, frameBlocked, installMark, installStep, lockfileProblem, needsInstall, NO_LOCK_INSTALL, npmLock, parseRunMark, printedPorts,
   recipeProblem, refusedWords, runMark, runScript, RUN_MARK, sameCommands, supervisorSpec, type Recipe } from './apprun.ts'
 
@@ -709,4 +709,67 @@ test('recipe (Bug 191): an npm install in the run command runs on every start, s
   fs.writeFileSync(path.join(root, 'web', 'package-lock.json'), '{}')
   assert.ok('recipe' in app('cd web && npm ci && npm start')) // follows the lockfile: slow on every start, but nothing written
   assert.match(err('cd web && npm install && npm start'), /`npm install` runs in web: use `npm ci`/)
+})
+
+test('Bug 399: a pnpm workspace root installs though its own package.json lists no packages; a pnpm-workspace.yaml of settings alone is no workspace', () => {
+  const all = () => true, none = () => false, bare = JSON.stringify({ name: 'ws', private: true, scripts: { start: 'x' } })
+  const ws = (files: Record<string, string>) => repo({ '.git': 'gitdir: x', 'package.json': bare, 'pnpm-workspace.yaml': 'packages:\n  - web\n', 'web/package.json': deps, ...files })
+  // the entry's case: no packages of its own, a pnpm-lock.yaml, nothing installed (it was no install at all)
+  const dir = ws({ 'pnpm-lock.yaml': "lockfileVersion: '9.0'\n" })
+  assert.equal(listsPackages(path.join(dir, 'package.json')), true)
+  assert.deepEqual(ownInstall(dir, all), { install: 'pnpm install --frozen-lockfile', install_when: 'pnpm-lock.yaml' })
+  assert.deepEqual(commandRecipe('pnpm start', dir).parts[0]!.install_when, onPath('pnpm') ? 'pnpm-lock.yaml' : undefined)
+  assert.deepEqual(installOutputs('pnpm install --frozen-lockfile', dir), [path.join(dir, 'node_modules')]) // installs again when it's gone
+  assert.equal(lockfileProblem('pnpm install --frozen-lockfile', dir, dir, 'pnpm-lock.yaml'), null)
+  // no lockfile and no packageManager: the pnpm-workspace.yaml says pnpm (npm would ignore it and install none of the members' packages)
+  assert.deepEqual(ownInstall(ws({}), all), { install: 'pnpm install --no-lockfile', install_when: 'package.json' })
+  assert.match(ownInstall(ws({}), none).stop ?? '', /^it uses pnpm \(it has a pnpm-workspace\.yaml\), and pnpm isn't installed .*the project asks for pnpm/)
+  // npm's, Yarn's and Bun's workspace roots as before (their package.json says so)
+  assert.equal(listsPackages(path.join(repo({ 'package.json': JSON.stringify({ workspaces: ['web'] }) }), 'package.json')), true)
+  // what it must not catch: pnpm 10's settings-only pnpm-workspace.yaml in a project with no packages; a lockfile alone
+  const settings = repo({ 'package.json': bare, 'pnpm-workspace.yaml': 'onlyBuiltDependencies:\n  - esbuild\n', 'pnpm-lock.yaml': '' })
+  assert.equal(listsPackages(path.join(settings, 'package.json')), false); assert.deepEqual(ownInstall(settings, all), {})
+  assert.deepEqual(ownInstall(repo({ 'package.json': bare, 'pnpm-lock.yaml': '' }), all), {})
+  assert.equal(installStep(repo({ 'package.json': bare, 'pnpm-workspace.yaml': 'packages: []\n' })), NO_LOCK_INSTALL) // npm's own rule: unchanged
+})
+
+test('Bug 400: a workspace member follows its workspace root\'s lockfile and package manager, inside its checkout only', () => {
+  const all = () => true, none = () => false, bare = (extra: object = {}) => JSON.stringify({ name: 'ws', private: true, ...extra })
+  const ws = (files: Record<string, string>) => repo({ '.git': 'gitdir: x', 'web/package.json': deps, ...files })
+  // the entry's case: web/ of a pnpm workspace, pnpm-lock.yaml at the root (it was `pnpm install --no-lockfile`, or npm with no packageManager)
+  const pnpm = ws({ 'package.json': bare(), 'pnpm-workspace.yaml': 'packages:\n  - web\n', 'pnpm-lock.yaml': "lockfileVersion: '9.0'\n" }), web = path.join(pnpm, 'web')
+  assert.deepEqual(ownInstall(web, all), { install: 'pnpm install --frozen-lockfile', install_when: 'pnpm-lock.yaml' })
+  assert.deepEqual(packageManager(web), { tool: 'pnpm', lock: 'pnpm-lock.yaml', why: 'its workspace root has a pnpm-lock.yaml', major: null, at: pnpm })
+  assert.equal(lockfileProblem('pnpm install --frozen-lockfile', web, pnpm, 'pnpm-lock.yaml'), null) // the same check as Claude's steps
+  assert.equal(installMark(web, 'pnpm-lock.yaml', pnpm), installMark(pnpm, 'pnpm-lock.yaml')) // installs again when the root's changes
+  fs.writeFileSync(path.join(web, 'package.json'), JSON.stringify({ name: 'web', dependencies: { ms: '2.1.3' }, packageManager: 'pnpm@10.4.0' }))
+  assert.deepEqual(ownInstall(web, all), { install: 'pnpm install --frozen-lockfile', install_when: 'pnpm-lock.yaml' }) // named by itself, the root's lockfile
+  assert.match(ownInstall(web, none).stop ?? '', /^it uses pnpm \(its package\.json names pnpm@10\.4\.0 as its packageManager\).*npm ignores the pnpm-lock\.yaml/)
+  // the root's package.json names the tool and there is no lockfile yet
+  const named = path.join(ws({ 'package.json': bare({ packageManager: 'pnpm@10.4.0' }), 'pnpm-workspace.yaml': 'packages:\n  - web\n' }), 'web')
+  assert.deepEqual(packageManager(named).why, 'its workspace root\'s package.json names pnpm@10.4.0 as its packageManager')
+  assert.deepEqual(ownInstall(named, all), { install: 'pnpm install --no-lockfile', install_when: 'package.json' })
+  // Yarn's (1 and 2+, whose settings are at the root too) and Bun's: members their root's package.json lists
+  const yarn = ws({ 'package.json': bare({ workspaces: ['web'] }), 'yarn.lock': '# yarn lockfile v1\n' })
+  assert.deepEqual(ownInstall(path.join(yarn, 'web'), all), { install: 'yarn install --frozen-lockfile', install_when: 'yarn.lock' })
+  const berry = ws({ 'package.json': bare({ workspaces: { packages: ['web'] } }), 'yarn.lock': '', '.yarnrc.yml': 'nodeLinker: pnp\n' })
+  assert.deepEqual(ownInstall(path.join(berry, 'web'), all), { install: 'yarn install --immutable', install_when: 'yarn.lock' })
+  assert.match(ownInstall(path.join(berry, 'web'), none).stop ?? '', /^it uses Yarn \(its workspace root has a yarn\.lock\)/)
+  fs.writeFileSync(path.join(berry, '.pnp.cjs'), ''); assert.deepEqual(ownInstall(path.join(berry, 'web'), none), {}) // installed at the root: runs as it is
+  const bun = ws({ 'package.json': bare({ workspaces: ['*'] }), 'bun.lock': '{}' })
+  assert.deepEqual(ownInstall(path.join(bun, 'web'), all), { install: 'bun install --frozen-lockfile', install_when: 'bun.lock' })
+  // npm's: npm ci follows the root's package-lock.json, and npm's record of what it installed is at the root too
+  const npm = ws({ 'package.json': bare({ workspaces: ['web'] }), 'package-lock.json': '{}' })
+  assert.equal(packageManager(path.join(npm, 'web')).tool, 'npm'); assert.deepEqual(ownInstall(path.join(npm, 'web'), all), { install: 'npm ci' })
+  fs.mkdirSync(path.join(npm, 'node_modules')); fs.writeFileSync(path.join(npm, 'node_modules/.package-lock.json'), '{}'); age(npm, 'package-lock.json', 60)
+  assert.equal(installStep(path.join(npm, 'web')), null)
+  // what it must not catch: a member's own lockfile beats the root's; a folder the root doesn't list; a root above the checkout (no .git
+  // between them: the folder is its own checkout); a folder outside any checkout reads only itself, as before
+  assert.deepEqual(ownInstall(path.join(ws({ 'package.json': bare(), 'pnpm-workspace.yaml': 'packages:\n  - web\n', 'pnpm-lock.yaml': '',
+    'web/package-lock.json': '{}' }), 'web'), all), { install: 'npm ci' })
+  assert.deepEqual(ownInstall(path.join(ws({ 'package.json': bare({ workspaces: ['pkgs/*'] }), 'yarn.lock': '' }), 'web'), all), { install: NO_LOCK_INSTALL })
+  const above = repo({ 'package.json': bare(), 'pnpm-workspace.yaml': 'packages:\n  - app\n', 'pnpm-lock.yaml': '', 'app/.git': 'gitdir: x', 'app/package.json': deps })
+  assert.deepEqual(ownInstall(path.join(above, 'app'), all), { install: NO_LOCK_INSTALL })
+  const loose = repo({ 'package.json': bare(), 'pnpm-workspace.yaml': 'packages:\n  - web\n', 'pnpm-lock.yaml': '', 'web/package.json': deps })
+  assert.equal(fs.existsSync(path.join(loose, '.git')), false); assert.deepEqual(ownInstall(path.join(loose, 'web'), all), { install: NO_LOCK_INSTALL })
 })

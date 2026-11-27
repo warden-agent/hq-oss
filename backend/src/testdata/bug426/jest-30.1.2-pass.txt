@@ -1,0 +1,14 @@
+(node:59474) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS ./shelf.test.js
+  ✓ adds a book (1 ms)
+  ✓ marks a book due soon
+  ✓ known bug
+  ○ skipped later
+  ✎ todo someday
+
+Test Suites: 1 passed, 1 total
+Tests:       1 skipped, 1 todo, 3 passed, 5 total
+Snapshots:   0 total
+Time:        0.106 s, estimated 1 s
+Ran all test suites.

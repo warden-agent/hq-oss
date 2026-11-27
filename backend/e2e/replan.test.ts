@@ -22,6 +22,7 @@ const openReview = (t: any, round: number) => waitFor(`round ${round}'s review`,
   (await hq.state()).reviews.find((r: any) => r.ticket_id === t.id && r.status === 'open' && r.round === round))
 const notices = async (to: string) => (await hq.state()).messages.filter((m: any) => m.to_id === to && m.from_id === 'hq' && /^HQ: the TPM updated/.test(m.body))
 const change = (t: any, a: Record<string, unknown>) => hq.mcp(tpm.id, 'update_ticket_spec', { key: t.key, ...a, user_asked: true }) // the user's change of mind
+const NO_REPEAT = " Don't message the engineer about this change yourself: HQ's notice tells it what changed and what to do." // Bug 406
 const CRIT = [{ kind: 'backend', text: 'A saved shelf is listed with its wood' }]
 const ASK = /Auto mode is off, so the user approves how a change to a started ticket is built: don't build it on the plan approved before\. Call EnterPlanMode/
 const REFUSED = /spec or criteria changed after its plan was handed in, and with auto mode off the user approves a new plan before the change is built\./
@@ -48,7 +49,8 @@ test('auto off: a changed spec asks for a new plan; open_pr waits for it; the ol
   const { t, eng } = await building('Shelf')
   const r = await change(t, { spec: 'An oak shelf.' })
   assert.equal(r.isError, false, r.text)
-  assert.match(r.text, /^Updated\. Auto mode is off, so T-\d+'s engineer shows the user a new plan for the change before it builds on; they approve it like the first\.$/)
+  assert.equal(r.text, `Updated. HQ has told ${t.key}'s engineer (${eng.id}). Auto mode is off, so ${t.key}'s engineer shows the user a new plan for the change`
+    + ` before it builds on; they approve it like the first.${NO_REPEAT}`) // Bug 406: and the TPM is told not to send its own message on top
   assert.equal((await ticketOf(t)).replan_after, 1)
   const told = await waitFor('the notice', async () => { const m = await notices(eng.id); return m.length ? m : null })
   assert.equal(told.length, 1); assert.match(told[0].body, new RegExp(`^HQ: the TPM updated ${t.key}'s spec\\. Call get_ticket to read it\\. ${ASK.source}`))
@@ -104,9 +106,42 @@ test('Bug 387: the TPM reads the plan rounds in list_tickets and in the finished
   assert.match(done.body, /you'll be told when it merges\. Its plans: R-1 approved by the user; R-2 approved by the user\.$/)
 })
 
+// Bug 394 follow-up: a change to a finished ticket is built with no new plan (the owner's call), and the TPM read only "R-1 approved by the user", as if that
+// plan covered the change: it told the user the plan was approved. The words now say the ticket changed after it, and how many times.
+test('Bug 394 follow-up: a finished ticket changed and built again: list_tickets and the finished notice say R-1 does not cover the change', async () => {
+  const { t, eng } = await building('Cabinet')
+  const plans = async () => JSON.parse((await hq.mcp(tpm.id, 'list_tickets')).text).flatMap((x: any) => x.tickets).find((x: any) => x.key === t.key).plans
+  const wt = (await ticketOf(t)).worktree_path
+  const finish = async (text: string) => {
+    fs.writeFileSync(path.join(wt, 'cabinet.txt'), text); sh(wt, 'add', '.'); sh(wt, 'commit', '-qm', text.trim())
+    await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
+    const pr = await hq.mcp(eng.id, 'open_pr', { title: 'Cabinet', body: '## Deviations from approved plan\nNone.',
+      tests: [{ criterion: 'A1', cant_test: 'This project has no test runner yet, so nothing can run a test of the saved shelf here.' }] })
+    assert.equal(pr.isError, false, pr.text)
+  }
+  const finished = (start: string) => waitFor(`"${start}"`, async () => (await hq.state()).messages.find((m: any) => m.from_id === 'hq' && m.to_id === tpm.id
+    && m.body.startsWith(start)))
+  await finish('pine\n')
+  assert.match((await finished(`HQ: ${t.key} is finished`)).body, /Its plans: R-1 approved by the user\.$/)
+  const once = 'R-1 approved by the user; then the ticket was changed after it was finished, with no new plan for the change: R-1 doesn\'t cover it'
+  assert.equal((await change(t, { spec: 'An oak cabinet.' })).isError, false)
+  assert.equal((await ticketOf(t)).status, 'resolving')
+  assert.equal(await plans(), once) // while its engineer builds it
+  await finish('oak\n')
+  const built = await finished(`HQ: ${t.key}'s engineer built the change`), branch = (await ticketOf(t)).branch
+  assert.equal(built.body, `HQ: ${t.key}'s engineer built the change to its spec (${branch}). The user merges it from HQ; you'll be told when it merges. Its plans: ${once}.`)
+  assert.equal((await change(t, { spec: 'An oak cabinet with two doors.' })).isError, false)
+  assert.equal(await plans(), 'R-1 approved by the user; then the ticket was changed 2 times after it was finished, with no new plan for the changes: R-1 doesn\'t cover them')
+  const db = hq.db({ readOnly: true }) // kept past the event log's clean-up: the TPM reads it for as long as the ticket lasts
+  try {
+    const rows = db.prepare("SELECT pinned, json_extract(payload, '$.round') AS round FROM events WHERE kind = 'ticket.change' AND json_extract(payload, '$.ticket') = ?").all(t.id)
+    assert.deepEqual(rows.map((r: any) => [r.pinned, r.round]), [[1, 1], [1, 1]])
+  } finally { db.close() }
+})
+
 test('new criteria ask for a new plan too; a new title alone does not', async () => {
   const { t, eng } = await building('Rack')
-  assert.equal((await change(t, { title: 'Steel rack' })).text, 'Updated.')
+  assert.equal((await change(t, { title: 'Steel rack' })).text, `Updated. HQ has told ${t.key}'s engineer (${eng.id}).${NO_REPEAT}`)
   assert.equal((await ticketOf(t)).replan_after, null)
   const r = await change(t, { criteria: [{ id: 'A1', ...CRIT[0] }, { id: 'A2', kind: 'backend', text: 'A rack holds at most ten shelves' }] })
   assert.equal(r.isError, false, r.text); assert.match(r.text, /shows the user a new plan/)
@@ -134,7 +169,7 @@ test('with the switch off (the other choice), the engineer builds the change on 
   assert.equal((await hq.api('settings', { key: 'replan_on_change', value: 'off' })).status, 200)
   try {
     const { t, eng } = await building('Stool')
-    assert.equal((await change(t, { spec: 'A tall stool.' })).text, 'Updated.')
+    assert.equal((await change(t, { spec: 'A tall stool.' })).text, `Updated. HQ has told ${t.key}'s engineer (${eng.id}).${NO_REPEAT}`)
     assert.equal((await ticketOf(t)).replan_after, null)
     const m = await waitFor('the notice', async () => { const x = await notices(eng.id); return x.length ? x : null })
     assert.deepEqual(m.map((x: any) => x.body), [`HQ: the TPM updated ${t.key}'s spec. Call get_ticket to read it.`])

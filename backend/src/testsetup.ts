@@ -36,8 +36,6 @@ function repoOfAgent(agentId: string): string | null {
   return readSetup(a.repo_id).job?.agent_id === agentId ? a.repo_id : null
 }
 const update = (repoId: string, fn: (f: SetupFile) => SetupFile): SetupFile => { const next = fn(readSetup(repoId)); writeSetup(repoId, next); repush(repoId); return next }
-/** Is this agent a test setup helper (so the Launch helper's sweep leaves it alone)? */
-export const isSetupHelper = (agentId: string): boolean => !!repoOfAgent(agentId)
 export const SETUP_WORKTREE = 'testsetup-'
 
 function prompt(repo: Repo, why: 'first' | 'again', current: TestSetup | null): string {
@@ -75,13 +73,15 @@ async function startOne(repoId: string): Promise<ReturnType<typeof setupState>> 
 }
 export const setupState = (repoId: string) => readSetup(repoId)
 
-/** The helper is done (or gone): stop it and delete its worktree. `ended`: what the pane says next (null: nothing). */
-export async function finishSetup(repoId: string, ended: SetupFile['ended']): Promise<void> {
+/** The helper is done (or gone): stop it and delete its worktree. `ended`: what the pane says next (null: nothing). `byUser`: the user stopped it (Bug 417):
+ *  its Events tab says so. */
+export async function finishSetup(repoId: string, ended: SetupFile['ended'], byUser = false): Promise<void> {
   const f = readSetup(repoId), repo = getRepo(repoId); if (!repo) return
   update(repoId, (x) => ({ ...x, job: null, ended }))
   if (live(f.job?.agent_id)) await stopAgent(f.job!.agent_id, 'test setup helper done').catch(() => {})
   if (f.job?.worktree) await removeWorktree(repo.path, f.job.worktree)
-  emit({ agentId: f.job?.agent_id ?? null, source: 'system', kind: 'testsetup.helper_done', payload: { repo: repo.name, state: ended?.state ?? 'saved', note: ended?.note ?? null } })
+  emit({ agentId: f.job?.agent_id ?? null, source: 'system', kind: 'testsetup.helper_done',
+    payload: { repo: repo.name, state: ended?.state ?? (byUser ? 'stopped' : 'saved'), note: ended?.note ?? null, ...(byUser ? { by: 'user' } : {}) } })
 }
 async function removeWorktree(repoPath: string, wt: string): Promise<void> {
   await killUnder(wt).catch(() => [])
@@ -162,13 +162,15 @@ export function cantTest(agent: Agent, reason: string): Result {
 export async function dismissSetup(repoId: string): Promise<SetupFile> {
   untell(repoId)
   const f = readSetup(repoId)
-  if (f.job) await finishSetup(repoId, null)
+  if (f.job) await finishSetup(repoId, null, true)
   return update(repoId, (x) => ({ ...x, seen: true }))
 }
 
-/** A setup helper that exited by itself or was lost. */
-export function onSetupAgentGone(agentId: string | null): void {
+/** A setup helper that exited by itself, was lost, or was stopped outside this file (its Agent tab's Stop: `stoppedWhy` 'user'). Bug 417: the user's own
+ *  Stop ends it as the pane's "Stop Claude" does (no banner, as Bug 299's Launch helper), never as Claude stopping by itself. */
+export function onSetupAgentGone(agentId: string | null, stoppedWhy: string | null = null): void {
   const repoId = agentId ? repoOfAgent(agentId) : null; if (!repoId) return
+  if (stoppedWhy === 'user') { void finishSetup(repoId, null, true); return }
   void finishSetup(repoId, { state: 'failed', note: 'Claude stopped before it finished.', at: Date.now() })
 }
 /** On backend start: helpers that didn't survive the restart are finished (a check in flight was lost with the backend). */

@@ -11,7 +11,7 @@ import { id } from './util.ts'
 import { autoGoing, getFeature, getRepo, getTicket, hqMoves, keepCheck, keepPastChecks, notClearing, setTicket, type Repo, type Ticket } from './records.ts'
 import { mergeBase, setConflict, whoMergedFirst } from './conflicts.ts'
 import { ensureFresh, git } from './repos.ts'
-import { failedLine, failReport, lookAtBase, showing, testBase, testCombined, type Failed, type Shown, type TestResult } from './testrun.ts'
+import { exitedAnyway, failedLine, failReport, lookAtBase, showing, testBase, testCombined, type Failed, type Shown, type TestResult } from './testrun.ts'
 import { combinedCommit } from './localmerge.ts'
 import { confirm, criteriaOf, outsideParts, proofOf, proofWords, ranWords, unproven, watchFor } from './criteria.ts'
 import { judge, lookReport, lookWords, movedWords, needsBase, type Look, type Seen } from './smokerules.ts'
@@ -26,7 +26,7 @@ import { fixConflicts, fixTests } from './tickets.ts'
 import { countWords, took } from './testcounts.ts'
 import { stepsOf } from './teststepsstore.ts'
 import { stepsDone, stepsReady } from './teststeps.ts'
-import { commandGap, checkOf, FINISHED, outOfDate, pastChecks, pastWith, STEP_NAME, unseenCount, unseenWords, type CheckStep, type HqCheck, type SendBack, type StepKind,
+import { commandGap, checkOf, FINISHED, nextRound, outOfDate, pastChecks, pastWith, STEP_NAME, unseenCount, unseenWords, type CheckStep, type HqCheck, type SendBack, type StepKind,
   type StepLine } from './hqcheckrules.ts'
 
 /** The checks under way, by ticket: what stops each one, and why it was stopped (the results say it). */
@@ -61,9 +61,10 @@ export async function startCheck(ticketId: string): Promise<{ id: string }> {
     if (!sha) throw new Error(`${t.key}'s branch ${t.branch} is gone, so HQ can't test it.`)
     if (!base_sha) throw new Error(`HQ couldn't find ${base.name} in ${repo.name}.`)
     if (own.stop.signal.aborted) throw new Error(own.why ? `It stopped before it began: ${own.why}.` : 'It stopped before it began.')
-    const c: HqCheck = { id: id('check'), state: 'running', sha, base: base.name, base_sha, finished_sha: t.finished_sha, started_at: now(), now: 'tests', steps: [] }
     // Bug 373: the check before this one stays with the ticket (the last few do): Test again used to wipe the results the user had sent to its engineer
-    const prev = checkOf(t); if (prev) keepPastChecks(t.id, pastWith(pastChecks(t), prev))
+    const prev = checkOf(t), past = prev ? pastWith(pastChecks(t), prev) : pastChecks(t); if (prev) keepPastChecks(t.id, past)
+    const c: HqCheck = { id: id('check'), state: 'running', sha, base: base.name, base_sha, finished_sha: t.finished_sha, started_at: now(), now: 'tests', steps: [],
+      round: nextRound(past) } // Bug 401: round 1, 2, … of test → send back → fix
     save(t.id, c)
     emit({ agentId: null, source: 'ui', kind: 'check.started', payload: { ticket: t.id, key: t.key, check: c.id, sha } })
     void runCheck(t, getRepo(repo.id) ?? repo, c, own).catch(() => {})
@@ -148,7 +149,7 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
     if (c.prep) { delete c.prep; save(t0.id, c) }
     // 1. The tests, with it merged into main as it was when the check began, and once they pass, the app opened in the same checkout (testrun.ts runAt)
     let r: TestResult = await testCombined(repo.path, c.base_sha, c.sha, key, repo.test_cmd, signal, show('ticket'),
-      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null, steps: stepsOf(repo.id) })
+      { watch: watchFor(proof?.tests ?? []), look: 'plan' in lp ? lp.plan : null, steps: stepsOf(repo.id), again: 'press Test again' }) // Bug 403: its button
     if (r.kind === 'stopped' || signal.aborted) return stopped()
     if (r.kind === 'error') return end('error', `HQ couldn't test it: ${r.why}`)
     if (r.kind === 'conflicts') {
@@ -170,13 +171,18 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
       // was main already like that? Then it isn't this ticket's fault, and there's nothing to send its engineer
       at('tests'); const b = await testBase(repo.path, c.base_sha, key, repo.test_cmd, signal, show('main'), { steps: stepsOf(repo.id) })
       if (b.kind === 'stopped' || signal.aborted) return stopped()
-      const words = r.hung ? `They froze and were stopped after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes` : `They failed: ${failedLine(`${r.earlier}\n${r.output}`)}`
+      const words = r.hung ? `They froze and were stopped after ${getSetting('test_timeout_min', DEFAULTS.test_timeout_min)} minutes`
+        : `They failed: ${failedLine(`${r.earlier}\n${r.output}`)}${exitedAnyway(r)}` // Bug 426: exitedAnyway, when the command exited 0 all the same
       if (b.kind === 'fail') {
         step({ kind: 'tests', state: 'fail', words: `${words} · ${c.base} fails them too, without ${t.key}.`, output: failReport(r, 4000) })
         return end('error', `${c.base}'s own tests fail, so HQ can't tell whether ${t.key} is fine. Fix ${c.base} first.`)
       }
-      step({ kind: 'tests', state: 'fail', words: `${words} · ${c.base} passes them without ${t.key}, so the failure is ${t.key}'s.`, output: failReport(r, 4000) })
-      return end('fail', undefined, fix({ test: r.test, output: r.output, earlier: r.earlier, ...(r.hung ? { hung: true } : {}) }))
+      // Bug 428: main alone passed (or has no tests): the failure is the ticket's. Its run went wrong (`error`): HQ doesn't know, and says so, as its engineer hears
+      const basePassed = b.kind === 'pass' || b.kind === 'no_tests', whose = basePassed ? `${c.base} passes them without ${t.key}, so the failure is ${t.key}'s.`
+        : `HQ couldn't test ${c.base} without ${t.key}${b.kind === 'error' ? ` (${b.why})` : ''}, so it can't tell whether the failure is ${t.key}'s.`
+      step({ kind: 'tests', state: 'fail', words: `${words} · ${whose}`, output: failReport(r, 4000) })
+      return end('fail', undefined, fix({ test: r.test, output: r.output, earlier: r.earlier, ...(r.hung ? { hung: true } : {}),
+        ...(basePassed ? { basePassed: true } : {}), ...(r.exit0 ? { exit0: r.exit0 } : {}) })) // Bug 405: as the step says
     } else if (r.kind === 'pass') {
       ranTests = r
       step({ kind: 'tests', state: 'pass', words: `\`${r.test}\` passed${r.counts ? `: ${countWords(r.counts)}` : ''} · ${took(r.ms)}` })
@@ -315,7 +321,7 @@ export async function sendCheck(ticketId: string): Promise<{ engineer: string | 
     ...(s.hung ? { hung: true } : {}), ...(s.unproven ? { unproven: true } : {}), ...(s.missing ? { missing: s.missing } : {}), ...(s.outside ? { outside: s.outside } : {}),
     ...(s.look ? { look: true } : {}),
     ...(s.review ? { review: true } : {}),
-    ...(s.tester ? { tester: true } : {}) } satisfies Failed)
+    ...(s.tester ? { tester: true } : {}), ...(s.basePassed ? { basePassed: true } : {}), ...(s.exit0 ? { exit0: s.exit0 } : {}) } satisfies Failed)
   const now0 = getTicket(ticketId), c2 = now0 && checkOf(now0)
   if (c2?.id === c.id) save(ticketId, { ...c2, sent_at: now() })
   emit({ agentId: r.engineer ?? null, source: 'ui', kind: 'check.sent', payload: { ticket: ticketId, key: t.key, check: c.id, kind: s.kind } })

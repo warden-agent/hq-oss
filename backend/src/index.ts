@@ -11,7 +11,7 @@ import { startStuckLoop } from './stuck.ts'
 import { lookAtStart } from './dialogclear.ts'
 import { startBgRuns } from './bgruns.ts'
 import { startMergeWatcher } from './mergewatch.ts'
-import { slotBasesNow, sweepWorktrees } from './slots.ts'
+import { settlePendingSlots, slotBasesNow, sweepWorktrees } from './slots.ts'
 import { startListeners } from './listeners.ts'
 import { recoverPreviews, resumeRestarts } from './preview.ts'
 import { recoverHelpers, resumeTries } from './launchhelper.ts'
@@ -21,7 +21,7 @@ import { repos } from './records.ts'
 import { emit } from './events.ts'
 import { attention } from './attention.ts'
 import { startRetention } from './retention.ts'
-import { finishParks, finishResumes, startFreshStartLoop } from './freshstart.ts'
+import { finishMoves, startFreshStartLoop } from './freshstart.ts'
 import { ensureTrusted } from './trust.ts'
 import { startAutoLoop } from './auto.ts'
 import { killTestRuns, sweepRunTmp, sweepTestWorktrees } from './testrun.ts'
@@ -69,6 +69,8 @@ async function main(): Promise<void> {
   // Every TPM workspace is a plain folder under this one, so trusting it once means TPM launches never write ~/.claude.json.
   try { await ensureTrusted(PATHS.workspaces) } catch (e) { emit({ agentId: null, source: 'system', kind: 'trust.error', payload: { error: String(e) } }) }
   await recoverAgents()
+  // Bug 422: ports a start of the last backend held under its own name go to the engineer it started, or are free: before anything starts one
+  for (const s of settlePendingSlots()) emit({ agentId: null, source: 'system', kind: 'slot.settled', payload: s })
   for (const a of liveAgents()) tellIfHqWasAway(a) // Bug 85: told to wait for HQ while it was down; an idle agent sends no hook to remind HQ
   lookAtStart() // Bug 217: a dialog that ended while HQ was down sent its sign to no one
   await sweepWorktrees().catch((e) => emit({ agentId: null, source: 'system', kind: 'worktree.sweep.error', payload: { error: String(e) } }))
@@ -96,8 +98,7 @@ async function main(): Promise<void> {
   // Bug 296: an urgent message or a fresh start's request the last backend was typing when it went down. Once the servers listen: the prompt it
   // types starts a turn, whose hooks must reach HQ (typed before, they failed with ECONNREFUSED on the screen). In the background: an Escape waits 1.5 s
   void typeCutShort().catch((e) => emit({ agentId: null, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
-  finishParks() // Bug 369: a switch away the last backend was in the middle of asks the rest of the project's agents (after typeCutShort's look)
-  finishResumes() // Bug 389: and a coming back it was in the middle of picks up the rest of the project's parked agents
+  finishMoves() // Bugs 369, 389, 402: the switches away and back the last backend was in the middle of or had queued, in order (after typeCutShort's look)
   startStuckLoop(); startMergeWatcher(); startRetention(); startFreshStartLoop(); startAutoLoop()
   startLeftoverSweeps()
   startClaudeCheck()

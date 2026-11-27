@@ -11,8 +11,8 @@ import type { TicketStatus } from './readiness.ts'
 import { getAgent, launchAgent, liveAgents, stopAgent, type Agent } from './agents.ts'
 import { pendingFor, sendMessage } from './delivery.ts'
 import { modelFor } from './roles.ts'
-import { autoGoing, closedWhy, features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTicket, sweepNotices, ticketInRepo, tickets, type Feature, type Fixing, type Ticket }
-  from './records.ts'
+import { autoGoing, closedWhy, features, getFeature, getRepo, getTicket, liveTpm, notClearing, setTicket, sweepNotices, ticketInRepo, tickets, type Feature, type Fixing, type Repo,
+  type Ticket } from './records.ts'
 import { ensureFresh, git } from './repos.ts'
 import { nextWorkerSlot, releaseSlot } from './slots.ts'
 import { portsNote } from './slotports.ts'
@@ -124,6 +124,10 @@ export function liveEngineerOf(t: Ticket): string | null {
  *  ticket is refused while the first is still under way. */
 export async function launchEngineer(ticketId: string, opts: { synced?: boolean; quiet?: boolean } = {}): Promise<Agent> {
   const t = getTicket(ticketId); if (!t) throw new Error('unknown ticket')
+  // Bug 398: the engineer a Launch of the last backend started before it went down: this Launch (or Start's fill) takes it over instead of being refused
+  // for it. Only on a queued ticket: nothing but a Launch starts one there, while a ticket under way may have had a resume or a send-back begun.
+  const cut = t.status === 'queued' && !starting.has(t.id) && !fixing.has(t.id) ? halfStarted(t) : undefined
+  if (cut) { notClearing(getFeature(t.feature_id)?.repo_id ?? ''); return adoptEngineer(t, cut, { quiet: opts.quiet }) }
   const live = liveEngineerOf(t)
   const blocked = launchBlocker(t, { starting: starting.has(t.id), liveEngineer: live }); if (blocked) throw new Error(blocked)
   const waits = unmergedDeps(t, tickets(t.feature_id)); if (waits.length) throw new Error(`${t.key} waits on ${waits.join(', ')} (not merged yet)`)
@@ -131,15 +135,20 @@ export async function launchEngineer(ticketId: string, opts: { synced?: boolean;
   starting.add(t.id)
   try { return await startEngineer(t, opts) } finally { starting.delete(t.id) }
 }
+/** Bug 421: the ticket went back to its engineer (`fixing` says what for), also while that engineer waits on an answer to a question it asked
+ *  meanwhile (awaiting_answer keeps `resolving` in prior_status): an engineer taking over gets HQ's instructions for it, not the plan from before. */
+const sentBack = (t: Ticket): boolean => t.status === 'resolving' || (t.status === 'awaiting_answer' && t.prior_status === 'resolving')
 /** `fix`: an engineer that finished work goes back to (Fix conflicts, auto mode's failed test on main, or a spec the TPM changed, as
  *  `fixing` says): it starts in acceptEdits with HQ's instructions as its prompt (no plan to review), and the ticket goes to `resolving`. */
 type Resume = { prompt: (worktree: string) => Promise<string>; mode: 'plan' | 'acceptEdits'; status: TicketStatus; noted: boolean } // noted: a handoff note was left
+/** A ticket's branch and worktree, as its first engineer gets them. */
+const branchOf = (t: Ticket, f: Feature): string => t.branch ?? `hq/${f.slug}/${t.key}-${t.slug}`
+const worktreeOf = (t: Ticket, repo: Repo): string => path.join(repo.path, '.claude', 'worktrees', t.key)
 /** `quiet`: the caller tells the TPM itself (fillSlots, Bug 127: one notice for all the engineers one click started). `back` (Bug 373): why HQ's check sent
  *  the ticket back and who sent it, in HQ's words (conflicts.ts backWords, backBy): the TPM is told that, not only "to fix its tests". */
 async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolean; fix?: (worktree: string) => string; fixing?: Fixing; back?: string; resume?: Resume }): Promise<Agent> {
   const f = getFeature(t.feature_id)!; notClearing(f.repo_id); const repo = opts.synced ? getRepo(f.repo_id)! : await ensureFresh(f.repo_id)
-  const branch = t.branch ?? `hq/${f.slug}/${t.key}-${t.slug}`
-  const wtName = t.key; const wtPath = path.join(repo.path, '.claude', 'worktrees', wtName)
+  const branch = branchOf(t, f), wtName = t.key, wtPath = worktreeOf(t, repo)
   if (fs.existsSync(wtPath)) {
     const cur = await git(wtPath, 'rev-parse', '--abbrev-ref', 'HEAD').catch(() => '')
     if (cur !== branch) {
@@ -168,20 +177,28 @@ async function startEngineer(t: Ticket, opts: { synced?: boolean; quiet?: boolea
   const tests = told && !t.repairs_main ? `\n\n${testCmdNote(told)}` : '' // a repair's spec has the command: it's the one that failed
   const ports = `\n\n${portsNote(slot.env)}` // Bug 259: its own, not another HQ's
   const a = await launchAgent({
-    role: 'engineer', repoId: f.repo_id, featureId: f.id, ticketId: t.id, model: modelFor('engineer', opts.fix || opts.resume?.status === 'resolving' ? 'S' : t.size), cwd: repo.path, displayName: `eng ${t.key}`, launchPrompt: prompt + tests + ports,
+    role: 'engineer', repoId: f.repo_id, featureId: f.id, ticketId: t.id, model: modelFor('engineer', opts.fix || (opts.resume && sentBack(t)) ? 'S' : t.size), cwd: repo.path, displayName: `eng ${t.key}`, launchPrompt: prompt + tests + ports,
     worktreeName: wtName, size: t.size, repoAllowlist: j<string[]>(repo.network_allowlist, []), editOverrides: j<string[]>(t.edit_overrides, []), extraEnv: slot.env,
     permissionMode: opts.fix ? 'acceptEdits' : opts.resume?.mode ?? 'plan',
   }).catch((e) => { releaseSlot(`pending-${t.id}`); throw e })
   run('UPDATE worker_slots SET agent_id = ? WHERE idx = ?', a.id, slot.idx)
-  setTicket(t.id, { status: opts.fix ? 'resolving' : opts.resume?.status ?? 'planning', prior_status: opts.resume ? t.prior_status : null, assignee_agent_id: a.id, branch, worktree_path: wtPath, parked_at: null })
+  return recordStart(t, a, { f, repo, branch, wtPath, slot: slot.idx, how: { fix: !!opts.fix, fixing: opts.fixing, back: opts.back, quiet: opts.quiet, resume: opts.resume } })
+}
+/** How an engineer started on a ticket, for what startEngineer records: Launch (none of these), a send-back (`fix`, what for), a resume. */
+type How = { fix?: boolean; fixing?: Fixing; back?: string; quiet?: boolean; resume?: { status: TicketStatus; noted: boolean } }
+/** What startEngineer records once the engineer's session runs: the ticket names it, what waited for the engineer before it is handed over, and the TPM is
+ *  told. `adopted` (Bug 398): a session the last backend started and never recorded, taken over now (adoptEngineer). */
+function recordStart(t: Ticket, a: Agent, s: { f: Feature; repo: Repo; branch: string; wtPath: string; slot: number | null; how: How; adopted?: boolean }): Agent {
+  const { f, repo, branch, wtPath, how } = s
+  setTicket(t.id, { status: how.fix ? 'resolving' : how.resume?.status ?? 'planning', prior_status: how.resume ? t.prior_status : null, assignee_agent_id: a.id, branch, worktree_path: wtPath, parked_at: null })
   // Bug 102: what was left for the ticket's engineer that has gone (a spec change, the TPM's messages) is for this one now. Every way an
   // engineer starts on a ticket comes here: launch, relaunch, Resume, and a send-back's Fix conflicts / Fix tests / Build the change.
   const prev = t.assignee_agent_id && t.assignee_agent_id !== a.id ? getAgent(t.assignee_agent_id) : undefined
   if (prev?.status === 'exited') handOver(prev.id, a.id)
-  emit({ agentId: a.id, source: 'system', kind: 'ticket.launched', payload: { ticket: t.id, branch, worktree: wtPath, slot: slot.idx, fix: !!opts.fix } })
-  const why = opts.fix ? ` to ${fixWords(opts.fixing ?? null, mergeBase(repo).name).to}`
-    : opts.resume ? ` to take over after a fresh start${opts.resume.noted ? ' (the last engineer left a handoff note)' : ''}` : ''
-  if (!opts.quiet) tellTpm(f, opts.back ? `HQ: ${t.key} went back to an engineer because ${opts.back} Engineer ${a.id} started on it (branch ${branch}). `
+  emit({ agentId: a.id, source: 'system', kind: 'ticket.launched', payload: { ticket: t.id, branch, worktree: wtPath, slot: s.slot, fix: !!how.fix, ...(s.adopted ? { adopted: true } : {}) } })
+  const why = how.fix ? ` to ${fixWords(how.fixing ?? null, mergeBase(repo).name).to}`
+    : how.resume ? ` to take over after a fresh start${how.resume.noted ? ' (the last engineer left a handoff note)' : ''}` : ''
+  if (!how.quiet) tellTpm(f, how.back ? `HQ: ${t.key} went back to an engineer because ${how.back} Engineer ${a.id} started on it (branch ${branch}). `
     + `Address messages for this ticket to id ${a.id}.` : `HQ: engineer ${a.id} started on ${t.key}${why} (branch ${branch}). Address messages for this ticket to id ${a.id}.`)
   return a
 }
@@ -205,7 +222,8 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
   if (old && old.status !== 'exited') throw new Error(`${t.key} still has an engineer running (${old.id}).`)
   if (starting.has(t.id)) throw new Error(`${t.key} is already starting.`)
   notClearing(getFeature(t.feature_id)?.repo_id ?? '')
-  const cut = !fixing.has(t.id) ? halfStarted(t) : undefined; if (cut) return adoptEngineer(t, cut, old)
+  const cut = !fixing.has(t.id) ? halfStarted(t) : undefined, noted = !!readNote(`resume:ticket:${t.id}`)
+  if (cut) return resumed(t, adoptEngineer(t, cut, { resume: { status: t.status, noted } }), old, { noted, adopted: true })
   const cap = canLaunch({ ignoreCap: !!o.replace }); if (!cap.ok) throw new Error(cap.why)
   starting.add(t.id)
   try {
@@ -213,39 +231,56 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
     const note = readNote(`resume:ticket:${t.id}`)
     const rev = one<{ edited_plan_text: string | null; plan_text: string }>(`SELECT edited_plan_text, plan_text FROM plan_revisions
       WHERE ticket_id = ? AND verdict IN ('approve', 'approve_with_edits') ORDER BY round DESC, submitted_at DESC`, t.id)
-    const plan = t.status === 'planning' || t.status === 'resolving' ? null : rev ? rev.edited_plan_text ?? rev.plan_text : null
-    const replan = t.status !== 'resolving' && replanDue(t, f.repo_id) // Bug 371: its spec changed after that plan: it plans again, for the user
+    const back = sentBack(t), plan = t.status === 'planning' || back ? null : rev ? rev.edited_plan_text ?? rev.plan_text : null
+    const replan = !back && replanDue(t, f.repo_id) // Bug 371: its spec changed after that plan: it plans again, for the user
     const mode = t.status === 'planning' || replan ? 'plan' : 'acceptEdits'
     const a = await startEngineer(t, { synced: true, resume: { mode, status: t.status, noted: !!note, prompt: async (wt) => {
       let fix: string | null = null
-      if (t.status === 'resolving' && t.fixing === 'changes') fix = changeText({ t })
-      else if (t.status === 'resolving' && forTests(t.fixing)) fix = fixTestsText({ t, base: base.name, failed: testsFailed(t, repo.test_cmd) }) // Bug 84
-      else if (t.status === 'resolving') {
+      if (back && t.fixing === 'changes') fix = changeText({ t })
+      else if (back && forTests(t.fixing)) fix = fixTestsText({ t, base: base.name, failed: testsFailed(t, repo.test_cmd) }) // Bug 84
+      else if (back) {
         const mh = await git(wt, 'rev-parse', '--git-path', 'MERGE_HEAD').catch(() => '')
         fix = fixConflictsText({ t, base: base.name, files: j<string[]>(t.conflict_files, []), merged: j<string[]>(t.conflict_with, []), inProgress: !!mh && fs.existsSync(path.resolve(wt, mh)) })
       }
       return engineerResumePrompt(t, { feature: f.title, worktree: wt, base: base.name, note, git: await gitFacts(wt, base.ref), plan, fix, replan,
         late: fix || t.status !== 'implementing' ? null : await lateCommits(repo.path, base.ref, t) })
     } } })
-    if (old) { for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
-    clearStalled(t.id) // someone is fixing its tests (or building its change) again
-    emit({ agentId: a.id, source: 'system', kind: 'ticket.resumed', payload: { ticket: t.id, key: t.key, previous: old?.id ?? null, note: !!note } })
-    return a
+    return resumed(t, a, old, { noted: !!note })
   } finally { starting.delete(t.id) }
 }
+/** A resume's engineer runs: the notices about the one before it go, and the Events tab says it took over. */
+function resumed(t: Ticket, a: Agent, old: Agent | undefined, o: { noted: boolean; adopted?: boolean }): Agent {
+  if (old) { for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
+  clearStalled(t.id) // someone is fixing its tests (or building its change) again
+  emit({ agentId: a.id, source: 'system', kind: 'ticket.resumed', payload: { ticket: t.id, key: t.key, previous: old?.id ?? null, note: o.noted,
+    ...(o.adopted ? { adopted: true } : {}) } })
+  return a
+}
 
-/** Bug 389: an engineer the last backend started on `t` for a resume but went down before recording it on the ticket (startEngineer records it once
- *  launchAgent returns): its session runs, from the note, while the ticket still says parked. Nothing of this backend is starting one (the callers check). */
-const halfStarted = (t: Ticket): Agent | undefined => q<Agent>(`SELECT * FROM agents WHERE role = 'engineer' AND ticket_id = ? AND status != 'exited'
-  AND id IS NOT ? ORDER BY started_at DESC`, t.id, t.assignee_agent_id).find((a) => a.started_at >= (t.parked_at ?? 0))
-/** It takes the ticket over, as startEngineer and resumeEngineer would have recorded it, so a resume run again starts no second engineer. */
-function adoptEngineer(t: Ticket, a: Agent, old: Agent | undefined): Agent {
-  run('UPDATE worker_slots SET agent_id = ? WHERE agent_id = ?', a.id, `pending-${t.id}`) // its ports, still under the launch's name
-  setTicket(t.id, { assignee_agent_id: a.id, parked_at: null })
-  if (old) { handOver(old.id, a.id); for (const k of ['engineer_exited', 'agent_exited', 'stuck', 'context_high']) resolveKind(k, old.id) }
-  clearStalled(t.id)
-  emit({ agentId: a.id, source: 'system', kind: 'ticket.resumed', payload: { ticket: t.id, key: t.key, previous: old?.id ?? null, note: !!readNote(`resume:ticket:${t.id}`), adopted: true } })
+/** Bugs 389, 398: an engineer the last backend started on `t` (a Launch, a resume, a send-back's fresh engineer) but went down before recording it on the
+ *  ticket (startEngineer records it once launchAgent returns): its session runs, from its launch prompt, while the ticket names no engineer, a parked one or
+ *  the one that stopped. Newer than the ticket's own engineer and than its park; none while that engineer still runs. Nothing of this backend is starting
+ *  one (the callers check `starting` and `fixing` first). */
+function halfStarted(t: Ticket): Agent | undefined {
+  const own = t.assignee_agent_id ? getAgent(t.assignee_agent_id) : undefined; if (own && own.status !== 'exited') return undefined
+  return q<Agent>(`SELECT * FROM agents WHERE role = 'engineer' AND ticket_id = ? AND status != 'exited' AND id IS NOT ? ORDER BY started_at DESC`,
+    t.id, t.assignee_agent_id).find((a) => a.started_at >= Math.max(t.parked_at ?? 0, own?.started_at ?? 0))
+}
+/** It takes the ticket over, recorded as startEngineer would have for `how` (its ports, still under the launch's name, too), so the same click again,
+ *  or a resume run again at start-up, starts no second engineer and the ticket doesn't sit there without the one that works on it. */
+function adoptEngineer(t: Ticket, a: Agent, how: How): Agent {
+  const f = getFeature(t.feature_id)!, repo = getRepo(f.repo_id)!
+  run('UPDATE worker_slots SET agent_id = ? WHERE agent_id = ?', a.id, `pending-${t.id}`)
+  const slot = one<{ idx: number }>('SELECT idx FROM worker_slots WHERE agent_id = ?', a.id)?.idx ?? null
+  recordStart(t, a, { f, repo, branch: branchOf(t, f), wtPath: worktreeOf(t, repo), slot, how, adopted: true })
   return getAgent(a.id) ?? a
+}
+/** Bug 398: a send-back's fresh engineer (Fix conflicts, Fix tests, Build the change) that the last backend started but never recorded, recorded now as
+ *  sendBack would have: the ticket resolving, for what its `fixing` says (kept before the start), and the notices about the engineer before it gone. */
+function adoptSentBack(t: Ticket, a: Agent, o: { quiet: boolean }): Agent {
+  const got = adoptEngineer(t, a, { fix: true, fixing: t.fixing, quiet: o.quiet })
+  if (t.assignee_agent_id) for (const k of ['engineer_exited', 'agent_exited', 'stuck']) resolveKind(k, t.assignee_agent_id)
+  clearStalled(t.id); return got
 }
 const fixing = new Set<string>() // tickets whose Fix conflicts (or fix of their tests, or change of spec) is under way
 const leaving = new Map<string, Promise<void>>() // by ticket: its engineer is being stopped because the ticket is finished (stopFinished)
@@ -309,6 +344,7 @@ export async function fixTests(ticketId: string, failed: Failed): Promise<{ via:
   fixing.add(t.id)
   try {
     await leaving.get(t.id) // its engineer is on its way out: a fresh one starts instead
+    const cut = halfStarted(getTicket(t.id) ?? t); if (cut) adoptSentBack(getTicket(t.id) ?? t, cut, { quiet: true }) // Bug 398: the message below goes to it
     const f = getFeature(t.feature_id)!, repo = getRepo(f.repo_id)!, base = mergeBase(repo).name
     const liveId = one<{ id: string }>("SELECT id FROM agents WHERE role = 'engineer' AND status != 'exited' AND ticket_id = ? ORDER BY started_at DESC", t.id)?.id
     const live = liveId ? getAgent(liveId) : undefined
@@ -335,6 +371,7 @@ export async function changeFinished(ticketId: string, change: { spec?: string; 
   fixing.add(t.id)
   try {
     await leaving.get(t.id)
+    const cut = halfStarted(getTicket(t.id) ?? t); if (cut) adoptSentBack(getTicket(t.id) ?? t, cut, { quiet: true }) // Bug 398: the message below goes to it
     const liveId = one<{ id: string }>("SELECT id FROM agents WHERE role = 'engineer' AND status != 'exited' AND ticket_id = ? ORDER BY started_at DESC", t.id)?.id
     const live = liveId ? getAgent(liveId) : undefined
     if (live && !(await tmux.hasSession(live.tmux_session))) throw new Error(`its engineer (${live.id}) can't be reached right now`)
@@ -343,7 +380,10 @@ export async function changeFinished(ticketId: string, change: { spec?: string; 
     const r = await sendBack(cur, f.id, live, (launch) => changeText({ t: cur, launch }), 'changes')
       .catch((e) => { setTicket(t.id, { spec: t.spec, title: t.title, criteria: t.criteria, fixing: t.fixing }); throw e })
     resolveKindForTicket('conflicts_fixed', t.id) // "ready to merge again" isn't true any more
-    emit({ agentId: r.engineer, source: 'mcp', kind: 'ticket.change', payload: { ticket: t.id, key: t.key, via: r.via } })
+    // Bug 394 follow-up: the plan round it was changed after, for planWords (no new plan is made for the change); pinned, so the TPM is told for as long
+    // as the ticket lasts, not only while the event log keeps its rows
+    const ev = emit({ agentId: r.engineer, source: 'mcp', kind: 'ticket.change', payload: { ticket: t.id, key: t.key, via: r.via, round: cur.plan_round } })
+    run('UPDATE events SET pinned = 1 WHERE id = ?', ev.id!)
     return r
   } finally { fixing.delete(t.id) }
 }
@@ -365,6 +405,13 @@ export async function fixConflicts(ticketId: string): Promise<{ key: string; cle
   try {
     await leaving.get(t0.id)
     const f = getFeature(t0.feature_id)!; if (f.status === 'cancelled') throw new Error(`${f.title} is cancelled`)
+    // Bug 398: the fresh engineer a send-back of the last backend started before it went down: it already has HQ's instructions (its launch prompt), so it
+    // takes the ticket over and nothing is sent again.
+    const cur = getTicket(t0.id) ?? t0, cut = halfStarted(cur)
+    if (cut) {
+      const a = adoptSentBack(cur, cut, { quiet: false }); for (const k of ['merge_conflict', 'conflicts_fixed']) resolveKindForTicket(k, cur.id)
+      return { key: cur.key, clean: false, via: 'launch', engineer: a.id }
+    }
     const liveId = one<{ id: string }>("SELECT id FROM agents WHERE role = 'engineer' AND status != 'exited' AND ticket_id = ? ORDER BY started_at DESC", t0.id)?.id
     const live = liveId ? getAgent(liveId) : undefined
     if (live && !(await tmux.hasSession(live.tmux_session))) throw new Error(`${t0.key}'s engineer (${live.id}) can't be reached right now; try again in a minute.`)

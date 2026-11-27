@@ -23,8 +23,8 @@ export function startListeners(): void {
   started = true
   const freed = (agentId: string | null) => { if (agentId) releaseSlot(agentId); void fillSlots().catch(() => {}) }
   bus.on('event:agent.stopped', (e: HqEvent) => { // a Launch helper stopped from its Agent tab too (Bug 276)
-    freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId, typeof e.payload.reason === 'string' ? e.payload.reason : null); onSetupAgentGone(e.agentId)
-    onStepsAgentGone(e.agentId)
+    const why = typeof e.payload.reason === 'string' ? e.payload.reason : null // 'user': the Agent tab's Stop, which each helper's words name (Bug 417)
+    freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId, why); onSetupAgentGone(e.agentId, why); onStepsAgentGone(e.agentId, why)
   })
   bus.on('event:agent.lost', (e: HqEvent) => { freed(e.agentId); releaseFor(e.agentId); onAgentGone(e.agentId); onSetupAgentGone(e.agentId); onStepsAgentGone(e.agentId) })
   bus.on('event:hook.SessionEnd', (e: HqEvent) => {

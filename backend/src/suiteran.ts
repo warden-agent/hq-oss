@@ -77,15 +77,27 @@ const gitOut = (cwd: string, args: string[], input?: string): Promise<string> =>
   if (input !== undefined) p.stdin?.end(input)
 })
 const hex = (algo: string, s: string): string => crypto.createHash(algo).update(s).digest('hex')
+const LOOKS = 3 // Bug 429: how many times worktreeState reads HEAD's files and `git status` when HEAD moves during each read
 /** Bug 194: what the worktree's files hold, as one hash: HEAD's files with what `git status` lists on top (untracked files too; ignored ones and
  *  HQ's plan folder not, see worktrees.ts). The same files give the same hash however they got there: reading files, or a commit that changes
- *  none, keeps it; `sed -i`, a merge or an Edit changes it. Writes nothing (no index, no objects). Null: git can't say (not a worktree). */
+ *  none, keeps it; `sed -i`, a merge or an Edit changes it. Writes nothing (no index, no objects). Null: git can't say (not a worktree).
+ *  Bug 429: HEAD's files and `git status` are two reads, so a commit landing between them (the engineer's `git commit` the instant its test run
+ *  is over) left the files it committed out of both, as a change. HEAD is read before and after, and the look starts again if it moved; a
+ *  look HEAD never held still for reads as a change (open_pr asks for another run), never as none. */
 export async function worktreeState(wt: string): Promise<string | null> {
   try {
-    const top = (await gitOut(wt, ['rev-parse', '--show-toplevel'])).trim(), files = new Map<string, string>()
-    const head = await gitOut(top, ['ls-tree', '-r', '-z', 'HEAD']).catch(() => '') // no commit yet: nothing committed
-    for (const e of head.split('\0')) { const tab = e.indexOf('\t'); if (tab > 0) files.set(e.slice(tab + 1), e.slice(0, tab).split(' ')[2]!) }
-    const listed = (await gitOut(top, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames'])).split('\0').filter(Boolean).map((e) => e.slice(3))
+    const top = (await gitOut(wt, ['rev-parse', '--show-toplevel'])).trim()
+    const headNow = (): Promise<string> => gitOut(top, ['rev-parse', '-q', '--verify', 'HEAD^{commit}']).then((s) => s.trim(), () => '') // '': no commit yet
+    let files = new Map<string, string>(), listed: string[] = [], still = false
+    for (let tries = 0; tries < LOOKS && !still; tries++) {
+      const at = await headNow(); files = new Map()
+      const head = at ? await gitOut(top, ['ls-tree', '-r', '-z', at]) : '' // no commit yet: nothing committed
+      for (const e of head.split('\0')) { const tab = e.indexOf('\t'); if (tab > 0) files.set(e.slice(tab + 1), e.slice(0, tab).split(' ')[2]!) }
+      listed = (await gitOut(top, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames'])).split('\0').filter(Boolean).map((e) => e.slice(3))
+      still = await headNow() === at
+    }
+    // Still moving (commits back to back): a mixed look could even match a state kept earlier and hide a change, so it matches nothing
+    if (!still) return `moving ${crypto.randomUUID()}`
     const toHash: string[] = []
     for (const f of listed) {
       const st = fs.lstatSync(path.join(top, f), { throwIfNoEntry: false })

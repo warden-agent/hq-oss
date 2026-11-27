@@ -149,8 +149,13 @@ const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 // and plain `go test` print none of these: HQ can't confirm a name there, and says so.
 // Bug 411, through HQ's sandbox, 2026-11-25: pytest 9.2 -v (file::name PASSED / SKIPPED (reason)); Python 3.14's unittest -v and Django 5.2's `manage.py test -v 2`
 // (`name (module.Class.name) ... ok`, `... skipped 'reason'`; Django's first one comes glued to the end of a migration's line, so these match at the line's end).
-const PASS_LINE = [/^\s*[✔✓√]\s/, /^\s*--- PASS: /, /^test .+ \.\.\. ok$/, /^\s*PASS(ED)?\s/, /\sPASSED(\s|$)/, /^\s*ok \d+ /, /\) \.\.\. ok$/]
-const SKIP_LINE = [/# (SKIP|TODO)\b/i, /^\s*[﹣↓○]\s/, /^\s*--- SKIP: /, /^test .+ \.\.\. ignored/, /^\s*SKIPPED\s/, /\sSKIPPED(\s|$)/, /\) \.\.\. skipped\b/,
+// Bug 427: a test marked as expected to fail. pytest 9.2 prints `XFAIL` for one that failed as expected (`file::name XFAIL (why)` with -v, `XFAIL file::name -
+// why` and `XFAIL at setup of …` with -rA; also for `run=False` and `pytest.xfail()`), and Python 3.14's unittest `... expected failure`: it proves nothing,
+// so it reads as skipped. pytest's `XPASS` (one that passed although marked, not strict) ran and its checks held, as pytest's own outcome says: a pass.
+// A strict one prints FAILED (`[XPASS(strict)]` after it) and fails the run, as unittest's `... unexpected success` does: neither line is a pass.
+const PASS_LINE = [/^\s*[✔✓√]\s/, /^\s*--- PASS: /, /^test .+ \.\.\. ok$/, /^\s*X?PASS(ED)?\s/, /\s(PASSED|XPASS)(\s|$)/, /^\s*ok \d+ /, /\) \.\.\. ok$/]
+const SKIP_LINE = [/# (SKIP|TODO)\b/i, /^\s*[﹣↓○]\s/, /^\s*--- SKIP: /, /^test .+ \.\.\. ignored/, /^\s*(SKIPPED|XFAIL)\s/, /\s(SKIPPED|XFAIL)(\s|$)/,
+  /\) \.\.\. (skipped\b|expected failure$)/,
   /^ {2,}- \S/] // mocha's pending test (`it.skip`): `  - name`, indented two more for each suite it's in (mocha 11.8 spec and list reporters; Bug 377)
 // A line for a whole test file, not for one test. It proves that file ran and names no test, so it's never a sign that the runner lists tests by name
 // (Bug 372: vitest's were read as that, and every named test "never ran"). Jest's `PASS test/a.test.js`; vitest's `✓ src/a.test.ts (8 tests | 1 skipped) 5ms`,
@@ -158,6 +163,10 @@ const SKIP_LINE = [/# (SKIP|TODO)\b/i, /^\s*[﹣↓○]\s/, /^\s*--- SKIP: /, /^
 // proves only that the file's tests that ran passed. Vitest's says when some were skipped (`| 1 skipped`, `| 1 todo`); jest's says nothing, and only its
 // summary does, for the whole run (`Tests:       1 skipped, 1 todo, 2 passed, 4 total`).
 const JEST_FILE = /^\s*PASS\s/, VITEST_FILE = /\s\((\d+) tests?( \| [^)]*)?\)/, JEST_SKIPS = /^\s*Tests:\s.*\b[1-9]\d* (skipped|todo)\b/
+// Bug 414: a line for ONE test that also names its file: pytest's node id (`tests/a.py::test_x SKIPPED (why)`, `-v`) and vitest's verbose reporter
+// (`↓ src/a.test.ts > list > a skipped one`). It names the test, so it says nothing about the file's other tests: it neither passes the file nor makes it
+// unsure. pytest -rA's skip summary (`SKIPPED [1] tests/a.py:8: why`) names no test, and still makes its file unsure (Bug 375).
+const ONE_TEST = [/(?:^|\s)[^\s:]+\.[\p{L}\p{N}]+::\S/u, /^\s*↓\s+(?:\|[^|]*\|\s+)?\S+ > \S/]
 const PATH_CHAR = /[\p{L}\p{N}_.@~/\\-]/u, PATH_GOES_ON = /^(?:[\p{L}\p{N}_/\\-]|\.[\p{L}\p{N}])/u
 /** Does this line name the test file `file` (its path from the repo's root)? Whole, or as a runner started in a folder prints it: the end of that path
  *  (`src/a.test.ts` for `frontend/src/a.test.ts`, perhaps after `./` or `../`). The printed path must begin and end where that end does, so `b/a.test.ts`
@@ -192,8 +201,9 @@ export function mergeWatched(seen: { dir: string; seen: Watched }[]): Watched {
 }
 /** Watches a test run's output as it streams in for the tests a ticket's map names: which names (and which files) showed up on a line that says "passed", and
  *  which names on a line that says "skipped". `prints`: the runner listed the tests it ran by name, so a name that never showed up wasn't run. One passing
- *  test printed by name shows that, unless the runner's own file lines counted more tests than it named (vitest naming just its slow ones). A file that a
- *  skip line names, whose vitest line counts skipped tests, or whose jest PASS line is in a run with skipped tests, is `unsure`, never passed.
+ *  test printed by name shows that, unless the runner's own file lines counted more tests than it named (vitest naming just its slow ones). Only a line for
+ *  a whole file passes that file (Bug 414). A file named by a skip line that names no test, whose vitest line counts skipped tests, or whose jest PASS line
+ *  is in a run with skipped tests, is `unsure`, never passed.
  *  `folders`: where the test command starts its runners, when HQ knows (namesFile). */
 export function nameWatch(wanted: Watch, folders: string[] | null = null): { take: (chunk: string) => void; seen: () => Watched } {
   const uniq = (xs: string[]) => [...new Set(xs.filter(Boolean))], names = uniq(wanted.names), files = uniq(wanted.files)
@@ -206,7 +216,10 @@ export function nameWatch(wanted: Watch, folders: string[] | null = null): { tak
     const perFile = pass ? VITEST_FILE.exec(s) : null, jest = pass && !perFile && JEST_FILE.test(s)
     if (skip) skips++; else if (perFile) counted += Number(perFile[1]); else if (!jest) named++
     for (const w of names) if (s.includes(w)) (skip ? skipped : passed).add(w)
-    for (const f of files) if (namesFile(s, f, folders)) (skip || perFile?.[2] ? unsure : jest ? byJest : filesOk).add(f)
+    // Bug 414: only a line for a whole file speaks for the tests in it HQ didn't see by name. One test's line passing made a test pytest -v never ran
+    // read "passed" when the rest of its file passed, and one test's skip line made the file's unprinted tests "couldn't see it" instead of "never ran"
+    const whole = skip ? !ONE_TEST.some((re) => re.test(s)) : !!perFile || jest
+    if (whole) for (const f of files) if (namesFile(s, f, folders)) (skip || perFile?.[2] ? unsure : jest ? byJest : filesOk).add(f)
   }
   return {
     take: (chunk) => { const parts = (rest + chunk).split('\n'); rest = parts.pop() ?? ''; parts.forEach(line); if (rest.length > 4000) rest = '' },

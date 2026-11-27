@@ -5,6 +5,8 @@ import { projectSlug } from '../../backend/src/projectname.ts'
 import { clock } from './testruns.ts'
 import { mdBlocks, mdInline } from './md.ts'
 import { backdropCloses, confirmPressCounts } from './backdrop.ts'
+import { useEscape } from './layers.ts'
+import { ownHosts, REGISTRY_WORDS } from '../../backend/src/downloads.ts'
 
 const statusColor: Record<string, string> = { working: 'bg-emerald-500/20 text-emerald-300', idle: 'bg-zinc-700/50 text-zinc-300', plan_review: 'bg-amber-500/20 text-amber-300', blocked: 'bg-rose-500/20 text-rose-300', paused: 'bg-rose-500/20 text-rose-300', launching: 'bg-sky-500/20 text-sky-300', exited: 'bg-zinc-800 text-zinc-500',
   planning: 'bg-sky-500/20 text-sky-300', implementing: 'bg-emerald-500/20 text-emerald-300', awaiting_answer: 'bg-amber-500/20 text-amber-300', pr_ready: 'bg-indigo-500/20 text-indigo-300', pr_open: 'bg-indigo-500/20 text-indigo-300', resolving: 'bg-amber-500/20 text-amber-300', merged: 'bg-emerald-500/30 text-emerald-200' }
@@ -56,10 +58,9 @@ export function Menu({ label, title, className = 'btn', align = 'right', childre
   useEffect(() => {
     if (!open) return
     const down = (e: PointerEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false) }
-    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    document.addEventListener('pointerdown', down, true); document.addEventListener('keydown', key)
-    return () => { document.removeEventListener('pointerdown', down, true); document.removeEventListener('keydown', key) }
+    document.addEventListener('pointerdown', down, true); return () => document.removeEventListener('pointerdown', down, true)
   }, [open])
+  useEscape(() => setOpen(false), open)
   return <div ref={ref} className="relative">
     <button className={className} title={title} aria-expanded={open} onClick={() => setOpen((o) => !o)}>{label}</button>
     {open && <div ref={pop} className={`absolute top-full z-50 mt-1 rounded-lg border border-zinc-700 bg-zinc-900 p-2 shadow-xl ${align === 'right' ? 'right-0' : 'left-0'}`}>{children(() => setOpen(false))}</div>}
@@ -82,10 +83,11 @@ export function ErrorBar() {
 }
 /** The dark backdrop behind each of HQ's dialogs. A press on it (not on the box) closes the dialog, but not one in the first half second: that is the second
  *  click of a double click on the button that opened it (Bug 252). `wrap-anywhere`: a long word with no spaces (a project name, a path) wraps inside the box
- *  instead of running past its edge (Bug 253). `canClose` false: the dialog is busy and stays. */
+ *  instead of running past its edge (Bug 253). `canClose` false: the dialog is busy and stays. Escape closes it too, while it's the top layer (Bug 407). */
 export function Backdrop({ onClose, canClose = true, z = 'z-[90]', children }: { onClose: () => void; canClose?: boolean; z?: string; children: React.ReactNode }) {
   const opened = useRef(Infinity) // Infinity until it's on screen: no press closes it before then
   useEffect(() => { opened.current = performance.now() }, [])
+  useEscape(onClose, true, canClose)
   return <div className={`fixed inset-0 ${z} flex items-center justify-center bg-black/50 p-4 wrap-anywhere`}
     onPointerDown={(e) => { if (e.target === e.currentTarget && canClose && backdropCloses(opened.current, performance.now())) onClose() }}>{children}</div>
 }
@@ -98,11 +100,6 @@ export function StopDialog() {
   useEffect(() => { onAsk((x) => new Promise((resolve) => setQ({ ...x, resolve }))); return () => onAsk(null) }, [])
   const done = (go: boolean) => { q?.resolve(go); setQ(null) }
   const press = (go: boolean) => (e: React.MouseEvent) => { if (confirmPressCounts(e.detail)) done(go) }
-  useEffect(() => {
-    if (!q) return
-    const k = (e: KeyboardEvent) => { if (e.key === 'Escape') done(false) }
-    document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
-  })
   if (!q) return null
   const list = (xs: string[]) => <ul className="ml-4 list-disc break-words text-zinc-300">{xs.map((x) => <li key={x}>{x}</li>)}</ul>
   return <Backdrop onClose={() => done(false)}>
@@ -131,10 +128,6 @@ export function NewProjectDialog({ onClose, onMade }: { onClose: () => void; onM
   const working = busy === 'make' || busy === 'add'
   // Bug 51: HQ may be restarting as the box opens, so keep asking until it answers
   useEffect(() => askUntilAnswered('repos/new-setup', { away: setAway, answer: (x) => { setSetup(x); setParent((p) => p || x.parent) }, refused: (e) => setErr(errText(e)) }), [])
-  useEffect(() => {
-    const k = (e: KeyboardEvent) => { if (e.key === 'Escape' && !working) onClose() }
-    document.addEventListener('keydown', k); return () => document.removeEventListener('keydown', k)
-  })
   const slug = projectSlug(name), ok = !!slug && !!parent.trim() && !busy
   /** A new name or place: what was offered for the old one no longer applies. */
   const where = (set: (v: string) => void, v: string) => { set(v); if (offer) { setOffer(null); setErr('') } }
@@ -173,6 +166,36 @@ export function NewProjectDialog({ onClose, onMade }: { onClose: () => void; onM
         {offer ? <button type="submit" className="btn btn-primary min-w-0 break-words" disabled={!!busy}>
           {busy === 'add' ? 'Adding…' : offer.repoId ? `Open ${offer.name}` : `Add ${offer.name} to HQ`}</button>
           : <button type="submit" className="btn btn-primary" disabled={!ok}>{busy === 'make' ? (github ? 'Making it on GitHub…' : 'Making it…') : 'Create'}</button>}</div>
+    </form>
+  </Backdrop>
+}
+
+/** Bug 425: + Project → Downloads: the extra hosts this project's agents may download from, which the user allows here or on a "Download refused"
+ *  notice and removes here. A change reaches each agent at its next start (Claude Code reads the list when its session starts). */
+export function DownloadsDialog({ repo, onClose }: { repo: any; onClose: () => void }) {
+  const [host, setHost] = useState(''), [busy, setBusy] = useState<string | null>(null), [err, setErr] = useState('')
+  const hosts = ownHosts(repo.network_allowlist) // Escape closes it through Backdrop's layer (Bug 407)
+  const send = (h: string, allow: boolean) => {
+    if (busy) return; setErr(''); setBusy(allow ? '+' : h)
+    api(`repos/${repo.id}/allowed-hosts`, { host: h, allow }).then(() => { if (allow) setHost('') }, (e) => setErr(errText(e))).finally(() => setBusy(null))
+  }
+  return <Backdrop onClose={onClose}>
+    <form role="dialog" aria-modal="true" aria-label={`Downloads for ${repo.name}`} onSubmit={(e) => { e.preventDefault(); if (host.trim()) send(host, true) }}
+      className="flex max-h-[90vh] w-[480px] max-w-full flex-col gap-3 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-xs text-zinc-400 shadow-xl">
+      <div className="break-words text-sm font-medium text-zinc-100">Downloads for {repo.name}</div>
+      <div>Agents work in a sandbox that lets them download packages only from {REGISTRY_WORDS}. These hosts are allowed for {repo.name} too:</div>
+      {hosts.length ? <ul className="flex flex-col gap-1">{hosts.map((h) => <li key={h} className="flex items-center gap-2 rounded-md border border-zinc-800 px-2 py-1">
+        <span className="min-w-0 grow break-all text-zinc-200">{h}</span>
+        <button type="button" className="btn-sm shrink-0" disabled={!!busy} title={`Agents started from now on can't download from ${h}`} onClick={() => send(h, false)}>
+          {busy === h ? 'Removing…' : 'Remove'}</button></li>)}</ul>
+        : <div className="text-zinc-500">None yet. When an agent is refused a download, HQ's "Download refused" notice names the host and has an Allow button for it.</div>}
+      <div className="flex gap-1.5"><input className="input min-w-0" value={host} onChange={(e) => { setHost(e.target.value); setErr('') }} placeholder="A host, like github.com"
+        aria-label="Host to allow" maxLength={260} />
+        <button type="submit" className="btn btn-primary shrink-0" disabled={!host.trim() || !!busy}>{busy === '+' ? 'Allowing…' : 'Allow'}</button></div>
+      {err && <div role="alert" className="break-words rounded-md border border-rose-500/40 bg-rose-950/30 p-2 text-rose-200">{err}</div>}
+      <div className="text-zinc-500">One host at a time, by its full name: github.com doesn't cover api.github.com. A change reaches each agent the next time it starts, so an
+        engineer that's running now needs a Fresh start (on its box, or in Sessions) to get it.</div>
+      <div className="flex justify-end"><button type="button" className="btn" onClick={onClose}>Close</button></div>
     </form>
   </Backdrop>
 }

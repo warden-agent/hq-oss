@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { BAD_PORTS } from './badports.ts'
 
 process.env.HQ_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-smoke-'))
 process.env.HQ_LOOK_START_S = '4' // an app that never answers is given up on after this long here
@@ -16,6 +17,7 @@ const { migrate } = await import('./db.ts'); migrate() // who has a port (Bug 37
 const { browserHere, ensureBrowser, lookIn, lookHow } = await import('./smoke.ts')
 const { runSandboxed, sandboxProblem } = await import('./testrun.ts')
 const { allProblems, judge } = await import('./smokerules.ts')
+const { portBusy } = await import('./apprun.ts')
 
 const cant = !browserHere() && process.env.HQ_TEST_BROWSER !== '1' ? "HQ's browser isn't on this machine yet (HQ_TEST_BROWSER=1 downloads it)" : await sandboxProblem()
 const opts = { skip: cant ?? false, timeout: 120_000 }
@@ -192,4 +194,24 @@ test('Bug 388: every part is listening before the look opens the page, not only 
 test('a look that auto mode stops says nothing', opts, async () => {
   const a = app('SILENT=1 node server.js'), c = new AbortController(); setTimeout(() => c.abort(), 700)
   assert.deepEqual(await lookIn(a.dir, a.plan, { signal: c.signal, run: runSandboxed }), { kind: 'stopped' })
+})
+
+// Bug 433: an app whose start steps hard-wire a port browsers refuse (6000, 6665–6669: badports.ts). HQ's wait for it to answer was a fetch, which throws
+// "bad port" without trying, and HQ's Chromium refused the page (net::ERR_UNSAFE_PORT), so the look said the app never answered.
+/** `n` ports browsers refuse that nothing on this machine holds, from this file's own few: test files run side by side, and the others that need one
+ *  (testermcp, uitester, recorder) take others. */
+async function badFree(n: number): Promise<number[]> {
+  const out: number[] = []; for (const p of [6665, 6666, 6697]) { assert.ok(BAD_PORTS.has(p)); if (out.length < n && !(await portBusy(p))) out.push(p) }
+  assert.equal(out.length, n, 'too few of the ports browsers refuse are free here'); return out
+}
+test('Bug 433: an app hard-wired to a port browsers refuse is looked at; another such port, not the app\'s, stays refused (must not catch)', opts, async () => {
+  const [port, other] = await badFree(2)
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-smoke-bad-'))), page = '<!doctype html><title>Bad port</title><h1>Bad port</h1>'
+    + `<script>fetch("http://localhost:${other}/x").catch(() => {})</script>`
+  fs.writeFileSync(path.join(dir, 'server.js'), `require('node:http').createServer((q, s) => { s.writeHead(q.url === '/' ? 200 : 404, { 'content-type': 'text/html' })
+  s.end(${JSON.stringify(page)}) }).listen(${port}, '127.0.0.1')\n`)
+  const recipe = { parts: [{ name: 'app', dir: '.', run: 'node server.js', port: port as number | 'auto' }], show: 'app', worktree_files: [], notes: '' }
+  const seen = await look({ dir, plan: { recipe, repoPath: dir, how: lookHow(recipe) } }); assert.ok(seen.kind === 'looked', JSON.stringify(seen))
+  assert.equal(seen.pages[0]!.title, 'Bad port'); assert.deepEqual(seen.pages[0]!.failed, [{ url: `GET http://localhost:${other}/x`, why: 'ERR_UNSAFE_PORT' }])
+  await waitGone(path.basename(dir))
 })

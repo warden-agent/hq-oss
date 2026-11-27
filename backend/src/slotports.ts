@@ -1,6 +1,7 @@
 // Engineers' ports (Bug 259). Each running engineer gets a block of 10 ports for its own servers (PORT is the first). They used to be
 // 3100+10n on every HQ, so two HQs on one machine (the live one and a test HQ, or two users') both gave their first engineer 3110 and
 // their test servers clashed. Now each HQ hands out blocks from a window of its own. No DB access here.
+import { badPort } from './badports.ts'
 
 /** Ports in one engineer's block. */
 export const SLOT_SIZE = 10
@@ -20,10 +21,10 @@ export function slotWindow(uiPort: number, spec?: string): [number, number] {
 }
 
 /** The first port of each block of 10 in the window, lowest first, leaving out a block that holds one of `avoid` (HQ's preview ports, its
- *  own UI, hooks and MCP ports). */
+ *  own UI, hooks and MCP ports) or a port browsers and Node's fetch refuse (10080, Bug 409: an engineer's server there can't be opened or tested). */
 export function slotBases(w: [number, number], avoid: number[] = []): number[] {
-  const out: number[] = []
-  for (let b = w[0]; b + SLOT_SIZE - 1 <= w[1]; b += SLOT_SIZE) if (!avoid.some((p) => p >= b && p < b + SLOT_SIZE)) out.push(b)
+  const out: number[] = [], no = (p: number) => avoid.includes(p) || badPort(p)
+  for (let b = w[0]; b + SLOT_SIZE - 1 <= w[1]; b += SLOT_SIZE) if (!Array.from({ length: SLOT_SIZE }, (_, i) => b + i).some(no)) out.push(b)
   return out
 }
 

@@ -3,8 +3,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { one, q, run, now, getSetting, tx } from './db.ts'
 import { DEFAULTS } from './config.ts'
-import { emit, patch } from './events.ts'
-import { id } from './util.ts'
+import { bus, emit, patch, type Patch } from './events.ts'
+import { id, sleep } from './util.ts'
 import { agentDir, getAgent, liveAgents, onDialog, update, type Agent } from './agents.ts'
 import { attention, resolveKind } from './attention.ts'
 import * as tmux from './tmux.ts'
@@ -163,10 +163,15 @@ export function turnEnded(agent: Agent, aborted: boolean): void {
   if (aborted) { update(agent.id, { interrupted_at: now() }); emit({ agentId: agent.id, source: 'system', kind: 'agent.interrupted', payload: { why: 'turn' } }) }
   else if (agent.interrupted_at) update(agent.id, { interrupted_at: null }) // both writes wake its waiting `next` (wake.ts)
 }
-/** One writer at a time in an agent's terminal. An urgent message, a fresh start's request and a typed batch are each a whole line. */
+/** One writer at a time in an agent's terminal. An urgent message, a fresh start's request and a typed batch are each a whole line, and the Escape
+ *  that stops a paused agent's turn (Bug 195, pause.ts) never lands in the middle of one. */
 const typing = new Map<string, Promise<unknown>>()
-function inTerminal<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
-  const p = (typing.get(agentId) ?? Promise.resolve()).then(fn, fn), done = (): void => { if (typing.get(agentId) === p) typing.delete(agentId) }
+/** Agents whose next batch was asked for (typeNext) while their terminal was taken. Bug 195: HQ now has it a little longer (its look whether a typed
+ *  line was sent, the Escape of a pause), and a batch asked for meanwhile used to wait for the mod's next look. It is typed once the terminal is free. */
+const typeAfter = new Set<string>()
+export function inTerminal<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
+  const p = (typing.get(agentId) ?? Promise.resolve()).then(fn, fn)
+  const done = (): void => { if (typing.get(agentId) !== p) return; typing.delete(agentId); if (typeAfter.delete(agentId)) typeNext(agentId) }
   typing.set(agentId, p); p.then(done, done); return p
 }
 /** A menu or a dialog on the screen, where Enter would pick an option, or a status that takes no messages. Blocked by an API error isn't one (Bug 72). */
@@ -181,13 +186,36 @@ function typeWaiting(a: Agent, why: string | null): void {
   if (why) { typeWaits.set(a.id, why); emit({ agentId: a.id, source: 'system', kind: 'batch.type_waits', payload: { why, status: a.status } }) } else typeWaits.delete(a.id)
   patch('agent', a.id, { type_waits: why })
 }
+/** Bug 436: the reason ends with the interrupt it was for. It stayed on an idle TPM and an exited engineer: only typeNext's next look changed it,
+ *  and none comes once the agent's prompts get through again. Cleared when a prompt starts a turn (the draft was sent, the menu answered: hooks.ts
+ *  UserPromptSubmit), when a turn ends normally and the interrupt is over (`interrupted_at` null: turnEnded, the Stop hook), and when the agent
+ *  ends. In memory only, so a restart starts with none (and the page takes the new snapshot whole). Cleared here and on the page together: a reason
+ *  kept here alone would stop the next interrupt's same reason from reaching the page (typeWaiting says each one once). */
+export function typeWaitsOver(agentId: string): void { if (typeWaits.delete(agentId)) patch('agent', agentId, { type_waits: null }) }
+bus.on('patch', (p: Patch) => { if (p.entity === 'agent' && p.patch && (p.patch.interrupted_at === null || p.patch.status === 'exited')) typeWaitsOver(p.id) })
+const SENT_LOOK_MS = Number(process.env.HQ_TYPED_LOOK_MS ?? 400)
+/** Makes sure Claude Code sent a line HQ has just typed into the agent's terminal. Bug 195, seen on 2.1.322 with a 618-character line on a busy
+ *  machine: the Enter came in on the heels of the line's last piece, and Claude Code took it for part of what was typed. The whole line sat in the
+ *  box with a line break at its end, unsent; HQ then held its own retry as "a half-written line somebody typed", and the agent waited for a person.
+ *  So HQ looks a moment later: a box that holds exactly this line, whole, lacks only its Enter (ownHalfLine ''), and gets it again, three times at
+ *  most. Anything else there (empty: it was sent; other words; a screen with no box) is left alone. Called by whoever typed the line, while it has
+ *  the terminal (inTerminal): the look is next in that line, and nobody who typed waits for it. */
+function confirmSent(agentId: string, session: string, line: string): void {
+  inTerminal(agentId, async () => {
+    for (let again = 1; again <= 3; again++) {
+      await sleep(SENT_LOOK_MS)
+      if (ownHalfLine(await tmux.visiblePaneStyled(session), line) !== '') return
+      await tmux.sendEnter(session); emit({ agentId, source: 'system', kind: 'typed.enter_again', payload: { again } })
+    }
+  }).catch((e) => emit({ agentId, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
+}
 /** Bug 110: types the agent's next batch into its terminal, as a person would, because the mod can't deliver it (see turnEnded). Only into Claude Code's
  *  empty waiting prompt: never into a menu or a dialog, not while it works, and not after a half-written line in the box (Bug 149). Otherwise nothing
  *  happens now, and the mod's `next` request looks again when something changes and every NEXT_BACKSTOP_MS (5 s, hooks.ts): a draft sent or cleared
  *  changes nothing HQ hears of, so that look is what ends its hold. The prompt's UserPromptSubmit hook acks the batch like any other; one that never
  *  starts is typed again after NOT_ACKED_MS, three times at most (requeue). */
 export function typeNext(agentId: string): void {
-  if (typing.has(agentId)) return
+  if (typing.has(agentId)) { typeAfter.add(agentId); return }
   inTerminal(agentId, async () => {
     const was = getAgent(agentId); if (!was) return
     const styled = await tmux.visiblePaneStyled(was.tmux_session), screen = plainScreen(styled)
@@ -196,7 +224,7 @@ export function typeNext(agentId: string): void {
       : /esc to interrupt/.test(screen) ? 'busy' : 'screen'
     typeWaiting(a, why); if (why) return
     const b = nextBatchFor(a, 'typed'); if (!b) return
-    try { await tmux.typeLine(a.tmux_session, b.text) }
+    try { await tmux.typeLine(a.tmux_session, b.text); confirmSent(a.id, a.tmux_session, b.text) }
     catch (e) { emit({ agentId: a.id, source: 'system', kind: 'batch.type_failed', payload: { id: b.id, error: String(e) } }); return requeue(b.id, 'type_failed') }
     markSubmitted(b.id); emit({ agentId: a.id, source: 'system', kind: 'batch.typed', payload: { id: b.id } })
   }).catch((e) => emit({ agentId, source: 'system', kind: 'backend.error', payload: { server: 'typing', error: String(e) } }))
@@ -257,7 +285,7 @@ async function typeUrgent(agent: Agent, m: Message, again: boolean): Promise<voi
     rest = again && paneLooksIdle(styled) ? ownHalfLine(styled, line) : null
     held = rest !== null ? null : paneHasDraft(styled) ? 'draft' : again && !paneLooksIdle(screen) ? 'screen' : null // Bug 149: one Escape leaves a half-written line in the box
     if (held) return
-    await tmux.typeLine(a.tmux_session, rest ?? line) // in pieces, as typeNext does: sent in one go, Claude Code kept only the end of a long one (Bug 183)
+    await tmux.typeLine(a.tmux_session, rest ?? line); confirmSent(a.id, a.tmux_session, line) // in pieces, as typeNext does: sent in one go, Claude Code kept only the end of a long one (Bug 183)
   })
   if (held === 'gone') return // its session ended: the message stays as it is, and a fresh start gets HQ's note (sweepFreshStarts)
   if (held) return holdForDraft(agent.id, m, held)
@@ -298,7 +326,7 @@ async function finishCutBatch(b: Batch): Promise<void> {
     const styled = await tmux.visiblePaneStyled(was.tmux_session), a = getAgent(b.agent_id) // read again: the look took a moment
     if (!a || a.status === 'exited' || notTypeable(a) || !paneLooksIdle(styled)) return
     const r = ownHalfLine(styled, b.text); if (r === null) return
-    await tmux.typeLine(a.tmux_session, r); rest = r
+    await tmux.typeLine(a.tmux_session, r); confirmSent(a.id, a.tmux_session, b.text); rest = r
   }).catch((e) => emit({ agentId: b.agent_id, source: 'system', kind: 'batch.type_failed', payload: { id: b.id, error: String(e) } }))
   if (one('SELECT 1 AS x FROM batches WHERE id = ? AND acked_at IS NULL AND dropped_at IS NULL', b.id)) markSubmitted(b.id)
   emit({ agentId: b.agent_id, source: 'system', kind: 'batch.cut_short', payload: { id: b.id, finished: rest !== null } })
@@ -355,12 +383,30 @@ export function ackBatchFromPrompt(agent: Agent, prompt: string): string | null 
     batchId = open.find((b) => head && (start(b) === head || (b.method === 'typed' && prompt.includes(start(b)))))?.id ?? null
   }
   if (!batchId) return null
-  ackBatch(agent, batchId); return batchId
+  takeBack(agent, batchId, prompt); ackBatch(agent, batchId); return batchId
+}
+/** Bug 435: a prompt that carries a batch HQ had already taken back (requeue: its line sat unsent in the box, and no prompt started within NOT_ACKED_MS)
+ *  delivered that batch's messages after all: a person pressed Enter on the old line. Those still in the queue go back on it, so they count as read
+ *  and aren't handed out again. Only what the prompt really carries: a labelled line names each message (`[msg <id>]`), a raw one is the user's words
+ *  as a whole, and an old line somebody cut short or changed delivers nothing. One already handed out again stays with its new batch. Not a cleared
+ *  box before the retry instead: the box can also hold a person's own words, and HQ never deletes those. */
+function takeBack(agent: Agent, batchId: string, prompt: string): void {
+  const b = one<Batch>('SELECT * FROM batches WHERE id = ? AND agent_id = ?', batchId, agent.id); if (!b?.dropped_at || b.method === 'launch') return
+  const handed = one<{ payload: string }>(`SELECT payload FROM events WHERE agent_id = ? AND kind = 'batch.handed' AND json_extract(payload, '$.id') = ?
+    ORDER BY id DESC LIMIT 1`, agent.id, b.id) // its messages: requeue unlinked them
+  const ids: string[] = handed ? JSON.parse(handed.payload).messages ?? [] : []
+  const labelled = b.text.startsWith(`HQ message batch ${b.id}`) || b.method === 'mod'
+  const carried = (msgId: string): boolean => labelled ? prompt.includes(`[msg ${msgId}]`) : oneLine(prompt).includes(oneLine(b.text))
+  const back = ids.filter((x) => carried(x) && one('SELECT 1 AS x FROM messages WHERE id = ? AND delivered_at IS NULL', x)); if (!back.length) return
+  const t = now(), how = b.method === 'typed' ? 'tmux' : 'mod'
+  tx(() => { for (const x of back) run('UPDATE messages SET batch_id = ?, delivered_at = ?, delivery_method = ? WHERE id = ?', b.id, t, how, x) })
+  emit({ agentId: agent.id, source: 'system', kind: 'batch.old_line', payload: { id: b.id, messages: back } }) // ackBatch acks them and tells the page
 }
 function ackBatch(agent: Agent, batchId: string): void {
   const t = now(); run('UPDATE batches SET acked_at = ? WHERE id = ? AND agent_id = ?', t, batchId, agent.id)
   run('UPDATE messages SET ack_at = ? WHERE batch_id = ?', t, batchId)
-  for (const row of q<Message>('SELECT * FROM messages WHERE batch_id = ?', batchId)) patch('message', row.id, { ack_at: t, delivered_at: row.delivered_at, delivery_method: row.delivery_method })
+  for (const row of q<Message>('SELECT * FROM messages WHERE batch_id = ?', batchId)) patch('message', row.id, { ack_at: t, batch_id: batchId,
+    delivered_at: row.delivered_at, delivery_method: row.delivery_method })
   emit({ agentId: agent.id, source: 'system', kind: 'batch.acked', payload: { id: batchId } })
   wake(agent.id) // the one in flight arrived: the next can go
 }
