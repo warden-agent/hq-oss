@@ -396,7 +396,7 @@ function onPage(s: Shown | null): { state: (to: TestRunView['state'], behind?: s
  *  pnpm 9.15, 10.34, 11.29, 12.23); with the wrong one pnpm 12 put a store in the checkout's node_modules/.pnpm-store. npm's spelling only for a pnpm
  *  install: npm 11 warns about any npm_config_ setting it doesn't know; it reads no pnpm_config_ ones, so that one goes with every install. */
 const PNPM_STORE = path.join(ENGINEER_CACHE, 'pnpm-store')
-const toolCaches = (install: string): Record<string, string> => ({ YARN_CACHE_FOLDER: path.join(ENGINEER_CACHE, 'yarn'),
+export const toolCaches = (install: string): Record<string, string> => ({ YARN_CACHE_FOLDER: path.join(ENGINEER_CACHE, 'yarn'),
   YARN_GLOBAL_FOLDER: path.join(ENGINEER_CACHE, 'yarn-berry'), BUN_INSTALL_CACHE_DIR: path.join(ENGINEER_CACHE, 'bun'), pnpm_config_store_dir: PNPM_STORE,
   ...(/\bpnpm install\b/.test(install) ? { npm_config_store_dir: PNPM_STORE } : {}) })
 /** Bug 431: what a run with the network off (the tests, HQ's look at the app) tells package managers, so none goes looking for the network on its own.
@@ -416,15 +416,18 @@ export function ownTmp(): { tmp: string | null; done: () => Promise<void> } {
 }
 /** A throwaway checkout of `sha` for work of auto mode's that isn't a test run (the tester, tester.ts): made, handed to `fn` with the signal that auto mode
  *  going off or stopping fires, and removed with everything still running in it, however `fn` ends. In turn with builds and test runs, and on the page
- *  (`show`) meanwhile. `stopped`: the signal fired before `fn` began. */
-export async function inCheckout<T>(repoPath: string, sha: string, key: string, auto: Owner, show: Shown | null, fn: (wt: string, signal: AbortSignal) => Promise<T>): Promise<T | 'stopped'> {
-  const wt = testWorktree(repoPath, key), { signal, done } = ownedBy(repoPath, auto); let page = onPage(null)
+ *  (`show`) meanwhile. `stopped`: the signal fired before `fn` began. `key`: the checkout's folder (hq-test-<key>), and the name the line of turns gives it;
+ *  `{ dir, name }` when they differ (Bug 460: a folder of each run's own, under the same name for the user). */
+export async function inCheckout<T>(repoPath: string, sha: string, key: string | { dir: string; name: string }, auto: Owner, show: Shown | null,
+  fn: (wt: string, signal: AbortSignal) => Promise<T>): Promise<T | 'stopped'> {
+  const { dir, name } = typeof key === 'string' ? { dir: key, name: key } : key
+  const wt = testWorktree(repoPath, dir), { signal, done } = ownedBy(repoPath, auto); let page = onPage(null)
   try {
     if (signal.aborted) return 'stopped'
     await dropWorktree(repoPath, wt); fs.mkdirSync(path.dirname(wt), { recursive: true })
     await git(repoPath, ['worktree', 'add', '--detach', '--quiet', wt, sha]); await seedPackages(repoPath, wt)
     page = onPage(signal.aborted ? null : show)
-    return await withTurn(`HQ's tester (${key})`, 'tests', async () => { if (signal.aborted) return 'stopped' as const; page.state('running'); return fn(wt, signal) },
+    return await withTurn(`HQ's tester (${name})`, 'tests', async () => { if (signal.aborted) return 'stopped' as const; page.state('running'); return fn(wt, signal) },
       (b) => page.state('waiting', b), { ticket: show?.ticketId, place: repoPath })
   } finally { done(); await dropWorktree(repoPath, wt).finally(page.over) }
 }

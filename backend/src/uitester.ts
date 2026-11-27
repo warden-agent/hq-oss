@@ -90,8 +90,10 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
   // Bug 380: the app is made ready first, in the checkout (HQ's browser, the ports, the installs), and only then are the scenarios asked for, a paid call.
   // So a project HQ can't start here (a fixed port that is held and can't be moved, no browser, an install that fails) costs nothing. Only what can't be
   // known without starting the app comes after the plan. The checkout's signal is auto mode's: auto going off or stopping ends the planning call too, and
-  // the board shows the tester meanwhile
-  const r = await inCheckout(o.repoPath, o.sha, 'uitest', o.gen, { repoId: o.repoId, ticketId: o.ticketId ?? null, what: 'tester' }, async (wt, signal): Promise<UiTest | 'stopped'> => {
+  // the board shows the tester meanwhile. Bug 460: a checkout of the run's own (hq-test-ui-check-1a2b3c4d: no longer than a ticket's test checkout), as two
+  // ticket checks in a project can run at once. One folder for all had the last to start decide whose code was in it, and the first to end remove it
+  const at = { dir: `ui-${o.runId}`, name: 'uitest' }, show = { repoId: o.repoId, ticketId: o.ticketId ?? null, what: 'tester' as const }
+  const r = await inCheckout(o.repoPath, o.sha, at, o.gen, show, async (wt, signal): Promise<UiTest | 'stopped'> => {
     const got = await prepareApp(wt, o.plan, { signal, run: runSandboxed })
     if (got.kind === 'stopped') return 'stopped'
     if (got.kind !== 'ready') return skipped(got.kind === 'no_start' ? `the app couldn't be started (${got.why})` : got.why)

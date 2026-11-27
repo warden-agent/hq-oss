@@ -11,7 +11,7 @@ fs.mkdirSync(path.join(tmp, 'real-hq')); fs.symlinkSync(path.join(tmp, 'real-hq'
 process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_ENGINEER_CACHE = path.join(tmp, 'cache')
 const { migrate } = await import('./db.ts')
 migrate()
-const { buildSettings, toolReads, rustReads, checkoutReads } = await import('./roles.ts')
+const { buildSettings, toolReads, rustReads, checkoutReads, usesPnpm, pnpmLockDirs } = await import('./roles.ts')
 const config = await import('./config.ts'); const { ENGINEER_CACHE } = config
 
 test('engineers\' package caches (npm, Go, Python) sit outside home; PyPI is reachable, github.com stays blocked', () => {
@@ -20,7 +20,7 @@ test('engineers\' package caches (npm, Go, Python) sit outside home; PyPI is rea
   for (const d of ['pypi.org', 'files.pythonhosted.org', 'registry.npmjs.org']) assert.ok(domains.includes(d), d)
   assert.ok(!domains.some((d) => d.includes('github')))
   assert.equal(ENGINEER_CACHE, fs.realpathSync(path.join(tmp, 'cache')))
-  assert.deepEqual(s.sandbox.filesystem.allowWrite, [ENGINEER_CACHE])
+  assert.deepEqual(s.sandbox.filesystem.allowWrite, [ENGINEER_CACHE, ...pnpmLockDirs()]) // and pnpm 12's lock folders (Bug 455)
   assert.equal(s.env.UV_CACHE_DIR, path.join(ENGINEER_CACHE, 'uv')); assert.equal(s.env.PIP_CACHE_DIR, path.join(ENGINEER_CACHE, 'pip'))
   assert.equal(s.env.UV_PYTHON_INSTALL_DIR, path.join(ENGINEER_CACHE, 'python')); assert.equal(s.env.UV_PYTHON_DOWNLOADS, 'never')
   assert.equal(s.env.npm_config_cache, path.join(ENGINEER_CACHE, 'npm')) // npm writes its _logs there too, not under ~/.npm
@@ -306,4 +306,41 @@ test('Bug 423: an agent\'s sandbox may read the main checkout\'s config files th
   }
   assert.deepEqual(checkoutReads(path.join(tmp, 'b423none')), []) // no such folder: nothing
   assert.equal((buildSettings('tpm', 'tok', { agentDir: tmp, repoPath: repo }) as any).sandbox, undefined)
+})
+
+test('Bug 455: engineers and the Launch helper keep Yarn\'s, pnpm\'s and Bun\'s downloads in the shared cache; npm\'s name for the pnpm store only in a pnpm project', () => {
+  const mk = (name: string, files: Record<string, string>) => {
+    const dir = path.join(tmp, name)
+    for (const [f, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), text) }
+    return dir
+  }
+  const pnpmOnes = [mk('b455lock', { 'pnpm-lock.yaml': '' }), mk('b455ws', { 'pnpm-workspace.yaml': 'packages:\n  - web\n' }),
+    mk('b455pin', { 'package.json': '{"packageManager":"pnpm@10.34.9"}' }), mk('b455part', { 'package.json': '{}', 'web/pnpm-lock.yaml': '' }),
+    mk('b455partpin', { 'web/package.json': '{"packageManager":"pnpm@12.23.0"}' })]
+  const others = [mk('b455npm', { 'package.json': '{"packageManager":"npm@11.7.0"}', 'package-lock.json': '{}', 'web/package-lock.json': '{}' }),
+    mk('b455yarn', { 'package.json': '{"packageManager":"yarn@4.19.0"}', 'yarn.lock': '' }), mk('b455deep', { 'a/b/pnpm-lock.yaml': '' }),
+    mk('b455dep', { 'package.json': '{}', 'node_modules/x/pnpm-lock.yaml': '', 'node_modules/x/package.json': '{"packageManager":"pnpm@9.0.0"}' }),
+    mk('b455hidden', { '.cache/pnpm-lock.yaml': '' }), mk('b455broken', { 'package.json': '{ not json' }), path.join(tmp, 'b455none')]
+  for (const d of pnpmOnes) assert.equal(usesPnpm(d), true, d)
+  for (const d of others) assert.equal(usesPnpm(d), false, d)
+  assert.equal(usesPnpm(undefined), false)
+  const store = path.join(ENGINEER_CACHE, 'pnpm-store')
+  for (const role of ['engineer', 'launcher'] as const) {
+    for (const repoPath of [...pnpmOnes, ...others, undefined]) {
+      const env = (buildSettings(role, 'tok', { agentDir: tmp, repoPath }) as any).env
+      assert.equal(env.YARN_CACHE_FOLDER, path.join(ENGINEER_CACHE, 'yarn')); assert.equal(env.YARN_GLOBAL_FOLDER, path.join(ENGINEER_CACHE, 'yarn-berry'))
+      assert.equal(env.BUN_INSTALL_CACHE_DIR, path.join(ENGINEER_CACHE, 'bun')); assert.equal(env.pnpm_config_store_dir, store) // pnpm 11 and 12
+      assert.equal(env.npm_config_store_dir, repoPath && pnpmOnes.includes(repoPath) ? store : undefined, `${role} ${repoPath}`) // pnpm 10 and older
+      assert.equal(env.npm_config_cache, path.join(ENGINEER_CACHE, 'npm')) // the rest stays
+    }
+  }
+  assert.equal((buildSettings('tpm', 'tok', { agentDir: tmp, repoPath: pnpmOnes[0] }) as any).env, undefined)
+  // pnpm 12's lock folders, by the fixed names it uses in /tmp (real path), and nothing else of /tmp
+  const t = fs.realpathSync('/tmp'), uid = process.getuid!()
+  assert.deepEqual(pnpmLockDirs(), [`pnpm-store-operation-locks-${uid}`, `pnpm-dir-locks-${uid}`, `pnpm-verify-deps-install-locks-${uid}`].map((n) => path.join(t, n)))
+  for (const role of ['engineer', 'launcher'] as const) {
+    const w: string[] = (buildSettings(role, 'tok', { agentDir: tmp }) as any).sandbox.filesystem.allowWrite
+    for (const d of pnpmLockDirs()) assert.ok(w.includes(d), `${role} ${d}`)
+    assert.ok(!w.includes(t) && !w.includes('/tmp'), role)
+  }
 })

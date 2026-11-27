@@ -296,11 +296,11 @@ test('Bug 428: when HQ can\'t test main alone, the results don\'t say the failur
 /** The UI tester's planning calls so far (fake-claude.mjs logs each call to its home). */
 const planCalls = (): any[] => { try { return fs.readFileSync(path.join(hq.home, 'fake-checks.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
   .filter((c) => /^You plan how to test/.test(c.system)) } catch { return [] } }
-/** A finished ticket with screen criteria (`crit`), each with no test of its own, so the UI tester has something to try. */
-async function screenTicket(p: P, title: string, crit: { kind: string; text: string }[]): Promise<any> {
+/** A finished ticket with screen criteria (`crit`), each with no test of its own, so the UI tester has something to try. `files`: what it commits, by its key. */
+async function screenTicket(p: P, title: string, crit: { kind: string; text: string }[], files = (key: string): Record<string, string> => ({ [`${key}.txt`]: 'x\n' })): Promise<any> {
   const t = (await hq.api('tickets', { featureId: p.f.id, title, size: 'S', spec: `${title}.`, criteria: crit })).json, eng = (await hq.api(`tickets/${t.id}/launch`, {})).json
   await waitFor('the engineer', async () => (await hq.state()).agents.find((a: any) => a.id === eng.id && a.status === 'working'))
-  for (const [f, text] of Object.entries({ [`${t.key}.txt`]: 'x\n' })) fs.writeFileSync(path.join(wt(p, t), f), text)
+  for (const [f, text] of Object.entries(files(t.key))) fs.writeFileSync(path.join(wt(p, t), f), text)
   sh(wt(p, t), 'add', '-A'); sh(wt(p, t), 'commit', '-qm', title)
   await hq.hook(eng.id, { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_use_id: `toolu_${eng.id}_1` })
   await hq.mcp(eng.id, 'update_handoff', { kind: 'before_pr', text: 'done' })
@@ -379,6 +379,30 @@ test('Bug 453: a ticket with no screen criteria is not tried by the UI tester: n
   assert.equal(planCalls().length, 0); assert.equal(c.cost_usd, undefined)
   assert.deepEqual(await button(t), ['View results ✓', 'green'])
 })
+
+// Bug 460: two checks pressed a moment apart in one project shared the UI tester's one checkout. The second to start replaced the first's code with its own
+// (and stopped its app), and the first to end removed the folder under the other: one ticket's tester tried another ticket's app, the other found no app.
+test('Bug 460: two checks at once each have the UI tester try their own ticket\'s app, in a checkout of its own, and leave none behind',
+  { skip: process.platform !== 'darwin' && 'the UI tester runs on macOS only' }, async () => {
+    const p = await project('b460two')
+    assert.equal((await hq.api('settings', { key: 'heavy_at_once', value: 2 })).status, 200) // room for both testers at once
+    assert.equal((await hq.api(`previews/${p.repo.id}/command`, { command: 'node server.js' })).status, 200)
+    const plan = `FAKE-PLAN: ${JSON.stringify({ scenarios: [{ kind: 'basic', title: 'Open the app', goal: 'Open the app.', criteria: ['A1'] }] })}`
+    // the app answers with version.txt, which each ticket sets to its own key; each tester waits for b460-go before it opens the page
+    const made = (title: string) => screenTicket(p, title, [{ kind: 'ui', text: `It shows its version. ${plan}` }, { kind: 'ui', text: 'Still. FAKE-UITEST: page b460-go' }],
+      (key) => ({ 'version.txt': `${key}\n` }))
+    const a = await made('Version A'), b = await made('Version B')
+    assert.equal((await check(a)).status, 200); assert.equal((await check(b)).status, 200)
+    // both testers have made their app ready and planned: the first holds its checkout while the second has made its own
+    await waitFor('both testers to plan', () => planCalls().length >= 2, 60_000)
+    assert.equal(testCheckouts(p).filter((x) => x.startsWith('hq-test-ui-')).length, 2, testCheckouts(p).join(' '))
+    fs.writeFileSync(path.join(hq.home, 'b460-go'), '')
+    for (const t of [a, b]) {
+      const c = await ended(t, 60_000), ui = c.steps.find((s) => s.kind === 'ui')!
+      assert.equal(ui.state, 'fail', JSON.stringify(c)); assert.match(ui.lines![0]!.text, new RegExp(`^Open the app: The page said ${t.key}\\.`)) // its own ticket's app
+    }
+    await waitFor('no checkout left', () => testCheckouts(p).length === 0); assert.equal(sh(p.dir, 'status', '--porcelain'), '')
+  })
 
 // Bug 374: the project's start steps give a part a fixed port (one the project hard-wires), and HQ's own preview of the app is running on it, as it
 // normally is. HQ's test used to skip the app ("port … is taken") and end amber. Now its copy runs on another port, in its own checkout: the look and the

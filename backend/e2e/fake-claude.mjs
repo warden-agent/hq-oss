@@ -53,22 +53,25 @@ if (args.includes('-p')) {
   // Its sessions come with the browser and HQ's scenario tools. The stand-in starts neither: it does what they and Claude Code's hooks would, against the
   // tester's host (src/uitesthost.mjs, which is real: the app runs under it): for each scenario in the prompt, start it, open the page, look, click Add, and
   // finish it. As a browser would, it asks the app for the page when it opens it, and POSTs to /api/add when it clicks (at the address the host gave it).
-  // `FAKE-UITEST: <json>` (by scenario id) is what it reports for each; with none, "ok". `hang` never answers; `error` is an API error.
+  // `FAKE-UITEST: <json>` (by scenario id) is what it reports for each; with none, "ok". `hang` never answers; `error` is an API error. `page <name>` (Bug 460)
+  // waits for $HOME/<name> before it opens the page, and reports what the app answered as a problem with A1, for a test to see whose app it was shown.
   const uitest = JSON.parse(flag('--mcp-config') ?? '{}').mcpServers?.uitest
   if (uitest) {
-    const told = /FAKE-UITEST: (.*)/.exec(prompt)?.[1]?.trim(), ctrl = JSON.parse(uitest.args[1]).ctrl
+    const told = /FAKE-UITEST: (.*)/.exec(prompt)?.[1]?.trim(), ctrl = JSON.parse(uitest.args[1]).ctrl, page = /^page (\S+)$/.exec(told ?? '')?.[1]
     if (told === 'error') { console.log(JSON.stringify({ type: 'result', is_error: true, result: 'API Error: Overloaded' })); process.exit(1) }
     const host = async (what, body) => (await fetch(`http://127.0.0.1:${ctrl}/${what}`, { method: 'POST', body: JSON.stringify(body) })).json()
-    let n = 0
+    let n = 0, seen = ''
     const tool = async (name, input, answer, act) => { const h = { tool_name: `mcp__browser__browser_${name}`, tool_input: input, tool_use_id: `t${++n}` }
       const pre = await host('pre', h); if (pre.hookSpecificOutput) return pre.hookSpecificOutput.permissionDecisionReason
-      if (act) await act().then((r) => r.text()).catch(() => {})
+      if (act) seen = await act().then((r) => r.text()).catch((e) => `no answer (${e.message})`)
       await host('post', { ...h, tool_response: [{ type: 'text', text: answer }] }) }
-    const reports = told && told !== 'hang' ? JSON.parse(told) : {}
+    const reports = told && told !== 'hang' && !page ? JSON.parse(told) : {}
     for (const [, id] of prompt.matchAll(/^### (s-\d+)/gm)) {
       const s = await host('start', { id }); if (!s.ok) break
       if (told === 'hang') { setInterval(() => {}, 1000); await new Promise(() => {}) }
+      while (page && !fs.existsSync(path.join(process.env.HOME, page))) await new Promise((r) => setTimeout(r, 100))
       await tool('navigate', { url: s.url }, `### Ran Playwright code\n\`\`\`js\nawait page.goto('${s.url}');\n\`\`\`\n### Page\n- Page URL: ${s.url}`, () => fetch(s.url))
+      if (page) reports[id] = { outcome: 'problem', notes: [], findings: [{ kind: 'no_feedback', what: `The page said ${seen.trim()}.`, expected: 'x', criterion: 'A1' }] }
       await tool('snapshot', {}, '### Page\n- Page URL: /\n### Snapshot\n```yaml\n- textbox "Name" [ref=e2]\n- button "Add" [ref=e3]\n```')
       await tool('click', { element: 'Add button', ref: 'e3' }, "### Ran Playwright code\n```js\nawait page.getByRole('button', { name: 'Add' }).click();\n```",
         () => fetch(`${s.url}api/add`, { method: 'POST', body: '{"name":"Dune"}' }))

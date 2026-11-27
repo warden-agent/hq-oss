@@ -20,9 +20,11 @@ const SECRETS = ['.ssh/id_rsa', '.netrc', '.npmrc', '.git-credentials', '.config
 for (const f of SECRETS) { fs.mkdirSync(path.dirname(path.join(home, f)), { recursive: true }); fs.writeFileSync(path.join(home, f), 'secret') }
 process.env.RUSTUP_HOME ??= path.join(os.homedir(), '.rustup') // the toolchain stays where it's installed, whatever HOME says
 process.env.HOME = home; process.env.HQ_HOME = path.join(tmp, 'hq'); process.env.HQ_ENGINEER_CACHE = path.join(tmp, 'cache')
+process.env.HQ_LOOK_RUNNER = '/usr/bin/true' // Bug 454's test gets an app ready to look at (smoke.ts prepareApp): no browser download for it
 const { bwrapArgs, detectTests, testFolders, testParts, runParts, rulesSkip, failReport, failedLine, failureLines, sandboxProblem, runSandboxed, autoGen, stopAutoTests, sweepRunTmp, testBase,
   testCombined, sweepTestWorktrees, testRunViews, testWorktree, failedAnyway, exitedAnyway } = await import('./testrun.ts')
 const { confirm, outsideParts } = await import('./criteria.ts')
+const { prepareApp } = await import('./smoke.ts')
 const { db, migrate } = await import('./db.ts'); migrate(); void db
 const { bus } = await import('./events.ts')
 
@@ -386,6 +388,25 @@ test('Bug 392: a pnpm project\'s run installs and tests with pnpm in the sandbox
   assert.equal(y.kind, 'error'); assert.match((y as { why: string }).why, /^it uses pnpm .*so HQ can't run its tests \(pnpm test\)\. Install pnpm, then press Resume\.$/)
   assert.equal((await withPath(off, () => testBase(d, 'main', 'P4', 'node --test'))).kind, 'pass')
   assert.equal(fs.readFileSync(pmLog, 'utf8').trim().split('\n').length, 2)
+})
+// Bug 454: HQ's look at the app (and the UI tester, the feature map, scenarios, the tester) installed a part with none of the caches a test run gets, so
+// Yarn, pnpm and Bun each downloaded everything into a folder of the one run, and pnpm 11/12 put its store in the checkout (node_modules/.pnpm-store)
+test('Bug 454: an app made ready to look at installs with the same package caches as a test run, pnpm\'s store by both names', boxed, async () => {
+  const wt = dir({ 'web/package.json': DEPS, 'web/pnpm-lock.yaml': '', 'api/package.json': DEPS, 'api/yarn.lock': '' }), store = path.join(tmp, 'cache', 'pnpm-store')
+  const part = (name: string, install: string) => ({ name, dir: name, install, run: 'node x.js', port: 'auto' as const })
+  const recipe = { parts: [part('web', 'pnpm install --frozen-lockfile'), part('api', 'yarn install --frozen-lockfile')], show: 'web', worktree_files: [], notes: '' }
+  fs.rmSync(pmLog, { force: true })
+  const got = await withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => prepareApp(wt, { recipe, repoPath: wt, how: 'x' }, { signal: new AbortController().signal, run: runSandboxed }))
+  assert.equal(got.kind, 'ready', JSON.stringify(got))
+  assert.deepEqual(fs.readFileSync(pmLog, 'utf8').trim().split('\n'), [`pnpm install --frozen-lockfile store=${store} pnpm_store=${store}`,
+    `yarn install --frozen-lockfile store= pnpm_store=${store}`]) // npm's spelling for a pnpm install only (Bug 450)
+})
+// A rule with no check gets broken: every sandboxed run with the network on is an install, and each one gets the caches
+test('Bug 454: every sandboxed run with the network on is given toolCaches', () => {
+  const src = import.meta.dirname, files = fs.readdirSync(src).filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+  const runs = files.flatMap((f) => fs.readFileSync(path.join(src, f), 'utf8').split('\n').filter((l) => /network: true\b/.test(l)).map((l) => `${f}: ${l.trim()}`))
+  assert.ok(runs.length >= 4 && runs.some((r) => r.startsWith('smoke.ts')), runs.join('\n'))
+  assert.deepEqual(runs.filter((r) => !/\btoolCaches\(/.test(r)), [])
 })
 // Bug 411: a repo split into folders ran as one command, and one suite's output was read as the whole run's. HQ takes the command it builds apart again
 // and runs each folder's suite as a part of its own.

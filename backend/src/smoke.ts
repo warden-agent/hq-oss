@@ -13,6 +13,7 @@ import { copyMainData } from './trydata.ts'
 import { shq } from './util.ts'
 import { movedNoStart, type MovedPort, type Seen } from './smokerules.ts'
 import { blocked, placePorts } from './testports.ts'
+import { toolCaches } from './testrun.ts'
 
 /** What HQ starts to look at a project's app: its launch recipe (the user's own command, or the steps they OK'd for the preview), the checkout whose own
  *  settings and data a copy is taken of (as Try it does), and the recipe in a few words for a report. */
@@ -70,7 +71,7 @@ export function ensureBrowser(): Promise<string | null> {
   return fetching
 }
 
-type Run = (cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; block?: number[] }) =>
+type Run = (cwd: string, cmd: string, o: { network: boolean; timeoutMs: number; signal?: AbortSignal; block?: number[]; env?: Record<string, string> }) =>
   Promise<{ code: number | null; output: string; timedOut: boolean }>
 /** A part's install is needed in a fresh checkout unless its packages came with it: HQ copies the main checkout's node_modules into a test checkout
  *  (worktrees.ts seedPackages), and an npm install on top of them would only rewrite files. Anything else (uv sync, go build) is quick when up to date. */
@@ -92,7 +93,8 @@ export async function prepareApp(wt: string, plan0: LookPlan, o: { signal: Abort
   const plan = placed.plan
   for (const p of plan.recipe.parts) {
     const dir = path.join(wt, p.dir); if (!installs(p, dir)) continue
-    const i = await o.run(dir, p.install!, { network: true, timeoutMs: INSTALL_MS, signal: o.signal })
+    // Bug 454: where Yarn, pnpm and Bun keep what they download, as for HQ's test runs: else a folder of the one run, and pnpm's store in the checkout
+    const i = await o.run(dir, p.install!, { network: true, timeoutMs: INSTALL_MS, signal: o.signal, env: toolCaches(p.install!) })
     if (o.signal.aborted) return stopped
     if (i.code !== 0) return { kind: 'no_start', why: `installing its ${p.name} part failed (\`${p.install}\`)`, output: i.output.slice(-3000) }
   }

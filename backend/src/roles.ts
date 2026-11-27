@@ -200,7 +200,7 @@ export function buildSettings(role: Role, token: string, opts: SettingsOpts): Re
     // "exit 255 in the spike HQ" isn't explained by the npm cache; with it set, nothing is written under ~/.npm at all.
     // Python venvs live in the worktree; uv uses the machine's Python, since downloading one needs github.com, which stays off HQ's
     // own list (spike 2026-10-29: uv sync + pytest pass in this sandbox). Bug 412: on a Mac, pip can't download here (systemCerts), uv can.
-    env: cacheEnv(),
+    env: { ...cacheEnv(), ...installCaches(usesPnpm(opts.repoPath)) }, // Bug 455: Yarn's, pnpm's and Bun's too
     sandbox: {
       enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true,
       // Bug 425: the project's own hosts as checked (only the user sets them, allowhosts.ts)
@@ -209,7 +209,7 @@ export function buildSettings(role: Role, token: string, opts: SettingsOpts): Re
         strictAllowlist: true, allowLocalBinding: true },
       ...(systemCerts() && !opts.localOnly ? { enableWeakerNetworkIsolation: true } : {}), // only the macOS certificate checker (trustd), nothing else
       // On a Linux with no keyring, gh keeps its token in a file in GH_CONFIG_DIR. HQ's own folder by its real path: that's what the sandbox compares (Bug 59).
-      filesystem: { allowWrite: [ENGINEER_CACHE], allowRead: [...new Set([...rustReads(), ...toolReads(), ...checkoutReads(opts.repoPath)])], // Bugs 71, 413, 423: rustup's, package
+      filesystem: { allowWrite: [ENGINEER_CACHE, ...pnpmLockDirs()], allowRead: [...new Set([...rustReads(), ...toolReads(), ...checkoutReads(opts.repoPath)])], // Bugs 71, 413, 423: rustup's, package
         // tools in home, the main checkout's config files
         denyRead: [`${HOME}/.claude`, `${HOME}/.claude.json`, real(PATHS.home), `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.config/gh`, GH_CONFIG_DIR] },
       credentials: { envVars: [{ name: 'HQ_AGENT_ID', mode: 'deny' }, { name: 'HQ_BACKEND', mode: 'deny' }, { name: 'ANTHROPIC_API_KEY', mode: 'deny' }, { name: 'GH_TOKEN', mode: 'deny' }, { name: 'GITHUB_TOKEN', mode: 'deny' }] },
@@ -233,6 +233,36 @@ export const cacheEnv = (): Record<string, string> => ({
   // sandboxed run can neither read nor write. A registry named makes it fetch Yarn 2+ from npm's (allowed), not repo.yarnpkg.com (2.1.322, corepack 0.34)
   COREPACK_HOME: path.join(ENGINEER_CACHE, 'corepack'), COREPACK_NPM_REGISTRY: process.env.COREPACK_NPM_REGISTRY || 'https://registry.npmjs.org',
 })
+/** Bug 455: where an engineer's (and the Launch helper's) Yarn, pnpm and Bun keep what they download: the same folders as HQ's own installs (testrun.ts
+ *  toolCaches), so a second ticket reuses the first one's downloads. Their own folders are in the home, which the sandbox can't write. Real engineers on
+ *  2.1.322, 2026-11-27: pnpm 12 failed outright when a store was already in the home (ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK, "Operation not permitted"),
+ *  and pnpm 10 made a store of its own in the worktree (`.pnpm-store/`, untracked, downloading everything again). pnpm 11 and 12 read
+ *  pnpm_config_store_dir, pnpm 10 and older npm_config_store_dir only (Bug 450). npm 11 warns about that one on every command ("Unknown env config
+ *  store-dir"), so it goes only to a project that uses pnpm (`pnpm`: usesPnpm). */
+const PNPM_STORE = path.join(ENGINEER_CACHE, 'pnpm-store')
+export const installCaches = (pnpm: boolean): Record<string, string> => ({
+  YARN_CACHE_FOLDER: path.join(ENGINEER_CACHE, 'yarn'), YARN_GLOBAL_FOLDER: path.join(ENGINEER_CACHE, 'yarn-berry'),
+  BUN_INSTALL_CACHE_DIR: path.join(ENGINEER_CACHE, 'bun'), pnpm_config_store_dir: PNPM_STORE, ...(pnpm ? { npm_config_store_dir: PNPM_STORE } : {}),
+})
+/** Bug 455: pnpm 12 keeps its lock files in these folders of /tmp, by that fixed name (not $TMPDIR, nor next to the store), shared by every pnpm 12 of the
+ *  user, which is what makes two installs into one store safe. An agent's sandbox writes only its own temp folder there, so every install failed with
+ *  ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK "Operation not permitted", whatever the store (real engineer on 2.1.322; pnpm 10 and 11 keep no locks
+ *  there). By the real path, which the sandbox compares (Bug 59). */
+export const pnpmLockDirs = (): string[] => ['pnpm-store-operation-locks', 'pnpm-dir-locks', 'pnpm-verify-deps-install-locks']
+  .map((n) => path.join(real('/tmp'), `${n}-${process.getuid?.() ?? 0}`))
+/** Whether the project in `repo` (the main checkout) uses pnpm: a pnpm-lock.yaml or pnpm-workspace.yaml, or a package.json whose `packageManager` is
+ *  pnpm, in its top folder or a folder right inside it (a `web/` part). Not node_modules or hidden folders. */
+export function usesPnpm(repo: string | undefined): boolean {
+  if (!repo) return false
+  const says = (dir: string): boolean => {
+    if (['pnpm-lock.yaml', 'pnpm-workspace.yaml'].some((f) => fs.existsSync(path.join(dir, f)))) return true
+    try { return /^pnpm@/.test(String(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))?.packageManager ?? '')) } catch { return false }
+  }
+  if (says(repo)) return true
+  let dirs: fs.Dirent[] = []
+  try { dirs = fs.readdirSync(repo, { withFileTypes: true }) } catch { return false }
+  return dirs.some((d) => d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules' && says(path.join(repo, d.name)))
+}
 
 const RELAY = path.join(import.meta.dirname, 'mcprelay.mjs')
 /** An agent's "hq" MCP server: the relay (mcprelay.mjs), which Claude Code starts itself and which passes each call on to the backend.
