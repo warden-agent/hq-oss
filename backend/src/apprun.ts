@@ -44,6 +44,13 @@ export function listsPackages(pkgPath: string): boolean {
     const v = pkg[k]; return !!v && typeof v === 'object' && Object.keys(v).length > 0
   })
 }
+/** Bug 446: does an install for the folder `dirPath` have packages to install: its package.json lists some (listsPackages), or the folder is a member of
+ *  a workspace inside the checkout `root` (listed in its root's package.json `workspaces`: npm's, Yarn's, Bun's; or under a pnpm-workspace.yaml with
+ *  `packages`), whose root always installs. A member that lists nothing itself still runs what its root lists (`"test": "jest"` with jest in the root's
+ *  devDependencies) and links to its sibling members, so it gets the root's install. A root above the checkout doesn't count (Bug 400). */
+export function installsPackages(dirPath: string, root: string = checkoutOf(dirPath)): boolean {
+  return listsPackages(path.join(dirPath, 'package.json')) || upTo(dirPath, root).slice(1).some((d) => pnpmPackages(d) || lists(d, dirPath))
+}
 
 /** The install for a project with packages but no lockfile: npm would write a package-lock.json into it (Bug 116). */
 export const NO_LOCK_INSTALL = 'npm install --no-package-lock'
@@ -55,7 +62,7 @@ export const NO_LOCK_INSTALL = 'npm install --no-package-lock'
 export function installStep(repoPath: string, root: string = checkoutOf(repoPath)): 'npm ci' | typeof NO_LOCK_INSTALL | null {
   const at = (f: string) => { try { return fs.statSync(path.resolve(repoPath, f)).mtimeMs } catch { return null } }
   const pkg = at('package.json')
-  if (pkg === null || !listsPackages(path.join(repoPath, 'package.json'))) return null
+  if (pkg === null || !installsPackages(repoPath, root)) return null
   // npm ci follows either lockfile (Bug 343), its own or its npm workspace root's (Bug 400), where npm keeps its record too
   const file = npmLock(repoPath, root), lock = file ? at(file) : null, record = at(path.join(file ? path.dirname(file) : repoPath, 'node_modules/.package-lock.json'))
   if (lock === null) return at('node_modules') === null || (record !== null && record < pkg) ? NO_LOCK_INSTALL : null
@@ -114,8 +121,8 @@ const pnpmPackages = (dir: string): boolean => /^packages\s*:/m.test(readIn(dir,
  *  fixed (HQ's own test runs use the same rule, Bug 392). */
 export function ownInstall(repoPath: string, has: (tool: string) => boolean = onPath, again = 'press Start again'): { install?: string; install_when?: string
   stop?: string } {
-  const pkg = path.join(repoPath, 'package.json'); if (!fs.existsSync(pkg) || !listsPackages(pkg)) return {}
-  const root = checkoutOf(repoPath), pm = packageManager(repoPath, root) // a workspace member's: its root's lockfile (Bug 400)
+  const root = checkoutOf(repoPath); if (!fs.existsSync(path.join(repoPath, 'package.json')) || !installsPackages(repoPath, root)) return {}
+  const pm = packageManager(repoPath, root) // a workspace member's: its root's lockfile (Bug 400)
   if (pm.tool === 'npm') { const install = installStep(repoPath, root); return install ? { install } : {} }
   const berry = pm.tool === 'yarn' && (pm.major !== null ? pm.major >= 2 : yarnBerry(pm.at))
   const install = pm.tool === 'pnpm' ? `pnpm install ${pm.lock ? '--frozen-lockfile' : '--no-lockfile'}`

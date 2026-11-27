@@ -65,6 +65,22 @@ test('the TPM\'s briefing says where each ticket stands, quotes recent talk and 
   assert.match(tpmPrompt(getRepo('r1')!, { ws: '/ws', previous: null, note: 'n', board: [], messages: [], cleared: true }), /The user just cleared the board: every ticket that was on it is gone/)
 })
 
+test('Bug 442: a note is the last session\'s only if left in it; an older TPM note is labelled with when, and the session that left none', async () => {
+  const { lastNote } = await import('./notes.ts')
+  run("INSERT INTO docs(scope, key, text, updated_at) VALUES ('resume:ticket:b442', 'note', 'B442-N', 1000)")
+  assert.deepEqual(lastNote('resume:ticket:b442', { started_at: 900 }), { text: 'B442-N', at: 1000, own: true }) // written in its session
+  assert.equal(lastNote('resume:ticket:b442', { started_at: 1000 })?.own, true) // HQ's note the moment it ended (same ms)
+  assert.equal(lastNote('resume:ticket:b442', { started_at: 1001 })?.own, false) // it started after the note: it took over from it
+  assert.equal(lastNote('resume:ticket:b442', undefined)?.own, true) // nobody ran since: as before
+  assert.equal(lastNote('resume:ticket:none', { started_at: 1 }), null)
+  const older = tpmPrompt(getRepo('r1')!, { ws: '/ws', previous: 'tpm-b442', note: '## In flight\n- APP-2', olderNote: Date.UTC(2026, 10, 27, 9, 5), board: [], messages: [] })
+  assert.match(older, /\n\nThe handoff note an earlier TPM session left on 2026-11-27 09:05 UTC\. The last session \(tpm-b442\) ended without writing one, so what this says is in flight/)
+  assert.match(older, /HQ's ticket list above and the last messages are newer\.\n## In flight\n- APP-2/)
+  assert.doesNotMatch(older, /The previous TPM's handoff note/)
+  const own = tpmPrompt(getRepo('r1')!, { ws: '/ws', previous: 'tpm-b442', note: 'n', olderNote: null, board: [], messages: [] })
+  assert.match(own, /The previous TPM's handoff note/); assert.doesNotMatch(own, /an earlier TPM session/)
+})
+
 test('Bug 163: the TPM\'s briefing says whether auto mode is on either way, and that history from the other mode no longer holds', () => {
   const talk = [{ from_id: 'tpm-old', body: 'HQ ran the tests before each merge.' }] as never
   const brief = (auto: number, o: { messages?: never; note?: string } = {}) =>

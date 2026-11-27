@@ -158,12 +158,13 @@ export function cantTest(agent: Agent, reason: string): Result {
   setTimeout(() => { void finishSetup(repoId, { state: 'cant_test', note: reason, at: Date.now() }) }, 1500)
   return { ok: true, text: 'Told the user. HQ ends this session now.' }
 }
-/** The user stops the helper (or says they've seen the setup). */
+/** The user stops the helper, says they've seen the setup, or dismisses why the last helper ended (Bug 439: `ended` goes, so its red banner stays gone
+ *  after a reload, until the next helper ends that way; the helper_done event keeps the why for its Events tab). */
 export async function dismissSetup(repoId: string): Promise<SetupFile> {
   untell(repoId)
   const f = readSetup(repoId)
   if (f.job) await finishSetup(repoId, null, true)
-  return update(repoId, (x) => ({ ...x, seen: true }))
+  return update(repoId, (x) => ({ ...x, seen: true, ended: null }))
 }
 
 /** A setup helper that exited by itself, was lost, or was stopped outside this file (its Agent tab's Stop: `stoppedWhy` 'user'). Bug 417: the user's own

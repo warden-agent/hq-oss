@@ -315,7 +315,8 @@ test('a project with start steps: the app is opened and the UI tester tries it; 
   const p = await project('app')
   assert.equal((await hq.api(`previews/${p.repo.id}/command`, { command: 'node server.js' })).status, 200)
   const plan = `FAKE-PLAN: ${JSON.stringify({ scenarios: [{ kind: 'basic', title: 'Tick Dune off', goal: 'Tick Dune off.', criteria: ['A1'] }] })}`
-  const found = `FAKE-UITEST: ${JSON.stringify({ 's-01': { outcome: 'problem', notes: [], findings: [{ kind: 'no_feedback', what: 'Ticking showed nothing.', expected: 'Crossed out' }] } })}`
+  const found = `FAKE-UITEST: ${JSON.stringify({ 's-01': { outcome: 'problem', notes: [],
+    findings: [{ kind: 'no_feedback', what: 'Ticking showed nothing.', expected: 'Crossed out', criterion: 'A1' }] } })}`
   const made = (title: string, crit: { kind: string; text: string }[]) => screenTicket(p, title, crit)
   const red = await made('Tick things off', [{ kind: 'ui', text: `Ticking crosses it out. ${plan}` }, { kind: 'ui', text: `It stays on the list. ${found}` }])
   assert.equal((await check(red)).status, 200)
@@ -327,6 +328,10 @@ test('a project with start steps: the app is opened and the UI tester tries it; 
   assert.equal(c.state, 'fail'); assert.deepEqual(c.steps.map((s) => [s.kind, s.state]), [['tests', 'pass'], ['criteria', 'skipped'], ['look', 'pass'], ['read', 'pass'], ['ui', 'fail']])
   assert.match(c.steps[1]!.words, /named no test for any of its criteria/) // each criterion says why instead (cant_test)
   assert.match(c.steps[4]!.lines![0]!.text, /Tick Dune off: Ticking showed nothing/); assert.equal(c.send?.kind, 'fix')
+  // Bug 453: it is about one of the ticket's own screen criteria, which is why it counts; and the tester was asked for this ticket's criteria only, a few each
+  assert.equal(c.steps[4]!.words, `A problem with ${red.key}'s screen criteria, in 1 scenario.`)
+  assert.match(c.send?.kind === 'fix' ? c.send.output : '', new RegExp(`\\n- ${red.key} A1: Ticking showed nothing\\. \\(expected: Crossed out\\)`))
+  assert.match(planCalls().at(-1).prompt, /\n\nWrite about 8 scenarios, every one about an item in what's new: [^\n]* Nothing about the rest of the app\. Fewer is fine: [^\n]*\n$/)
   assert.equal(checkOf((await tk(red))!)!.cost_usd! > 0, true)
   const amber = await made('Something', [{ kind: 'ui', text: 'It does something. FAKE-PLAN: error' }])
   assert.equal((await check(amber)).status, 200)
@@ -334,6 +339,45 @@ test('a project with start steps: the app is opened and the UI tester tries it; 
   assert.equal(a.state, 'error', JSON.stringify(a)); assert.equal(a.why, "the UI tester couldn't run; nothing that ran failed")
   assert.match(a.steps.at(-1)!.words, /couldn't plan its scenarios/); assert.equal(a.steps.at(-1)!.trouble, true)
   assert.deepEqual(await button(amber), ["Couldn't finish", 'amber'])
+})
+
+// Bug 453: on a live run, a ticket that changed no screen was failed by the UI tester for an old quirk of another screen, and another for an error from an
+// outside service HQ's sandbox can't reach: any finding anywhere was the ticket's, and Send to engineer offered its engineer what it couldn't fix.
+test('Bug 453: what the tester finds that isn\'t about the ticket\'s screen criteria is said in its results and not held against it: green, and nothing to send',
+  { skip: process.platform !== 'darwin' && 'the UI tester runs on macOS only' }, async () => {
+    const p = await project('aside')
+    assert.equal((await hq.api(`previews/${p.repo.id}/command`, { command: 'node server.js' })).status, 200)
+    const plan = `FAKE-PLAN: ${JSON.stringify({ scenarios: [{ kind: 'basic', title: 'Star a chat', goal: 'Star a chat and see it starred.', about: ['A1'] },
+      { kind: 'complex', title: 'Star, then search', goal: 'Star a chat, then find it by searching.', about: ['A1'] }] })}`
+    // the tester names no criterion for it: it is about the search, which this ticket didn't touch
+    const quirk = `FAKE-UITEST: ${JSON.stringify({ 's-02': { outcome: 'problem', notes: [], findings: [{ kind: 'no_feedback', what: 'Opening a search match did not scroll to it.',
+      expected: 'The match in view' }] } })}`
+    const t = await screenTicket(p, 'Star chats', [{ kind: 'ui', text: `A starred chat shows a star. ${plan}` }, { kind: 'ui', text: `The star stays after a reload. ${quirk}` }])
+    assert.equal((await check(t)).status, 200)
+    const c = await ended(t), ui = c.steps.at(-1)!
+    assert.equal(c.state, 'pass', JSON.stringify(c)); assert.deepEqual([ui.kind, ui.state, ui.trouble], ['ui', 'pass', undefined]); assert.equal(c.send, undefined)
+    assert.equal(ui.words, `1 of 2 scenarios fine, nothing wrong with ${t.key}'s screen criteria. 1 more thing seen on the way (listed below) is not about them.`)
+    assert.deepEqual(ui.lines, [{ tone: 'ok', text: 'Star a chat: fine' },
+      { tone: 'plain', text: `Star, then search: seen on the way, not about ${t.key}'s screen criteria: Opening a search match did not scroll to it.` }])
+    assert.deepEqual(await button(t), ['View results ✓', 'green'])
+    assert.match((await hq.api(`tickets/${t.id}/check-send`, {})).json.error, /found nothing to send to its engineer/) // nothing of the ticket's to send
+    assert.match(planCalls().at(-1).prompt, /\n\nWrite about 8 scenarios, every one about an item in what's new: /) // two screen criteria: eight, not the whole app's thirty
+    // the tester is told what a finding with no [id] is taken for
+    const sessions = fs.readFileSync(path.join(hq.home, 'fake-checks.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((x) => /^You are testing a web app/.test(x.system))
+    assert.match(sessions.at(-1).prompt, /\nOnly what's new is under test\. A finding names an item's \[id\] only when what that item's line says doesn't hold; anything else you notice, /)
+  })
+
+test('Bug 453: a ticket with no screen criteria is not tried by the UI tester: nothing is planned or paid for, and the check is not amber for it', async () => {
+  const p = await project('behind')
+  assert.equal((await hq.api(`previews/${p.repo.id}/command`, { command: 'node server.js' })).status, 200)
+  const t = await screenTicket(p, 'Keep a count', [{ kind: 'backend', text: 'One record is kept per item.' }])
+  assert.equal((await check(t)).status, 200)
+  const c = await ended(t), ui = c.steps.at(-1)!
+  assert.equal(c.state, 'pass', JSON.stringify(c)); assert.deepEqual(c.steps.map((s) => [s.kind, s.state]).slice(0, 3), [['tests', 'pass'], ['criteria', 'skipped'], ['look', 'pass']])
+  assert.deepEqual([ui.kind, ui.state, ui.trouble], ['ui', 'skipped', undefined])
+  assert.equal(ui.words, `Not tried: ${t.key} has no screen criteria, so there is nothing new on screen to try.`)
+  assert.equal(planCalls().length, 0); assert.equal(c.cost_usd, undefined)
+  assert.deepEqual(await button(t), ['View results ✓', 'green'])
 })
 
 // Bug 374: the project's start steps give a part a fixed port (one the project hard-wires), and HQ's own preview of the app is running on it, as it

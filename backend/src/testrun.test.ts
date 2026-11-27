@@ -66,12 +66,14 @@ test('Bug 376: testFolders reads the folders back from the command detectTests b
     assert.equal(testFolders(c), null, c)
 })
 
-/** Bug 392: stand-ins for Yarn, pnpm and Bun on PATH, each logging what it was asked to do (and where pnpm was told to keep its store); `pnpm test` runs node's tests. */
+/** Bug 392: stand-ins for Yarn, pnpm and Bun on PATH, each logging what it was asked to do (and where pnpm was told to keep its store, by both names, Bug 450:
+ *  pnpm 10 reads npm's, pnpm 11 and 12 their own); `pnpm test` runs node's tests. */
 // In the engineer cache, which Linux's sandbox binds in: its runs get a /tmp of their own, where a stand-in under the temp folder isn't there
 fs.mkdirSync(path.join(tmp, 'cache'), { recursive: true })
 const toolBin = fs.mkdtempSync(path.join(tmp, 'cache', 'bin-')), noTools = fs.mkdtempSync(path.join(tmp, 'cache', 'none-')), pmLog = path.join(tmp, 'cache', 'pm.log')
 for (const t of ['pnpm', 'yarn', 'bun']) {
-  const script = [`echo "${t} $* store=$npm_config_store_dir" >> "${pmLog}"`, '[ "$1" = install ] && mkdir -p node_modules', '[ "$1" = test ] && exec node --test', 'exit 0']
+  const script = [`echo "${t} $* store=$npm_config_store_dir pnpm_store=$pnpm_config_store_dir" >> "${pmLog}"`,
+    '[ "$1" = install ] && mkdir -p node_modules', '[ "$1" = test ] && exec node --test', 'exit 0']
   fs.writeFileSync(path.join(toolBin, t), `#!/bin/sh\n${script.join('\n')}\n`, { mode: 0o755 })
 }
 /** `fn` with PATH set to `dirs`, until it has ended (a run reads PATH after its git steps). */
@@ -149,7 +151,7 @@ test('Bug 430: an npm workspace member installs with npm ci by its root\'s lockf
   // what it must not catch: a member's own lockfile, a folder the root doesn't list, a package with nothing to install
   assert.deepEqual(ws({ 'web/package-lock.json': '{}' }), { install: '(cd "web" && npm ci)', test: '(cd "web" && npm test)' })
   assert.deepEqual(ws({ 'package.json': WS.replace('"web",', '') }), { install: '(cd "web" && npm install)', test: '(cd "web" && npm test)' })
-  assert.deepEqual(ws({ 'web/package.json': '{"scripts":{"test":"node --test"},"dependencies":{}}' }), { install: null, test: '(cd "web" && npm test)' })
+  assert.deepEqual(ws({ 'web/package.json': '{"scripts":{"test":"node --test"},"dependencies":{}}' }), { install: 'npm ci', test: '(cd "web" && npm test)' }) // a member: Bug 446
   assert.deepEqual(detectTests(dir({ 'package.json': '{"scripts":{"test":"node --test"}}', 'package-lock.json': '{}' })), { install: null, test: 'npm test' })
   // Yarn and Bun (PR #402's rules, through ownInstall): the same two cases already follow the root
   withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => {
@@ -159,6 +161,28 @@ test('Bug 430: an npm workspace member installs with npm ci by its root\'s lockf
       assert.deepEqual(yb({ 'package.json': root }), { install, test: run }, lock)
     }
   })
+})
+// Bug 446: a workspace member whose package.json lists no packages, only `"test": "jest"`, with jest in the root's devDependencies, got no install at all
+test('Bug 446: a workspace member that lists no packages of its own gets its root\'s install (npm, Yarn, Bun, pnpm)', () => {
+  const ROOT = '{"name":"b446ws","private":true,"workspaces":["web"],"devDependencies":{"jest":"29.7.0"}}', WEB = '{"name":"web","scripts":{"test":"jest"}}'
+  const ws = (files: Record<string, string>) => detectTests(dir({ '.git/HEAD': '', 'package.json': ROOT, 'web/package.json': WEB, ...files }))
+  assert.deepEqual(ws({ 'package-lock.json': '{}' }), { install: 'npm ci', test: '(cd "web" && npm test)' }) // the entry's case: it was no install
+  assert.deepEqual(ws({ 'package-lock.json': '{}', 'node_modules/jest/index.js': '' }), { install: null, test: '(cd "web" && npm test)' }) // seeded already
+  assert.deepEqual(ws({ 'package-lock.json': '{}', 'api/package.json': WEB.replace('"web"', '"api"'), 'package.json': ROOT.replace('["web"]', '["web","api"]') }),
+    { install: 'npm ci', test: '(cd "api" && npm test) && (cd "web" && npm test)' }) // two such members: one install
+  assert.deepEqual(ws({}), { install: '(cd "web" && npm install)', test: '(cd "web" && npm test)' }) // no lockfile: as a member that lists packages
+  withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => {
+    for (const [lock, install, run] of [['yarn.lock', 'yarn install --frozen-lockfile', 'yarn test'], ['bun.lock', 'bun install --frozen-lockfile', 'bun run test']]) {
+      assert.deepEqual(ws({ [lock!]: '' }), { install: `(cd "web" && ${install})`, test: `(cd "web" && ${run})` }, lock)
+    }
+    const pnpm = { 'package.json': ROOT.replace(',"workspaces":["web"]', ''), 'pnpm-workspace.yaml': 'packages:\n  - web\n', 'pnpm-lock.yaml': '' }
+    assert.deepEqual(ws(pnpm), { install: '(cd "web" && pnpm install --frozen-lockfile)', test: '(cd "web" && pnpm test)' })
+    // what it must not catch: a folder its root doesn't list, a pnpm-workspace.yaml of settings alone, a workspace root above the checkout
+    assert.deepEqual(ws({ ...pnpm, 'pnpm-workspace.yaml': 'onlyBuiltDependencies:\n  - esbuild\n' }), { install: null, test: '(cd "web" && pnpm test)' })
+  })
+  assert.deepEqual(ws({ 'package-lock.json': '{}', 'package.json': ROOT.replace('["web"]', '["api"]') }), { install: null, test: '(cd "web" && npm test)' })
+  const above = dir({ 'package.json': ROOT.replace('["web"]', '["app/web"]'), 'package-lock.json': '{}', 'app/.git/HEAD': '', 'app/web/package.json': WEB })
+  assert.deepEqual(detectTests(path.join(above, 'app')), { install: null, test: '(cd "web" && npm test)' })
 })
 /** Bug 430: an npm workspace whose web/ needs its sibling b430-shared (a link npm ci makes from the root's lockfile; no registry), committed with no node_modules. */
 function npmWorkspace(rootTest?: string): string {
@@ -177,6 +201,19 @@ test('Bug 430: in the sandbox, an npm workspace installs by its root\'s lockfile
     assert.equal(r.kind, 'pass', JSON.stringify(r)); assert.equal((r as { test: string }).test, test)
     assert.equal(sh(d, 'status', '--porcelain'), ''); assert.equal(fs.existsSync(path.join(d, 'node_modules')), false) // nothing left in the project
   }
+})
+test('Bug 446: in the sandbox, a member that lists no packages runs the tool its workspace root\'s devDependencies give it', boxed, async () => {
+  const d = fs.mkdtempSync(path.join(tmp, 'r-')); sh(d, 'init', '-q', '-b', 'main')
+  write(d, { '.gitignore': 'node_modules/\n.claude/\n', '.npmrc': 'audit=false\nfund=false\n',
+    'package.json': JSON.stringify({ name: 'b446ws', private: true, workspaces: ['web'], devDependencies: { 'b446-tool': 'file:tool' } }),
+    'tool/package.json': '{"name":"b446-tool","version":"1.0.0","bin":{"b446check":"cli.js"}}', 'tool/cli.js': '#!/usr/bin/env node\nconsole.log("b446 tool ran")\n',
+    'web/package.json': '{"name":"web","version":"1.0.0","scripts":{"test":"b446check"}}' })
+  fs.chmodSync(path.join(d, 'tool/cli.js'), 0o755)
+  execFileSync('npm', ['install', '--offline', '--no-audit', '--no-fund'], { cwd: d, stdio: 'ignore' }); fs.rmSync(path.join(d, 'node_modules'), { recursive: true })
+  sh(d, 'add', '.'); sh(d, 'commit', '-qm', 'base')
+  const r = await testBase(d, 'main', 'W1', null) // on main: no install, and `b446check: command not found`
+  assert.equal(r.kind, 'pass', JSON.stringify(r)); assert.equal((r as { test: string }).test, '(cd "web" && npm test)')
+  assert.equal(sh(d, 'status', '--porcelain'), ''); assert.equal(fs.existsSync(path.join(d, 'node_modules')), false) // nothing left in the project
 })
 test('CI really has the sandbox: these tests can\'t quietly go back to being skipped', { skip: process.env.CI ? false : 'only matters in CI' }, () => assert.equal(problem, null))
 
@@ -331,9 +368,10 @@ test('Bug 392: a pnpm project\'s run installs and tests with pnpm in the sandbox
   const d = fs.mkdtempSync(path.join(tmp, 'r-')); sh(d, 'init', '-q', '-b', 'main')
   write(d, { '.gitignore': 'node_modules/\n.claude/\n', 'package.json': DEPS, 'pnpm-lock.yaml': '', 'a.test.js': `${TEST}t.test('one',()=>a.ok(1))` })
   sh(d, 'add', '.'); sh(d, 'commit', '-qm', 'base'); fs.rmSync(pmLog, { force: true })
-  const r = await withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => testBase(d, 'main', 'P1', null))
+  const r = await withPath(`${toolBin}${path.delimiter}${process.env.PATH}`, () => testBase(d, 'main', 'P1', null)), store = path.join(tmp, 'cache', 'pnpm-store')
   assert.equal(r.kind, 'pass', JSON.stringify(r)); assert.equal((r as { test: string }).test, 'pnpm test')
-  assert.deepEqual(fs.readFileSync(pmLog, 'utf8').trim().split('\n'), [`pnpm install --frozen-lockfile store=${path.join(tmp, 'cache', 'pnpm-store')}`, 'pnpm test store='])
+  assert.deepEqual(fs.readFileSync(pmLog, 'utf8').trim().split('\n'), [`pnpm install --frozen-lockfile store=${store} pnpm_store=${store}`,
+    'pnpm test store= pnpm_store='])
   for (const custom of [null, 'touch "$HOME/../ran.txt"']) {
     const x = await withPath(`${noTools}${path.delimiter}${process.env.PATH!.split(path.delimiter).filter((p) => !fs.existsSync(path.join(p, 'pnpm'))).join(path.delimiter)}`,
       () => testBase(d, 'main', 'P2', custom))

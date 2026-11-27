@@ -191,6 +191,59 @@ test('a TPM fresh start briefs the new TPM with the note', async () => {
   assert.match(fs.readFileSync(path.join(hq.hqHome, 'workspaces', `repo-${repo.id}`, 'tpm', 'HANDOFF.md'), 'utf8'), /TPM-NOTE-MARKER/)
 })
 
+// Bug 442: after a fresh start, a plain Stop of the new engineer and Resume handed the third engineer the first one's note as "the previous
+// engineer's handoff note", though the second had worked since. A note is handed on once: the next engineer gets one only from the session
+// it takes over from (it wrote it, or HQ wrote it as it ended); the TPM keeps an older note (the project's memory, Bug 52), labelled as such.
+test('Bug 442: a handoff note is handed on once: Resume after a plain Stop gets none; a note the next session writes is handed on', async () => {
+  const { f } = await setup('b442fresh')
+  const t = await ticket(f, 'Once'); const e1 = await building(t, 'Plan: write once.txt (B442-PLAN).')
+  const ended = (id: string) => waitFor('it ended', async () => (await agent(id)).status === 'exited')
+  const next = (not: string[]) => waitFor('the next engineer', async () => {
+    const a = await live(t); return a && !not.includes(a.id) && (await tk(t)).assignee_agent_id === a.id && a })
+  const resume = async () => { const r = await hq.api(`tickets/${t.id}/resume`, {}); assert.equal(r.status, 200, JSON.stringify(r.json)); return r.json.id as string }
+  assert.equal((await hq.api(`agents/${e1.id}/fresh-start`, {})).status, 200)
+  assert.equal((await hq.mcp(e1.id, 'write_handoff_note', { text: '## Where I stopped\n- B442-FIRST-NOTE' })).isError, false)
+  const e2 = await next([e1.id]); assert.match(await prompt(e2.id), /B442-FIRST-NOTE/) // the session it was written for gets it
+  // the user stops it in its Agent tab: no note; Resume
+  assert.equal((await hq.api(`agents/${e2.id}/stop`, {})).status, 200); await ended(e2.id)
+  const e3 = await resume(), p3 = await prompt(e3)
+  assert.doesNotMatch(p3, /B442-FIRST-NOTE/)
+  assert.match(p3, /## The previous engineer's handoff note\n\(none: the last engineer's session ended without writing one\. Git below/)
+  assert.match(p3, /The previous engineer's session ended; nothing from it carries over/) // not "for a fresh start": it was stopped
+  assert.match(p3, /B442-PLAN/) // the approved plan is still handed on
+  const started = (await hq.api(`events?agent=${e3}`)).json.filter((e: any) => e.kind === 'ticket.resumed')
+  assert.deepEqual(started.map((e: any) => JSON.parse(e.payload).note), [false]) // and the TPM isn't told it left a note
+  // stopped twice: still none
+  assert.equal((await hq.api(`agents/${e3}/stop`, {})).status, 200); await ended(e3)
+  const e4 = await resume(); assert.doesNotMatch(await prompt(e4), /B442-FIRST-NOTE/); assert.match(await prompt(e4), /\(none: the last engineer's/)
+  // what it must not catch: a note this session writes (here without a fresh start asking) is the next one's, also after a plain Stop
+  assert.equal((await hq.mcp(e4, 'write_handoff_note', { text: '## Where I stopped\n- B442-FOURTH-NOTE' })).isError, false)
+  assert.equal((await hq.api(`agents/${e4}/stop`, {})).status, 200); await ended(e4)
+  const e5 = await resume(); assert.match(await prompt(e5), /B442-FOURTH-NOTE/); assert.doesNotMatch(await prompt(e5), /\(none: the last/)
+  // and a fresh start of that one hands its own note on, never the older one
+  assert.equal((await hq.api(`agents/${e5}/fresh-start`, {})).status, 200)
+  assert.equal((await hq.mcp(e5, 'write_handoff_note', { text: '## Where I stopped\n- B442-FIFTH-NOTE' })).isError, false)
+  const e6 = await next([e1.id, e2.id, e3, e4, e5]); assert.match(await prompt(e6.id), /B442-FIFTH-NOTE/)
+  assert.doesNotMatch(await prompt(e6.id), /B442-FOURTH-NOTE/)
+})
+
+test('Bug 442: a TPM started after a plain Stop gets the older TPM note labelled as an earlier session\'s', async () => {
+  const { repo, tpm } = await setup('b442tpm')
+  const tpmBack = (old: string) => waitFor('the TPM back', async () => {
+    const id = (await repoRow(repo.id)).tpm_agent_id; return id && id !== old && (await agent(id))?.status === 'working' ? id as string : null })
+  assert.equal((await hq.api(`agents/${tpm.id}/fresh-start`, { then: 'continue' })).status, 200)
+  assert.equal((await hq.mcp(tpm.id, 'write_handoff_note', { text: '## What the user wants\n- B442-TPM-NOTE' })).isError, false)
+  const t2 = await tpmBack(tpm.id), p2 = await prompt(t2)
+  assert.match(p2, /The previous TPM's handoff note \(HQ's ticket list above is the truth for statuses\):\n## What the user wants\n- B442-TPM-NOTE/)
+  assert.equal((await hq.api(`agents/${t2}/stop`, {})).status, 200)
+  await waitFor('it ended', async () => (await agent(t2)).status === 'exited')
+  const r = await hq.api(`repos/${repo.id}/restart-tpm`, {}); assert.equal(r.status, 200, JSON.stringify(r.json))
+  const p3 = await prompt(r.json.id)
+  assert.match(p3, new RegExp(`The handoff note an earlier TPM session left on \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\. The last session \\(${t2}\\) ended without writing one, `
+    + 'so what this says is in flight or next may be out of date[^\\n]*\\n## What the user wants\\n- B442-TPM-NOTE'))
+  assert.doesNotMatch(p3, /The previous TPM's handoff note/)
+})
+
 test('switching away parks the repo; coming back resumes it', async () => {
   const { repo, f, tpm } = await setup('fresh-park')
   const t = await ticket(f, 'Park'); const eng = await building(t)

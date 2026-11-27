@@ -4,6 +4,7 @@
 import type { Criterion } from './criteria.ts'
 import { cssWords, ordinal, within } from './findingrules.ts'
 import { movedWords, type MovedPort } from './smokerules.ts'
+import type { CheckStep, StepLine } from './hqcheckrules.ts'
 
 export type ScenarioKind = 'basic' | 'weird' | 'complex' | 'retry'
 /** One thing to try, written by the tester's planning call from the feature map and what's new (or, for `retry`, by HQ from a finding a replay couldn't
@@ -45,6 +46,10 @@ export const SCENARIOS = Number(process.env.HQ_UITEST_SCENARIOS) || 30
 export const PER_SESSION = Number(process.env.HQ_UITEST_BATCH) || 5
 export const BUDGET = { actions: 12, looks: 16, screenshots: 2 }
 export const MAX_FINDINGS = 3 // a scenario's
+/** How many scenarios a run plans. The whole app, as an auto run ends: SCENARIOS. One ticket's check (`onlyNew`, hqcheck.ts): a few for each of its screen
+ *  criteria and nothing else. Bug 453: it used to plan the whole app's thirty too, and anything they found anywhere failed the ticket. */
+export const PER_NEW = 4
+export const scenariosFor = (newItems: number, onlyNew: boolean): number => onlyNew ? Math.min(SCENARIOS, Math.max(PER_NEW, newItems * PER_NEW)) : SCENARIOS
 
 /** The browser tools (Playwright MCP) the tester gets: what a person does with a page, a look at it as text, and a screenshot. Not running JavaScript, not
  *  uploading files, not reading the network or the console (HQ records those itself), not other tabs. roles.ts gives Claude Code these and nothing else. */
@@ -67,8 +72,16 @@ export function whatsNew(tickets: { key: string; title: string; criteria: Criter
 
 const BLIND = `You never see the app's code, and you don't guess at it. All you know is the feature map (what a person sees on each screen and what each control
 does), the list of what's new, and the page in front of you.`
+/** Where the tester works, in as few words as will do. Bug 453: neither call was told, so the planner wrote scenarios that needed an outside service's answer,
+ *  and the tester called the same "Connection error." a finding in one scenario and "couldn't test" in the next. Word for word in both system prompts, with
+ *  nothing of the run in it, so it is cached; uitesterrules.test.ts holds its size. The limits are roles.ts TESTER_DENIED's and the browser sandbox's. */
+export const HERE = `The app runs on this computer with no internet. Its own pages and server must work; anything it gets from an outside service (an AI's
+reply, another site's sign-in, payments, email, maps) fails here, and that is the test's doing, not the app's. The browser is one desktop-size tab: no file
+upload or download, drag and drop, clipboard, microphone, camera, second tab or other window size, and no way to cut the connection or force an error.`
 
 export const PLAN_SYSTEM = `You plan how to test a web app the way people really use it. ${BLIND}
+
+${HERE} Plan nothing whose result needs one of these; a what's-new item that does gets one scenario, on the part a person can still see.
 
 Write scenarios: each one thing a person wants to get done, in their words. Mix three kinds:
 - basic: the everyday tasks, one per screen or control the map names, and one for each item in what's new.
@@ -81,9 +94,13 @@ export const PLAN_SCHEMA = JSON.stringify({ type: 'object', required: ['scenario
   required: ['kind', 'title', 'goal', 'about'], properties: { kind: { enum: ['basic', 'weird', 'complex'] }, title: { type: 'string' }, goal: { type: 'string' },
   about: { type: 'array', items: { type: 'string' }, description: 'The ids of the what\'s-new items this scenario is about (for example "T-03 A2"); empty if none.' },
 } } } } })
-export function planPrompt(map: string, news: string[], n: number): string {
+/** `onlyNew`: one ticket's check, which tries what the ticket adds to the screen and leaves the rest of the app to the run's end (Bug 453). */
+export function planPrompt(map: string, news: string[], n: number, onlyNew = false): string {
+  const ask = onlyNew ? `Write about ${n} scenarios, every one about an item in what's new: the everyday way to use it, the weird ways, and a few steps that pass `
+    + 'through it. Nothing about the rest of the app. Fewer is fine: an item that needs an outside service gets one scenario, not its share.'
+    : `Write about ${n} scenarios: about half basic, a third weird, the rest complex.`
   return `## Feature map\n${map.trim() || '(There is no map yet: plan from what\'s new, and include scenarios that find their way around the app from its start page.)'}\n\n`
-    + `## What's new\n${news.join('\n') || '(Nothing listed: test the app as a whole.)'}\n\nWrite about ${n} scenarios: about half basic, a third weird, the rest complex.\n`
+    + `## What's new\n${news.join('\n') || '(Nothing listed: test the app as a whole.)'}\n\n${ask}\n`
 }
 
 const line = (s: unknown, max: number): string => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max)
@@ -119,6 +136,8 @@ export function keepPlan(raw: unknown, n: number, ids: string[], retry: Omit<Sce
 
 export const TESTER_SYSTEM = `You are testing a web app as a person using it for the first time. ${BLIND}
 
+${HERE}
+
 For each scenario you are given, in order:
 1. Call start_scenario with its id. HQ resets the app to a clean start and tells you its address. Open it with browser_navigate, then look at it
    (browser_snapshot): element refs from before the reset name nothing.
@@ -129,25 +148,34 @@ For each scenario you are given, in order:
 4. Call finish_scenario with what happened, always, even when the scenario went badly or its budget ran out. Then go on to the next scenario.
 
 Rules:
-- Each scenario has a fixed budget of actions, looks and screenshots. When the browser refuses a step because the budget is spent, finish the scenario.
+- Each scenario has a fixed budget of actions, looks and screenshots. When the browser refuses a step because the budget is spent, finish the scenario:
+  running out is not a finding by itself.
 - outcome "ok": it worked and nothing was confusing. "problem": you have at least one finding. "unspecified": the map and what's new don't say what should
   happen here (for example what an empty name should do), so you can't say whether it's right; say what the app did in notes, without a verdict.
-  "couldnt_test": the scenario needs something a person can't do from this browser (change the computer's clock or date, wait hours, get an email or a text,
-  use a second device or account), so you couldn't check it; say what in couldnt_test, with no findings. If you also saw a real problem on the way, the
+  "couldnt_test": the scenario needs something a person can't do from this browser (anything ruled out above; change the computer's clock or date, wait hours,
+  get an email or a text, use a second device or account), so you couldn't check it; say what in couldnt_test, with no findings. If you also saw a real problem on the way, the
   outcome is "problem" with that finding, and what you couldn't check still goes in couldnt_test.
 - A finding is something a person would trip over: stuck (couldn't go on), confusing (wrong click or backtrack), unclear_label (the label didn't match what
   happened), no_feedback (nothing showed that it worked or failed), broken (an error, or the wrong result), missing (the map says it's there and it isn't).
   Give the action it happened at (count your page opens, clicks, typing and key presses in this scenario from 1; looks don't count), what you saw, what you expected, and the what's-new [id] if it is
   about one. If you were looking for an element, name it in looked_for (its role and name as the page text shows them).
 - That you couldn't try something is never a finding: a finding is about what the app did. "I couldn't change the clock to see the morning greeting" goes
-  in couldnt_test.
+  in couldnt_test. So does anything that waits on an outside service: when its answer doesn't come you can't judge it, so neither the error the app shows nor
+  what is missing because of it is a finding, even for a what's-new item.
+- Before you report no_feedback or missing, look again: your look comes a second or two after the action, so a brief message or highlight may be gone, and a
+  change of colour alone only shows in a screenshot.
 - Report only what you saw on the page. Nothing about how it is built or how you would build it.`
 
-export function testerPrompt(o: { map: string; news: string[]; scenarios: Scenario[]; budget: typeof BUDGET }): string {
+/** `onlyNew`: one ticket's check (Bug 453). A finding counts against the ticket only when it names one of its criteria (uiStep, below), so the
+ *  tester is told when a finding names one, and what a finding with no [id] is taken for. On the real tester a looser line ("a finding about one of its
+ *  items names that item's [id]") had it name the criterion for how the same screen took an empty box, which the ticket never touched. */
+export function testerPrompt(o: { map: string; news: string[]; scenarios: Scenario[]; budget: typeof BUDGET; onlyNew?: boolean }): string {
   const one = (s: Scenario) => `### ${s.id} (${s.kind}): ${s.title}\n${s.goal}${s.criteria?.length ? `\nAbout: ${s.criteria.join(', ')}` : ''}`
   return `## Feature map\n${o.map.trim() || '(There is no map yet: find your way from the start page.)'}\n\n## What's new\n${o.news.join('\n') || '(Nothing listed.)'}\n\n`
     + `## Your scenarios\n${o.scenarios.map(one).join('\n\n')}\n\nEach scenario's budget: ${o.budget.actions} actions, ${o.budget.looks} looks, `
     + `${o.budget.screenshots} screenshots.\n`
+    + (o.onlyNew ? 'Only what\'s new is under test. A finding names an item\'s [id] only when what that item\'s line says doesn\'t hold; anything else you notice, '
+      + 'even on the same screen, gets no [id] and is taken as being about the rest of the app, which this test leaves alone.\n' : '')
 }
 
 // --- Steps, from the Playwright code the browser tools ran -----------------------------------------------------------------------------------------------
@@ -403,5 +431,38 @@ export function uiTestLines(u: UiTest | null): string[] {
     ...u.findings.map((f) => `- ${f.id} (${KIND_WORDS[f.kind]}, ${f.scenario} ${title(f.scenario)}${f.criterion ? `, ${f.criterion}` : ''}): ${f.what}`
       + `${f.expected ? ` Expected: ${f.expected}` : ''}${f.steps.length ? ` Steps: ${chain(f.steps)}` : ''}`),
     ...u.scenarios.filter((s) => s.outcome !== 'problem').map((s) => `- ${s.id} ${s.title}: ${verdict(s)}`)]
+}
+/** The UI tester's step of a ticket's check, from what the tester did, and what goes to the ticket's engineer (`report`, null when nothing does). Bug 453:
+ *  the tester tries the ticket's own screen criteria, and a finding counts against the ticket only when it names one of them (keepReport keeps a finding's
+ *  `criterion` only when it is one of the ticket's). Anything else it noticed on the way is said, in a plain line, and goes to nobody: it may have been
+ *  there before the ticket, and its engineer couldn't be asked to fix what the ticket didn't touch. Any finding anywhere used to fail the ticket: an old
+ *  quirk of another screen, or an outside service HQ's sandbox can't reach. Here and not in hqcheckrules.ts: the page imports that file, and this one
+ *  reads the environment. */
+export function uiStep(u: Extract<UiTest, { state: 'done' }>, key: string): { step: CheckStep; report: string | null } {
+  const title = (sid: string) => u.scenarios.find((s) => s.id === sid)?.title ?? sid
+  const mine = u.findings.filter((f) => f.criterion), other = u.findings.filter((f) => !f.criterion), lines: StepLine[] = []
+  if (u.moved?.length) lines.push({ text: `HQ ran its own copy of the app on ${movedWords(u.moved)}.`, tone: 'plain' }) // Bug 374
+  for (const s of u.scenarios) {
+    const red = mine.filter((f) => f.scenario === s.id), grey = other.filter((f) => f.scenario === s.id)
+    if (red.length) lines.push({ tone: 'bad', text: `${s.title}: ${red.map((f) => f.what).join(' · ')}` })
+    if (grey.length) lines.push({ tone: 'plain', text: `${s.title}: seen on the way, not about ${key}'s screen criteria: ${grey.map((f) => f.what).join(' · ')}` })
+    if (red.length || grey.length) continue
+    lines.push(s.outcome === 'ok' ? { tone: 'ok', text: `${s.title}: fine` } : { tone: 'plain', text: `${s.title}: ${
+      s.outcome === 'unspecified' ? 'no verdict (nothing says what should happen)' : s.outcome === 'couldnt_test' ? `couldn't test from a browser${s.why ? ` (${s.why})` : ''}`
+        : s.outcome === 'problem' ? 'a problem the tester didn\'t describe' : `not run${s.why ? ` (${s.why})` : ''}`}` })
+  }
+  const n = u.scenarios.length, ok = u.scenarios.filter((s) => s.outcome === 'ok').length, of = `${n} scenario${n === 1 ? '' : 's'}`
+  const aside = other.length ? ` ${things(other.length, 'more thing')} seen on the way (listed below) ${other.length === 1 ? 'is' : 'are'} not about them` : ''
+  if (mine.length) {
+    const report = ["HQ's UI tester used the app in a browser, as a person would, with the ticket merged in. What it found:",
+      ...mine.map((f) => `- ${f.criterion}: ${f.what} (expected: ${f.expected}). In "${title(f.scenario)}", after: ${f.steps.map((s) => s.code).join(' → ') || 'opening the app'}`)].join('\n')
+    return { step: { kind: 'ui', state: 'fail', lines, words: `${mine.length === 1 ? 'A problem' : `${mine.length} problems`} with ${key}'s screen criteria, in ${of}.`
+      + (aside ? `${aside}, and won't go to its engineer.` : '') }, report }
+  }
+  if (ok) return { step: { kind: 'ui', state: 'pass', lines, words: other.length ? `${ok} of ${of} fine, nothing wrong with ${key}'s screen criteria.${aside}.`
+    : `${ok} of ${of} fine, nothing found.` }, report: null }
+  // none even ran (the sessions ended early): something went wrong, so the check can't say all passed
+  return { step: { kind: 'ui', state: 'skipped', lines, words: other.length ? `No verdicts on ${key}'s screen criteria: none of its ${of} went through.${aside}.`
+    : `No verdicts: none of its ${of} could be judged.`, ...(u.scenarios.every((s) => s.outcome === 'not_run') ? { trouble: true } : {}) }, report: null }
 }
 export const uiTestOf = (json: string | null | undefined): UiTest | null => { try { return json ? JSON.parse(json) as UiTest : null } catch { return null } }

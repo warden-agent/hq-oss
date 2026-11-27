@@ -11,7 +11,7 @@ import { getAgent, liveAgents, onDialog, stopAgent, update, type Agent } from '.
 import { interruptAndType, sendMessage, type Message } from './delivery.ts'
 import { autoOn, features, getFeature, getRepo, getTicket, repoOfAgent, setTicket, tickets } from './records.ts'
 import { planWaitsWhy } from './checks.ts'
-import { agentNote, HQ_NOTE_HEAD, noteScope, readNote, saveNote } from './notes.ts'
+import { agentNote, HQ_NOTE_HEAD, noteScope, noteStays, readNote, saveNote } from './notes.ts'
 import { resumeEngineer } from './tickets.ts'
 import { restartTpm } from './tpm.ts'
 import { maybeFinishClear } from './clear.ts'
@@ -315,7 +315,7 @@ const move = (repoId: string, away: boolean): void => { moves.set(repoId, { n: (
  *  parked, from the note the session before wrote. Unless the switch has asked it for a note of its own already. */
 async function parkStarted(next: Agent): Promise<void> {
   const a = getAgent(next.id); if (!a || a.status === 'exited' || a.fresh_start_at) return
-  await stopAgent(a.id, 'parked'); park(a)
+  await stopAgent(a.id, 'parked'); noteStays(a); park(a)
 }
 function inTurn<T>(repoId: string, fn: () => Promise<T>): Promise<T> {
   const p = (turns.get(repoId) ?? Promise.resolve()).catch(() => {}).then(fn)

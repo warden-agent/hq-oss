@@ -1,6 +1,7 @@
 // "Have HQ test this": with auto mode off, the user asks HQ to run auto mode's checks on one finished ticket (plans/ticket-test-button.md). HQ runs what auto
 // mode runs before a merge, in the same order and stopping at the first failure (auto.ts testAndMerge): the tests on the ticket merged into main, the tests
-// named for its criteria, HQ's look at the app, a reader of its changes (only when auto mode would read them), and the UI tester on this ticket's screens. It
+// named for its criteria, HQ's look at the app, a reader of its changes (only when auto mode would read them), and the UI tester on this ticket's screens (its
+// own screen criteria, and only what it finds about them counts: Bug 453; the whole app is the tester's as an auto run ends). It
 // only reports, on the ticket (tickets.hq_check, hqcheckrules.ts): nothing merges and nothing goes back to the engineer unless the user says so (sendCheck).
 // The check is owned by its ticket, with a stop of its own (not auto mode's count): the user's Stop, the ticket leaving "finished", auto mode taking the
 // ticket over, a Clear or Remove, and a backend restart each end it, and it says why.
@@ -14,7 +15,7 @@ import { ensureFresh, git } from './repos.ts'
 import { exitedAnyway, failedLine, failReport, lookAtBase, showing, testBase, testCombined, type Failed, type Shown, type TestResult } from './testrun.ts'
 import { combinedCommit } from './localmerge.ts'
 import { confirm, criteriaOf, outsideParts, proofOf, proofWords, ranWords, unproven, watchFor } from './criteria.ts'
-import { judge, lookReport, lookWords, movedWords, needsBase, type Look, type Seen } from './smokerules.ts'
+import { judge, lookReport, lookWords, needsBase, type Look, type Seen } from './smokerules.ts'
 import { lookHow, type LookPlan } from './smoke.ts'
 import { row as previewRow, runnableRecipe } from './preview.ts'
 import { readAgain, readDiff, readReport, whyRead } from './diffcheck.ts'
@@ -28,6 +29,7 @@ import { stepsOf } from './teststepsstore.ts'
 import { stepsDone, stepsReady } from './teststeps.ts'
 import { commandGap, checkOf, FINISHED, nextRound, outOfDate, pastChecks, pastWith, STEP_NAME, unseenCount, unseenWords, type CheckStep, type HqCheck, type SendBack, type StepKind,
   type StepLine } from './hqcheckrules.ts'
+import { uiStep } from './uitesterrules.ts'
 
 /** The checks under way, by ticket: what stops each one, and why it was stopped (the results say it). */
 const going = new Map<string, { stop: AbortController; why?: string }>()
@@ -255,8 +257,11 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
     }
     // 5. The UI tester on this ticket's screens, in a checkout of it merged into main
     if (signal.aborted) return stopped()
-    const tp = lookPlanFor(repo, true)
+    const tp = lookPlanFor(repo, true), screen = criteriaOf(cur).filter((x) => x.kind === 'ui')
     if (!uiTestOn(repo)) step({ kind: 'ui', state: 'skipped', words: "Not tried: the UI tester is turned off (HQ's settings or this project's)." })
+    // Bug 453: the tester tries what the ticket adds to the screen. With nothing of that there is nothing of the ticket's to try, and nothing it found could
+    // be the ticket's: how the ticket is, never a reason for amber, and nothing is paid for
+    else if (!screen.length) step({ kind: 'ui', state: 'skipped', words: `Not tried: ${cur.key} has no screen criteria, so there is nothing new on screen to try.` })
     // how the machine is, not something gone wrong: never a reason for amber (runUiTest says the same, but as a skip that would count against the check)
     else if (process.platform !== 'darwin') step({ kind: 'ui', state: 'skipped', words: 'Not tried: the UI tester runs on macOS only for now.' })
     else if (!('plan' in tp)) step({ kind: 'ui', state: 'skipped', words: `Not tried: ${tp.skip}.` })
@@ -266,7 +271,7 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
       if (!('sha' in comb)) step({ kind: 'ui', state: 'skipped', words: `Not tried: HQ couldn't merge it into ${c.base} for the tester.`, trouble: true })
       else {
         const u = await runUiTest({ repoPath: repo.path, repoId: repo.id, runId: c.id, sha: comb.sha, plan: tp.plan, gen: signal, ticketId: t0.id,
-          tickets: [{ key: cur.key, title: cur.title, criteria: criteriaOf(cur) }] })
+          tickets: [{ key: cur.key, title: cur.title, criteria: criteriaOf(cur) }], onlyNew: true })
           .catch((e) => ({ at: now(), state: 'skipped' as const, why: `HQ hit an error (${(e as Error).message.split('\n')[0]})` }))
         if (u === 'stopped' || signal.aborted) return stopped()
         if (u.state === 'skipped') {
@@ -276,23 +281,8 @@ async function runCheck(t0: Ticket, repo: Repo, c: HqCheck, own: { stop: AbortCo
             ...('quiet' in u && u.quiet ? {} : { trouble: true }) }) // quiet: how the project is set up
         } else {
           c.cost_usd = u.cost_usd
-          const title = (sid: string) => u.scenarios.find((s) => s.id === sid)?.title ?? sid
-          const lines: StepLine[] = u.scenarios.map((s) => ({ tone: s.outcome === 'ok' ? 'ok' as const : s.outcome === 'problem' ? 'bad' as const : 'plain' as const,
-            text: `${s.title}: ${s.outcome === 'ok' ? 'fine' : s.outcome === 'problem' ? u.findings.filter((f) => f.scenario === s.id).map((f) => f.what).join(' · ') || 'a problem'
-              : s.outcome === 'unspecified' ? 'no verdict (nothing says what should happen)' : s.outcome === 'couldnt_test' ? `couldn't test from a browser${s.why ? ` (${s.why})` : ''}`
-              : `not run${s.why ? ` (${s.why})` : ''}`}` }))
-          if (u.moved?.length) lines.unshift({ text: `HQ ran its own copy of the app on ${movedWords(u.moved)}.`, tone: 'plain' }) // Bug 374
-          const ok = u.scenarios.filter((s) => s.outcome === 'ok').length, n = u.scenarios.length
-          if (u.findings.length) {
-            step({ kind: 'ui', state: 'fail', words: `${u.findings.length === 1 ? 'A problem' : `${u.findings.length} problems`} in ${n} scenario${n === 1 ? '' : 's'}.`, lines })
-            const report = ["HQ's UI tester used the app in a browser, as a person would, with the ticket merged in. What it found:",
-              ...u.findings.map((f) => `- ${f.criterion ? `${f.criterion}: ` : ''}${f.what} (expected: ${f.expected}). In "${title(f.scenario)}", after: `
-                + (f.steps.map((s) => s.code).join(' → ') || 'opening the app'))].join('\n')
-            return end('fail', undefined, fix({ test: "HQ's UI tester", look: true, tester: true, earlier: '', output: report }))
-          }
-          step(ok ? { kind: 'ui', state: 'pass', words: `${ok} of ${n} scenario${n === 1 ? '' : 's'} fine, nothing found.`, lines }
-            : { kind: 'ui', state: 'skipped', words: `No verdicts: none of its ${n} scenario${n === 1 ? '' : 's'} could be judged.`, lines,
-              ...(u.scenarios.every((s) => s.outcome === 'not_run') ? { trouble: true } : {}) }) // none even ran: the sessions ended early
+          const ui = uiStep(u, cur.key); step(ui.step) // only what is about this ticket's screen criteria counts (Bug 453)
+          if (ui.report) return end('fail', undefined, fix({ test: "HQ's UI tester", look: true, tester: true, earlier: '', output: ui.report }))
         }
       }
     }

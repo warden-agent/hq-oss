@@ -15,6 +15,16 @@ type Who = Pick<Agent, 'role' | 'repo_id' | 'feature_id' | 'ticket_id'>
 export const noteScope = (a: Who): string | null =>
   a.role === 'tpm' && a.repo_id ? `resume:repo:${a.repo_id}` : a.role === 'engineer' && a.ticket_id ? `resume:ticket:${a.ticket_id}` : null
 export function readNote(scope: string): string | null { return one<{ text: string }>("SELECT text FROM docs WHERE scope = ? AND key = 'note'", scope)?.text ?? null }
+/** Bug 442: the note for the session that takes over from `prev` (the one that ran last), when it was left, and whether it is prev's own: left in
+ *  prev's session (by it, or HQ's for it as it ended). If not, an earlier session wrote it, prev took over from it and ended without one (a plain
+ *  Stop, a crash), so it says where things stood before prev's work. No `prev`: the note counts as the last session's, as before. */
+export function lastNote(scope: string, prev: Pick<Agent, 'started_at'> | undefined): { text: string; at: number; own: boolean } | null {
+  const row = one<{ text: string; updated_at: number }>("SELECT text, updated_at FROM docs WHERE scope = ? AND key = 'note'", scope)
+  return row ? { text: row.text, at: row.updated_at, own: !prev || row.updated_at >= prev.started_at } : null
+}
+/** Bug 442: `a` started from the note and HQ stopped it at once, before it could leave one (a switch away while it started, Bug 339): the note is
+ *  counted as left in its session, so the session after it gets it (lastNote). */
+export function noteStays(a: Who): void { const scope = noteScope(a); if (scope) run("UPDATE docs SET updated_at = ? WHERE scope = ? AND key = 'note'", now(), scope) }
 /** How HQ's own note starts when the agent left none (freshstart.ts fallbackNote). Notes saved before Bug 196 carry it too. */
 export const HQ_NOTE_HEAD = '(Written by HQ'
 /** The note the agent itself wrote, or null. HQ's stand-in from an earlier fresh start or Clear never counts as one (Bug 196). */

@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { cantTry, costOf, keepPlan, keepReport, knownCriterion, numbered, onPage, PLAN_SCHEMA, stepOf, stepsOf, stepWords, uiTestLines, whatsNew, type Scenario, type UiTest } from './uitesterrules.ts'
+import { BUDGET, cantTry, costOf, HERE, keepPlan, keepReport, knownCriterion, numbered, onPage, PLAN_SCHEMA, PLAN_SYSTEM, planPrompt, scenariosFor, stepOf, stepsOf, stepWords,
+  TESTER_SYSTEM, testerPrompt, uiStep, uiTestLines, whatsNew, type Scenario, type UiFinding, type UiTest } from './uitesterrules.ts'
 
 const O = 'http://localhost:4321'
 test('steps come from the code the browser ran, in a form a script can replay: role and name, label, text, the value typed, the path opened', () => {
@@ -263,4 +264,95 @@ test('the summary when no scenario ran, all for one reason: that reason once (Bu
     `- s-01 T s-01: not run (${why})`, '- s-02 T s-02: not run (the session ended before it)'])
   assert.deepEqual(uiTestLines({ ...base, scenarios: [s('s-01', why), { ...s('s-02', why), outcome: 'ok' }] }).length, 3)
   assert.deepEqual(uiTestLines({ ...base, scenarios: [s('s-01', why)] }), ['- 1 scenario: 0 fine, 0 findings, 0 unspecified, 1 not run', `- s-01 T s-01: not run (${why})`])
+})
+
+// Bug 453: HQ runs the app with no internet, and neither the planner nor the tester was told. On a live run the same "Connection error." (the app asking an
+// AI for a reply) was a red finding in two scenarios and "couldn't test" in two others, and the planner kept writing scenarios that needed the reply.
+test('Bug 453: both calls are told where the tester works, in the same few words, and those words stay short', () => {
+  const flat = (t: string) => t.replace(/\s+/g, ' ')
+  assert.ok(PLAN_SYSTEM.includes(HERE)); assert.ok(TESTER_SYSTEM.includes(HERE))
+  assert.match(flat(HERE), /no internet/); assert.match(flat(HERE), /anything it gets from an outside service .* fails here, and that is the test's doing, not the app's/)
+  assert.match(flat(PLAN_SYSTEM), /Plan nothing whose result needs one of these; a what's-new item that does gets one scenario, on the part a person can still see\./)
+  assert.match(flat(TESTER_SYSTEM), /anything that waits on an outside service: when its answer doesn't come you can't judge it, so neither the error the app shows /)
+  assert.match(flat(TESTER_SYSTEM), / nor what is missing because of it is a finding, even for a what's-new item\./)
+  assert.match(flat(TESTER_SYSTEM), /"couldnt_test": the scenario needs something a person can't do from this browser \(anything ruled out above;/)
+  // the smaller causes, in one sentence and a clause: a brief highlight gone before the look, a change of colour alone, a budget that ran out
+  assert.match(flat(TESTER_SYSTEM), /Before you report no_feedback or missing, look again: .* a brief message or highlight may be gone, and a change of colour alone only shows in a screenshot\./)
+  assert.match(flat(TESTER_SYSTEM), /finish the scenario: running out is not a finding by itself\./)
+  // what it must not excuse: the app's own pages and server
+  assert.match(flat(HERE), /Its own pages and server must work/)
+  // short, and the same for every run (a system prompt with nothing of the run in it is cached): the whole of what Bug 453 added to the tester is about 170 words
+  const words = (t: string) => t.trim().split(/\s+/).length
+  assert.ok(words(HERE) <= 80, `${words(HERE)} words`); assert.ok(words(PLAN_SYSTEM) <= 285, `${words(PLAN_SYSTEM)} words`); assert.ok(words(TESTER_SYSTEM) <= 715, `${words(TESTER_SYSTEM)} words`)
+  assert.match(PLAN_SYSTEM, /^You plan how to test/) // the e2e's stand-in Claude Code knows the planning call by these words
+})
+
+test('Bug 453: a ticket\'s check plans a few scenarios for each of its screen criteria and none about the rest of the app; the run\'s end still plans the whole app', () => {
+  assert.deepEqual([1, 3, 7, 8, 40].map((n) => scenariosFor(n, true)), [4, 12, 28, 30, 30]); assert.equal(scenariosFor(0, true), 4)
+  assert.deepEqual([0, 1, 12].map((n) => scenariosFor(n, false)), [30, 30, 30]) // what it must not change: the whole app, as an auto run ends
+  const news = ['- [T-01 A1] Shows Dune ×2.']
+  assert.match(planPrompt('MAP', news, 4, true), /\n\nWrite about 4 scenarios, every one about an item in what's new: .* Nothing about the rest of the app\. Fewer is fine: /)
+  assert.match(planPrompt('MAP', news, 4, true), / an item that needs an outside service gets one scenario, not its share\.\n$/)
+  assert.match(planPrompt('MAP', news, 30), /\n\nWrite about 30 scenarios: about half basic, a third weird, the rest complex\.\n$/)
+  const s: Scenario[] = [{ id: 's-01', kind: 'basic', title: 'Add Dune twice', goal: 'Add Dune twice and see ×2.', criteria: ['T-01 A1'] }]
+  // the tester is told what a finding with no [id] is taken for, in a ticket's check only
+  assert.match(testerPrompt({ map: 'MAP', news, scenarios: s, budget: BUDGET, onlyNew: true }),
+    /screenshots\.\nOnly what's new is under test\. A finding names an item's \[id\] only when what that item's line says doesn't hold; anything else you notice, even on the same /)
+  assert.match(testerPrompt({ map: 'MAP', news, scenarios: s, budget: BUDGET }), /screenshots\.\n$/)
+})
+
+test('Bug 453: HQ takes no finding away for its words: an error from the app\'s own server reads the same as one from an outside service, and stays a finding', () => {
+  const save = { kind: 'broken', at_step: 2, what: 'Pressing Save showed "Connection error." and the note was not added.', expected: 'The note in the list', criterion: 'A1' }
+  const r = keepReport({ outcome: 'problem', notes: [], findings: [save] }, S, [[nav], [add]], [], ['T-01 A1'])
+  assert.deepEqual([r.outcome, r.findings.map((f) => [f.kind, f.criterion])], ['problem', [['broken', 'T-01 A1']]])
+  // the tester's own call, as the prompt asks, is what makes an outside service's silence "couldn't test"
+  const ai = keepReport({ outcome: 'couldnt_test', couldnt_test: 'The reply comes from an outside AI service, which can\'t be reached here.', notes: [], findings: [] }, S, [[nav]], [], ['T-01 A1'])
+  assert.deepEqual([ai.outcome, ai.why, ai.findings.length], ['couldnt_test', 'The reply comes from an outside AI service, which can\'t be reached here.', 0])
+})
+
+// Bug 453: on a live run a ticket that changed no screen went red for an old quirk of another screen, and another for an outside service HQ's sandbox can't
+// reach: any finding anywhere failed the ticket, and Send to engineer offered its engineer what it couldn't fix.
+test('Bug 453: the UI tester\'s step counts a finding against the ticket only when it names one of its screen criteria; the rest is said, and sent to nobody', () => {
+  const click = { action: 'click' as const, role: 'button', name: 'Star', code: "await page.getByRole('button', { name: 'Star' }).click()" }
+  const f = (id: string, scenario: string, what: string, criterion?: string): UiFinding => ({ id, scenario, kind: 'broken', what, expected: 'It works', steps: [click],
+    ...(criterion ? { criterion } : {}) })
+  const sc = (id: string, title: string, outcome: 'ok' | 'problem' | 'unspecified' | 'couldnt_test' | 'not_run', why?: string) =>
+    ({ id, kind: 'basic' as const, title, outcome, actions: 2, ...(why ? { why } : {}) })
+  const run = (scenarios: ReturnType<typeof sc>[], findings: UiFinding[], more: Record<string, unknown> = {}) =>
+    ({ at: 1, state: 'done', scenarios, findings, ms: 9, tokens: 9, cost_usd: 0.1, model: 'sonnet', sessions: 1, ...more }) as Extract<UiTest, { state: 'done' }>
+  const mine = f('U1', 's-01', 'The star stays empty after a click.', 'T-01 A1'), quirk = f('U2', 's-02', 'Opening a search match does not scroll to it.')
+  // one of each: red for the ticket's own, plain for the other, and only the ticket's own goes to its engineer
+  const both = uiStep(run([sc('s-01', 'Star a chat', 'problem'), sc('s-02', 'Star, then search', 'problem'), sc('s-03', 'Unstar', 'ok')], [mine, quirk]), 'T-01')
+  assert.deepEqual([both.step.kind, both.step.state, both.step.trouble], ['ui', 'fail', undefined])
+  assert.equal(both.step.words, "A problem with T-01's screen criteria, in 3 scenarios. 1 more thing seen on the way (listed below) is not about them, and won't go to its engineer.")
+  assert.deepEqual(both.step.lines, [{ tone: 'bad', text: 'Star a chat: The star stays empty after a click.' },
+    { tone: 'plain', text: "Star, then search: seen on the way, not about T-01's screen criteria: Opening a search match does not scroll to it." }, { tone: 'ok', text: 'Unstar: fine' }])
+  assert.match(both.report!, /^HQ's UI tester used the app in a browser[^\n]*\n- T-01 A1: The star stays empty after a click\. \(expected: It works\)\. In "Star a chat", after: await page/)
+  assert.doesNotMatch(both.report!, /search match/); assert.equal(both.report!.split('\n').length, 2)
+  // only the other kind: the ticket passes, and says what else was seen
+  const aside = uiStep(run([sc('s-02', 'Star, then search', 'problem'), sc('s-03', 'Unstar', 'ok')], [quirk, f('U3', 's-02', 'The search box keeps the old words.')]), 'T-01')
+  assert.deepEqual([aside.step.state, aside.report], ['pass', null])
+  assert.equal(aside.step.words, "1 of 2 scenarios fine, nothing wrong with T-01's screen criteria. 2 more things seen on the way (listed below) are not about them.")
+  assert.deepEqual(aside.step.lines!.map((l) => l.tone), ['plain', 'ok'])
+  assert.match(aside.step.lines![0]!.text, /does not scroll to it\. · The search box keeps the old words\.$/)
+  // both kinds in one scenario: a line each, and the red one still counts (what it must not lose)
+  const one = uiStep(run([sc('s-01', 'Star a chat', 'problem')], [mine, f('U2', 's-01', 'The page title is cut off.')]), 'T-01')
+  assert.deepEqual([one.step.state, one.step.lines!.map((l) => l.tone)], ['fail', ['bad', 'plain']]); assert.match(one.step.words, /^A problem with T-01's screen criteria, in 1 scenario\./)
+  assert.match(uiStep(run([sc('s-01', 'a', 'problem'), sc('s-02', 'b', 'problem')], [mine, f('U2', 's-02', 'The star flickers on reload.', 'T-01 A2')]), 'T-01').step.words,
+    /^2 problems with T-01's screen criteria, in 2 scenarios\.$/)
+  // nothing found at all: as before
+  const fine = uiStep(run([sc('s-01', 'Star a chat', 'ok'), sc('s-02', 'Reply arrives', 'couldnt_test', 'the reply comes from an outside service')], []), 'T-01')
+  assert.deepEqual([fine.step.state, fine.step.words, fine.report], ['pass', '1 of 2 scenarios fine, nothing found.', null])
+  assert.deepEqual(fine.step.lines![1], { tone: 'plain', text: "Reply arrives: couldn't test from a browser (the reply comes from an outside service)" })
+  // nothing fine: no verdict, never a pass; amber only when none even ran
+  const none = uiStep(run([sc('s-01', 'Reply arrives', 'couldnt_test', 'no internet'), sc('s-02', 'Empty name', 'unspecified')], []), 'T-01')
+  assert.deepEqual([none.step.state, none.step.words, none.step.trouble], ['skipped', 'No verdicts: none of its 2 scenarios could be judged.', undefined])
+  const way = uiStep(run([sc('s-02', 'Star, then search', 'problem')], [quirk]), 'T-01')
+  assert.deepEqual([way.step.state, way.step.trouble, way.report], ['skipped', undefined, null])
+  assert.equal(way.step.words, "No verdicts on T-01's screen criteria: none of its 1 scenario went through. 1 more thing seen on the way (listed below) is not about them.")
+  const dead = uiStep(run([sc('s-01', 'a', 'not_run', 'the session ended early (API Error)'), sc('s-02', 'b', 'not_run', 'the session ended before it')], []), 'T-01')
+  assert.deepEqual([dead.step.state, dead.step.trouble], ['skipped', true]); assert.equal(dead.step.lines![0]!.text, 'a: not run (the session ended early (API Error))')
+  // Bug 374: the ports HQ moved its copy to are still said first
+  const moved = uiStep(run([sc('s-01', 'a', 'ok')], [], { moved: [{ part: 'app', from: 3000, to: 3105, by: "HQ's preview of shop" }] }), 'T-01')
+  assert.equal(moved.step.lines![0]!.text, "HQ ran its own copy of the app on port 3105 instead of 3000 (in use by HQ's preview of shop)."); assert.equal(moved.step.lines!.length, 2)
 })

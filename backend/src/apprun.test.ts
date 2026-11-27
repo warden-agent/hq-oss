@@ -6,7 +6,8 @@ import os from 'node:os'
 import net from 'node:net'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { commandWarning, EPHEMERAL_FROM, listsPackages, onPath, ownInstall, packageManager, installLeftovers, installOutputs, portBusy, portBusyWith, strayPorts, testPorts } from './apprun.ts'
+import { commandWarning, EPHEMERAL_FROM, installsPackages, listsPackages, onPath, ownInstall, packageManager, installLeftovers, installOutputs, portBusy, portBusyWith, strayPorts,
+  testPorts } from './apprun.ts'
 import { assignPorts, portRange, checkRecipe, commandRecipe, detectCommand, frameBlocked, installMark, installStep, lockfileProblem, needsInstall, NO_LOCK_INSTALL, npmLock, parseRunMark, printedPorts,
   recipeProblem, refusedWords, runMark, runScript, RUN_MARK, sameCommands, supervisorSpec, type Recipe } from './apprun.ts'
 
@@ -772,4 +773,29 @@ test('Bug 400: a workspace member follows its workspace root\'s lockfile and pac
   assert.deepEqual(ownInstall(path.join(above, 'app'), all), { install: NO_LOCK_INSTALL })
   const loose = repo({ 'package.json': bare(), 'pnpm-workspace.yaml': 'packages:\n  - web\n', 'pnpm-lock.yaml': '', 'web/package.json': deps })
   assert.equal(fs.existsSync(path.join(loose, '.git')), false); assert.deepEqual(ownInstall(path.join(loose, 'web'), all), { install: NO_LOCK_INSTALL })
+})
+
+test('Bug 446: a workspace member that lists no packages of its own installs by its root\'s rule, where the root\'s packages are', () => {
+  const all = () => true, none = () => false, web = JSON.stringify({ name: 'web', scripts: { start: 'jest' } })
+  const root = (extra: object = {}) => JSON.stringify({ name: 'b446ws', private: true, devDependencies: { jest: '29.7.0' }, ...extra })
+  const ws = (files: Record<string, string>) => path.join(repo({ '.git': 'gitdir: x', 'web/package.json': web, ...files }), 'web')
+  // the entry's case, the preview's side: an npm workspace with its lockfile at the root (it was nothing installed)
+  const npm = ws({ 'package.json': root({ workspaces: ['web'] }), 'package-lock.json': '{}' }), top = path.dirname(npm)
+  assert.equal(listsPackages(path.join(npm, 'package.json')), false); assert.equal(installsPackages(npm), true)
+  assert.equal(installStep(npm), 'npm ci'); assert.deepEqual(ownInstall(npm, all), { install: 'npm ci' })
+  fs.mkdirSync(path.join(top, 'node_modules')); fs.writeFileSync(path.join(top, 'node_modules/.package-lock.json'), '{}'); age(top, 'package-lock.json', 60)
+  assert.equal(installStep(npm), null) // npm's record at the root says it's installed
+  assert.equal(installStep(ws({ 'package.json': root({ workspaces: ['web'] }) })), NO_LOCK_INSTALL) // no lockfile: nothing written (Bug 116)
+  // Yarn's, Bun's and pnpm's
+  assert.deepEqual(ownInstall(ws({ 'package.json': root({ workspaces: ['web'] }), 'yarn.lock': '' }), all), { install: 'yarn install --frozen-lockfile', install_when: 'yarn.lock' })
+  assert.deepEqual(ownInstall(ws({ 'package.json': root({ workspaces: ['*'] }), 'bun.lock': '{}' }), all), { install: 'bun install --frozen-lockfile', install_when: 'bun.lock' })
+  const pnpm = ws({ 'package.json': root(), 'pnpm-workspace.yaml': 'packages:\n  - web\n', 'pnpm-lock.yaml': '' })
+  assert.deepEqual(ownInstall(pnpm, all), { install: 'pnpm install --frozen-lockfile', install_when: 'pnpm-lock.yaml' })
+  assert.match(ownInstall(pnpm, none).stop ?? '', /^it uses pnpm \(its workspace root has a pnpm-lock\.yaml\)/)
+  // what it must not catch: a folder the root doesn't list, a pnpm-workspace.yaml of settings alone, a root above the checkout, a loose package
+  assert.deepEqual(ownInstall(ws({ 'package.json': root({ workspaces: ['api'] }), 'package-lock.json': '{}' }), all), {})
+  assert.deepEqual(ownInstall(ws({ 'package.json': root(), 'pnpm-workspace.yaml': 'onlyBuiltDependencies:\n  - esbuild\n', 'pnpm-lock.yaml': '' }), all), {})
+  const above = repo({ 'package.json': root({ workspaces: ['app'] }), 'package-lock.json': '{}', 'app/.git': 'gitdir: x', 'app/package.json': web })
+  assert.equal(installsPackages(path.join(above, 'app')), false); assert.equal(installStep(path.join(above, 'app')), null)
+  assert.equal(installsPackages(repo({ 'package.json': web })), false)
 })

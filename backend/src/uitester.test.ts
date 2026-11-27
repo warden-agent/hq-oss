@@ -17,8 +17,8 @@ const { migrate } = await import('./db.ts'); migrate()
 const { browserHere, ensureBrowser, headlessShell, appSpec, lookHow } = await import('./smoke.ts')
 const { runSandboxed, sandboxProblem } = await import('./testrun.ts')
 const { _forTests } = await import('./uitester.ts')
-const { testerFlags, testerSettings, TESTER_TOOLS } = await import('./roles.ts')
-const { LOOK_TOOLS, ON_ELEMENT } = await import('./uitesterrules.ts')
+const { testerFlags, testerSettings, TESTER_DENIED, TESTER_TOOLS } = await import('./roles.ts')
+const { HERE, LOOK_TOOLS, ON_ELEMENT } = await import('./uitesterrules.ts')
 
 const mac = process.platform === 'darwin'
 const noSandbox = mac ? await sandboxProblem() : 'the UI tester runs on macOS only'
@@ -123,8 +123,8 @@ test('the host when a reset can\'t start the app again: the tester is told why, 
 })
 
 /** Starts the host in HQ's sandbox on a small app in a fresh folder; `record`: the test setup's part of its spec. */
-async function hostOn(record: Record<string, unknown> | null, budget = { actions: 6, looks: 6, screenshots: 0 }) {
-  const wt = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-uitester-rec-'))); fs.writeFileSync(path.join(wt, 'server.js'), APP)
+async function hostOn(record: Record<string, unknown> | null, budget = { actions: 6, looks: 6, screenshots: 0 }, app = APP) {
+  const wt = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-uitester-rec-'))); fs.writeFileSync(path.join(wt, 'server.js'), app)
   fs.writeFileSync(path.join(wt, 'seed.json'), '["seeded"]')
   const recipe = { parts: [{ name: 'app', dir: '.', run: 'node server.js', port: 'auto' as const }], show: 'app', worktree_files: [], notes: '' }
   const out = path.join(wt, '.hq-uitest'), spec = { ...appSpec(wt, { recipe, repoPath: wt, how: lookHow(recipe) }), out, budget, looks: LOOK_TOOLS, shots: ['take_screenshot'],
@@ -273,5 +273,84 @@ test('the lockdown Claude Code adds: no built-in tools, only HQ\'s MCP servers, 
   const s = testerSettings(4321) as any
   assert.match(s.hooks.PreToolUse[0].hooks[0].command, /http:\/\/127\.0\.0\.1:4321\/pre$/); assert.equal(s.hooks.PreToolUse[0].matcher, '^mcp__browser__')
   assert.match(s.hooks.PostToolUse[0].hooks[0].command, /\/post$/); assert.match(s.hooks.PostToolUseFailure[0].hooks[0].command, /\/post-failed$/)
+  // Bug 453: what the tester is told its browser can't do (uitesterrules.ts HERE) is what this lockdown refuses: a tool allowed later must come off that list
+  const told = HERE.replace(/\s+/g, ' ')
+  for (const [words, refused] of [['file upload', ['file_upload']], ['drag and drop', ['drag', 'drop']], ['second tab', ['tabs']], ['other window size', ['resize']]] as const) {
+    assert.ok(told.includes(words), words); for (const t of refused) { assert.ok(TESTER_DENIED.includes(`mcp__browser__browser_${t}`), t); assert.ok(!allowed.includes(`mcp__browser__browser_${t}`)) }
+  }
   assert.ok(s.hooks.PostToolUse[0].hooks[0].timeout > 30, 'a step\'s record may wait for the app to settle')
 })
+
+// Bug 453: the host puts the app's files back before each scenario, but the tester's browser stayed open for a whole session of five, so what one scenario
+// stored in it (a setting, a sign-in cookie, a dismissed hint) was there for the next. Now HQ's relay closes the browser as each scenario starts.
+// An app whose page says what the browser already had when it opened, then stores a value in every place a page can keep one.
+const STORE = `const http = require('node:http')
+const PAGE = \`<!doctype html><title>Store</title><h1>Store</h1><p id="was">loading</p><script>
+(async () => {
+  const idb = await new Promise((res) => { const r = indexedDB.open('hq', 1); r.onupgradeneeded = () => r.result.createObjectStore('s')
+    r.onsuccess = () => { const tx = r.result.transaction('s', 'readwrite'), st = tx.objectStore('s'), g = st.get('k')
+      g.onsuccess = () => { const had = g.result || 'none'; st.put('kept', 'k'); tx.oncomplete = () => res(had) } }
+    r.onerror = () => res('error') })
+  const had = [localStorage.getItem('k') || 'none', sessionStorage.getItem('k') || 'none', document.cookie || 'none', idb, 'SID']
+  localStorage.setItem('k', 'kept'); sessionStorage.setItem('k', 'kept'); document.cookie = 'k=kept; max-age=3600'
+  document.getElementById('was').textContent = 'had ' + had.join(' | ')
+})()
+</script>\`
+http.createServer((q, s) => { s.setHeader('set-cookie', 'sid=1; HttpOnly; Max-Age=3600'); s.setHeader('content-type', 'text/html')
+  s.end(PAGE.replace('SID', /sid=1/.test(q.headers.cookie || '') ? 'kept' : 'none')) }).listen(Number(process.env.PORT), '127.0.0.1')
+`
+test('Bug 453: each scenario starts in a browser that remembers nothing of the one before: local and session storage, cookies and IndexedDB are all gone',
+  { skip: noBrowser ?? false, timeout: 120_000 }, async () => {
+    assert.equal(await ensureBrowser(), null)
+    const h = await hostOn(null, { actions: 6, looks: 6, screenshots: 0 }, STORE); assert.equal(h.up?.started, true, JSON.stringify(h.up))
+    const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hq-uitester-project-')))
+    const b = fs.mkdtempSync('/private/tmp/hq-ut-test-'); for (const d of ['empty', 'home', 'out']) fs.mkdirSync(path.join(b, d))
+    // Both servers as Claude Code starts them for a session: the browser behind HQ's relay in the browser's sandbox, and HQ's scenario tools
+    const cmd = _forTests.browserServer(b, h.up.port, project, headlessShell()!)
+    const browser = new Client({ name: 'hq-test', version: '0.0.1' }), tools = new Client({ name: 'hq-test', version: '0.0.1' })
+    await browser.connect(new StdioClientTransport({ command: cmd.command, args: cmd.args, stderr: 'pipe' }))
+    await tools.connect(new StdioClientTransport({ command: process.execPath, args: _forTests.toolsArgs({ ctrl: h.up.ctrl, ask: _forTests.askSocket(b) }), stderr: 'pipe' }))
+    const text = (r: unknown) => (r as { content: { text?: string }[] }).content.map((c) => c.text ?? '').join('\n')
+    const start = async (id: string) => text(await tools.callTool({ name: 'start_scenario', arguments: { id } }))
+    const finish = async (id: string) => text(await tools.callTool({ name: 'finish_scenario', arguments: { id, outcome: 'ok', notes: [], findings: [] } }))
+    /** Opens the app and reads what its page says the browser had. */
+    const had = async () => { await browser.callTool({ name: 'browser_navigate', arguments: { url: h.url } })
+      return /had [^"\n]*/.exec(text(await browser.callTool({ name: 'browser_snapshot', arguments: {} })))?.[0] ?? '(no line)' }
+    try {
+      assert.match(await start('s-01'), /^The app is reset\. Its address is /) // no browser open yet: nothing to close, and it doesn't wait
+      assert.equal(await had(), 'had none | none | none | none | none')
+      assert.equal(await had(), 'had kept | kept | k=kept | kept | kept') // within a scenario the browser remembers, as a person's does (what it must not clear)
+      assert.match(await finish('s-01'), /^Recorded/)
+      assert.match(await start('s-02'), /^The app is reset/)
+      assert.equal(await had(), 'had none | none | none | none | none') // a new browser: nothing of s-01 in it, the cookie only the server reads included
+      assert.match(await finish('s-02'), /^Recorded/); assert.match(await start('s-03'), /^The app is reset/)
+      assert.equal(await had(), 'had none | none | none | none | none')
+      assert.deepEqual(fs.readdirSync(path.join(b, 'empty')), [], 'the folder it starts in stays empty')
+    } finally {
+      await browser.close(); await tools.close(); await h.end(); fs.rmSync(b, { recursive: true, force: true }); fs.rmSync(project, { recursive: true, force: true })
+    }
+  })
+
+test('Bug 453: a scenario whose browser couldn\'t be closed is kept as a reset that failed, for the run\'s summary, and no scenario is under way', { skip: noSandbox ?? false, timeout: 60_000 },
+  async () => {
+    const h = await hostOn(null)
+    try {
+      assert.equal(h.up?.started, true, JSON.stringify(h.up)); const why = "the tester's browser couldn't be closed (the browser didn't close within 15 s)"
+      // HQ's scenario tools for real, with nobody on the relay's socket: they tell the host, and the tester to stop
+      // (a short folder, as the browser's own is: a socket's path may be 104 bytes at most)
+      const short = fs.mkdtempSync(path.join(process.env.HQ_SHORT_TMPDIR ?? '/private/tmp', 'hq-ut-test-')), none = path.join(short, 'fresh.sock')
+      const tools = new Client({ name: 'hq-test', version: '0.0.1' })
+      await tools.connect(new StdioClientTransport({ command: process.execPath, args: _forTests.toolsArgs({ ctrl: h.up.ctrl, ask: none, askMs: 300 }), stderr: 'pipe' }))
+      try {
+        const r = await tools.callTool({ name: 'start_scenario', arguments: { id: 's-01' } }) as { content: { text?: string }[]; isError?: boolean }
+        assert.equal(r.isError, true); assert.match(r.content[0]!.text!, /^HQ couldn't reset the app: the tester's browser couldn't be closed \(its browser tools aren't running\)\. Stop now\.$/)
+      } finally { await tools.close(); fs.rmSync(short, { recursive: true, force: true }) }
+      assert.equal(_forTests.resetFailed(h.out), "the tester's browser couldn't be closed (its browser tools aren't running)")
+      // and the host's own answer to it
+      assert.deepEqual(await post(h.up.ctrl, 'cant', { id: 's-02', why }), { ok: false, why })
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(h.out, 'reset-failed.json'), 'utf8')), { id: 's-02', why })
+      assert.match((await post(h.up.ctrl, 'pre', hook('navigate', 'a'))).hookSpecificOutput.permissionDecisionReason, /^Call start_scenario first/)
+      assert.equal(_forTests.resetFailed(h.out), why); assert.equal(_forTests.resetFailed(h.out), null)
+      assert.deepEqual(await post(h.up.ctrl, 'start', { id: 's-03' }), { ok: true, url: h.url }) // the next session's first scenario can begin
+    } finally { await h.end() }
+  })

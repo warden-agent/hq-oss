@@ -172,8 +172,8 @@ export async function stopFrozen(agentId: string, by: 'user' | 'auto'): Promise<
   const still = getAgent(a.id), same = !!still && still.status !== 'exited' && !beingStopped(a.id) && still.claude_session_id === a.claude_session_id
   const its = getRepo(repoOfAgent(a) ?? ''), testCmd = its ? savedCmd(its.test_cmd, stepsOf(its.id)) : null
   if (same) sendMessage({ repoId: a.repo_id, featureId: a.feature_id, channel: 'dm', from: 'hq', to: a.id, reason: 'fyi', body: `Your background run ${cmds} did nothing `
-    + `for ${minutes} min (no CPU, no output), so HQ stopped it. Don't wait on a run in the background: run only the test files for what you changed, with the test `
-    + "runner's force-exit and per-test time limit (for node --test: --test-force-exit --test-timeout=120000). "
+    + `for ${minutes} min (no CPU, no output), so HQ stopped it. Don't wait on a run in the background: run only the test files for what you changed, with `
+    + 'no extra flags, except that node --test needs --test-force-exit --test-timeout=120000 (pytest and other runners reject those flags). '
     + (testCmd ? `For the full suite, run the project's test command once, just before open_pr: ${testCmd}` : "If the full suite won't finish, say so in your handoff.") })
   endRuns(a.id, hit.map((x) => x.r.task), 'stopped'); resolveKind('bg_stalled', a.id)
   if (same && !hasRuns(a.id)) patch('agent', a.id, { activity: 'HQ stopped its frozen run: waking it' }) // its "failed" notice comes as a new turn

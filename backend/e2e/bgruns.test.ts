@@ -62,6 +62,7 @@ test('a frozen run: a notice, the engineer stays working meanwhile, and Stop it 
   await hq.hook(eng.id, { hook_event_name: 'Stop', last_assistant_message: 'It was stopped.' })
   const m = (await hq.state()).messages.find((x: any) => x.to_id === eng.id && x.from_id === 'hq'); assert.equal(m?.reason, 'fyi')
   assert.match(m.body, /did nothing for \d+ min \(no CPU, no output\), so HQ stopped it\. .*run only the test files for what you changed/s)
+  assert.match(m.body, /with no extra flags, except that node --test needs --test-force-exit --test-timeout=120000 \(pytest and other runners reject/) // Bug 447
 })
 
 test('Bug 181: an engineer HQ stops while its frozen run is being stopped gets no message', async () => {

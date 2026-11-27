@@ -14,7 +14,7 @@ import { patchQuestion, sendMessage, type Message } from './delivery.ts'
 import { wake } from './wake.ts'
 import { resolveKind } from './attention.ts'
 import { tpmPrompt } from './handover.ts'
-import { readNote } from './notes.ts'
+import { lastNote } from './notes.ts'
 import { writeRepoMd } from './projectmd.ts'
 import { answerOpenAsks } from './asks.ts'
 
@@ -56,9 +56,10 @@ async function launch(repoId: string, o: { message?: string | null; cleared?: bo
       AND status != 'exited' AND id IS NOT ? ORDER BY started_at DESC`, repoId, r0.tpm_agent_id)
     if (cut) return took(repoId, cut, prev, { why: o.why, adopted: true })
     const repo = await ensureFresh(repoId)
-    const ws = writeRepoMd(repoId), note = readNote(`resume:repo:${repoId}`)
-    const prompt = tpmPrompt(repo, { ws, previous: prev?.id ?? null, note, board: board(repoId), messages: prev ? lastTalk(repoId) : [], message: o.message,
-      cleared: o.cleared, context: fs.existsSync(path.join(ws, 'CONTEXT.md')), localOnly: localOnly(repo) })
+    const ws = writeRepoMd(repoId), note = lastNote(`resume:repo:${repoId}`, prev) // Bug 442: an older session's is kept (Bug 52), labelled
+    const prompt = tpmPrompt(repo, { ws, previous: prev?.id ?? null, note: note?.text ?? null, olderNote: note && !note.own ? note.at : null,
+      board: board(repoId), messages: prev ? lastTalk(repoId) : [], message: o.message, cleared: o.cleared,
+      context: fs.existsSync(path.join(ws, 'CONTEXT.md')), localOnly: localOnly(repo) })
     const a = await launchAgent({ role: 'tpm', repoId, model: modelFor('tpm'), cwd: ws, displayName: `TPM ${repo.name}`, launchPrompt: prompt, extraFlags: ['--add-dir', repo.path] })
     return took(repoId, a, prev, { why: o.why })
   } finally { starting.delete(repoId) }

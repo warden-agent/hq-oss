@@ -3,10 +3,12 @@
 // 0. A throwaway checkout of main is made ready for the app first (HQ's browser, its ports, its installs: smoke.ts prepareApp), so nothing is paid for
 //    on an app that can't be started here (Bug 380).
 // 1. One call (Sonnet, no tools) writes about 30 scenarios from the feature map and the run's screen criteria as a plain "what's new" list (uitesterrules.ts).
+//    For one ticket's check (hqcheck.ts, `onlyNew`) it writes a few for each of the ticket's screen criteria, and none about the rest of the app (Bug 453).
 // 2. HQ starts the app once, in a throwaway checkout of main, inside its test sandbox, under the tester's host (uitesthost.mjs), which resets it before each
 //    scenario and records each step on HQ's clock.
 // 3. The scenarios run in small batches, each a fresh Claude Code session locked down as the `tester` role (roles.ts): Playwright MCP and HQ's two scenario
 //    tools, nothing else; its browser in a sandbox of its own that reaches the app's port only and can't read the project (testrun.ts browserProfile).
+//    Each scenario starts in a new browser, which remembers nothing of the one before: HQ closes it itself (uitestbrowser.mjs, Bug 453).
 // 4. HQ turns what the browser ran into replayable steps, keeps each scenario's log, and the findings with their steps, in its own folder for the project.
 // 5. With a test setup (Part 3), the app runs under HQ's recorder instead: its production start on the setup's seed, every API call, server line and data
 //    change written down per scenario, kept next to the scenario's log as <id>.rec/ for the backend checker (Part 5). The tester sees none of it.
@@ -29,17 +31,22 @@ import type { TestSetup } from './testsetupstore.ts'
 import { stepWords as loopWords } from './findingrules.ts'
 import type { Retry } from './loopinputs.ts'
 import {
-  BUDGET, keepPlan, ON_ELEMENT, keepReport, LOOK_TOOLS, numbered, PER_SESSION, PLAN_SCHEMA, PLAN_SYSTEM, planPrompt, SCENARIOS, stepsOf, stepWords, TESTER_SYSTEM, testerPrompt, whatsNew,
+  BUDGET, keepPlan, ON_ELEMENT, keepReport, LOOK_TOOLS, numbered, PER_SESSION, PLAN_SCHEMA, PLAN_SYSTEM, planPrompt, scenariosFor, stepsOf, stepWords, TESTER_SYSTEM, testerPrompt,
+  whatsNew,
   type Scenario, type ScenarioResult, type Step, type UiTest,
 } from './uitesterrules.ts'
 import type { Criterion } from './criteria.ts'
 import { shq } from './util.ts'
 
-const HOST = path.join(import.meta.dirname, 'uitesthost.mjs'), TOOLS = path.join(import.meta.dirname, 'uitestmcp.mjs')
+const HOST = path.join(import.meta.dirname, 'uitesthost.mjs'), TOOLS = path.join(import.meta.dirname, 'uitestmcp.mjs'), RELAY = path.join(import.meta.dirname, 'uitestbrowser.mjs')
+/** The browser relay's socket, in the browser's own folder (short: a socket's path may be 104 bytes at most). The scenario tools ask on it. */
+const askSocket = (b: string): string => path.join(b, 'fresh.sock')
 const require = createRequire(import.meta.url)
 const MCP_CLI = (): string => path.join(path.dirname(require.resolve('@playwright/mcp/package.json')), 'cli.js')
 const sdk = (): string => { const p = require.resolve('@modelcontextprotocol/sdk/server/mcp.js'), at = '@modelcontextprotocol/sdk'; return p.slice(0, p.indexOf(at) + at.length) }
 const zod = (): string => path.dirname(require.resolve('zod'))
+/** HQ's scenario tools as Claude Code starts them (uitestmcp.mjs): where HQ's own packages are, the host's port, and the browser relay's socket. */
+const toolsArgs = (o: { ctrl: number; ask?: string; askMs?: number }): string[] => [TOOLS, JSON.stringify({ sdk: sdk(), zod: zod(), ...o })]
 /** A session's time limit, and the whole run's (the host and the app go with it). */
 const SESSION_MS = (Number(process.env.HQ_UITEST_SESSION_S) || 900) * 1000, HOST_START_MS = 120_000, SEED_MS = 120_000, BUILD_MS = 10 * 60_000
 /** The browser's own folder: short, because the browser's sockets go in it and a socket's path may be 104 bytes at most. Named by the backend's pid, so a
@@ -48,7 +55,9 @@ const TMP_ROOT = '/private/tmp', TMP_PREFIX = 'hq-ut-'
 
 export type RunInput = { repoPath: string; repoId: string; runId: string; sha: string; plan: LookPlan; gen: Owner;
   tickets: { key: string; title: string; criteria: Criterion[] }[]; retry?: Retry[]
-  ticketId?: string } // one ticket's check (hqcheck.ts): the board shows the tester on its box
+  ticketId?: string // one ticket's check (hqcheck.ts): the board shows the tester on its box
+  /** One ticket's check: only its own screen criteria are tried, a few scenarios each, and the rest of the app is left to the run's end (Bug 453). */
+  onlyNew?: boolean }
 
 const skipped = (why: string, quiet?: boolean): UiTest => ({ at: Date.now(), state: 'skipped', why, ...(quiet ? { quiet } : {}) })
 /** Where a run's scenarios, logs and findings are kept: HQ's own folder for the project, never the user's repo. Part 5 (findings) reads them from here. */
@@ -73,6 +82,7 @@ function pruneRecordings(repoId: string): void {
 export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
   if (process.platform !== 'darwin') return skipped('the UI tester runs on macOS only for now: its browser\'s sandbox is macOS\'s')
   const model = modelFor('tester'), began = Date.now(), map = featureMap(o.repoId), news = whatsNew(o.tickets)
+  const onlyNew = !!o.onlyNew, count = scenariosFor(news.ids.length, onlyNew)
   let tokens = 0, cost = 0
   // A step that ends untried once the plan was paid for keeps what it cost (Bug 380), for the check's results and the run's summary
   const paid = (why: string): UiTest => ({ ...skipped(why), ...(tokens ? { tokens, cost_usd: Math.round(cost * 100) / 100 } : {}) })
@@ -91,7 +101,7 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
 
     // 1. The scenarios
     const planned = await call({ args: ['--model', model, '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', ...PLAIN, '--json-schema', PLAN_SCHEMA,
-      '--system-prompt', PLAN_SYSTEM], prompt: planPrompt(map, news.lines, SCENARIOS), signal })
+      '--system-prompt', PLAN_SYSTEM], prompt: planPrompt(map, news.lines, count, onlyNew), signal })
     if (planned.kind === 'error') return skipped(`the tester couldn't plan its scenarios (${planned.why})`)
     if (planned.kind === 'stopped' || signal.aborted) return 'stopped'
     tokens += planned.tokens; cost += planned.r.total_cost_usd ?? 0
@@ -101,7 +111,7 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
     const retry = (o.retry ?? []).map((f) => ({ title: `Again: ${(f.own ? f.what : f.expected || f.what).slice(0, 80)}`, goal: [f.goal,
       f.own ? `Seen before: ${f.what}` : f.what,
       f.steps.length ? `The steps then, which may not fit the app any more (find your own way): ${f.steps.map(loopWords).join(' → ')}` : ''].filter(Boolean).join('\n') }))
-    const scenarios = keepPlan(planned.r.structured_output as unknown, SCENARIOS, news.ids, retry)
+    const scenarios = keepPlan(planned.r.structured_output as unknown, count, news.ids, retry)
     if (!scenarios.length) return paid('the tester\'s plan had no scenarios HQ could use')
     // Its folder starts empty: a run whose tester was stopped halfway and starts again keeps nothing of the first try
     const dir = uiTestDir(o.repoId, o.runId); fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true })
@@ -127,10 +137,10 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
       for (let i = 0, n = 0; i < scenarios.length; i += PER_SESSION, n++) {
         const batch = scenarios.slice(i, i + PER_SESSION), b = path.join(tmp, `b${n}`)
         for (const d of ['empty', 'home', 'out']) fs.mkdirSync(path.join(b, d), { recursive: true })
-        const scenarioTools = { type: 'stdio', command: process.execPath, args: [TOOLS, JSON.stringify({ sdk: sdk(), zod: zod(), ctrl: up.ctrl })] }
+        const scenarioTools = { type: 'stdio', command: process.execPath, args: toolsArgs({ ctrl: up.ctrl, ask: askSocket(b) }) }
         const mcp = { browser: browserServer(b, up.port, o.repoPath, exe), uitest: scenarioTools }
         const c = await call({ args: [...testerFlags({ model, mcp, ctrl: up.ctrl }), ...PLAIN, '--system-prompt', TESTER_SYSTEM], cwd: path.join(b, 'empty'),
-          prompt: testerPrompt({ map, news: news.lines, scenarios: batch, budget: BUDGET }), signal, timeoutMs: SESSION_MS })
+          prompt: testerPrompt({ map, news: news.lines, scenarios: batch, budget: BUDGET, onlyNew }), signal, timeoutMs: SESSION_MS })
         if (c.kind === 'stopped' || signal.aborted) return 'stopped'
         // A session that ended mid-scenario (its time limit, an API error, or it simply stopped) leaves it open: it's written as it stands, and the next
         // session's first scenario can begin
@@ -161,7 +171,8 @@ export async function runUiTest(o: RunInput): Promise<UiTest | 'stopped'> {
   return r
 }
 
-/** The browser tools as Claude Code starts them: Playwright MCP in the browser's sandbox, with nothing of the backend's environment, its home and temp folder
+/** The browser tools as Claude Code starts them: Playwright MCP in the browser's sandbox, behind HQ's relay (uitestbrowser.mjs: every message passed on, and
+ *  the browser closed when a scenario starts, Bug 453), with nothing of the backend's environment, its home and temp folder
  *  its own (`b`), told the app's address as the one origin it may ask for. Its Chromium may open that port even when it's one browsers refuse (6000, Bug
  *  433): a flag Playwright MCP takes only from a config file, written in `b`. */
 function browserServer(b: string, port: number, project: string, exe: string): { type: 'stdio'; command: string; args: string[] } {
@@ -169,7 +180,7 @@ function browserServer(b: string, port: number, project: string, exe: string): {
   const config = path.join(b, 'browser.json'); fs.writeFileSync(config, JSON.stringify({ browser: { launchOptions: { args: [`--explicitly-allowed-ports=${port}`] } } }))
   const flags = ['--headless', '--isolated', '--browser', 'chromium', '--executable-path', exe, '--no-sandbox', '--output-dir', path.join(b, 'out'), '--config', config,
     '--viewport-size', '1280x800', '--allowed-origins', `http://localhost:${port}`, '--block-service-workers', '--image-responses', 'allow']
-  const run = `cd ${shq(path.join(b, 'empty'))} && exec ${shq(process.execPath)} ${shq(MCP_CLI())} ${flags.map(shq).join(' ')}`
+  const run = `cd ${shq(path.join(b, 'empty'))} && exec ${[process.execPath, RELAY, askSocket(b), process.execPath, MCP_CLI(), ...flags].map(shq).join(' ')}`
   // Chromium's own sandbox is off (--no-sandbox): macOS refuses a sandbox inside a sandbox, and the page then crashes at once (spike). HQ's holds.
   return { type: 'stdio', command: '/usr/bin/env', args: ['-i', ...Object.entries(env).map(([k, v]) => `${k}=${v}`), '/usr/bin/sandbox-exec', '-p', browserProfile(b, port, project),
     '/bin/sh', '-c', run] }
@@ -266,4 +277,4 @@ export function sweepUiTmp(): string[] {
   }
   return gone
 }
-export const _forTests = { resultOf, browserServer, consoleErrors, keepRecording, ranOf, resetFailed }
+export const _forTests = { resultOf, browserServer, consoleErrors, keepRecording, ranOf, resetFailed, askSocket, toolsArgs }

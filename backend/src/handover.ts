@@ -65,11 +65,13 @@ function autoLine(repo: Repo, history: boolean): string {
     : `Auto mode is off for this project: ${AUTO_OFF_WORDS}. Don't tell the user HQ tested or merged anything by itself; each "merged" notice says what HQ ran.`
     + (history ? ' If earlier messages or the handoff note say HQ starts, tests or merges tickets by itself, that was while auto mode was on.' : '')
 }
+/** A time as HQ writes it in what agents read: UTC, to the minute (as update_handoff's entries). */
+const stamp = (t: number): string => `${new Date(t).toISOString().slice(0, 16).replace('T', ' ')} UTC`
 /** The launch prompt of the project's TPM (Bug 52), built from HQ's records, never from an old session. `previous`: the session
  *  it takes over from (a fresh start, a resume, a TPM that stopped), with its handoff note. `cleared`: the user just cleared the
  *  board. `message`: what the user just wrote, when that is what starts it. PROJECT.md and features/ have the rest. */
-export function tpmPrompt(repo: Repo, o: { ws: string; previous: string | null; note?: string | null; board: { f: Feature; tickets: Ticket[] }[];
-  messages: Message[]; message?: string | null; cleared?: boolean; context?: boolean; localOnly?: boolean }): string {
+export function tpmPrompt(repo: Repo, o: { ws: string; previous: string | null; note?: string | null; olderNote?: number | null;
+  board: { f: Feature; tickets: Ticket[] }[]; messages: Message[]; message?: string | null; cleared?: boolean; context?: boolean; localOnly?: boolean }): string {
   const name = (f: Feature) => f.handle ? `${f.handle} ${f.title}` : f.title
   const board = o.board.map(({ f, tickets }) => `- ${name(f)}\n${tickets.map((t) => `  - ${t.key} (${t.size}) ${t.title}: ${standing(t, tickets, repo)}${t.branch ? ` · branch ${t.branch}` : ''}`)
     .join('\n') || '  - no tickets yet'}`).join('\n')
@@ -86,7 +88,10 @@ export function tpmPrompt(repo: Repo, o: { ws: string; previous: string | null; 
     + `\n\n${autoLine(repo, o.messages.length > 0 || !!o.note)}`
     + (o.localOnly ? `\n\nHQ can't push to ${repo.name}, so nothing in it goes to GitHub: no PRs; ${autoGoing(repo) ? 'HQ merges' : 'the user merges'} finished tickets into the local`
       + ` ${repo.default_branch}${autoGoing(repo) ? '' : ' from HQ'}.` : '') // stopped: the user, until Resume (Bug 292)
-  const note = o.note ? `\n\nThe previous TPM's handoff note (HQ's ticket list above is the truth for statuses):\n${o.note}` : ''
+  // Bug 442: `olderNote` (when it was left): an earlier session's note; the last one ended without writing its own. It stays the project's memory (Bug 52)
+  const note = !o.note ? '' : o.olderNote ? `\n\nThe handoff note an earlier TPM session left on ${stamp(o.olderNote)}. The last session${o.previous ? ` (${o.previous})` : ''}`
+    + ' ended without writing one, so what this says is in flight or next may be out of date: HQ\'s ticket list above and the last messages are newer.'
+    + `\n${o.note}` : `\n\nThe previous TPM's handoff note (HQ's ticket list above is the truth for statuses):\n${o.note}`
   const ask = o.message
     ? `\n\nThe user's new message, verbatim:\n"""\n${o.message}\n"""\n\nAct on it. New work: start_feature, then create_ticket for each ticket (S/M/L, spec, criteria,`
       + ' expected_files, depends_on), set_merge_order, and tell the user the breakdown in a few lines; don\'t assign tickets unless they ask you to start now.'
@@ -111,6 +116,8 @@ export const lateWords = (l: LateCommits, base: string): string => {
     + `\n${list}\nCheck they finish what they started, run the tests, commit, then call open_pr again (with the same tests): HQ tests ${l.merged ? 'them' : 'it'} and `
     + `merges ${l.merged ? 'them' : 'it'}.`
 }
+/** Bug 442: the last engineer left no note of its own (stopped, or its session ended), so none is handed on: an older one would be from before its work. */
+const NO_NOTE = "(none: the last engineer's session ended without writing one. Git below shows what it did; get_ticket has the ticket's update_handoff log.)"
 /** The launch prompt of an engineer taking over a ticket after a fresh start: the goal, the last engineer's note, what git
  *  shows, and the approved plan or HQ's instructions for what it went back for (conflicts or its tests, Bug 84). Not the update_handoff log: get_ticket has it if needed. */
 export function engineerResumePrompt(t: Ticket, o: { feature: string; worktree: string; base: string; note: string | null; git: GitFacts; plan: string | null; fix: string | null;
@@ -126,14 +133,14 @@ export function engineerResumePrompt(t: Ticket, o: { feature: string; worktree: 
 Feature: ${o.feature}
 Branch: ${t.branch} (your worktree: ${o.worktree})
 
-The previous engineer's session ended for a fresh start; nothing from it carries over except what is written here. ${where}
+The previous engineer's session ended; nothing from it carries over except what is written here. ${where}
 Git is the truth for what exists: if the note and git disagree, trust git.
 
 ## Spec
 ${t.spec ?? ''}
 ${criteriaBlock(criteriaOf(t))}
 ## The previous engineer's handoff note
-${o.note ?? '(none)'}
+${o.note ?? NO_NOTE}
 
 ## What git shows (against ${o.base})
 Uncommitted changes:

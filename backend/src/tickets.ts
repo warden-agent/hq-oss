@@ -21,7 +21,7 @@ import { engineerResumePrompt, type LateCommits } from './handover.ts'
 import { replanDue } from './replan.ts'
 import { handOver, keepFirstRequest, messageTpm, tpmStarting } from './tpm.ts'
 import { writeFeatureMd } from './projectmd.ts'
-import { gitFacts, readNote } from './notes.ts'
+import { gitFacts, lastNote } from './notes.ts'
 import { suiteCmd } from './suiteran.ts'
 import { stepsOf } from './teststepsstore.ts'
 import { backBy, backWords, changeText, clearConflict, clearStalled, fixConflictsText, fixingFor, fixTestsText, fixWords, forTests, keepTestsFailed, mergeBase, testsFailed,
@@ -222,13 +222,15 @@ export async function resumeEngineer(ticketId: string, o: { replace?: boolean } 
   if (old && old.status !== 'exited') throw new Error(`${t.key} still has an engineer running (${old.id}).`)
   if (starting.has(t.id)) throw new Error(`${t.key} is already starting.`)
   notClearing(getFeature(t.feature_id)?.repo_id ?? '')
-  const cut = !fixing.has(t.id) ? halfStarted(t) : undefined, noted = !!readNote(`resume:ticket:${t.id}`)
+  // Bug 442: a note is handed on once. One an earlier engineer left, which `old` took over from before it ended without one, is left out
+  const own = (): string | null => { const n = lastNote(`resume:ticket:${t.id}`, old); return n?.own ? n.text : null }
+  const cut = !fixing.has(t.id) ? halfStarted(t) : undefined, noted = !!own()
   if (cut) return resumed(t, adoptEngineer(t, cut, { resume: { status: t.status, noted } }), old, { noted, adopted: true })
   const cap = canLaunch({ ignoreCap: !!o.replace }); if (!cap.ok) throw new Error(cap.why)
   starting.add(t.id)
   try {
     const f = getFeature(t.feature_id)!; const repo = await ensureFresh(f.repo_id); const base = mergeBase(repo)
-    const note = readNote(`resume:ticket:${t.id}`)
+    const note = own()
     const rev = one<{ edited_plan_text: string | null; plan_text: string }>(`SELECT edited_plan_text, plan_text FROM plan_revisions
       WHERE ticket_id = ? AND verdict IN ('approve', 'approve_with_edits') ORDER BY round DESC, submitted_at DESC`, t.id)
     const back = sentBack(t), plan = t.status === 'planning' || back ? null : rev ? rev.edited_plan_text ?? rev.plan_text : null

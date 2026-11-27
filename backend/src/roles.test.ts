@@ -101,8 +101,12 @@ test("Bug 96: the engineer prompt says what a Bash timeout really does, and neve
   const text = fs.readFileSync(path.join(import.meta.dirname, '..', 'roles', 'engineer.prompt.md'), 'utf8') // what ensureAssets copies to ~/.hq/roles
   assert.doesNotMatch(text, /Give a long suite a time limit with the Bash tool's own `timeout`/)
   assert.match(text, /`timeout` setting doesn't stop a command: when it runs out, the command moves to the background and keeps going/)
-  assert.match(text, /run only the test files for what you changed, with the test runner's own force-exit and per-test time limit/)
+  assert.match(text, /run only the test files for what you changed, with no extra flags/)
   assert.match(text, /never end your turn to wait on a run that is still going/)
+  // Bug 447: Haiku engineers put node's `--test-force-exit` / `--test-timeout` on pytest ("unrecognized arguments"). Checked on real engineers:
+  // a plain pytest example to copy stopped it; "the runner's own flags", a jest example (they took `--forceExit`) or "node only" alone didn't
+  assert.match(text, /with no extra flags \(`uv run pytest tests\/test_x\.py`\), except that node --test needs `--test-force-exit --test-timeout=120000` \(pytest/)
+  assert.doesNotMatch(text, /force-exit and per-test time limit|forceExit|testTimeout/)
   const { testCmdNote } = await import('./tickets.ts')
   assert.match(testCmdNote('npm test'), /^While you work, run only the tests for what you changed\. .*run it once, just before open_pr: .*: npm test$/)
   const from = testCmdNote('npm run t', { key: 'T-01', base: 'origin/main' }) // Bug 147: a repair's command may need what its branch adds

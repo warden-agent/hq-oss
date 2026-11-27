@@ -5,6 +5,7 @@
 //   POST /post   hook JSON it ran (PostToolUse): stamped, with what it answered
 //   POST /finish {id, report}  the scenario is over: everything about it is written to <out>/<id>.json
 //   POST /close             a session ended: a scenario it left open is written as it stands, with no report (from HQ)
+//   POST /cant   {id, why}  the scenario can't begin: the tester's browser couldn't be closed for it (uitestmcp.mjs, Bug 453); kept as a reset that failed
 // With the project's test setup (spec.record), the app runs under HQ's recorder (recorder.mjs), as a scripted scenario's does: its production start on a clean
 // seed, behind the recorder's proxy, whose address is the one the tester's browser is given. Each scenario gets a folder of its own (<out>/rec/<id>): every
 // API call, the server's output, and the stored data after each action, for the backend checker to read afterwards. A reset is the recorder's.
@@ -134,6 +135,7 @@ const server = http.createServer(async (req, res) => {
     if (cur) { write(cur.id, { id: cur.id, began: cur.began, ended: Date.now(), log: cur.log, used: cur.used, report: null }); cur = null }
     return answer({ ok: true })
   }
+  if (req.url === '/cant') return answer(resetFailed(String(b.id ?? ''), String(b.why ?? 'no reason given').slice(0, 300)))
   if (req.url === '/start') { // one reset at a time; a scenario left open is written as it stands
     busy = busy.then(async () => {
       if (cur && cur.id !== String(b.id ?? '')) return answer({ ok: false, why: `${cur.id} isn't finished: call finish_scenario for it first` })

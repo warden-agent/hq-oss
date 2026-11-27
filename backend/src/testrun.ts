@@ -18,7 +18,7 @@ import { cacheEnv, HOME_SECRETS } from './roles.ts'
 import { git } from './reposync.ts'
 import { id, real } from './util.ts'
 import { seedPackages } from './worktrees.ts'
-import { listsPackages, npmLock, onPath, ownInstall, packageManager } from './apprun.ts'
+import { installsPackages, npmLock, onPath, ownInstall, packageManager } from './apprun.ts'
 import { countWords, shownLine, summaryLines, testCounts, type Counts } from './testcounts.ts'
 import { mergeWatched, nameWatch, type Watch, type Watched } from './criteria.ts'
 import { lookIn, type LookPlan } from './smoke.ts'
@@ -41,7 +41,7 @@ const npmTest = (root: string): boolean => {
  *  still installs (its members list theirs), and a member with no lockfile of its own follows its workspace root's: `npm ci` there, where npm puts the
  *  packages (and seedPackages copies the main checkout's). */
 const nodeInstall = (root: string, rel: string): string | null => {
-  const dir = path.join(root, rel); if (!listsPackages(path.join(dir, 'package.json'))) return null
+  const dir = path.join(root, rel); if (!installsPackages(dir, root)) return null // Bug 446: a member that lists none still gets its root's
   const lock = npmLock(dir, root), at = lock ? path.relative(root, path.dirname(lock)) || '.' : rel
   if (has(root, at, 'node_modules')) return null // seedPackages copied the main checkout's
   const install = lock ? 'npm ci' : 'npm install'
@@ -392,10 +392,13 @@ function onPage(s: Shown | null): { state: (to: TestRunView['state'], behind?: s
 }
 /** Bug 392: where Yarn, pnpm and Bun keep what they download, for an install in the sandbox: their own folders in the home can't be written there, and
  *  each fell back to a folder of the one run (Yarn 1.22, Yarn 4.19, pnpm 10.34, Bun 1.4: spike 2026-11-24), so every run downloaded everything again.
- *  pnpm's only for a pnpm install: npm 11 warns about any npm_config_ setting it doesn't know. */
+ *  Bug 450: pnpm's store has two names. pnpm 10 and older read npm_config_store_dir only, pnpm 11 and 12 pnpm_config_store_dir only (spike 2026-11-27,
+ *  pnpm 9.15, 10.34, 11.29, 12.23); with the wrong one pnpm 12 put a store in the checkout's node_modules/.pnpm-store. npm's spelling only for a pnpm
+ *  install: npm 11 warns about any npm_config_ setting it doesn't know; it reads no pnpm_config_ ones, so that one goes with every install. */
+const PNPM_STORE = path.join(ENGINEER_CACHE, 'pnpm-store')
 const toolCaches = (install: string): Record<string, string> => ({ YARN_CACHE_FOLDER: path.join(ENGINEER_CACHE, 'yarn'),
-  YARN_GLOBAL_FOLDER: path.join(ENGINEER_CACHE, 'yarn-berry'), BUN_INSTALL_CACHE_DIR: path.join(ENGINEER_CACHE, 'bun'),
-  ...(/\bpnpm install\b/.test(install) ? { npm_config_store_dir: path.join(ENGINEER_CACHE, 'pnpm-store') } : {}) })
+  YARN_GLOBAL_FOLDER: path.join(ENGINEER_CACHE, 'yarn-berry'), BUN_INSTALL_CACHE_DIR: path.join(ENGINEER_CACHE, 'bun'), pnpm_config_store_dir: PNPM_STORE,
+  ...(/\bpnpm install\b/.test(install) ? { npm_config_store_dir: PNPM_STORE } : {}) })
 /** Bug 431: what a run with the network off (the tests, HQ's look at the app) tells package managers, so none goes looking for the network on its own.
  *  pnpm 12 does before a script: `verifyDepsBeforeRun` installs when node_modules is missing or is the copy seedPackages made (to pnpm a moved folder is
  *  out of date), and a v12 `packageManager` pin not yet in pnpm-lock.yaml fetches pnpm's own details. Offline, each retried for 70 s, then failed, and the

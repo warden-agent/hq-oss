@@ -117,3 +117,24 @@ test('Bug 417: the user\'s Stop, from the pane or the Agent tab, ends the helper
   s = await over(p); assert.equal(s.state, 'failed'); assert.equal(s.note, 'Claude stopped before it finished.')
   await said(h3.id, 'Done with the test setup, with no setup that works: Claude stopped before it finished.'); await gone(p, h3.id)
 })
+
+test('Bug 439: Dismiss on the red banner (can\'t test, or Claude stopped by itself) takes it away for good, also after a restart, until a helper ends that way again', async () => {
+  const p = await project('b439dis')
+  // Claude says the app can't be tested here: the red banner, and a notice
+  await ask(p); const h1 = await helper(p); await nextBatch(h1.id)
+  assert.equal((await hq.mcp(h1.id, 'report_cant_test', { reason: 'it needs a real Postgres server' })).isError, false)
+  let s = await over(p); assert.equal(s.state, 'cant_test'); assert.equal(s.note, 'it needs a real Postgres server')
+  await gone(p, h1.id); assert.equal((await notices(`repo_testsetup:${p.repo.id}`)).length, 1)
+  await ask(p, 'dismiss')
+  s = await setup(p); assert.equal(s.state, null); assert.equal(s.note, null) // was: still cant_test, so the banner stayed
+  assert.equal((await notices(`repo_testsetup:${p.repo.id}`)).length, 0)
+  await said(h1.id, 'Done with the test setup: it says HQ can\'t test this app: it needs a real Postgres server') // the why stays in its Events tab
+  await hq.restart()
+  s = await setup(p); assert.equal(s.state, null); assert.equal(s.note, null); assert.equal(s.working, false)
+  // what Dismiss must not swallow: the next helper that ends badly shows its banner again
+  await ask(p); const h2 = await helper(p, [h1.id]); await nextBatch(h2.id)
+  await hq.hook(h2.id, { hook_event_name: 'SessionEnd', reason: 'other' })
+  s = await over(p); assert.equal(s.state, 'failed'); assert.equal(s.note, 'Claude stopped before it finished.'); await gone(p, h2.id)
+  await ask(p, 'dismiss')
+  s = await setup(p); assert.equal(s.state, null); assert.equal(s.note, null)
+})
